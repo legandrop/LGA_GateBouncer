@@ -1,0 +1,33 @@
+# Simulation behavior
+
+The fixed message `Simulation · Firewall engine not connected` applies to every screen and request. Names, publishers, paths, signatures, process states and destinations are fixtures, including familiar application names. They are not inspected on this computer.
+
+## Requests and decisions
+
+Reviewing a pending request opens an in-window, nonmodal notice. Its application scope and duration selections remain in memory when you expand details, navigate, close the notice or press Escape. Those actions do not resolve the request. Allow and Block save explicit sample decisions.
+
+The requested destination is separate from the rule scope: **all outbound destinations and protocols**. Process scope, permanent permissions, timed permissions and restart behavior are simulated descriptions. There is no enforcement or timer that revokes an actual network permission.
+
+Saving or activating a rule records a decision, without creating an authorized attempt or observed traffic. Ask removes the matching sample rule; it does not invent a new network attempt. A future request would require an engine that is not implemented here.
+
+## History
+
+Last attempt, last authorized attempt and observed traffic have separate fixture sources. Authorization alone is not proof of connectivity. Not observed means no matching sample event is present, rather than a claim that an application never connected.
+
+The sample clock is fixed at October 8, 2026, 10:42:40 UTC−03. Relative ages and absolute timestamps use this clock. History coverage is synthetic; it does not describe monitoring of the machine.
+
+## Rules and import
+
+Import loads a built-in sample containing 12 rows. Seven Ready mappings can be saved as inactive candidates; three Needs review and two Unsupported mappings remain excluded, with their reasons visible. No personal XML export is opened. Saving a candidate and explicitly activating it are separate steps.
+
+Cleanup previews rules with old sample attempts and requires explicit selection. It backs up the full synthetic state in memory before removal. Restore recovers policies, rules, pending requests, review selections, events and import state from that snapshot. No executable is removed, and absence of observed traffic is not used as a cleanup criterion.
+
+## Explanations and unavailable state
+
+Settings can enable a sample configured state and consent to the proposed sharing. Automatic explanations default to enabled after consent and can be turned off for manual requests. Expected purpose, insufficient information and errors are synthetic outcomes. Cancellation, closing a notice, a resolved request, configuration removal, revoked consent, reset or loss of the simulated service invalidates a pending response. Responses are plain text and never change policies or network events.
+
+The API key field stays empty and read only. A future online feature would require separate approval of the provider, terms, transport, limited payload, privacy, key storage, untrusted responses and behavior while an application remains blocked. This prototype does not satisfy or implement those integration requirements.
+
+The unavailable service scenario rejects policy changes, import, activation, cleanup and restore in both the interface and the model. The UI closed scenario keeps the preview open to illustrate a proposed state; no service continues enforcing anything.
+
+Escape dismisses the current overlay and keeps unresolved requests pending. Tab follows controls, Enter opens a selected actionable row, and headings can sort the Processes and Activity tables. Help & about reiterates the simulation limits. Reset restores the initial fixtures; closing the application discards session state.
