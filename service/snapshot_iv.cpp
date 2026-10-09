@@ -1188,7 +1188,16 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
         }
         return true;
       }
-      if (old.storedState != State::Applied ||
+      // El bootstrap vacío sólo abre la primera transición de formato;
+      // no acredita autoridad ni prueba corriente del runtime.
+      const bool bootstrap =
+          old.sequence == 1 && old.desired == 0 && zero(old.active) &&
+          old.rules.empty() && old.entries.empty() && old.archive.size() == 0 &&
+          old.migrationBase == 0 && old.effective == 0 && !old.storedKnown &&
+          old.storedState == State::RecoveryRequired &&
+          old.activeProjection == Digest{} && old.activeAdmission == Digest{} &&
+          old.archiveDigest == Digest{};
+      if ((old.storedState != State::Applied && !bootstrap) ||
           after.storedState != State::Prepared || old.desired == UINT64_MAX ||
           after.desired != old.desired + 1 ||
           after.entries.size() != old.entries.size() + 1)
