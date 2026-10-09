@@ -1789,7 +1789,7 @@ void MainWindow::renderLive() {
         pageLayout_->addWidget(label("Inactive · Unverified · External unaccredited. Source fields may be known while subject scope, constraints and overlap remain unknown. No synthetic profile is selected automatically.", "muted", true));
         auto *profiles = line(pageLayout_); profiles->addWidget(label("Source profile", "muted"));
         auto *format = combo({"Structural XML · unknown semantics", "NetLimiter QName profile · source subset"}, "migration-format");
-        format->setCurrentIndex(product_.importFormat() == ImportFormat::QNameProfile ? 1 : 0); profiles->addWidget(format); profiles->addStretch();
+        format->setSizeAdjustPolicy(QComboBox::AdjustToContents); format->setCurrentIndex(product_.importFormat() == ImportFormat::QNameProfile ? 1 : 0); profiles->addWidget(format); profiles->addStretch();
         connect(format, &QComboBox::currentIndexChanged, this, [this](int index) { product_.setImportFormat(index == 1 ? ImportFormat::QNameProfile : ImportFormat::Structural); });
         auto *bar = line(pageLayout_); auto *choose = button("Choose migration XML…", "choose-migration"); bar->addWidget(choose);
         auto *reset = button("Clear preview", "clear-preview", "ghost"); bar->addWidget(reset); bar->addStretch();
