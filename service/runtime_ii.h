@@ -33,6 +33,7 @@ class NativeRuntime {
 
   private:
     struct PrincipalAdmission;
+    bool principalActorCurrent(const PrincipalAdmission &) const noexcept;
     directional::Result writePrincipal(const principal::Snapshot &, const principal::Entry &,
         const std::shared_ptr<PrincipalAdmission> &);
     bool principalAdmissionCurrent(const PrincipalAdmission &, const principal::Entry &,

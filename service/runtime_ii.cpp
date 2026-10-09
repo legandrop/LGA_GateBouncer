@@ -1,5 +1,6 @@
 #include "runtime_ii.h"
 #include "runtime_reply_iii.h"
+#include "principal_actor_vi.h"
 #include <algorithm>
 #include <thread>
 namespace gb::decisions {
@@ -46,6 +47,19 @@ struct NativeRuntime::PrincipalAdmission {
     native::TokenEvidence identity;
     bool consumed = false, cancelled = false;
 };
+bool NativeRuntime::principalActorCurrent(const PrincipalAdmission &admission) const noexcept {
+    struct Owner { const NativeRuntime &runtime; const PrincipalAdmission &admission; }
+        owner{*this, admission};
+    auto accepts = [](void *raw, const native::TokenEvidence &fresh) noexcept {
+        auto &o = *static_cast<Owner *>(raw);
+        try { return o.runtime.profile_.value().generation == o.admission.profile &&
+            o.runtime.profile_.accepts(fresh, false); }
+        catch (...) { return false; }
+    };
+    PrincipalActorQuery::Api api;
+    return PrincipalActorQuery::current(admission.actor, admission.identity,
+        admission.cancelled, &owner, accepts, api);
+}
 bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admission,
     const principal::Entry &command, allnative::Stage requiredStage) const noexcept {
     try {
@@ -55,18 +69,13 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
             !principalCatalog_ || !admission.source || admission.source->stage() != requiredStage ||
             admission.source->poisoned_.load() ||
             (requiredStage != allnative::Stage::Active && requiredStage != allnative::Stage::Drained) ||
-            !admission.actor.current() || !profile_.accepts(admission.identity, false) ||
+            !principalActorCurrent(admission) ||
             admission.profile != profile_.value().generation || command.command.commandEpoch != epoch_ ||
             command.command.boot != boot_ || command.command.profileGeneration != admission.profile ||
             command.command.accountSid != admission.identity.account ||
             command.command.logonSid != admission.identity.logon ||
             command.command.sessionId != admission.identity.session) return false;
-        native::Handle token; HANDLE raw = nullptr;
-        if (!OpenProcessToken(admission.actor.process.value, TOKEN_QUERY, &raw)) return false;
-        token.reset(raw); native::TokenEvidence current;
-        if (!native::tokenEvidence(token.value, current) || current.account != admission.identity.account ||
-            current.logon != admission.identity.logon || current.session != admission.identity.session ||
-            !profile_.accepts(current, false)) return false;
+        const auto &current = admission.identity;
         Frame frame;
         if (decode(command.command.payload, frame) != Error::Ok ||
             !find(frame, Tag::TargetDigest) || find(frame, Tag::TargetDigest)->bytes !=
@@ -214,9 +223,9 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         // Read-accessible sólo prueba forma. Ningún outcome anuncia protección,
         // coverageReady ni un permiso efectivo para el cliente.
         profile_.refresh();
-        if (started != Reason::None || !admission->actor.current() ||
-            admission->cancelled || !profile_.accepts(admission->identity, false) ||
-            profile_.value().generation != admission->profile) {
+        // El flush y start pudieron cruzar un cambio de token: consultar el
+        // HANDLE retenido otra vez, sin depender del Source A ya retirado.
+        if (started != Reason::None || !principalActorCurrent(*admission)) {
             principalWriteFault_ = true;
             result.state = State::RecoveryRequired; result.error = Error::RecoveryRequired;
         }
