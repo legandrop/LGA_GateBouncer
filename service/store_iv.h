@@ -2,6 +2,8 @@
 #include "coordinator_iii.h"
 #include "snapshot_iv.h"
 
+namespace gb::decisions { class NativeRuntime; }
+
 namespace gb::principal {
 enum class StoredImage { Missing, LegacyReadOnly, Principal, Uncertain };
 struct StoreRead {
@@ -31,11 +33,17 @@ public:
   bool uncertain() const;
 
 private:
+  friend class decisions::NativeRuntime;
+  using RetainRead = bool (*)(void *, const ByteView &) noexcept;
+  bool loadRetained(StoreRead &, void *, RetainRead);
+  StoreWrite replaceOwned(std::uint64_t, std::uint64_t, ByteView, bool rereadFailure = false);
   bool observe(StoreRead &out);
   std::shared_ptr<directional::SnapshotFile> file_;
   mutable std::mutex mutex_;
   ByteView active_;
   StoreRead read_;
   bool lease_ = false, loaded_ = false, uncertain_ = true;
+  void *readContext_ = nullptr;
+  RetainRead retainRead_ = nullptr;
 };
 } // namespace gb::principal

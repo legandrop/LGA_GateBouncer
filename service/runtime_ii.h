@@ -2,6 +2,10 @@
 #include "../common/pipe_ii_win.h"
 #include "collector_ii.h"
 #include "effects_ii.h"
+#include "engine_resource_iv.h"
+#include "catalog_plan_iv.h"
+#include "store_iv.h"
+#include "windows/allapps/native/NativeSource.h"
 #include "journal_iii.h"
 #include "wfp_backend.h"
 namespace gb::decisions {
@@ -11,6 +15,7 @@ class NativeRuntime {
                   std::filesystem::path store, Bytes account, Id epoch, Id boot);
     ~NativeRuntime();
     bool initialize();
+    ServiceContext serviceContext() const;
     void tick();
     Frame status(Type type) const;
     Frame dispatch(const Frame &request, const VerifiedControl &peer, Pages &pages);
@@ -24,12 +29,26 @@ class NativeRuntime {
     std::uint64_t latest() const { return ring_.latest(); }
     Id epoch() const { return epoch_; }
     std::uint64_t profileGeneration() const { return profile_.value().generation; }
-    std::mutex mutex;
+    mutable std::mutex mutex;
 
   private:
     std::vector<ii::RuleRecord> rules() const;
     Frame error(Error error) const;
+    bool acquireObservationEngine();
+    bool loadPrincipalImage();
+    bool bindPrincipalObservation(CatalogPlanBuilder &);
+    void retirePrincipalObservation() noexcept;
+    std::shared_ptr<EngineResource> observationEngine_;
+    std::shared_ptr<EngineResource> retainedEngineFault_;
+    std::uint64_t observationGeneration_ = 0;
     directional::NativeSnapshotFile file_;
+    allnative::CatalogRegistry catalogRegistry_;
+    std::unique_ptr<principal::SnapshotStore> principalStore_;
+    principal::StoreRead principalRead_;
+    std::shared_ptr<allnative::NativeSource> principalSource_;
+    std::shared_ptr<const allnative::CatalogSnapshot> principalCatalog_;
+    std::uint64_t inventoryRevision_ = 0;
+    bool principalMode_ = false;
     NativeDirections directions_;
     directional::SnapshotCoordinator coordinator_;
     WfpBackend &backend_;

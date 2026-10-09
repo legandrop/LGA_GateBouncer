@@ -37,10 +37,29 @@ NativeRuntime::NativeRuntime(WfpBackend &b, SelectorRegistry &r,
       backend_(b), registry_(r), epoch_(epoch), boot_(boot), journal_(coordinator_, r),
       effects_(coordinator_, directions_), engine_(epoch, boot, journal_, effects_, 2),
       profile_(std::move(account)), ring_(epoch, 1, 2), collector_(r, engine_, ring_, epoch) {
+    // El cargo de un source retirado puede sobrevivir al Runtime. Compartir
+    // el registro del proceso mientras queda cualquier token físico evita
+    // reiniciar el límite al construir otro owner; el registro no posee arenas.
+    static std::mutex registryMutex;
+    static std::weak_ptr<allnative::CatalogRegistry::State> processRegistry;
+    {
+        std::lock_guard<std::mutex> lock(registryMutex);
+        if (auto state = processRegistry.lock()) catalogRegistry_.state_ = std::move(state);
+        else processRegistry = catalogRegistry_.state_;
+    }
     backend_.attachCollector(&collector_);
 }
-NativeRuntime::~NativeRuntime() { backend_.attachCollector(nullptr); }
+NativeRuntime::~NativeRuntime() {
+    retirePrincipalObservation();
+    backend_.attachCollector(nullptr);
+}
 bool NativeRuntime::initialize() {
+    if (!loadPrincipalImage()) return false;
+    if (principalMode_) {
+        loaded_ = true;
+        tick();
+        return true;
+    }
     if (!coordinator_.load()) return false;
     directions_.initialLegacy(coordinator_.legacy());
     // Leer/migrar no aplica baseline ni reproduce comandos. Gate U aún sin prueba OS.
@@ -59,12 +78,108 @@ bool NativeRuntime::initialize() {
     tick();
     return true;
 }
+ServiceContext NativeRuntime::serviceContext() const {
+    std::lock_guard<std::mutex> lock(mutex);
+    ServiceContext context;
+    context.serviceEpoch = epoch_;
+    context.boot = boot_;
+    if (observationEngine_) {
+        context.engineContext = observationEngine_->context_;
+        context.engineBindingGeneration = observationEngine_->generation_;
+    }
+    return context;
+}
+bool NativeRuntime::acquireObservationEngine() {
+    if (observationEngine_) return true;
+    if (retainedEngineFault_ || observationGeneration_ == UINT64_MAX) return false;
+    auto acquired = EngineResource::acquire(observationGeneration_ + 1, &retainedEngineFault_);
+    if (!acquired) return false;
+    ++observationGeneration_;
+    observationEngine_ = std::move(acquired);
+    return true;
+}
+bool NativeRuntime::loadPrincipalImage() {
+    if (principalStore_) return false;
+    try {
+        // Cargo completo ANTES de read/ByteView/parse. La función retainRead
+        // ancla ese mismo cargo al owner físico antes de crear metadata IV.
+        CatalogPlanBuilder plan(catalogRegistry_, allnative::MaxPolicyArenaBytes,
+                                allnative::MaxCatalogRules, allnative::MaxCatalogSlots);
+        if (plan.reservationStatus() != gatebouncer::service::windows::allapps::Reason::None)
+            return false;
+        auto file = std::shared_ptr<directional::SnapshotFile>(&file_, [](auto *) {});
+        principalStore_ = std::make_unique<principal::SnapshotStore>(std::move(file));
+        if (!principalStore_->loadRetained(principalRead_, &plan, &CatalogPlanBuilder::retainRead))
+            return false;
+        if (principalRead_.kind == principal::StoredImage::LegacyReadOnly) {
+            // Compatibilidad III: se suelta el lease IV antes del único owner III.
+            principalStore_.reset();
+            principalRead_ = {};
+            return true;
+        }
+        principalMode_ = true;
+        if (principalRead_.kind == principal::StoredImage::Principal)
+            bindPrincipalObservation(plan);
+        // Un archivo histórico, Missing o un fallo de lectura actual no crea
+        // permisos, baseline ni replay. El servicio queda consultable sin efecto conocido.
+        return true;
+    } catch (...) { return false; }
+}
+bool NativeRuntime::bindPrincipalObservation(CatalogPlanBuilder &plan) {
+    using Reason = gatebouncer::service::windows::allapps::Reason;
+    if (principalRead_.kind != principal::StoredImage::Principal || principalSource_ ||
+        inventoryRevision_ == UINT64_MAX || !acquireObservationEngine()) return false;
+    try {
+        auto sdk = allnative::systemSdk();
+        auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
+            allnative::EngineLease(observationEngine_->handle(), observationEngine_->pin()),
+            allnative::BindReceipt(observationEngine_->context_, observationEngine_->generation_), sdk));
+        std::array<std::uint16_t, 8> domain{};
+        std::array<allnative::recipe::SupportField, 32> support{};
+        std::size_t count = 0;
+        if (observationEngine_->readDomain(domain, support, count) != Reason::None ||
+            plan.stage(principalRead_.snapshot.encoded, source->binding_, inventoryRevision_ + 1,
+                       domain, {support.data(), count}) != Reason::None ||
+            plan.confirmInventory(observationEngine_->handle(), sdk, &allnative::guardedRead) != Reason::None)
+            return false;
+        auto catalog = plan.freeze();
+        if (!catalog) return false;
+        allnative::CatalogReceipt receipt(catalog); // Únicamente owner real, después del readback completo.
+        principalSource_ = std::move(source);
+        if (principalSource_->start(receipt) != Reason::None) {
+            retirePrincipalObservation();
+            return false;
+        }
+        ++inventoryRevision_;
+        principalCatalog_ = std::move(catalog);
+        return true;
+    } catch (...) {
+        retirePrincipalObservation();
+        return false;
+    }
+}
+void NativeRuntime::retirePrincipalObservation() noexcept {
+    principalCatalog_.reset();
+    if (principalSource_) {
+        const auto stage = principalSource_->stop();
+        if (stage != allnative::Stage::Drained) return; // Mantener pin en RPC/callback/fault.
+        principalSource_.reset();
+    }
+    if (observationEngine_ && observationEngine_->retire() == ERROR_SUCCESS)
+        observationEngine_.reset();
+    if (retainedEngineFault_ && retainedEngineFault_->retire() == ERROR_SUCCESS)
+        retainedEngineFault_.reset();
+}
 void NativeRuntime::tick() {
     auto prior = profile_.value().generation;
     profile_.refresh();
     if (prior != profile_.value().generation) {
         engine_.invalidateProfile(0, GetTickCount64());
         ring_.invalidate(profile_.value().generation);
+    }
+    if (principalMode_) {
+        collector_.unavailable(7);
+        return;
     }
     if (coordinator_.recovery() || !directions_.ready())
         collector_.unavailable(7);
@@ -79,7 +194,8 @@ Frame NativeRuntime::error(Error e) const {
 }
 Frame NativeRuntime::status(Type type) const {
     auto s = coordinator_.snapshot();
-    auto known = loaded_ && !coordinator_.recovery() && directions_.ready() &&
+    if (principalMode_) s.desired = principalRead_.snapshot.desired;
+    auto known = !principalMode_ && loaded_ && !coordinator_.recovery() && directions_.ready() &&
                  coordinator_.currentReadback(s.desired);
     auto active = known && !engine_.recoveryRequired() && engine_.profile().state == 1 &&
                   profile_.value().state == 1;
@@ -145,7 +261,7 @@ bool NativeRuntime::peer(HANDLE pipe, bool control, VerifiedControl &out, bool a
         !profile_.accepts(token, control))
         return false;
     out = profile_.authority(token, full);
-    if (control && activate && directions_.ready() && !coordinator_.recovery() && engine_.profile().state != 1 &&
+    if (!principalMode_ && control && activate && directions_.ready() && !coordinator_.recovery() && engine_.profile().state != 1 &&
         !engine_.activate(profile_.value(), true, GetTickCount64()))
         return false;
     return true;
@@ -174,6 +290,7 @@ Frame NativeRuntime::dispatch(const Frame &f, const VerifiedControl &peer, Pages
     if (wire::validate(f) != Error::Ok) return error(Error::Malformed);
     if (f.type == Type::GetStatus)
         return status(Type::Status);
+    if (principalMode_) return error(Error::BackendUnavailable);
     if (idValue(f, Tag::ServiceEpoch) != epoch_)
         return error(Error::Stale);
     auto p = profile_.value();

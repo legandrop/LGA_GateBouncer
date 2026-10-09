@@ -1,6 +1,8 @@
 #pragma once
 #include "policy.h"
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <windows.h>
 #include <string>
 

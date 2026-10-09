@@ -1,5 +1,7 @@
 #pragma once
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include "policy.h"
 #include "coordinator_iii.h"
 #include <windows.h>

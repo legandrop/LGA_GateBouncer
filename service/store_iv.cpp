@@ -17,6 +17,8 @@ bool SnapshotStore::observe(StoreRead &out) {
     return true;
   }
   ByteView bytes(std::move(b));
+  if (retainRead_ && !retainRead_(readContext_, bytes))
+    return false;
   if (parse(bytes, s.snapshot))
     s.kind = StoredImage::Principal;
   else if (parseLegacy(bytes, s.legacy))
@@ -27,10 +29,19 @@ bool SnapshotStore::observe(StoreRead &out) {
   return true;
 }
 bool SnapshotStore::load(StoreRead &out) {
+  return loadRetained(out, nullptr, nullptr);
+}
+bool SnapshotStore::loadRetained(StoreRead &out, void *context, RetainRead retain) {
   std::lock_guard<std::mutex> lock(mutex_);
   if (loaded_ || lease_ || !file_ || !file_->claimWriter(this))
     return false;
   lease_ = true;
+  readContext_ = context;
+  retainRead_ = retain;
+  struct ClearRead {
+    SnapshotStore &owner;
+    ~ClearRead() { owner.readContext_ = nullptr; owner.retainRead_ = nullptr; }
+  } clear{*this};
   StoreRead s;
   if (!observe(s))
     return false;
@@ -48,6 +59,10 @@ bool SnapshotStore::uncertain() const {
 }
 StoreWrite SnapshotStore::replace(std::uint64_t sequence, std::uint64_t desired,
                                   Bytes candidate) {
+  return replaceOwned(sequence, desired, ByteView(std::move(candidate)), true);
+}
+StoreWrite SnapshotStore::replaceOwned(std::uint64_t sequence, std::uint64_t desired,
+                                       ByteView candidate, bool rereadFailure) {
   std::lock_guard<std::mutex> lock(mutex_);
   StoreWrite result;
   if (!loaded_ || !lease_ || uncertain_)
@@ -57,7 +72,7 @@ StoreWrite SnapshotStore::replace(std::uint64_t sequence, std::uint64_t desired,
     return result;
   }
   Snapshot next;
-  if (!parse(std::move(candidate), next)) {
+  if (!parse(candidate, next)) {
     result.error = Error::Malformed;
     return result;
   }
@@ -104,8 +119,11 @@ StoreWrite SnapshotStore::replace(std::uint64_t sequence, std::uint64_t desired,
     active_ = {};
     read_ = {};
     next = {};
+    candidate = {};
     StoreRead after;
-    if (observe(after)) {
+    // Un candidato anclado pertenece al productor que ya reservó A+B.
+    // No asignar una tercera imagen durante una recuperación automática.
+    if (rereadFailure && observe(after)) {
       result.observed = after.kind;
       result.observedSequence = after.kind == StoredImage::Principal
                                     ? after.snapshot.sequence
