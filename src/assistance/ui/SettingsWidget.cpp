@@ -11,6 +11,32 @@
 #include <cstring>
 namespace Gate::Assistance::Ui {
 namespace C=Configuration;
+namespace {
+QString activationMessage(const C::NetworkActivationSnapshot& activation){
+    switch(activation.cause){
+    case C::ActivationCause::Ready:
+        return activation.technicallyAvailable?"Ready to explain reviewed public information":"Configuration could not be confirmed. Refresh to check it again.";
+    case C::ActivationCause::LocalConfigurationUnavailable:return "Local assistance settings are unavailable. Refresh to inspect them.";
+    case C::ActivationCause::CredentialMissing:return "Store your own NVIDIA API key to continue setup.";
+    case C::ActivationCause::CredentialCorrupt:return "The saved API key cannot be read safely. Forget it before storing it again.";
+    case C::ActivationCause::EntitlementMissing:return "Permission for everyday use of this hosted model service has not been verified.";
+    case C::ActivationCause::OperationalUseRestricted:return "This service permits internal trial evaluation; permission for everyday explanations is not configured.";
+    case C::ActivationCause::EntitlementExpired:return "The reviewed service permission has expired. Explanations are unavailable.";
+    case C::ActivationCause::EntitlementConflict:return "The reviewed permission does not match this account, model or service configuration.";
+    case C::ActivationCause::ModelConsentMissing:return "Read the current model notice and agree before explanations can start.";
+    case C::ActivationCause::WebConsentMissing:return "Read the current web search notice and agree before searches can start.";
+    case C::ActivationCause::SearchConfigurationMissing:return "Select the current web search configuration to continue setup.";
+    case C::ActivationCause::PublicQueryApprovalMissing:return "The public information for this request could not be registered. Refresh the current request.";
+    case C::ActivationCause::ProviderPolicyChanged:return "The web search configuration changed. Refresh and review its current notice.";
+    case C::ActivationCause::SessionStale:return "The assistance session changed. Refresh to check the current configuration.";
+    case C::ActivationCause::ServiceUnavailable:return "The current request service is unavailable. Your request remains undecided.";
+    case C::ActivationCause::PayloadNotSealed:return "The explanation could not be prepared for this request. Refresh the current request.";
+    case C::ActivationCause::TechnicalPrerequisitesMissing:return "The explanation prerequisites could not be confirmed. Refresh the current request.";
+    case C::ActivationCause::LocalMutationUncertain:return "A settings update could not be confirmed. Refresh; it will not be retried automatically.";
+    }
+    return "Assistance configuration is unavailable. Refresh to inspect it.";
+}
+}
 SettingsWidget::SettingsWidget(GeneralSession* session,QWidget* parent):QFrame(parent),session_(session){
     setObjectName("assistance-settings");setProperty("role","panel");auto* layout=new QVBoxLayout(this);layout->setContentsMargins(16,16,16,16);layout->setSpacing(8);
     auto addText=[&](const QString& text,const char* name){auto* label=new QLabel(text,this);label->setObjectName(name);
@@ -28,9 +54,10 @@ SettingsWidget::SettingsWidget(GeneralSession* session,QWidget* parent):QFrame(p
     key_=new QLineEdit(this);key_->setObjectName("nvidia-key-input");key_->setEchoMode(QLineEdit::Password);
     key_->setMaxLength(512);key_->setPlaceholderText("Your NVIDIA Developer API key");key_->setInputMethodHints(Qt::ImhSensitiveData|Qt::ImhNoPredictiveText);layout->addWidget(key_);
     store_=addButton("Store API key","store-assistance-key");forget_=addButton("Forget API key","forget-assistance-key");
-    addText("An API key alone does not enable explanations. This build cannot yet confirm permission to use the model service.","faint");
+    addText("Saving a key does not verify it with NVIDIA or establish permission to use the service.","faint");
     addText("When to explain","heading");
     mode_=new QComboBox(this);mode_->setObjectName("assistance-mode");mode_->addItems({"Not selected","Automatic","Manual"});layout->addWidget(mode_);
+    addText("Automatic starts when reviewed public information and current permissions are available. Manual waits for you to start the explanation.","faint");
     selectSearch_=addButton("Set up web search","select-assistance-search");
     auto* permissions=new QGroupBox("Permissions · read each notice before agreeing",this);
     permissions->setObjectName("assistance-permissions");
@@ -72,8 +99,8 @@ void SettingsWidget::refresh(){
     const bool writable=connected&&!busy&&view.has_value();
     status_->setText(!connected?"Assistance is not connected":!view?"Connected · refresh to view your settings":
         QString("%1\nAPI key: %2 · Model: %3 · Web search: %4")
-            .arg(view->activation.cause==C::ActivationCause::Ready?"Ready to explain":"Explanations are not available yet")
-            .arg(view->local.credential==C::CredentialState::Stored?"saved":"not saved or unavailable")
+            .arg(activationMessage(view->activation))
+            .arg(view->local.credential==C::CredentialState::Stored?"saved locally":"not saved or unavailable")
             .arg(view->local.modelConsent.granted?"consented":"consent needed")
             .arg(view->local.webConsent.granted?"consented":"consent needed"));
     connect_->setEnabled(!connected&&!busy);refresh_->setEnabled(connected&&!busy);progress_->setVisible(busy);

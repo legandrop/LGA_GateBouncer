@@ -42,8 +42,11 @@ void ExplanationWidget::setSession(GeneralSession* session){
 }
 void ExplanationWidget::refresh(){
     const bool busy=session_&&session_->busy(),available=session_&&session_->available();
+    const auto configuration=session_?session_->configuration():std::nullopt;
+    const bool configured=configuration&&configuration->activation.technicallyAvailable&&
+        configuration->activation.cause==Configuration::ActivationCause::Ready;
     const auto binding=binding_?binding_():std::nullopt;
-    approve_->setEnabled(available&&!busy&&binding.has_value());start_->setEnabled(available&&!busy&&binding.has_value()&&session_->publicReviewCurrent());cancel_->setEnabled(busy);
+    approve_->setEnabled(available&&!busy&&binding.has_value());start_->setEnabled(available&&configured&&!busy&&binding.has_value()&&session_->publicReviewCurrent());cancel_->setEnabled(busy);
     product_->setEnabled(!busy);publisher_->setEnabled(!busy);progress_->setVisible(busy);
     state_->setText(!session_?"Assistance unavailable":busy?session_->publicApprovalPending()?"Registering reviewed public information…":session_->state()==G::State::Explaining?"Explaining public evidence…":session_->state()==G::State::Searching?"Searching for reviewed public information…":"Reading the current request or assistance configuration…":
         session_->state()==G::State::Cancelled?"Explanation cancelled · request remains undecided":

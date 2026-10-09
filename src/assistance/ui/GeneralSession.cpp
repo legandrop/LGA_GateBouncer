@@ -232,7 +232,7 @@ bool GeneralSession::explainReviewed(){
     if(!matching(config.modelConsent,presentation_->expectedModel(),config.epochs.modelConsent)||
         !matching(config.webConsent,presentation_->expectedWeb(),config.epochs.webConsent)||
         !canonical.activation.technicallyAvailable||
-        (canonical.activation.cause!=C::ActivationCause::Ready&&canonical.activation.cause!=C::ActivationCause::PublicQueryApprovalMissing))return false;
+        canonical.activation.cause!=C::ActivationCause::Ready)return false;
     const auto review=*review_;
     // 23/24 registra el texto ya revisado para este snapshot: no solicita otra decisión del usuario.
     return registerPublic(review.binding,review.fields,true);

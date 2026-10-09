@@ -59,7 +59,7 @@ bool GeneralRuntime::admission(const std::shared_ptr<Data>& d,const FullBinding&
     const auto snapshot=d->configuration->snapshot();
     if(!matchesConfiguration(b,snapshot)||!current())return false;
     const auto activation=d->issuer->snapshot();
-    if(activation.cause!=Configuration::ActivationCause::PublicQueryApprovalMissing||!current())return false;
+    if(activation.cause!=Configuration::ActivationCause::Ready||!activation.technicallyAvailable||!current())return false;
     return !d->closed&&d->job==job&&d->configuration->snapshot()==snapshot;
 }
 void GeneralRuntime::bindSearch(Configuration::SearchBindingRef binding,Configuration::ConsentReceipt notice) {

@@ -63,8 +63,13 @@ NetworkActivationIssuer::NetworkActivationIssuer(ConfigurationController &c):aut
 NetworkActivationSnapshot NetworkActivationIssuer::snapshot() const {
     NetworkActivationSnapshot result;auto a=authority_.lock();if(!a){result.cause=ActivationCause::SessionStale;return result;}
     Detail::AuthorityImage copy;std::function<bool()> ordinary;{std::lock_guard<std::mutex> lock(a->mutex);copy=Detail::image(*a);ordinary=a->ordinary;}
-    result.cause=ordinary&&ordinary()?Detail::availability(copy,utcNow()):ActivationCause::LocalConfigurationUnavailable;
-    if(result.cause==ActivationCause::Ready)result.cause=ActivationCause::PublicQueryApprovalMissing;
+    bool current=false;
+    try {current=ordinary&&ordinary();}catch(...) {}
+    // Ordinary puede reentrar, revocar o destruir el controlador: no publicar la imagen anterior.
+    std::lock_guard<std::mutex> lock(a->mutex);
+    if(!(Detail::image(*a)==copy)||!a->alive){result.cause=ActivationCause::SessionStale;return result;}
+    result.cause=current?Detail::availability(copy,utcNow()):ActivationCause::LocalConfigurationUnavailable;
+    result.technicallyAvailable=result.cause==ActivationCause::Ready;
     result.entitlementState=copy.provider.evidence;result.profileRef=copy.provider.profile;result.destinationModelModeBinding=copy.provider.destination;result.entitlementRevisionBinding=copy.provider.evidenceRevision;result.epochs=copy.snapshot.epochs;return result;
 }
 PermitResult NetworkActivationIssuer::evaluate(BrokerJobAuthorization job) {
