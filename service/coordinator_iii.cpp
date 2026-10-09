@@ -25,6 +25,12 @@ bool NativeSnapshotFile::readLegacyJournal(Bytes &b, bool &exists) {
 bool NativeSnapshotFile::replace(const Bytes &b) {
     return lease_ && directory_.replace(L"policy.bin", b, true);
 }
+bool NativeSnapshotFile::compare(const std::uint8_t *b,std::size_t size,bool &matches,bool &exists) {
+    return lease_&&directory_.compare(L"policy.bin",b,size,matches,exists);
+}
+bool NativeSnapshotFile::replaceView(const std::uint8_t *b,std::size_t size) {
+    return lease_&&directory_.replace(L"policy.bin",b,size,true);
+}
 SnapshotCoordinator::SnapshotCoordinator(SnapshotFile &file, DirectionalBackend &backend,
                                          SelectorRegistry &registry, Id epoch,
                                          std::function<std::uint64_t()> monotonic)

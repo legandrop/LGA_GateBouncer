@@ -25,6 +25,8 @@ class SnapshotFile {
     virtual bool read(Bytes &policy, bool &exists) = 0;
     virtual bool readLegacyJournal(Bytes &journal, bool &exists) = 0;
     virtual bool replace(const Bytes &policy) = 0;
+    virtual bool compare(const std::uint8_t *,std::size_t,bool &,bool &) { return false; }
+    virtual bool replaceView(const std::uint8_t *,std::size_t) { return false; }
 };
 class NativeSnapshotFile final : public SnapshotFile {
   public:
@@ -34,6 +36,8 @@ class NativeSnapshotFile final : public SnapshotFile {
     bool read(Bytes &bytes, bool &exists) override;
     bool readLegacyJournal(Bytes &bytes, bool &exists) override;
     bool replace(const Bytes &bytes) override;
+    bool compare(const std::uint8_t *bytes,std::size_t size,bool &matches,bool &exists) override;
+    bool replaceView(const std::uint8_t *bytes,std::size_t size) override;
 
   private:
     native::ProtectedDirectory directory_;

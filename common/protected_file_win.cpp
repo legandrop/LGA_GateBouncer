@@ -1,4 +1,5 @@
 #include "protected_file_win.h"
+#include <algorithm>
 #include <aclapi.h>
 #include <bcrypt.h>
 #include <climits>
@@ -239,7 +240,39 @@ bool ProtectedDirectory::read(const wchar_t *leaf, std::size_t cap, wire::Bytes 
     return true;
 }
 bool ProtectedDirectory::replace(const wchar_t *leaf, const wire::Bytes &b, bool stateSnapshot) {
-    if (!leafName(leaf) || b.size() > ULONG_MAX || !acquire())
+    return replace(leaf,b.data(),b.size(),stateSnapshot);
+}
+bool ProtectedDirectory::compare(const wchar_t *leaf,const std::uint8_t *bytes,std::size_t count,
+                                bool &matches,bool &exists) {
+    matches=false;exists=false;
+    if(!leafName(leaf)||(!bytes&&count)||count>32*1024*1024||!acquire())return false;
+    Handle f(CreateFileW((root_/leaf).c_str(),GENERIC_READ|READ_CONTROL|FILE_READ_ATTRIBUTES,
+                         FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+    if(!f)return GetLastError()==ERROR_FILE_NOT_FOUND;
+    exists=true;LARGE_INTEGER size{};
+    if(!protectedObject(f.value,false,false)||!GetFileSizeEx(f.value,&size)||size.QuadPart<0)return false;
+    if(static_cast<std::uint64_t>(size.QuadPart)!=count)return true;
+    auto read=[](void *context,std::uint8_t *buffer,std::uint32_t cap,std::uint32_t &done) {
+        DWORD actual=0;bool ok=ReadFile(static_cast<HANDLE>(context),buffer,cap,&actual,nullptr)!=FALSE;
+        done=actual;return ok;
+    };
+    return compareStream(bytes,count,f.value,read,matches);
+}
+bool compareStream(const std::uint8_t *bytes,std::size_t count,void *context,BoundedRead read,bool &matches) {
+    matches=false;
+    if(!read||(!bytes&&count)||count>32*1024*1024)return false;
+    std::array<std::uint8_t,65536> chunk{};std::size_t at=0;
+    while(at<count){auto take=static_cast<std::uint32_t>(std::min(chunk.size(),count-at));std::uint32_t done=0;
+        if(!read(context,chunk.data(),take,done)||done!=take)return false;
+        if(!std::equal(chunk.begin(),chunk.begin()+take,bytes+at))return true;
+        at+=take;}
+    std::uint32_t done=0;
+    if(!read(context,chunk.data(),1,done)||done!=0)return false;
+    matches=true;return true;
+}
+bool ProtectedDirectory::replace(const wchar_t *leaf,const std::uint8_t *bytes,std::size_t count,bool stateSnapshot) {
+    if (!leafName(leaf) || (!bytes&&count) || count > ULONG_MAX ||
+        (stateSnapshot&&count>32*1024*1024) || !acquire())
         return false;
     if (stateSnapshot && std::wstring(leaf) != L"policy.bin")
         return false;
@@ -269,8 +302,8 @@ bool ProtectedDirectory::replace(const wchar_t *leaf, const wire::Bytes &b, bool
     if (!f || !protectedObject(f.value, false, false))
         return false;
     DWORD done = 0;
-    if (!WriteFile(f.value, b.data(), static_cast<DWORD>(b.size()), &done, nullptr) ||
-        done != b.size() || !FlushFileBuffers(f.value))
+    if (!WriteFile(f.value, bytes, static_cast<DWORD>(count), &done, nullptr) ||
+        done != count || !FlushFileBuffers(f.value))
         return false;
     f.reset();
     auto attributes = GetFileAttributesW(final.c_str());

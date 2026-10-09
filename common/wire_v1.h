@@ -14,12 +14,17 @@ enum class Type : std::uint16_t { Hello=1, HelloAck=2, GetStatus=3, Status=4,
     ListRules=5, RulesPage=6, ListPending=7, PendingPage=8, CommitDecision=9,
     CreateRule=10, RevokeRule=11, MutationAck=12, Attempt=13, Authorization=14,
     Traffic=15, ProtocolError=16, GetCommandStatus=17, CommandStatus=18,
-    GetPending=19, PendingRecord=20, SubscribeEvents=21, SubscriptionAck=22, ObservationGap=23 };
+    GetPending=19, PendingRecord=20, SubscribeEvents=21, SubscriptionAck=22, ObservationGap=23,
+    ListObserved=24, ObservedPage=25, GetObservedRecord=26, ObservedRecord=27,
+    OpenReview=28, PrepareFuturePolicy=29, FutureDraftRecord=30, CommitFuturePolicy=31,
+    FuturePolicyAck=32, GetFutureCommandStatus=33, FutureCommandStatus=34,
+    ListPrincipalRules=35, PrincipalRulesPage=36, RevokePrincipalRule=37,
+    GetFutureDraft=38, ReviewQueued=39 };
 enum class Error : std::uint16_t { Ok=0, Unsupported=1, Unauthorized=2, Stale=3,
     Malformed=4, VersionMismatch=5, Conflict=6, Capacity=7, StoreFailure=8,
     WfpFailure=9, RecoveryRequired=10, IdentityUnavailable=11, Timeout=12,
     BackendUnavailable=13, PipeAuthenticationFailure=14, NotFound=15,
-    SnapshotExpired=16, CommandUnknown=17 };
+    SnapshotExpired=16, CommandUnknown=17, ScopeUnsupported=18 };
 enum class State : std::uint8_t { Prepared=1, Applied=2, Failed=3,
     RecoveryRequired=4, AppliedUnrecorded=5 };
 enum class EngineState : std::uint8_t { Simulation=0, Unavailable=1,
@@ -40,10 +45,15 @@ enum class Tag : std::uint16_t { ClientRole=1, ServiceEpoch=2, BootId=3,
     SelectorState=56, CommandFound=58, OriginalCommandType=59, ObservedResult=60,
     PendingSnapshotRevision=61, AttemptLink=62, PolicyDirection=63,
     ObservationRevision=64, ProfileGeneration=65, ReviewProfileState=66,
-    SourceAccountMatched=67, DirectionOrigin=68, DirectionProfile=69 };
+    SourceAccountMatched=67, DirectionOrigin=68, DirectionProfile=69,
+    ObservedId=70, ObservedRevision=71, SourceEpoch=72, DraftId=73, DraftVersion=74,
+    TargetRevision=75, PackageMode=76, AcceptedScope=77, TargetDigest=78,
+    MigrationDigest=79, DraftState=80, ProofState=81, ObservedSnapshotRevision=82,
+    KnownAppliedUnrecorded=83, Durable=84, ConsentChallengeId=85,
+    CaptureBindingId=86, IVProfile=87 };
 constexpr std::uint64_t ReadStatus=1ull<<0, PathPermanentRule=1ull<<1,
     BlockRetry=1ull<<2, RuleRevoke=1ull<<3, Ipv4Ale=1ull<<4, Ipv6Ale=1ull<<5,
-    DirectionalPath=1ull<<22;
+    DirectionalPath=1ull<<22, ObservedRead=1ull<<23, FuturePolicyControl=1ull<<24;
 struct Field { Tag tag; bool required=true; Bytes bytes; };
 struct Frame {
     std::uint16_t minor=0;

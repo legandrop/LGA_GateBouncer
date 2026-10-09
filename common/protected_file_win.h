@@ -36,6 +36,10 @@ bool fixedPath(const std::filesystem::path &path);
 bool protectedRegistry(HKEY key);
 wire::Digest digest(const wire::Bytes &bytes);
 wire::Id randomIdentity();
+using BoundedRead = bool (*)(void *,std::uint8_t *,std::uint32_t,std::uint32_t &);
+// Comparación pura acotada; no comprueba procedencia, ACL ni flush por sí misma.
+bool compareStream(const std::uint8_t *bytes,std::size_t size,void *context,
+                   BoundedRead read,bool &matches);
 // Conserva handles de raíz a hoja; no repara permisos ni acepta rutas externas.
 class ProtectedDirectory {
   public:
@@ -45,6 +49,9 @@ class ProtectedDirectory {
     bool writerLease(Handle &lease);
     bool read(const wchar_t *leaf, std::size_t cap, wire::Bytes &bytes, bool &exists);
     bool replace(const wchar_t *leaf, const wire::Bytes &bytes, bool stateSnapshot = false);
+    bool replace(const wchar_t *leaf, const std::uint8_t *bytes,std::size_t size,bool stateSnapshot);
+    bool compare(const wchar_t *leaf,const std::uint8_t *bytes,std::size_t size,
+                 bool &matches,bool &exists);
     const std::filesystem::path &root() const { return root_; }
 
   private:
