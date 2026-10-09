@@ -32,6 +32,16 @@ The boot identifier uses a protected volatile registry key retained across servi
 
 ## Validation limits
 
+The principal GBS4 runtime additionally retains a private dynamic observation session
+and constructs a compact immutable catalog through exact readback before admitting a
+source. It preserves the complete session identity and strong lifetimes through callback
+drain and uncertain cleanup. Loading this snapshot never applies or replays rules;
+its current policy proof remains unknown and mutation is unavailable. The catalog
+supports 4,096 rules and up to 24,604 slots, charging 40 MiB per retained generation,
+with two generations at most. Separate per-source queues and operating-system resources
+are outside that catalog budget. This source integration has not been validated by
+executing the service against actual Windows traffic.
+
 The native runtime, server, journal/effect adapters and Qt reviewer are implemented, with laboratory activation gates. Compilation, codec/store tests and local doubles do not establish WFP enforcement, pre-user startup coverage, SYSTEM/service-SID authentication, effective pipe permissions, elevated input handling or coexistence with another firewall.
 
 Weights do not guarantee precedence over another firewall provider; a third-party hard permit can affect declarative arbitration. Coverage for all applications/accounts, multicast/broadcast, boot and failure recovery, indirect egress, temporal scopes and protected distribution remains unvalidated. There is no guarantee against an administrator or kernel component.

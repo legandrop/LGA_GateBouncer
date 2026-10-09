@@ -8,8 +8,10 @@ The subscription entry point is resolved from the system library; a missing entr
 is unsupported. No older event profile is substituted.
 
 Only the runtime owner can create a source, engine lease, immutable catalog or recovery
-receipt. Integration requires a real shared session lifetime before these private
-constructors can be used. This adapter alone does not supply that runtime integration.
+receipt. The principal runtime retains a privately acquired dynamic engine session,
+its full 128-bit context and an immutable catalog before starting observation.
+Acquisition verifies the session through read-only enumeration. This integration
+has not been validated by running the service against operating-system traffic.
 Each source retains its lease, module and callback context until Start, workers,
 cancellation and callbacks have drained. An ambiguous failure retains those resources
 and prevents restart. A stalled RPC has no bounded cancellation guarantee.
@@ -25,14 +27,24 @@ failure, zero and the maximum sentinel are rejected. Its documented uniqueness h
 ends at a system restart. Object identity also prevents transfer between source contexts,
 even if scalar stamps are made equal. Public metadata cannot create a native proof.
 
-Read-only reconciliation compares every accessible provider filter on the four ALE
-application authorization layers against an immutable expected catalog. The initial
-catalog limit is 256 entries, 32 conditions per entry and 8 MiB of retained metadata.
-Exceeding capacity rejects the source; it does not establish coverage of all applications.
+Read-only reconciliation compares accessible provider filters across eight declared
+policy layers and a separate global inventory against one immutable expected catalog.
+The compact principal catalog supports 4,096 rules, up to 24,604 slots and application
+blobs up to 65,536 bytes. Its metadata admits up to 32 fields per declared layer.
+Budget reservation precedes file reads, parsing and allocation: each retained
+generation charges 32 MiB of storage plus 8 MiB of auxiliary capacity, with at most
+two generations. Physical aliases retain that charge until their last reference.
+This 80 MiB catalog budget is not a limit on total process memory. Each NativeSource
+has its own separate queue of at most 256 records and 8 MiB of charged record storage.
+Overflow remains visible as degraded coverage; it is never evidence of a healthy source.
+The event decoder retains its separate four-layer authorization observation scope.
+Exceeding capacity rejects admission; it does not establish coverage of all applications.
 Enumeration cannot prove absence of filters hidden by access control. Current shapes
 carry read-accessible coverage and unproven temporal continuity, so historical events
 remain Unknown. No pending request, firewall permission or observed traffic is produced.
 
-A future causal emission path and an explicit policy for future application attempts
-need separate runtime integration. Current metadata does not implement either decision
-path, scoped principal filters, persistence, notification or enforcement.
+A causal pending-request path, user decisions and an explicit policy for future
+application attempts still require runtime integration and operating-system validation.
+Loading a GBS4 principal snapshot does not apply or replay its policy. Its historical
+outcome remains separate from current proof, and its mutation path is closed.
+Current metadata does not implement notification, permission or enforcement.
