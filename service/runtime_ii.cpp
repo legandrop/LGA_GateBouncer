@@ -1,6 +1,7 @@
 #include "runtime_ii.h"
 #include "runtime_reply_iii.h"
 #include "principal_actor_vi.h"
+#include "../common/ordinary_iii_win.h"
 #include <algorithm>
 #include <thread>
 namespace gb::decisions {
@@ -32,33 +33,18 @@ Frame readOnlyII(Frame f) {
     return f;
 }
 } // namespace
-// Ningún DTO crea esta admisión. El productor canónico futuro debe adquirir
-// y registrar estas capacidades privadas; hasta entonces la tabla está vacía
-// y ListPending3/dispatch de mutaciones permanece cerrado.
-struct NativeRuntime::PrincipalAdmission {
-    Id request{}, binding{};
-    std::uint64_t revision = 0, profile = 0;
-    Digest target{};
-    std::shared_ptr<allnative::NativeSource> source;
-    std::optional<allnative::NativeCopiedMetadata> event;
-    std::optional<allnative::NativeProof> proof;
-    std::optional<principal::Rule> revocation;
-    native::ProcessEvidence actor;
-    native::TokenEvidence identity;
-    bool consumed = false, cancelled = false;
-};
 bool NativeRuntime::principalActorCurrent(const PrincipalAdmission &admission) const noexcept {
     struct Owner { const NativeRuntime &runtime; const PrincipalAdmission &admission; }
         owner{*this, admission};
     auto accepts = [](void *raw, const native::TokenEvidence &fresh) noexcept {
         auto &o = *static_cast<Owner *>(raw);
-        try { return o.runtime.profile_.value().generation == o.admission.profile &&
+        try { return o.admission.owner && o.runtime.principalPeerCurrent(*o.admission.owner) &&
+            o.runtime.profile_.value().generation == o.admission.profile &&
             o.runtime.profile_.accepts(fresh, false); }
         catch (...) { return false; }
     };
-    PrincipalActorQuery::Api api;
     return PrincipalActorQuery::current(admission.actor, admission.identity,
-        admission.cancelled, &owner, accepts, api);
+        admission.cancelled, &owner, accepts, principalActorApi_);
 }
 bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admission,
     const principal::Entry &command, allnative::Stage requiredStage) const noexcept {
@@ -74,12 +60,14 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
             command.command.boot != boot_ || command.command.profileGeneration != admission.profile ||
             command.command.accountSid != admission.identity.account ||
             command.command.logonSid != admission.identity.logon ||
-            command.command.sessionId != admission.identity.session) return false;
+            command.command.sessionId != admission.identity.session ||
+            principalNow_() >= admission.deadline) return false;
         const auto &current = admission.identity;
         Frame frame;
         if (decode(command.command.payload, frame) != Error::Ok ||
             !find(frame, Tag::TargetDigest) || find(frame, Tag::TargetDigest)->bytes !=
-                Bytes(admission.target.begin(), admission.target.end())) return false;
+                Bytes(admission.target.begin(), admission.target.end()) ||
+            !find(frame, Tag::MigrationDigest) || find(frame, Tag::MigrationDigest)->bytes != Bytes(32)) return false;
         if (frame.type == Type::RevokePrincipalRule) {
             if (!admission.revocation) return false;
             const auto &rule = *admission.revocation;
@@ -107,7 +95,14 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
                 allnative::CatalogReceipt(principalCatalog_), requiredStage) ||
             idValue(frame, Tag::SourceEpoch) != admission.source->binding_->epoch ||
             idValue(frame, Tag::DraftId) != admission.request || get(frame, Tag::DraftVersion) != admission.revision ||
-            idValue(frame, Tag::CaptureBindingId) != admission.binding || get(frame, Tag::AcceptedScope) == 0)
+            idValue(frame, Tag::CaptureBindingId) != admission.binding ||
+            idValue(frame, Tag::SelectorId) != admission.selector ||
+            idValue(frame, Tag::ConsentChallengeId) != admission.challenge ||
+            get(frame, Tag::ExpectedDesiredRev) != admission.expectedDesired ||
+            get(frame, Tag::TargetRevision) != 1 || get(frame, Tag::PackageMode) != admission.package ||
+            get(frame, Tag::PolicyDirection) != admission.direction ||
+            get(frame, Tag::AcceptedScope) != (1u | (admission.package == 1 ? 2u : 0u) |
+                (get(frame, Tag::Decision) == 2 && admission.direction == 3 ? 4u : 0u)))
             return false;
         return true;
     } catch (...) { return false; }
@@ -159,7 +154,7 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         if (oldSource->stop() != allnative::Stage::Drained) {
             principalWriteFault_ = true; return result;
         }
-        auto sdk = allnative::systemSdk();
+        auto sdk = principalSdk_();
         auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
             allnative::EngineLease(observationEngine_->handle(), observationEngine_->pin()),
             allnative::BindReceipt(observationEngine_->context_, observationEngine_->generation_), sdk));
@@ -201,6 +196,8 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         if (!principalAdmissionCurrent(*admission, command, allnative::Stage::Drained)) {
             principalWriteFault_ = true; return result;
         }
+        // Soltar las subviews de validación del target B antes del seal único.
+        principalTarget = {};
         struct Seal { CatalogPlanBuilder &plan; principal::ByteView &bytes;
             principal::StoreRead &runtimeRead;
             principal::Snapshot &parsed; std::shared_ptr<const allnative::CatalogSnapshot> catalog;
@@ -212,7 +209,7 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
                 s.catalog = s.plan.freeze(); return bool(s.catalog); }
         } seal{plan, bytes, principalRead_, checked, {}};
         const auto final = principalStore_->completeOwned(sequence + 1, target.desired,
-            GetTickCount64(), &seal, &Seal::before, &Seal::after);
+            principalNow_(), &seal, &Seal::before, &Seal::after);
         if (!final.physicallyConfirmed) { principalWriteFault_ = true; return result; }
         principalRead_ = principalStore_->read_;
         principalCatalog_ = std::move(seal.catalog); principalSource_ = std::move(source);
@@ -233,8 +230,9 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
     } catch (...) { principalWriteFault_ = true; return result; }
 }
 NativeRuntime::NativeRuntime(WfpBackend &b, SelectorRegistry &r,
-                             std::filesystem::path store, Bytes account, Id epoch, Id boot)
-    : file_(std::move(store)), directions_(b), coordinator_(file_, directions_, r, epoch),
+                             std::filesystem::path store, Bytes account, Id epoch, Id boot,
+                             std::filesystem::path ordinaryImage)
+    : ordinaryImage_(std::move(ordinaryImage)), file_(std::move(store)), directions_(b), coordinator_(file_, directions_, r, epoch),
       backend_(b), registry_(r), epoch_(epoch), boot_(boot), journal_(coordinator_, r),
       effects_(coordinator_, directions_), engine_(epoch, boot, journal_, effects_, 2),
       profile_(std::move(account)), ring_(epoch, 1, 2), collector_(r, engine_, ring_, epoch) {
@@ -251,6 +249,7 @@ NativeRuntime::NativeRuntime(WfpBackend &b, SelectorRegistry &r,
     backend_.attachCollector(&collector_);
 }
 NativeRuntime::~NativeRuntime() {
+    invalidatePrincipalObservations();
     retirePrincipalObservation();
     backend_.attachCollector(nullptr);
 }
@@ -368,7 +367,7 @@ bool NativeRuntime::bindPrincipalObservation(CatalogPlanBuilder &plan) {
     if (principalRead_.kind != principal::StoredImage::Principal || principalSource_ ||
         inventoryRevision_ == UINT64_MAX || !acquireObservationEngine()) return false;
     try {
-        auto sdk = allnative::systemSdk();
+        auto sdk = principalSdk_();
         auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
             allnative::EngineLease(observationEngine_->handle(), observationEngine_->pin()),
             allnative::BindReceipt(observationEngine_->context_, observationEngine_->generation_), sdk));
@@ -412,11 +411,25 @@ void NativeRuntime::tick() {
     auto prior = profile_.value().generation;
     profile_.refresh();
     if (prior != profile_.value().generation) {
+        invalidatePrincipalObservations();
         engine_.invalidateProfile(0, GetTickCount64());
         ring_.invalidate(profile_.value().generation);
     }
     if (principalMode_) {
         collector_.unavailable(7);
+        if (!principalSource_ || principalSource_->stage() != allnative::Stage::Active ||
+            principalSource_->source_.health().health != gatebouncer::service::windows::allapps::Health::Ready ||
+            principalWriteFault_) invalidatePrincipalObservations();
+        else collectPrincipalObservations();
+        const auto now = principalNow_();
+        for (auto entry = principalAdmissions_.begin(); entry != principalAdmissions_.end();) {
+            auto &admission = *entry->second;
+            if (admission.cancelled || admission.consumed || admission.profile != profile_.value().generation ||
+                !admission.owner || admission.owner->cancelled || now >= admission.deadline ||
+                !principalActorCurrent(admission)) {
+                admission.cancelled = true; entry = principalAdmissions_.erase(entry);
+            } else ++entry;
+        }
         return;
     }
     if (coordinator_.recovery() || !directions_.ready())
@@ -706,17 +719,19 @@ Error NativeRuntime::events(std::uint64_t after, std::uint32_t mask, std::vector
     return ring_.after(after, mask, rows, gap);
 }
 bool NativeServer::run(HANDLE stop) {
-    std::thread view([&] { channel(false, stop); }), control([&] { channel(true, stop); });
+    std::thread view([&] { channel(false, stop); }), control([&] { channel(true, stop); }),
+        ordinary([&] { channel(false, stop, true); });
     while (WaitForSingleObject(stop, 250) == WAIT_TIMEOUT) {
         std::lock_guard<std::mutex> lock(runtime_.mutex);
         runtime_.tick();
     }
     view.join();
     control.join();
+    ordinary.join();
     return true;
 }
-void NativeServer::channel(bool control, HANDLE stop) {
-    const std::wstring name = control ? L"\\\\.\\pipe\\LGA.GateBouncer.Control.v1"
+void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
+    const std::wstring name = ordinary ? ipc::iii::OrdinaryPipe : control ? L"\\\\.\\pipe\\LGA.GateBouncer.Control.v1"
                                       : L"\\\\.\\pipe\\LGA.GateBouncer.View.v1";
     while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT) {
         ipc::ii::Principals principals;
@@ -745,15 +760,18 @@ void NativeServer::channel(bool control, HANDLE stop) {
             }
             Frame hello;
             VerifiedControl peer;
+            std::shared_ptr<NativeRuntime::PrincipalPeer> ordinaryPeer;
             bool authenticated = false;
             if (ipc::ii::receive(pipe.value, hello, stop) &&
-                (hello.minor == 2 || hello.minor == 1 || (!control && (hello.minor == 0 || hello.minor == 3))) && hello.type == Type::Hello &&
+                (ordinary ? hello.minor == 3 : (hello.minor == 2 || hello.minor == 1 ||
+                    (!control && (hello.minor == 0 || hello.minor == 3)))) && hello.type == Type::Hello &&
                 zero(hello.connection) && hello.sequence == 1 &&
                 get(hello, Tag::ClientRole) == (control ? 2 : 1)) {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
                 runtime_.tick();
                 authenticated = runtime_.profileGeneration() == profile &&
-                                runtime_.peer(pipe.value, control, peer, true);
+                                (ordinary ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer)
+                                    : runtime_.peer(pipe.value, control, peer, true));
             }
             if (!authenticated) {
                 DisconnectNamedPipe(pipe.value);
@@ -763,7 +781,10 @@ void NativeServer::channel(bool control, HANDLE stop) {
             Frame ack;
             {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
-                ack = runtime_.status(Type::HelloAck, hello.minor == 3 ? 3 : 2);
+                if (ordinary) {
+                    ordinaryPeer->connection = connection;
+                    ack = runtime_.ordinaryStatus(Type::HelloAck, ordinaryPeer);
+                } else ack = runtime_.status(Type::HelloAck, hello.minor == 3 ? 3 : 2);
             }
             ack.connection = connection;
             ack.correlation = hello.correlation;
@@ -771,6 +792,10 @@ void NativeServer::channel(bool control, HANDLE stop) {
                 ack = readOnlyA(std::move(ack));
             else if (hello.minor == 1) ack = readOnlyII(std::move(ack));
             if (!ipc::ii::send(pipe.value, ack, stop)) {
+                if (ordinary) {
+                    std::lock_guard<std::mutex> lock(runtime_.mutex);
+                    runtime_.closeOrdinaryPeer(ordinaryPeer);
+                }
                 DisconnectNamedPipe(pipe.value);
                 continue;
             }
@@ -832,9 +857,11 @@ void NativeServer::channel(bool control, HANDLE stop) {
                 {
                     std::lock_guard<std::mutex> lock(runtime_.mutex);
                     if (runtime_.profileGeneration() != profile ||
-                        !runtime_.peer(pipe.value, control, peer, false))
+                        !(ordinary ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer)
+                                   : runtime_.peer(pipe.value, control, peer, false)))
                         break;
-                    if (hello.minor == 3) {
+                    if (ordinary) response = runtime_.dispatchOrdinary(f, ordinaryPeer);
+                    else if (hello.minor == 3) {
                         response = runtime_.status(Type::Status, 3);
                         if (f.type != Type::GetStatus) {
                             response = {};
@@ -875,6 +902,7 @@ void NativeServer::channel(bool control, HANDLE stop) {
             DisconnectNamedPipe(pipe.value);
             {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
+                if (ordinary) runtime_.closeOrdinaryPeer(ordinaryPeer);
                 if (runtime_.profileGeneration() != profile)
                     break;
             }

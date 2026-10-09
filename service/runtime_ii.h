@@ -8,11 +8,13 @@
 #include "windows/allapps/native/NativeSource.h"
 #include "journal_iii.h"
 #include "wfp_backend.h"
+#include "principal_actor_vi.h"
 namespace gb::decisions {
 class NativeRuntime {
   public:
     NativeRuntime(WfpBackend &backend, SelectorRegistry &registry,
-                  std::filesystem::path store, Bytes account, Id epoch, Id boot);
+                  std::filesystem::path store, Bytes account, Id epoch, Id boot,
+                  std::filesystem::path ordinaryImage = {});
     ~NativeRuntime();
     bool initialize();
     ServiceContext serviceContext() const;
@@ -32,7 +34,77 @@ class NativeRuntime {
     mutable std::mutex mutex;
 
   private:
-    struct PrincipalAdmission;
+    friend class NativeServer;
+    struct PrincipalPage {
+        std::vector<wire::iv::ObservedRecord> rows;
+        Id source{};
+        std::uint64_t revision = 0, deadline = 0;
+        std::uint32_t next = 0;
+    };
+    struct PrincipalPeer {
+        native::ProcessEvidence actor;
+        native::TokenEvidence identity;
+        native::Handle pipe;
+        native::Handle image;
+        std::unique_ptr<native::ProtectedDirectory> directory;
+        BY_HANDLE_FILE_INFORMATION imageId{};
+        Id connection{};
+        std::uint64_t profile = 0;
+        std::map<Id, PrincipalPage> pages;
+        bool cancelled = false;
+    };
+    struct PrincipalObservation;
+    struct PrincipalAdmission {
+        Id request{}, binding{};
+        std::uint64_t revision = 0, profile = 0;
+        Digest target{};
+        std::shared_ptr<allnative::NativeSource> source;
+        std::optional<allnative::NativeCopiedMetadata> event;
+        std::optional<allnative::NativeProof> proof;
+        std::optional<principal::Rule> revocation;
+        native::ProcessEvidence actor;
+        native::TokenEvidence identity;
+        std::shared_ptr<PrincipalPeer> owner;
+        Id observed{}, selector{}, challenge{};
+        std::uint64_t observedRevision = 0, expectedDesired = 0, deadline = 0;
+        principal::ByteView fullTarget;
+        std::uint8_t direction = 0, package = 0;
+        bool consumed = false, cancelled = false;
+    };
+    void collectPrincipalObservations();
+    void invalidatePrincipalObservations() noexcept;
+    bool ordinaryPeer(HANDLE, std::shared_ptr<PrincipalPeer> &);
+    bool principalPeerCurrent(const PrincipalPeer &) const noexcept;
+    bool principalPolicyReady() const noexcept;
+    void closeOrdinaryPeer(const std::shared_ptr<PrincipalPeer> &) noexcept;
+    Frame dispatchOrdinary(const Frame &, const std::shared_ptr<PrincipalPeer> &);
+    Frame ordinaryStatus(Type, const std::shared_ptr<PrincipalPeer> &) const;
+    Frame principalError(Error) const;
+    Frame principalResult(const Id &, const directional::Result &, Type = Type::FuturePolicyAck) const;
+    Frame preparePrincipal(const Frame &, const std::shared_ptr<PrincipalPeer> &);
+    Frame commitPrincipal(const Frame &, const std::shared_ptr<PrincipalPeer> &);
+    std::filesystem::path ordinaryImage_;
+    // Sustituciones privadas del owner para bancos SDK; ningún peer/DTO las fija.
+    PrincipalActorQuery::Api principalActorApi_;
+    bool (*principalImageCheck_)(const PrincipalPeer &, const std::filesystem::path &) noexcept = nullptr;
+    decltype(&DuplicateHandle) principalDuplicate_ = &DuplicateHandle;
+    decltype(&GetTickCount64) principalNow_ = &GetTickCount64;
+    allnative::SdkApi (*principalSdk_)() = &allnative::systemSdk;
+    std::map<Id, std::shared_ptr<PrincipalObservation>> principalObservations_;
+    std::uint64_t principalObservedRevision_ = 0;
+    std::size_t principalPendingBytes_ = 0;
+    struct PrincipalOutcome {
+        Bytes payload;
+        directional::Result result;
+        native::TokenEvidence identity;
+        DWORD pid = 0;
+        FILETIME created{};
+        BY_HANDLE_FILE_INFORMATION imageId{};
+        std::uint64_t profile = 0;
+        Type type = Type::CommitFuturePolicy;
+    };
+    std::map<Id, PrincipalOutcome> principalOutcomes_;
+    std::size_t principalOutcomeBytes_ = 0;
     bool principalActorCurrent(const PrincipalAdmission &) const noexcept;
     directional::Result writePrincipal(const principal::Snapshot &, const principal::Entry &,
         const std::shared_ptr<PrincipalAdmission> &);
@@ -78,7 +150,7 @@ class NativeServer {
     bool run(HANDLE stop);
 
   private:
-    void channel(bool control, HANDLE stop);
+    void channel(bool control, HANDLE stop, bool ordinary = false);
     NativeRuntime &runtime_;
 };
 } // namespace gb::decisions

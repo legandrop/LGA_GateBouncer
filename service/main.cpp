@@ -42,11 +42,22 @@ void WINAPI serviceMain(DWORD,wchar_t**){
             RegGetValueW(config,nullptr,L"ViewSid",RRF_RT_REG_SZ,nullptr,viewSid,&bytes)!=ERROR_SUCCESS||
             RegGetValueW(config,nullptr,L"ViewSessionId",RRF_RT_REG_DWORD,nullptr,&session,&sessionBytes)!=ERROR_SUCCESS||
             RegGetValueW(config,nullptr,L"EnableWfp",RRF_RT_REG_DWORD,nullptr,&enabled,&enabledBytes)!=ERROR_SUCCESS||enabled!=1){RegCloseKey(config);throw std::runtime_error("Configuracion de invitado incompleta");}
+        // La instalación administrativa puede fijar una imagen ordinary. Su
+        // ausencia no se sustituye por un nombre o carpeta supuestos.
+        wchar_t ordinaryPath[32768]{}; DWORD ordinaryBytes=sizeof(ordinaryPath);
+        std::filesystem::path ordinaryImage;
+        if(RegGetValueW(config,nullptr,L"OrdinaryImage",RRF_RT_REG_SZ,nullptr,ordinaryPath,&ordinaryBytes)==ERROR_SUCCESS&&
+            ordinaryBytes>=4&&ordinaryBytes<=sizeof(ordinaryPath)&&!(ordinaryBytes%sizeof(wchar_t))&&
+            ordinaryPath[ordinaryBytes/sizeof(wchar_t)-1]==L'\0'&&
+            wcslen(ordinaryPath)+1==ordinaryBytes/sizeof(wchar_t)){
+            std::filesystem::path candidate(ordinaryPath);
+            if(native::fixedPath(candidate))ordinaryImage=std::move(candidate);
+        }
         RegCloseKey(config);
         PSID sid=nullptr;if(!ConvertStringSidToSidW(viewSid,&sid))throw std::runtime_error("SID de lectura invalido");Bytes account(static_cast<BYTE*>(sid),static_cast<BYTE*>(sid)+GetLengthSid(sid));LocalFree(sid);auto boot=bootIdentity();
         auto root=std::filesystem::path(programData)/L"LGAGateBouncerLab";native::ProtectedDirectory protectedStore(root);if(!protectedStore.acquire())throw std::runtime_error("Store no protegido");
         SelectorRegistry registry;WfpBackend backend(registry);if(!backend.connectGuest())throw std::runtime_error("Backend no conectado");
-        decisions::NativeRuntime runtime(backend,registry,root,std::move(account),randomId(),boot);
+        decisions::NativeRuntime runtime(backend,registry,root,std::move(account),randomId(),boot,std::move(ordinaryImage));
         if(!runtime.initialize())throw std::runtime_error("Recuperacion de store pendiente");
         // El perfil único limita revisión; no afirma cobertura completa ni autoriza kernel scopes.
         decisions::NativeServer server(runtime);report(SERVICE_RUNNING);server.run(stopEvent);report(SERVICE_STOPPED);
