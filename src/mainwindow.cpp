@@ -11,6 +11,7 @@
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QHash>
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
@@ -382,7 +383,10 @@ class RowsModel final : public QAbstractTableModel {
             return;
         sortColumn_ = column;
         sortOrder_ = order;
-        beginResetModel();
+        emit layoutAboutToBeChanged({}, QAbstractItemModel::VerticalSortHint);
+        const auto persistent = persistentIndexList();
+        QStringList identities;
+        for (const auto &i : persistent) identities.append(rows_[i.row()].id);
         std::stable_sort(rows_.begin(), rows_.end(), [&](const Row &a, const Row &b) {
             const auto &ac = a.cells[column];
             const auto &bc = b.cells[column];
@@ -397,7 +401,15 @@ class RowsModel final : public QAbstractTableModel {
             if (cmp == 0) cmp = QString::compare(a.id, b.id, Qt::CaseSensitive);
             return order == Qt::AscendingOrder ? cmp < 0 : cmp > 0;
         });
-        endResetModel();
+        QHash<QString, int> positions;
+        for (int row = 0; row < rows_.size(); ++row) positions.insert(rows_[row].id, row);
+        QModelIndexList remapped;
+        for (int i = 0; i < persistent.size(); ++i) {
+            const int row = positions.value(identities[i], -1);
+            remapped.append(row < 0 ? QModelIndex{} : index(row, persistent[i].column()));
+        }
+        changePersistentIndexList(persistent, remapped);
+        emit layoutChanged({}, QAbstractItemModel::VerticalSortHint);
     }
 
   private:
