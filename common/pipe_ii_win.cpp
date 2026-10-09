@@ -1,4 +1,5 @@
 #include "pipe_ii_win.h"
+#include "../controller/deployment_win.h"
 #include <aclapi.h>
 #include <array>
 #include <memory>
@@ -269,7 +270,7 @@ bool readableServerEvidence(HANDLE pipe, const std::filesystem::path &image,
     if (!manager)
         return false;
     SC_HANDLE service =
-        OpenServiceW(manager, L"LGAGateBouncerLab", SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG);
+        OpenServiceW(manager, L"LGAGateBouncerLab", SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG | READ_CONTROL);
     bool ok = false;
     if (service) {
         SERVICE_STATUS_PROCESS status{};
@@ -283,7 +284,8 @@ bool readableServerEvidence(HANDLE pipe, const std::filesystem::path &image,
                                  sizeof(status), &n)) {
             auto config = reinterpret_cast<QUERY_SERVICE_CONFIGW *>(b.data());
             std::wstring command = config->lpBinaryPathName ? config->lpBinaryPathName : L"";
-            ok = config->dwServiceType == SERVICE_WIN32_OWN_PROCESS && config->lpServiceStartName &&
+            ok = controller::serviceConfiguration(service,image,pid) &&
+                 config->dwServiceType == SERVICE_WIN32_OWN_PROCESS && config->lpServiceStartName &&
                  _wcsicmp(config->lpServiceStartName, L"LocalSystem") == 0 &&
                  command == L"\"" + image.native() + L"\" --service --guest-wfp" &&
                  status.dwCurrentState == SERVICE_RUNNING && status.dwProcessId == pid;

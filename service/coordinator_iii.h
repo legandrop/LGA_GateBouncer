@@ -38,6 +38,7 @@ class NativeSnapshotFile final : public SnapshotFile {
     bool replace(const Bytes &bytes) override;
     bool compare(const std::uint8_t *bytes,std::size_t size,bool &matches,bool &exists) override;
     bool replaceView(const std::uint8_t *bytes,std::size_t size) override;
+    bool cleanForInitial(const void *owner);
 
   private:
     native::ProtectedDirectory directory_;

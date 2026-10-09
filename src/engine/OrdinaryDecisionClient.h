@@ -18,6 +18,13 @@ class OrdinaryDecisionClient final : public QObject {
         gb::wire::Id boot{}, observed{};
         quint64 observedRevision = 0, bindingGeneration = 0;
     };
+    // Copia observacional; no concede autoridad ni acredita tráfico o permisos actuales.
+    struct ObservationContext {
+        gb::wire::iv::ServiceContext service;
+        gb::wire::Id connection{};
+        quint64 profile = 0, desired = 0, selection = 0, observedRevision = 0;
+    };
+    std::optional<ObservationContext> observationContext() const;
     explicit OrdinaryDecisionClient(bool isolatedQa, QObject *parent = nullptr,
                                     std::unique_ptr<gb::ipc::ii::SessionChannel> channel = {});
     bool refresh();
@@ -61,6 +68,7 @@ class OrdinaryDecisionClient final : public QObject {
     bool stopping_ = false, connected_ = false, current_ = false, visible_ = false;
     bool finalStatus_ = false, checkOnly_ = false;
     quint64 generation_ = 1, desired_ = 0, profile_ = 0, bindingGeneration_ = 0, pageRevision_ = 0;
+    quint64 observedGeneration_ = 0;
     int direction_ = 1;
     quint32 cursor_ = 0;
     gb::wire::Id epoch_{}, boot_{}, source_{}, connection_{}, snapshot_{}, expected_{}, command_{};

@@ -31,6 +31,25 @@ bool NativeSnapshotFile::compare(const std::uint8_t *b,std::size_t size,bool &ma
 bool NativeSnapshotFile::replaceView(const std::uint8_t *b,std::size_t size) {
     return lease_&&directory_.replace(L"policy.bin",b,size,true);
 }
+bool NativeSnapshotFile::cleanForInitial(const void *owner) {
+    std::lock_guard<std::mutex> lock(leaseMutex_);
+    if (!owner || owner != owner_ || !lease_ || !directory_.acquire()) return false;
+    WIN32_FIND_DATAW row{};
+    const auto search = FindFirstFileW((directory_.root()/L"*").c_str(),&row);
+    if (search == INVALID_HANDLE_VALUE) return false;
+    bool ok = true, foundLease = false;
+    do {
+        const std::wstring name = row.cFileName;
+        if (name == L"." || name == L"..") continue;
+        // Store nuevo: sólo el MISMO lock vacío, ningún journal/backup/temp/desconocido.
+        if (name != L"state-writer.lock" || (row.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+            ok = false; break;
+        }
+        foundLease = true;
+    } while (FindNextFileW(search,&row));
+    const auto error = GetLastError(); FindClose(search);
+    return ok && foundLease && error == ERROR_NO_MORE_FILES && native::protectedObject(lease_.value,false,false);
+}
 SnapshotCoordinator::SnapshotCoordinator(SnapshotFile &file, DirectionalBackend &backend,
                                          SelectorRegistry &registry, Id epoch,
                                          std::function<std::uint64_t()> monotonic)

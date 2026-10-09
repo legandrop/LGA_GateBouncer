@@ -1,6 +1,8 @@
 #include "deployment_win.h"
 #include <algorithm>
 #include <set>
+#include <aclapi.h>
+#include <sddl.h>
 namespace gb::controller {
 namespace {
 std::wstring lower(std::wstring s) {
@@ -27,6 +29,137 @@ std::uint64_t number(const wire::Bytes &b, std::size_t at, unsigned n) {
     return value;
 }
 } // namespace
+const std::vector<std::wstring> &deploymentFiles(DeploymentRole role) {
+    static const std::vector<std::wstring> decision = {
+        L"GateBouncerDecisionBootstrap.exe", L"GateBouncerDecisionStage.dll", L"Qt6Core.dll",
+        L"Qt6Gui.dll", L"Qt6Widgets.dll", L"libgcc_s_seh-1.dll", L"libstdc++-6.dll",
+        L"libwinpthread-1.dll", L"plugins\\platforms\\qwindows.dll", L"fonts\\Inter-Regular.ttf",
+        L"fonts\\Inter-Medium.ttf", L"fonts\\Inter-SemiBold.ttf", L"qt.conf"};
+    static const std::vector<std::wstring> product = [] {
+        auto result = decision;
+        result.insert(result.end(), {L"GateBouncer.exe", L"GateBouncerGuiStage.dll",
+            L"GateBouncerService.exe", L"GateBouncerAssistant.exe"});
+        return result;
+    }();
+    return role == DeploymentRole::DecisionController ? decision : product;
+}
+bool encodeInventory(const Inventory &inventory, wire::Bytes &out) {
+    if (inventory.empty() || inventory.size() > 64) return false;
+    wire::Bytes bytes{'G','B','D','1',1,0,0,0,0,0,0,0,
+        std::uint8_t(inventory.size()),0,0,0};
+    for (const auto &row : inventory) {
+        if (!name(row.first)) return false;
+        bytes.push_back(std::uint8_t(row.first.size())); bytes.push_back(0);
+        bytes.insert(bytes.end(), row.second.begin(), row.second.end());
+        for (auto c : row.first) bytes.push_back(std::uint8_t(c));
+    }
+    if (bytes.size() + 32 > 32768) return false;
+    const auto length = bytes.size() + 32;
+    for (unsigned i = 0; i < 4; ++i) bytes[8+i] = std::uint8_t(length >> (8*i));
+    const auto hash = native::digest(bytes);
+    bytes.insert(bytes.end(), hash.begin(), hash.end());
+    Inventory checked;
+    if (!parseInventory(bytes, checked) || checked != inventory) return false;
+    out = std::move(bytes); return true;
+}
+bool serviceDescriptor(PSECURITY_DESCRIPTOR descriptor) {
+    if (!descriptor || !IsValidSecurityDescriptor(descriptor)) return false;
+    BYTE sy[SECURITY_MAX_SID_SIZE]{}, ba[SECURITY_MAX_SID_SIZE]{};
+    DWORD sn = sizeof(sy), bn = sizeof(ba), revision = 0;
+    PSID owner = nullptr; PACL acl = nullptr; BOOL present = FALSE, def = FALSE;
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, sy, &sn) ||
+        !CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, ba, &bn)) return false;
+    const auto trusted = [&](PSID sid) { return sid && IsValidSid(sid) &&
+        (EqualSid(sid, sy) || EqualSid(sid, ba)); };
+    if (!GetSecurityDescriptorOwner(descriptor, &owner, &def) || !trusted(owner) ||
+        !GetSecurityDescriptorDacl(descriptor, &present, &acl, &def) || !present || !acl || !IsValidAcl(acl) ||
+        !GetSecurityDescriptorControl(descriptor, &control, &revision) || !(control & SE_DACL_PROTECTED)) return false;
+    GENERIC_MAPPING mapping{STANDARD_RIGHTS_READ | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS |
+        SERVICE_INTERROGATE | SERVICE_ENUMERATE_DEPENDENTS, STANDARD_RIGHTS_WRITE | SERVICE_CHANGE_CONFIG,
+        STANDARD_RIGHTS_EXECUTE | SERVICE_START | SERVICE_STOP | SERVICE_PAUSE_CONTINUE |
+        SERVICE_USER_DEFINED_CONTROL, SERVICE_ALL_ACCESS};
+    constexpr DWORD unsafe = SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_STOP | SERVICE_PAUSE_CONTINUE |
+        SERVICE_USER_DEFINED_CONTROL | DELETE | WRITE_DAC | WRITE_OWNER;
+    bool fullSy = false, fullBa = false;
+    for (DWORD i = 0; i < acl->AceCount; ++i) {
+        void *raw = nullptr; if (!GetAce(acl, i, &raw)) return false;
+        auto header = static_cast<ACE_HEADER *>(raw);
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE || header->AceFlags) return false;
+        auto ace = static_cast<ACCESS_ALLOWED_ACE *>(raw); auto mask = ace->Mask;
+        if (!IsValidSid(&ace->SidStart) || (mask & MAXIMUM_ALLOWED)) return false;
+        MapGenericMask(&mask, &mapping);
+        if (!trusted(&ace->SidStart) && (mask & unsafe)) return false;
+        if ((mask & SERVICE_ALL_ACCESS) == SERVICE_ALL_ACCESS) {
+            fullSy |= EqualSid(&ace->SidStart, sy) != FALSE;
+            fullBa |= EqualSid(&ace->SidStart, ba) != FALSE;
+        }
+    }
+    return fullSy && fullBa;
+}
+bool serviceConfiguration(SC_HANDLE service, const std::filesystem::path &image, DWORD pid) {
+    if (!service || !native::fixedPath(image)) return false;
+    DWORD needed = 0;
+    QueryServiceConfigW(service, nullptr, 0, &needed);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(QUERY_SERVICE_CONFIGW) || needed > 65536)
+        return false;
+    wire::Bytes bytes(needed);
+    if (!QueryServiceConfigW(service, reinterpret_cast<QUERY_SERVICE_CONFIGW *>(bytes.data()), needed, &needed))
+        return false;
+    auto config = reinterpret_cast<QUERY_SERVICE_CONFIGW *>(bytes.data());
+    const auto text = [&](const wchar_t *p, const std::wstring &expected) {
+        const auto first = reinterpret_cast<std::uintptr_t>(bytes.data()), at = reinterpret_cast<std::uintptr_t>(p);
+        if (!p || at < first || at - first >= bytes.size() || at % alignof(wchar_t)) return false;
+        const auto count = (bytes.size() - (at - first)) / sizeof(wchar_t);
+        std::size_t n = 0; while (n < count && p[n]) ++n;
+        return n < count && std::wstring(p, n) == expected;
+    };
+    SERVICE_SID_INFO sid{}; SERVICE_STATUS_PROCESS status{}; DWORD done = 0;
+    if (config->dwServiceType != SERVICE_WIN32_OWN_PROCESS || config->dwStartType != SERVICE_AUTO_START ||
+        !text(config->lpBinaryPathName, L"\"" + image.native() + L"\" --service --guest-wfp") ||
+        !text(config->lpServiceStartName, L"LocalSystem") ||
+        !QueryServiceConfig2W(service, SERVICE_CONFIG_SERVICE_SID_INFO, reinterpret_cast<BYTE *>(&sid), sizeof(sid), &done) ||
+        sid.dwServiceSidType != SERVICE_SID_TYPE_UNRESTRICTED ||
+        !QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<BYTE *>(&status), sizeof(status), &done) ||
+        status.dwServiceType != SERVICE_WIN32_OWN_PROCESS ||
+        (pid && (status.dwProcessId != pid ||
+         (status.dwCurrentState != SERVICE_RUNNING && status.dwCurrentState != SERVICE_START_PENDING)))) return false;
+    constexpr DWORD information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+    needed = 0; QueryServiceObjectSecurity(service, information, nullptr, 0, &needed);
+    if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || !needed || needed > 65536) return false;
+    bytes.resize(needed);
+    return QueryServiceObjectSecurity(service, information, bytes.data(), needed, &done) && serviceDescriptor(bytes.data());
+}
+struct Deployment::Registration {
+    HKEY key = nullptr, gate = nullptr;
+    SC_HANDLE service = nullptr;
+    std::filesystem::path root, store, ordinary;
+    wire::Bytes account;
+    std::wstring sid;
+    bool provision = false;
+    ~Registration() { if (key) RegCloseKey(key); if (gate) RegCloseKey(gate); if (service) CloseServiceHandle(service); }
+    bool read(const wchar_t *name, std::wstring &out) const {
+        wchar_t text[32768]{}; DWORD size = sizeof(text);
+        if (RegGetValueW(key, nullptr, name, RRF_RT_REG_SZ, nullptr, text, &size) != ERROR_SUCCESS ||
+            size < 2 || size > sizeof(text) || size % sizeof(wchar_t) ||
+            text[size/sizeof(wchar_t)-1] || wcslen(text)+1 != size/sizeof(wchar_t)) return false;
+        out = text; return true;
+    }
+    bool current() const {
+        DWORD enabled = 0, size = sizeof(enabled), initial = 0, initialSize = sizeof(initial);
+        std::wstring packageText, storeText, ordinaryText, sidText;
+        return native::protectedRegistry(key) && native::protectedRegistry(gate) &&
+            RegGetValueW(gate,nullptr,L"EnableWfp",RRF_RT_REG_DWORD,nullptr,&enabled,&size) == ERROR_SUCCESS && enabled == 1 &&
+            RegGetValueW(key,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&initial,&initialSize) == ERROR_SUCCESS &&
+            initial == (provision ? 1u : 0u) && read(L"PackageRoot", packageText) && packageText == root.native() &&
+            read(L"StoreRoot", storeText) && storeText == store.native() &&
+            read(L"OrdinaryImage", ordinaryText) && ordinaryText == ordinary.native() &&
+            read(L"ViewSid", sidText) && sidText == sid &&
+            serviceConfiguration(service, root / L"GateBouncerService.exe", GetCurrentProcessId());
+    }
+};
+Deployment::Deployment(std::filesystem::path root) : root_(std::move(root)), directory_(root_, true) {}
+Deployment::~Deployment() = default;
 bool parseInventory(const wire::Bytes &b, Inventory &out) {
     if (b.size() < 48 || b.size() > 32768 || !std::equal(b.begin(), b.begin() + 4, "GBD1") ||
         number(b, 4, 2) != 1 || number(b, 6, 2) != 0 || number(b, 8, 4) != b.size())
@@ -77,17 +210,20 @@ bool Deployment::readFile(const std::filesystem::path &relative, wire::Bytes &ou
         !GetFileSizeEx(h.value, &size) || size.QuadPart < 0 || std::uint64_t(size.QuadPart) > cap)
         return false;
     wire::Bytes bytes(std::size_t(size.QuadPart));
+    BY_HANDLE_FILE_INFORMATION identity{};
+    if (!GetFileInformationByHandle(h.value, &identity)) return false;
     DWORD done = 0;
     if (!ReadFile(h.value, bytes.data(), DWORD(bytes.size()), &done, nullptr) ||
         done != bytes.size())
         return false;
+    files_.push_back({relative, identity, held_.size()});
     held_.push_back(std::move(h));
     out = std::move(bytes);
     return true;
 }
 bool Deployment::enumerate(const std::filesystem::path &relative, unsigned depth,
-                           std::vector<std::wstring> &files) {
-    if (depth > 4 || files.size() > 64 || held_.size() >= 128)
+                           std::vector<std::wstring> &files, bool retain) {
+    if (depth > 4 || files.size() > 64 || (retain && held_.size() >= 128))
         return false;
     if (!relative.empty()) {
         native::Handle h(
@@ -96,7 +232,7 @@ bool Deployment::enumerate(const std::filesystem::path &relative, unsigned depth
                         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
         if (!h || !native::protectedObject(h.value, false, true, true))
             return false;
-        held_.push_back(std::move(h));
+        if (retain) held_.push_back(std::move(h));
     }
     WIN32_FIND_DATAW data{};
     auto found = FindFirstFileW((root_ / relative / L"*").c_str(), &data);
@@ -113,7 +249,7 @@ bool Deployment::enumerate(const std::filesystem::path &relative, unsigned depth
         }
         auto next = relative / file;
         if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!enumerate(next, depth + 1, files)) {
+            if (!enumerate(next, depth + 1, files, retain)) {
                 ok = false;
                 break;
             }
@@ -130,23 +266,15 @@ bool Deployment::enumerate(const std::filesystem::path &relative, unsigned depth
     FindClose(found);
     return ok && error == ERROR_NO_MORE_FILES;
 }
-bool Deployment::verify(const std::filesystem::path &own) {
-    if (verified_ || own != root_ / L"GateBouncerDecisionBootstrap.exe" || !directory_.acquire())
+bool Deployment::verify(const std::filesystem::path &own, DeploymentRole role) {
+    const auto expected = role == DeploymentRole::DecisionController ? L"GateBouncerDecisionBootstrap.exe" :
+        role == DeploymentRole::OrdinaryGui ? L"GateBouncer.exe" : L"GateBouncerService.exe";
+    if (verified_ || revoked_ || !held_.empty() || own != root_ / expected || !directory_.acquire())
         return false;
     wire::Bytes manifest;
     if (!readFile(L"deployment.gbd", manifest, 32768) || !parseInventory(manifest, inventory_))
         return false;
-    const wchar_t *mandatory[] = {L"GateBouncerDecisionBootstrap.exe",
-                                  L"GateBouncerDecisionStage.dll",
-                                  L"Qt6Core.dll",
-                                  L"Qt6Gui.dll",
-                                  L"Qt6Widgets.dll",
-                                  L"plugins\\platforms\\qwindows.dll",
-                                  L"fonts\\Inter-Regular.ttf",
-                                  L"fonts\\Inter-Medium.ttf",
-                                  L"fonts\\Inter-SemiBold.ttf",
-                                  L"qt.conf"};
-    for (auto file : mandatory)
+    for (const auto &file : deploymentFiles(role))
         if (!inventory_.count(file))
             return false;
     std::vector<std::wstring> files;
@@ -165,10 +293,75 @@ bool Deployment::verify(const std::filesystem::path &own) {
             return false;
     }
     verified_ = true;
+    role_ = role;
     return true;
 }
+bool Deployment::matchesImage(const std::filesystem::path &path, const BY_HANDLE_FILE_INFORMATION &identity) const {
+    if (!verified_ || revoked_ || path.parent_path() != root_) return false;
+    const auto row = std::find_if(files_.begin(), files_.end(), [&](const auto &p) { return root_ / p.path == path; });
+    return row != files_.end() && row->identity.dwVolumeSerialNumber == identity.dwVolumeSerialNumber &&
+        row->identity.nFileIndexHigh == identity.nFileIndexHigh && row->identity.nFileIndexLow == identity.nFileIndexLow &&
+        row->identity.nFileSizeHigh == identity.nFileSizeHigh && row->identity.nFileSizeLow == identity.nFileSizeLow &&
+        CompareFileTime(&row->identity.ftLastWriteTime, &identity.ftLastWriteTime) == 0;
+}
+bool Deployment::current() noexcept {
+    if (!verified_ || revoked_) return false;
+    try {
+        bool ok = directory_.acquire();
+        for (const auto &h : held_) {
+            FILE_ATTRIBUTE_TAG_INFO shape{};
+            if (!GetFileInformationByHandleEx(h.value, FileAttributeTagInfo, &shape, sizeof(shape)) ||
+                !native::protectedObject(h.value, false, bool(shape.FileAttributes & FILE_ATTRIBUTE_DIRECTORY), true)) {
+                ok = false; break;
+            }
+        }
+        for (const auto &file : files_) {
+            BY_HANDLE_FILE_INFORMATION now{};
+            const auto &was = file.identity;
+            if (!GetFileInformationByHandle(held_[file.handle].value, &now) ||
+                now.dwVolumeSerialNumber != was.dwVolumeSerialNumber || now.nFileIndexHigh != was.nFileIndexHigh ||
+                now.nFileIndexLow != was.nFileIndexLow || now.nFileSizeHigh != was.nFileSizeHigh ||
+                now.nFileSizeLow != was.nFileSizeLow || CompareFileTime(&now.ftLastWriteTime, &was.ftLastWriteTime)) {
+                ok = false; break;
+            }
+        }
+        std::vector<std::wstring> names;
+        if (!enumerate({},0,names,false) || names.size() != inventory_.size()) ok = false;
+        for (const auto &n : names) if (!inventory_.count(n)) ok = false;
+        if (registration_ && !registration_->current()) ok = false;
+        if (!ok) revoked_ = true;
+        return ok;
+    } catch (...) { revoked_ = true; return false; }
+}
+bool Deployment::admitServiceConfiguration(wire::Bytes &account, std::filesystem::path &store, bool &provision) {
+    if (role_ != DeploymentRole::Service || registration_ || !current()) return false;
+    auto candidate = std::make_unique<Registration>();
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",0,KEY_QUERY_VALUE | READ_CONTROL,&candidate->gate) != ERROR_SUCCESS ||
+        RegOpenKeyExW(candidate->gate,L"DeploymentVIII",0,KEY_QUERY_VALUE | READ_CONTROL,&candidate->key) != ERROR_SUCCESS ||
+        !native::protectedRegistry(candidate->gate) || !native::protectedRegistry(candidate->key)) return false;
+    std::wstring root, ordinary, storeText;
+    DWORD initial = 0, size = sizeof(initial);
+    if (!candidate->read(L"PackageRoot",root) || root != root_.native() ||
+        !candidate->read(L"OrdinaryImage",ordinary) || ordinary != (root_ / L"GateBouncer.exe").native() ||
+        !candidate->read(L"StoreRoot",storeText) || !candidate->read(L"ViewSid",candidate->sid) ||
+        RegGetValueW(candidate->key,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&initial,&size) != ERROR_SUCCESS || initial > 1)
+        return false;
+    candidate->root = root_; candidate->ordinary = ordinary; candidate->store = storeText; candidate->provision = initial == 1;
+    native::ProtectedDirectory protectedStore(candidate->store);
+    if (!native::fixedPath(candidate->store) || candidate->store == root_ || !protectedStore.acquire()) return false;
+    PSID sid = nullptr;
+    if (!ConvertStringSidToSidW(candidate->sid.c_str(), &sid) || !IsValidSid(sid)) return false;
+    candidate->account.assign(static_cast<BYTE *>(sid),static_cast<BYTE *>(sid) + GetLengthSid(sid)); LocalFree(sid);
+    SC_HANDLE manager = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
+    if (!manager) return false;
+    candidate->service = OpenServiceW(manager,L"LGAGateBouncerLab",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL);
+    CloseServiceHandle(manager);
+    if (!candidate->current()) return false;
+    account = candidate->account; store = candidate->store; provision = candidate->provision;
+    registration_ = std::move(candidate); return true;
+}
 bool Deployment::prepareEnvironment() {
-    if (!verified_)
+    if (!current())
         return false;
     auto block = GetEnvironmentStringsW();
     if (!block)

@@ -5,6 +5,7 @@
 #include <QGuiApplication>
 #ifdef Q_OS_WIN
 #include <windows.h>
+#include "../../controller/deployment_win.h"
 #endif
 
 namespace Gate::Lifecycle {
@@ -61,9 +62,10 @@ class NativeRunBackend final : public RunBackend {
         if (own.isEmpty() || (command && *command != own) ||
             (expected.exists && (!expected.stringType || expected.command != own)))
             return {StartupState::ForeignValue, QStringLiteral("Startup command ownership mismatch")};
+        std::unique_ptr<DeploymentValidator> validator;
         if (command) {
             QString reason;
-            const auto validator = makeOrdinaryGuiDeploymentValidator();
+            validator = makeOrdinaryGuiDeploymentValidator();
             if (!validator->validate(QCoreApplication::applicationFilePath(), reason))
                 return {StartupState::DeploymentRequired, reason};
         }
@@ -71,6 +73,10 @@ class NativeRunBackend final : public RunBackend {
         QString error;
         if (!read(current, error)) return {StartupState::Error, error};
         if (!(current == expected)) return {StartupState::Conflict, QStringLiteral("Startup entry changed; refresh and retry")};
+        if (validator) {
+            QString reason;
+            if (!validator->validate(QCoreApplication::applicationFilePath(),reason)) return {StartupState::DeploymentRequired,reason};
+        }
         HKEY key = nullptr;
         LONG rc = command ? RegCreateKeyExW(HKEY_CURRENT_USER, runKey, 0, nullptr, 0, KEY_SET_VALUE,
                                              nullptr, &key, nullptr)
@@ -91,10 +97,15 @@ class NativeRunBackend final : public RunBackend {
         if (!read(after, error)) return {StartupState::Error, error};
         const RunValue desired{command.has_value(), true, command.value_or(QString{})};
         if (!(after == desired)) return {StartupState::Conflict, QStringLiteral("Startup entry changed during update")};
+        if (validator) {
+            QString reason;
+            if (!validator->validate(QCoreApplication::applicationFilePath(),reason)) return {StartupState::DeploymentRequired,reason};
+        }
         return {command ? StartupState::Registered : StartupState::Absent, {}};
     }
 };
 class OrdinaryGuiDeploymentValidator final : public DeploymentValidator {
+    mutable std::unique_ptr<gb::controller::Deployment> deployment_;
   public:
     bool validate(const QString &executable, QString &reason) const override {
         const QFileInfo file(executable);
@@ -107,8 +118,8 @@ class OrdinaryGuiDeploymentValidator final : public DeploymentValidator {
         const std::wstring path = QDir::toNativeSeparators(file.absoluteFilePath()).toStdWString();
         const std::wstring drive = path.substr(0, 3);
         const UINT driveType = GetDriveTypeW(drive.c_str());
-        if (driveType != DRIVE_FIXED && driveType != DRIVE_REMOVABLE) {
-            reason = QStringLiteral("Startup requires an executable on a local drive"); return false;
+        if (driveType != DRIVE_FIXED) {
+            reason = QStringLiteral("Startup requires a protected package on a fixed local drive"); return false;
         }
         const DWORD attributes = GetFileAttributesW(path.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
@@ -135,8 +146,18 @@ class OrdinaryGuiDeploymentValidator final : public DeploymentValidator {
         }
         FreeLibrary(image);
         if (!ordinary) reason = QStringLiteral("Startup supports an ordinary user GUI executable only");
-        // No certifica ACL, integridad futura ni protección de un build escribible.
-        return ordinary;
+        if (!ordinary) return false;
+        const auto own = std::filesystem::path(path);
+        if (!deployment_) {
+            deployment_ = std::make_unique<gb::controller::Deployment>(own.parent_path());
+            if (!deployment_->verify(own,gb::controller::DeploymentRole::OrdinaryGui)) {
+                reason = QStringLiteral("Startup requires an admitted protected GateBouncer package"); return false;
+            }
+        }
+        if (own != deployment_->root()/L"GateBouncer.exe" || !deployment_->current()) {
+            reason = QStringLiteral("The protected package was revoked"); return false;
+        }
+        return true;
     }
 };
 #else

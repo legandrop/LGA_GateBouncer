@@ -231,8 +231,9 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
 }
 NativeRuntime::NativeRuntime(WfpBackend &b, SelectorRegistry &r,
                              std::filesystem::path store, Bytes account, Id epoch, Id boot,
-                             std::filesystem::path ordinaryImage)
-    : ordinaryImage_(std::move(ordinaryImage)), file_(std::move(store)), directions_(b), coordinator_(file_, directions_, r, epoch),
+                             std::filesystem::path ordinaryImage, std::shared_ptr<controller::Deployment> deployment)
+    : ordinaryImage_(std::move(ordinaryImage)), deployment_(std::move(deployment)), file_(std::move(store)),
+      directions_(b), coordinator_(file_, directions_, r, epoch),
       backend_(b), registry_(r), epoch_(epoch), boot_(boot), journal_(coordinator_, r),
       effects_(coordinator_, directions_), engine_(epoch, boot, journal_, effects_, 2),
       profile_(std::move(account)), ring_(epoch, 1, 2), collector_(r, engine_, ring_, epoch) {
@@ -253,7 +254,12 @@ NativeRuntime::~NativeRuntime() {
     retirePrincipalObservation();
     backend_.attachCollector(nullptr);
 }
-bool NativeRuntime::initialize() {
+bool NativeRuntime::deploymentCurrent() const noexcept {
+    return deployment_ && deployment_->current();
+}
+bool NativeRuntime::initialize(bool provision) {
+    if (!deploymentCurrent()) return false;
+    provisionRequested_ = provision;
     if (!loadPrincipalImage()) return false;
     if (principalMode_) {
         loaded_ = true;
@@ -284,6 +290,7 @@ ServiceContext NativeRuntime::serviceContext() const {
 }
 ServiceContext NativeRuntime::readServiceContext() const noexcept {
     ServiceContext unavailable{epoch_, boot_, {}, 0};
+    if (deployment_ && !deploymentCurrent()) return unavailable;
     const auto source = principalSource_;
     const auto catalog = principalCatalog_;
     const auto engine = observationEngine_;
@@ -355,11 +362,70 @@ bool NativeRuntime::loadPrincipalImage() {
         }
         principalMode_ = true;
         principalDesired_ = principalRead_.snapshot.desired;
+        if (principalRead_.kind == principal::StoredImage::Missing && provisionRequested_) {
+            if (!provisionPrincipalImage(plan)) principalWriteFault_ = true;
+            return true;
+        }
         if (principalRead_.kind == principal::StoredImage::Principal)
             bindPrincipalObservation(plan);
         // Un archivo histórico, Missing o un fallo de lectura actual no crea
         // permisos, baseline ni replay. El servicio queda consultable sin efecto conocido.
         return true;
+    } catch (...) { return false; }
+}
+bool NativeRuntime::provisionPrincipalImage(CatalogPlanBuilder &plan) {
+    using Reason = gatebouncer::service::windows::allapps::Reason;
+    if (initialAttempted_ || !provisionRequested_ || !deploymentCurrent() || !principalStore_ ||
+        principalStore_->uncertain() || principalRead_.kind != principal::StoredImage::Missing || principalSource_ ||
+        inventoryRevision_ || !file_.cleanForInitial(principalStore_.get())) return false;
+    initialAttempted_ = true; // Consumido también si falla reserva, lectura o flush: no retry.
+    try {
+        if (!acquireObservationEngine()) return false;
+        principal::Snapshot bootstrap;
+        bootstrap.sequence = 1; bootstrap.writerEpoch = epoch_;
+        Bytes policy, directions, journal, serialized;
+        if (!principal::sections({},0,policy,directions) ||
+            !principal::serializeJournal(std::vector<principal::Entry>{},1,0,epoch_,journal)) return false;
+        bootstrap.policy = principal::ByteView(std::move(policy));
+        bootstrap.directions = principal::ByteView(std::move(directions));
+        bootstrap.journal = principal::ByteView(std::move(journal));
+        bootstrap.targetSet = principal::targetSetDigest(0,bootstrap.policy,bootstrap.directions);
+        if (!principal::serialize(bootstrap,serialized)) return false;
+        principal::ByteView bytes(std::move(serialized));
+        if (!plan.retain(bytes)) return false;
+        auto sdk = principalSdk_();
+        auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
+            allnative::EngineLease(observationEngine_->handle(),observationEngine_->pin()),
+            allnative::BindReceipt(observationEngine_->context_,observationEngine_->generation_),sdk));
+        std::array<std::uint16_t,8> domain{}; std::array<allnative::recipe::SupportField,32> support{};
+        std::size_t count = 0;
+        if (observationEngine_->readDomain(domain,support,count) != Reason::None ||
+            plan.stage(bytes,source->binding_,1,domain,{support.data(),count}) != Reason::None ||
+            !deploymentCurrent() || !file_.cleanForInitial(principalStore_.get())) return false;
+        const auto saved = principalStore_->replaceOwned(0,0,bytes);
+        if (!saved.physicallyConfirmed) return false;
+        principalRead_ = principalStore_->read_;
+        struct Before { NativeRuntime &runtime; const principal::ByteView &bytes; } before{*this,bytes};
+        const auto verify = [](void *raw) noexcept {
+            auto &b = *static_cast<Before *>(raw);
+            try {
+                bool same = false, exists = false;
+                return b.runtime.deploymentCurrent() && b.runtime.principalStore_ &&
+                    !b.runtime.principalStore_->uncertain() &&
+                    b.runtime.file_.compare(b.bytes.data(),b.bytes.size(),same,exists) && same && exists;
+            } catch (...) { return false; }
+        };
+        const auto effect = backend_.applyInitialPrincipalPlan(plan,verify,&before);
+        if (!effect.attempted || !effect.committed || effect.cleanupUnknown || !deploymentCurrent() ||
+            plan.confirmInventory(observationEngine_->handle(),sdk,&allnative::guardedRead) != Reason::None) return false;
+        const auto catalog = plan.freeze();
+        if (!catalog || !deploymentCurrent()) return false;
+        const auto started = source->start(allnative::CatalogReceipt(catalog));
+        // Un fallo de start conserva el pin hasta el retiro/drenado; nunca publica catálogo parcialmente sano.
+        principalSource_ = std::move(source);
+        if (started != Reason::None) { retirePrincipalObservation(); return false; }
+        principalCatalog_ = catalog; inventoryRevision_ = 1;
+        return true; // Bootstrap queda RecoveryRequired/Unknown: sin Applied ni completeOwned.
     } catch (...) { return false; }
 }
 bool NativeRuntime::bindPrincipalObservation(CatalogPlanBuilder &plan) {
@@ -761,6 +827,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
             Frame hello;
             VerifiedControl peer;
             std::shared_ptr<NativeRuntime::PrincipalPeer> ordinaryPeer;
+            bool principalReader = false;
             bool authenticated = false;
             if (ipc::ii::receive(pipe.value, hello, stop) &&
                 (ordinary ? hello.minor == 3 : (hello.minor == 2 || hello.minor == 1 ||
@@ -769,8 +836,9 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                 get(hello, Tag::ClientRole) == (control ? 2 : 1)) {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
                 runtime_.tick();
+                principalReader = !ordinary && !control && hello.minor == 3;
                 authenticated = runtime_.profileGeneration() == profile &&
-                                (ordinary ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer)
+                                (ordinary || principalReader ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer, principalReader)
                                     : runtime_.peer(pipe.value, control, peer, true));
             }
             if (!authenticated) {
@@ -781,7 +849,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
             Frame ack;
             {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
-                if (ordinary) {
+                if (ordinary || principalReader) {
                     ordinaryPeer->connection = connection;
                     ack = runtime_.ordinaryStatus(Type::HelloAck, ordinaryPeer);
                 } else ack = runtime_.status(Type::HelloAck, hello.minor == 3 ? 3 : 2);
@@ -792,7 +860,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                 ack = readOnlyA(std::move(ack));
             else if (hello.minor == 1) ack = readOnlyII(std::move(ack));
             if (!ipc::ii::send(pipe.value, ack, stop)) {
-                if (ordinary) {
+                if (ordinary || principalReader) {
                     std::lock_guard<std::mutex> lock(runtime_.mutex);
                     runtime_.closeOrdinaryPeer(ordinaryPeer);
                 }
@@ -857,19 +925,11 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                 {
                     std::lock_guard<std::mutex> lock(runtime_.mutex);
                     if (runtime_.profileGeneration() != profile ||
-                        !(ordinary ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer)
+                        !(ordinary || principalReader ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer, principalReader)
                                    : runtime_.peer(pipe.value, control, peer, false)))
                         break;
-                    if (ordinary) response = runtime_.dispatchOrdinary(f, ordinaryPeer);
-                    else if (hello.minor == 3) {
-                        response = runtime_.status(Type::Status, 3);
-                        if (f.type != Type::GetStatus) {
-                            response = {};
-                            response.minor = 3;
-                            response.type = Type::ProtocolError;
-                            response.fields = {value(Tag::ErrorCode, unsigned(Error::Unsupported), 2)};
-                        }
-                    } else if (!hello.minor) {
+                    if (ordinary || principalReader) response = runtime_.dispatchOrdinary(f, ordinaryPeer);
+                    else if (!hello.minor) {
                         response = runtime_.status(Type::Status);
                         if (f.type != Type::GetStatus) {
                             response = {};
@@ -902,7 +962,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
             DisconnectNamedPipe(pipe.value);
             {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
-                if (ordinary) runtime_.closeOrdinaryPeer(ordinaryPeer);
+                if (ordinary || principalReader) runtime_.closeOrdinaryPeer(ordinaryPeer);
                 if (runtime_.profileGeneration() != profile)
                     break;
             }

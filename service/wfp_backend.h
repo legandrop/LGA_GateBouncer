@@ -33,6 +33,8 @@ private:
         decisions::CatalogPlanBuilder &,
         const std::shared_ptr<const decisions::allnative::CatalogSnapshot> &,
         decisions::CatalogPlanBuilder::VerifyBeforeWrite, void *) noexcept;
+    decisions::CatalogPlanBuilder::WriteOutcome applyInitialPrincipalPlan(
+        decisions::CatalogPlanBuilder &, decisions::CatalogPlanBuilder::VerifyBeforeWrite, void *) noexcept;
     static void CALLBACK eventCallback(void* context,const FWPM_NET_EVENT1* event);
     SelectorRegistry& registry_;
     HANDLE engine_=nullptr,subscription_=nullptr;

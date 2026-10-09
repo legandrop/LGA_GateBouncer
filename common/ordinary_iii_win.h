@@ -1,6 +1,7 @@
 #pragma once
 #include "client_ii_win.h"
 #include "wire_iv.h"
+#include "../controller/deployment_win.h"
 
 namespace gb::ipc::iii {
 inline constexpr wchar_t OrdinaryPipe[] = L"\\\\.\\pipe\\LGA.GateBouncer.Ordinary.v1";
@@ -13,6 +14,10 @@ public:
         close();
         if (control || !native::fixedPath(serviceImage)) return false;
         image_ = serviceImage;
+        deployment_ = std::make_unique<controller::Deployment>(image_.parent_path());
+        if (!deployment_->verify(image_,controller::DeploymentRole::Service) || !deployment_->current()) {
+            close(); return false;
+        }
         pipe_.reset(CreateFileW(OrdinaryPipe, ii::ClientAccess, 0, nullptr, OPEN_EXISTING,
             FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IMPERSONATION, nullptr));
         if (!pipe_ || !authenticated()) { close(); return false; }
@@ -50,7 +55,7 @@ public:
         batch.clear(); return authenticated(); // Sin suscripción inventada por este canal.
     }
     void close() override {
-        pipe_.reset(); server_ = {}; connection_ = {}; hello_ = {}; tx_ = rx_ = 1;
+        pipe_.reset(); server_ = {}; connection_ = {}; hello_ = {}; tx_ = rx_ = 1; deployment_.reset();
     }
     const wire::Frame &hello() const override { return hello_; }
     bool actualOsAuthenticated() const override {
@@ -59,7 +64,7 @@ public:
 private:
     bool authenticated() {
         native::ProcessEvidence acquired;
-        if (!pipe_ || !ii::readableServerEvidence(pipe_.value, image_, acquired)) return false;
+        if (!pipe_ || !deployment_ || !deployment_->current() || !ii::readableServerEvidence(pipe_.value, image_, acquired)) return false;
         if (server_.pid && (server_.pid != acquired.pid ||
             CompareFileTime(&server_.created, &acquired.created) != 0 || server_.image != acquired.image)) return false;
         server_ = std::move(acquired); return true;
@@ -76,6 +81,7 @@ private:
               wire::idValue(frame, wire::Tag::BootId) == wire::idValue(hello_, wire::Tag::BootId)));
     }
     native::Handle pipe_;
+    std::unique_ptr<controller::Deployment> deployment_;
     native::ProcessEvidence server_;
     std::filesystem::path image_;
     wire::Frame hello_;

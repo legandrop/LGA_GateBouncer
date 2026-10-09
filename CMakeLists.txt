@@ -27,8 +27,9 @@ endif()
 target_compile_definitions(gatebouncer_service_view_ui PRIVATE UNICODE _UNICODE NOMINMAX)
 target_compile_options(gatebouncer_service_view_ui PRIVATE -Wall -Wextra -Wpedantic)
 
-qt_add_executable(GateBouncer WIN32
+qt_add_library(GateBouncerGuiStage SHARED
     src/main.cpp
+    controller/deployment_ordinary_stage.cpp
     src/bootstrap.cpp
     src/bootstrap.h
     src/simulation.cpp
@@ -43,10 +44,11 @@ qt_add_executable(GateBouncer WIN32
     src/engine/ReviewGateway.h
     resources/app.rc
 )
-target_link_libraries(GateBouncer PRIVATE Qt6::Widgets gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle advapi32)
-target_include_directories(GateBouncer PRIVATE src common)
-target_compile_options(GateBouncer PRIVATE -Wall -Wextra -Wpedantic)
-qt_add_resources(GateBouncer "gatebouncer_assets"
+set_source_files_properties(src/main.cpp PROPERTIES COMPILE_DEFINITIONS "main=GateBouncerGuiMain")
+target_link_libraries(GateBouncerGuiStage PRIVATE Qt6::Widgets gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle advapi32)
+target_include_directories(GateBouncerGuiStage PRIVATE src common)
+target_compile_options(GateBouncerGuiStage PRIVATE -Wall -Wextra -Wpedantic)
+qt_add_resources(GateBouncerGuiStage "gatebouncer_assets"
     PREFIX "/gatebouncer"
     FILES
         resources/fonts/Inter-Regular.ttf
@@ -63,8 +65,15 @@ qt_add_resources(GateBouncer "gatebouncer_assets"
 
 # El observador externo reutiliza el binario real; no forma parte del producto.
 if(GATEBOUNCER_OBSERVER_SOURCE)
-    target_sources(GateBouncer PRIVATE "${GATEBOUNCER_OBSERVER_SOURCE}")
-    target_compile_definitions(GateBouncer PRIVATE GATEBOUNCER_OBSERVER)
+    get_target_property(observer_sources GateBouncerGuiStage SOURCES)
+    list(FILTER observer_sources EXCLUDE REGEX "deployment_ordinary_stage.cpp")
+    qt_add_executable(GateBouncerObserver WIN32 ${observer_sources}
+        controller/deployment_observer_main.cpp "${GATEBOUNCER_OBSERVER_SOURCE}")
+    target_compile_definitions(GateBouncerObserver PRIVATE GATEBOUNCER_OBSERVER)
+    target_include_directories(GateBouncerObserver PRIVATE src common)
+    target_link_libraries(GateBouncerObserver PRIVATE Qt6::Widgets gatebouncer_data gatebouncer_assistance
+        gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire
+        gatebouncer_lifecycle gatebouncer_native_ii advapi32 shell32)
 endif()
 
 # Componentes de decisiones: no habilitan endpoints ni ejecución elevada.
@@ -88,7 +97,7 @@ target_link_libraries(GateBouncerDecisionStage PRIVATE Qt6::Widgets gatebouncer_
 target_compile_options(GateBouncerDecisionStage PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(GateBouncerDecisionStage PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00)
 set_target_properties(GateBouncerDecisionStage PROPERTIES PREFIX "")
-target_link_libraries(GateBouncer PRIVATE gatebouncer_native_ii shell32)
+target_link_libraries(GateBouncerGuiStage PRIVATE gatebouncer_native_ii shell32)
 qt_add_executable(GateBouncerAssistant WIN32 src/assistance/broker/BrokerMain.cpp)
 target_link_libraries(GateBouncerAssistant PRIVATE gatebouncer_general_live)
 target_compile_options(GateBouncerAssistant PRIVATE -Wall -Wextra -Wpedantic)
@@ -106,3 +115,5 @@ if(GATEBOUNCER_REVIEW_TEST_SOURCE)
     target_link_libraries(GateBouncerReviewTests PRIVATE Qt6::Widgets Qt6::Test gatebouncer_review gatebouncer_native_ii)
     target_include_directories(GateBouncerReviewTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
+
+set_target_properties(GateBouncerGuiStage PROPERTIES PREFIX "" AUTOMOC ON)

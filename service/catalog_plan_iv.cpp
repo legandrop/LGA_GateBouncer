@@ -119,6 +119,10 @@ Reason CatalogPlanBuilder::stage(const principal::ByteView &bytes,
     principal::Snapshot parsed;
     if (!principal::parse(bytes, parsed) || parsed.desired == UINT64_MAX)
       return fail(Reason::InvalidEvent);
+    initialCandidate_ = parsed.sequence == 1 && !parsed.desired && !parsed.effective && !parsed.storedKnown &&
+        parsed.storedState == State::RecoveryRequired && zero(parsed.active) && !zero(parsed.writerEpoch) &&
+        parsed.rules.empty() && parsed.entries.empty() && !parsed.archive.size() && !parsed.migrationBase &&
+        parsed.activeProjection == Digest{} && parsed.activeAdmission == Digest{} && parsed.archiveDigest == Digest{};
     if (parsed.rules.size() > maxRules_ || parsed.rules.capacity() > 2 * allnative::MaxCatalogRules ||
         parsed.entries.capacity() > 2 * allnative::MaxCatalogRules)
       return fail(Reason::Oversized);
@@ -263,13 +267,27 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transact(
     HANDLE engine, const WriteApi &api,
     const std::shared_ptr<const allnative::CatalogSnapshot> &before,
     VerifyBeforeWrite verify, void *context) noexcept {
+  if (!before) return {};
+  return transactBody(engine,api,before,verify,context,false);
+}
+CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactInitial(
+    HANDLE engine,const WriteApi &api,VerifyBeforeWrite verify,void *context) noexcept {
+  return transactBody(engine,api,{},verify,context,true);
+}
+CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactBody(
+    HANDLE engine,const WriteApi &api,const std::shared_ptr<const allnative::CatalogSnapshot> &before,
+    VerifyBeforeWrite verify,void *context,bool initial) noexcept {
   WriteOutcome result;
   if (phase_ != Phase::Staged || !storage_.storage_ || writeAttempted_ ||
-      !engine || !before || !verify || !context || !api.begin || !api.commit ||
+      !engine || !verify || !context || !api.begin || !api.commit ||
       !api.abort || !api.erase || !api.add)
     return result;
   const auto &after = *storage_.storage_;
-  if (!after.binding_ || !before->binding_ ||
+  if (!after.binding_) return result;
+  if (initial) {
+    if (before || !initialCandidate_ || !after.arena_ || after.desired_ || after.generation_ != 1 ||
+        !after.rules_.empty() || after.slots_.size() != 28) return result;
+  } else if (!before || !before->binding_ ||
       after.binding_->epoch != before->binding_->epoch ||
       after.binding_->generation != before->binding_->generation ||
       before->desired_ == UINT64_MAX ||
@@ -298,7 +316,7 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transact(
     if (!verify(context)) {
       result.error = ERROR_INVALID_STATE;
     } else {
-      for (const auto &old : before->slots_) {
+      if (before) for (const auto &old : before->slots_) {
         GUID key{};
         std::memcpy(&key, old.key.data(), sizeof(key));
         result.error = api.erase(engine, &key);

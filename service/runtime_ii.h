@@ -9,14 +9,16 @@
 #include "journal_iii.h"
 #include "wfp_backend.h"
 #include "principal_actor_vi.h"
+#include "../controller/deployment_win.h"
 namespace gb::decisions {
 class NativeRuntime {
   public:
     NativeRuntime(WfpBackend &backend, SelectorRegistry &registry,
                   std::filesystem::path store, Bytes account, Id epoch, Id boot,
-                  std::filesystem::path ordinaryImage = {});
+                  std::filesystem::path ordinaryImage = {},
+                  std::shared_ptr<controller::Deployment> deployment = {});
     ~NativeRuntime();
-    bool initialize();
+    bool initialize(bool provision = false);
     ServiceContext serviceContext() const;
     void tick();
     Frame status(Type type, std::uint16_t minor = 2) const;
@@ -52,6 +54,8 @@ class NativeRuntime {
         std::uint64_t profile = 0;
         std::map<Id, PrincipalPage> pages;
         bool cancelled = false;
+        bool readonly = false;
+        std::filesystem::path admittedImage;
     };
     struct PrincipalObservation;
     struct PrincipalAdmission {
@@ -73,7 +77,7 @@ class NativeRuntime {
     };
     void collectPrincipalObservations();
     void invalidatePrincipalObservations() noexcept;
-    bool ordinaryPeer(HANDLE, std::shared_ptr<PrincipalPeer> &);
+    bool ordinaryPeer(HANDLE, std::shared_ptr<PrincipalPeer> &, bool readonly = false);
     bool principalPeerCurrent(const PrincipalPeer &) const noexcept;
     bool principalPolicyReady() const noexcept;
     void closeOrdinaryPeer(const std::shared_ptr<PrincipalPeer> &) noexcept;
@@ -84,6 +88,9 @@ class NativeRuntime {
     Frame preparePrincipal(const Frame &, const std::shared_ptr<PrincipalPeer> &);
     Frame commitPrincipal(const Frame &, const std::shared_ptr<PrincipalPeer> &);
     std::filesystem::path ordinaryImage_;
+    std::shared_ptr<controller::Deployment> deployment_;
+    bool provisionRequested_ = false, initialAttempted_ = false;
+    bool deploymentCurrent() const noexcept;
     // Sustituciones privadas del owner para bancos SDK; ningún peer/DTO las fija.
     PrincipalActorQuery::Api principalActorApi_;
     bool (*principalImageCheck_)(const PrincipalPeer &, const std::filesystem::path &) noexcept = nullptr;
@@ -119,6 +126,7 @@ class NativeRuntime {
     bool acquireObservationEngine();
     bool loadPrincipalImage();
     bool bindPrincipalObservation(CatalogPlanBuilder &);
+    bool provisionPrincipalImage(CatalogPlanBuilder &);
     void retirePrincipalObservation() noexcept;
     std::shared_ptr<EngineResource> observationEngine_;
     std::shared_ptr<EngineResource> retainedEngineFault_;

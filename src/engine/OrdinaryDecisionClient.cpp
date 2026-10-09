@@ -141,6 +141,18 @@ void OrdinaryDecisionClient::closeNotice() {
 bool OrdinaryDecisionClient::ready() const {
     return current_ && visible_ && state_ == State::Ready && draft_ && draftAge_.isValid() && draftAge_.elapsed() < draft_->ttl;
 }
+std::optional<OrdinaryDecisionClient::ObservationContext> OrdinaryDecisionClient::observationContext() const {
+    if (stopping_ || !connected_ || !current_ || !visible_ || !observed_ || observedGeneration_ != generation_ ||
+        (state_ != State::Preparing && state_ != State::Ready) || !profile_ || !bindingGeneration_ ||
+        zero(epoch_) || zero(boot_) || zero(source_) || zero(connection_) ||
+        observed_->state != 1 || observed_->source != source_) return {};
+    const auto row = std::find_if(rows_.begin(),rows_.end(),[&](const auto &r) {
+        return r.observed == observed_->observed && r.revision == observed_->revision && r.binding == observed_->binding &&
+            r.source == source_ && r.state == 1;
+    });
+    if (row == rows_.end() || (state_ == State::Ready && !ready())) return {};
+    return ObservationContext{{epoch_,boot_,source_,bindingGeneration_},connection_,profile_,desired_,generation_,observed_->revision};
+}
 bool OrdinaryDecisionClient::decide(bool allow, bool consent, quint64 selection) {
     if (!consent || selection != generation_ || !ready() || !session_.idle()) return false;
     const auto d = *draft_; const auto accepted = d.accepted | (allow && d.direction == 3 ? 4u : 0u);
@@ -227,7 +239,7 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         if (f.type != Type::ObservedRecord || iv::unpack(find(f, Tag::Records)->bytes, 1, rows) != Error::Ok ||
             rows[0].observed != observed_->observed || rows[0].revision != observed_->revision || rows[0].source != source_ ||
             rows[0].binding != observed_->binding || rows[0].state != 1) { fail("This observation is no longer current."); return; }
-        observed_ = rows[0]; prepare(); return;
+        observed_ = rows[0]; observedGeneration_ = generation_; prepare(); return;
     }
     if (expectedType_ == Type::PrepareFuturePolicy || expectedType_ == Type::GetFutureDraft) {
         std::vector<iv::FutureDraftRecord> rows;
@@ -247,6 +259,7 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         if (expectedType_ == Type::PrepareFuturePolicy) { send(Type::GetFutureDraft, {value(Tag::DraftId, draft_->draft),
             value(Tag::DraftVersion, draft_->version), value(Tag::ProfileGeneration, profile_), value(Tag::IVProfile, 1, 1)}); return; }
         draftAge_.restart(); draftExpiry_.start(int(draft_->ttl)); state_ = State::Ready;
+        observedGeneration_ = generation_;
         message_ = "Review the effective scope before choosing Allow or Block."; emit changed(); return;
     }
     if ((expectedType_ == Type::CommitFuturePolicy && f.type == Type::FuturePolicyAck) ||

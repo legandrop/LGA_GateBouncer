@@ -76,6 +76,29 @@ bool objects(HANDLE engine){
     if(ok){FWPM_SUBLAYER0* current=nullptr;ok=FwpmSubLayerGetByKey0(engine,&Sublayer,&current)==ERROR_SUCCESS;if(ok)ok=current->providerKey&&same(*current->providerKey,Provider)&&current->flags==FWPM_SUBLAYER_FLAG_PERSISTENT&&current->weight==0x7d00;if(current)FwpmFreeMemory0(reinterpret_cast<void**>(&current));}
     LocalFree(sd);return ok&&objectIdentity(engine);
 }
+bool initialAbsent(HANDLE engine) {
+    FWPM_PROVIDER0 *provider = nullptr; FWPM_SUBLAYER0 *sublayer = nullptr;
+    const auto p = FwpmProviderGetByKey0(engine,&Provider,&provider);
+    const auto s = FwpmSubLayerGetByKey0(engine,&Sublayer,&sublayer);
+    const bool absent = p == FWP_E_PROVIDER_NOT_FOUND && s == FWP_E_SUBLAYER_NOT_FOUND && !provider && !sublayer;
+    if (provider) FwpmFreeMemory0(reinterpret_cast<void **>(&provider));
+    if (sublayer) FwpmFreeMemory0(reinterpret_cast<void **>(&sublayer));
+    if (!absent) return false;
+    HANDLE enumeration = nullptr;
+    if (FwpmFilterCreateEnumHandle0(engine,nullptr,&enumeration) != ERROR_SUCCESS || !enumeration) return false;
+    bool ok = true, ended = false; std::size_t total = 0;
+    while (ok && !ended) {
+        FWPM_FILTER0 **rows = nullptr; UINT32 count = 0;
+        const auto result = FwpmFilterEnum0(engine,enumeration,64,&rows,&count);
+        if (result != ERROR_SUCCESS || count > 64 || (count && !rows) || count > 65536-total) ok = false;
+        if (ok) for (UINT32 i = 0; i < count; ++i)
+            if (!rows[i] || (rows[i]->providerKey && same(*rows[i]->providerKey,Provider))) { ok = false; break; }
+        if (rows) FwpmFreeMemory0(reinterpret_cast<void **>(&rows));
+        total += count; ended = count < 64;
+        if (total > 65536) ok = false;
+    }
+    return FwpmFilterDestroyEnumHandle0(engine,enumeration) == ERROR_SUCCESS && ok && ended;
+}
 }
 bool guestActivationAuthorized(){
     // Marcador administrativo del harness invitado. No se escribe desde el producto.
@@ -100,6 +123,19 @@ decisions::CatalogPlanBuilder::WriteOutcome WfpBackend::applyPrincipalPlan(
         catch (...) { return false; }
     };
     return plan.transact(engine_, decisions::CatalogPlanBuilder::WriteApi{}, before, inside, &check);
+}
+decisions::CatalogPlanBuilder::WriteOutcome WfpBackend::applyInitialPrincipalPlan(
+    decisions::CatalogPlanBuilder &plan,decisions::CatalogPlanBuilder::VerifyBeforeWrite verify,void *context) noexcept {
+    if (!engine_ || !guestActivationAuthorized() || !verify || !context) return {};
+    struct Check { HANDLE engine; decisions::CatalogPlanBuilder::VerifyBeforeWrite verify; void *context; }
+        check{engine_,verify,context};
+    const auto inside = [](void *raw) noexcept {
+        auto &c = *static_cast<Check *>(raw);
+        try { return c.verify(c.context) && initialAbsent(c.engine) && objects(c.engine) &&
+            objectIdentity(c.engine) && c.verify(c.context); }
+        catch (...) { return false; }
+    };
+    return plan.transactInitial(engine_,decisions::CatalogPlanBuilder::WriteApi{},inside,&check);
 }
 bool WfpBackend::connectGuest(){
     if(!guestActivationAuthorized()||engine_)return false;

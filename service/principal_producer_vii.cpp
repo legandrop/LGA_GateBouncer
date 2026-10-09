@@ -55,11 +55,13 @@ bool NativeRuntime::principalPeerCurrent(const PrincipalPeer &peer) const noexce
             FILE_ATTRIBUTE_TAG_INFO attributes{};
             return !c.peer.cancelled && c.peer.profile == c.runtime.profile_.value().generation &&
                 c.runtime.profile_.accepts(fresh, false) && !fresh.uiAccess &&
+                c.runtime.deploymentCurrent() &&
                 c.peer.image && c.peer.pipe && c.peer.directory &&
                 GetNamedPipeClientProcessId(c.peer.pipe.value, &pid) && pid == c.peer.actor.pid &&
                 QueryFullProcessImageNameW(c.peer.actor.process.value, 0, path, &length) && length &&
-                std::filesystem::path(std::wstring(path, length)) == c.runtime.ordinaryImage_ &&
+                std::filesystem::path(std::wstring(path, length)) == c.peer.admittedImage &&
                 GetFileInformationByHandle(c.peer.image.value, &actual) && sameImage(actual, c.peer.imageId) &&
+                c.runtime.deployment_->matchesImage(c.peer.admittedImage,actual) &&
                 GetFileInformationByHandleEx(c.peer.image.value, FileAttributeTagInfo, &attributes, sizeof(attributes)) &&
                 !(attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
                 native::protectedObject(c.peer.image.value, false, false, true);
@@ -67,10 +69,11 @@ bool NativeRuntime::principalPeerCurrent(const PrincipalPeer &peer) const noexce
     };
     return PrincipalActorQuery::current(peer.actor, peer.identity, peer.cancelled, &check, accepts, principalActorApi_);
 }
-bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &peer) {
-    if (peer) return principalPeerCurrent(*peer);
+bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &peer, bool readonly) {
+    if (peer) return peer->readonly == readonly && principalPeerCurrent(*peer);
     if (ordinaryImage_.empty() || !native::fixedPath(ordinaryImage_) || !principalMode_ ||
-        ((!principalSource_ || !principalCatalog_ || principalWriteFault_) && principalOutcomes_.empty())) return false;
+        !deploymentCurrent() || ((!principalSource_ || !principalCatalog_ || principalWriteFault_) &&
+            (readonly || principalOutcomes_.empty()))) return false;
     try {
         native::Handle serviceToken;
         HANDLE raw = nullptr;
@@ -78,15 +81,18 @@ bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &pe
         serviceToken.reset(raw);
         if (!native::systemServiceToken(serviceToken.value)) return false;
         auto acquired = std::make_shared<PrincipalPeer>();
+        acquired->readonly = readonly;
+        acquired->admittedImage = readonly ? deployment_->root()/L"GateBouncerAssistant.exe" : ordinaryImage_;
         if (!ipc::ii::clientEvidence(pipe, acquired->identity, acquired->actor) ||
             !profile_.accepts(acquired->identity, false) || acquired->identity.uiAccess ||
-            acquired->actor.image != ordinaryImage_) return false;
-        acquired->directory = std::make_unique<native::ProtectedDirectory>(ordinaryImage_.parent_path(), true);
+            acquired->actor.image != acquired->admittedImage) return false;
+        acquired->directory = std::make_unique<native::ProtectedDirectory>(acquired->admittedImage.parent_path(), true);
         if (!acquired->directory->acquire()) return false;
-        acquired->image.reset(CreateFileW(ordinaryImage_.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
+        acquired->image.reset(CreateFileW(acquired->admittedImage.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
             FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
         if (!acquired->image || !native::protectedObject(acquired->image.value, false, false, true) ||
-            !GetFileInformationByHandle(acquired->image.value, &acquired->imageId)) return false;
+            !GetFileInformationByHandle(acquired->image.value, &acquired->imageId) ||
+            !deployment_->matchesImage(acquired->admittedImage,acquired->imageId)) return false;
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), pipe, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS))
             return false;
@@ -126,10 +132,11 @@ Frame NativeRuntime::ordinaryStatus(Type type, const std::shared_ptr<PrincipalPe
     const bool admitted = peer && principalPeerCurrent(*peer) && principalMode_ && !principalWriteFault_ &&
         principalStore_ && !principalStore_->uncertain() && principalSource_ && principalCatalog_ &&
         principalSource_->stage() == allnative::Stage::Active && !zero(idValue(frame, Tag::SourceEpoch));
+    if (peer && peer->readonly && !admitted) peer->pages.clear();
     for (auto &field : frame.fields) {
         if (field.tag == Tag::Capabilities) field = value(Tag::Capabilities,
-            ReadStatus | (admitted ? ObservedRead | (principalPolicyReady() ? FuturePolicyControl : 0) : 0));
-        if (field.tag == Tag::IVProfile) field = value(Tag::IVProfile, admitted && principalPolicyReady() ? 1 : 0, 1);
+            ReadStatus | (admitted ? ObservedRead | (!peer->readonly && principalPolicyReady() ? FuturePolicyControl : 0) : 0));
+        if (field.tag == Tag::IVProfile) field = value(Tag::IVProfile, admitted && !peer->readonly && principalPolicyReady() ? 1 : 0, 1);
     }
     return ordered(std::move(frame));
 }
@@ -304,10 +311,14 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
     return principalResult(frame.correlation, receipt.result);
 }
 Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<PrincipalPeer> &peer) {
+    if (peer && peer->readonly && frame.type != Type::GetStatus && frame.type != Type::ListObserved &&
+        frame.type != Type::GetObservedRecord) return principalError(Error::Unauthorized);
     tick();
     if (frame.minor != 3 || wire::iv::validate(frame) != Error::Ok) return principalError(Error::Malformed);
-    if (!peer || frame.connection != peer->connection || !principalPeerCurrent(*peer))
+    if (!peer || frame.connection != peer->connection || !principalPeerCurrent(*peer)) {
+        if (peer && peer->readonly) peer->pages.clear();
         return principalError(Error::IdentityUnavailable);
+    }
     if (frame.type == Type::GetStatus) return ordinaryStatus(Type::Status, peer);
     if (idValue(frame, Tag::ServiceEpoch) != epoch_) return principalError(Error::Stale);
     const auto now = principalNow_();
@@ -337,8 +348,27 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         return commitPrincipal(frame, peer);
     if (!principalMode_ || principalWriteFault_ || !principalSource_ || !principalCatalog_ ||
         principalSource_->stage() != allnative::Stage::Active ||
-        principalSource_->source_.health().health != gatebouncer::service::windows::allapps::Health::Ready)
+        principalSource_->source_.health().health != gatebouncer::service::windows::allapps::Health::Ready) {
+        if (peer->readonly) peer->pages.clear();
         return principalError(Error::BackendUnavailable);
+    }
+    const auto causeCurrent = [&](const PrincipalObservation &o) {
+        return o.row.state == 1 && o.row.source == principalSource_->binding_->epoch &&
+            o.source == principalSource_ && o.profile == peer->profile && o.event && o.proof &&
+            o.event->owned().identity.userSid.bytes == peer->identity.account &&
+            principalSource_->retainedCause(*o.event,*o.proof,allnative::CatalogReceipt(principalCatalog_),allnative::Stage::Active);
+    };
+    if (peer->readonly && (frame.type == Type::ListObserved || frame.type == Type::GetObservedRecord)) {
+        const auto retainedSource = principalSource_;
+        const auto retainedCatalog = principalCatalog_;
+        const auto fresh = readServiceContext(); // READ/reconcile real; el cache de páginas no da frescura.
+        if (principalSource_ != retainedSource || principalCatalog_ != retainedCatalog ||
+            fresh.engineContext != retainedSource->binding_->epoch ||
+            fresh.engineBindingGeneration != retainedSource->binding_->generation ||
+            !principalPeerCurrent(*peer)) {
+            peer->pages.clear(); return principalError(Error::BackendUnavailable);
+        }
+    }
     if (frame.type == Type::PrepareFuturePolicy) return preparePrincipal(frame, peer);
     if (frame.type == Type::GetFutureDraft) {
         auto found = principalAdmissions_.find(idValue(frame, Tag::DraftId));
@@ -375,11 +405,16 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         const auto &row = found->second->row;
         if (row.revision != get(frame, Tag::ObservedRevision) || row.source != idValue(frame, Tag::SourceEpoch))
             return principalError(Error::Stale);
+        if (peer->readonly && !causeCurrent(*found->second)) {
+            peer->pages.clear(); return principalError(Error::Stale);
+        }
         if (frame.type == Type::OpenReview) {
             Frame response = frame; response.type = Type::ReviewQueued; return response;
         }
         Bytes records;
-        if (wire::iv::pack(std::vector<wire::iv::ObservedRecord>{row}, records) != Error::Ok)
+        auto presented = row;
+        if (peer->readonly) presented.display = found->second->fullDisplay;
+        if (wire::iv::pack(std::vector<wire::iv::ObservedRecord>{presented}, records) != Error::Ok)
             return principalError(Error::IdentityUnavailable);
         Frame response; response.minor = 3; response.type = Type::ObservedRecord;
         response.fields = {value(Tag::ServiceEpoch, epoch_), {Tag::Records, true, std::move(records)}, value(Tag::SourceEpoch, row.source)};
@@ -397,13 +432,31 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             PrincipalPage page;
             page.revision = principalObservedRevision_ ? principalObservedRevision_ : 1;
             page.source = principalSource_->binding_->epoch; page.deadline = now + 5000;
-            for (const auto &entry : principalObservations_) page.rows.push_back(entry.second->row);
+            for (const auto &entry : principalObservations_) {
+                if (peer->readonly && entry.second->row.state != 1) continue;
+                if (peer->readonly && !causeCurrent(*entry.second)) {
+                    peer->pages.clear(); return principalError(Error::Stale);
+                }
+                page.rows.push_back(entry.second->row);
+            }
             snapshot = native::randomIdentity();
             if (zero(snapshot) || !peer->pages.emplace(snapshot, std::move(page)).second) return principalError(Error::Capacity);
         }
         auto found = peer->pages.find(snapshot);
         if (found == peer->pages.end()) return principalError(Error::SnapshotExpired);
         auto &page = found->second;
+        if (peer->readonly) {
+            if (page.source != principalSource_->binding_->epoch) {
+                peer->pages.clear(); return principalError(Error::Stale);
+            }
+            for (const auto &row : page.rows) {
+                const auto current = principalObservations_.find(row.observed);
+                if (current == principalObservations_.end() || current->second->row.revision != row.revision ||
+                    !causeCurrent(*current->second)) {
+                    peer->pages.clear(); return principalError(Error::Stale);
+                }
+            }
+        }
         const auto cursor = static_cast<std::uint32_t>(get(frame, Tag::Cursor));
         if (cursor != page.next || cursor > page.rows.size()) return principalError(Error::Stale);
         const auto limit = static_cast<std::size_t>(get(frame, Tag::Limit));

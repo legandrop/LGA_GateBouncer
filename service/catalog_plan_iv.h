@@ -24,6 +24,9 @@ class CatalogPlanBuilder final {
   WriteOutcome transact(HANDLE writeEngine, const WriteApi &,
       const std::shared_ptr<const allnative::CatalogSnapshot> &before,
       VerifyBeforeWrite, void *) noexcept;
+  WriteOutcome transactInitial(HANDLE, const WriteApi &, VerifyBeforeWrite, void *) noexcept;
+  WriteOutcome transactBody(HANDLE, const WriteApi &,
+      const std::shared_ptr<const allnative::CatalogSnapshot> &, VerifyBeforeWrite, void *, bool initial) noexcept;
   bool detachOutcomeArena() noexcept;
   bool attachOutcomeArena(const principal::ByteView &) noexcept;
   CatalogPlanBuilder(allnative::CatalogRegistry &, std::size_t arenaCapacity,
@@ -52,6 +55,7 @@ class CatalogPlanBuilder final {
   enum class Phase { Reserved, Staged, Failed, Frozen };
   Phase phase_ = Phase::Reserved;
   bool writeAttempted_ = false;
+  bool initialCandidate_ = false;
   const std::uint8_t *outcomePointer_ = nullptr;
   std::size_t outcomeSize_ = 0, outcomeCapacity_ = 0;
   CatalogPlanBuilder(const CatalogPlanBuilder &) = delete;
