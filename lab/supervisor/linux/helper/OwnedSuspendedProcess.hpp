@@ -13,11 +13,14 @@
 namespace gb {
 class OwnedHelperLaunchAdapter;
 class GuestNoJobObserver;
+class LinuxSshCreator;
+class PrivateDesktopOwner;
+class WindowsNativeOwnedLaunchContext;
 class OwnedSuspendedProcess final : public std::enable_shared_from_this<OwnedSuspendedProcess> {
 public:
-    enum class State { Creating, Suspended, ClosePending, Closed };
+    enum class State { Creating, Suspended, Running, ClosePending, Closed };
     enum class Cause { None, InputInvalid, CreateFailed, IdentityUnconfirmed,
-        Cancelled, TerminateUnconfirmed, ExitUnconfirmed, CloseUnconfirmed };
+        Cancelled, TerminateUnconfirmed, ExitUnconfirmed, CloseUnconfirmed, ResumeUnconfirmed };
     struct Snapshot { State state; Cause cause; DWORD pid; std::uint64_t creation;
         bool revoked; bool exitObserved; };
     ~OwnedSuspendedProcess() noexcept = default;
@@ -31,6 +34,9 @@ public:
 private:
     friend class OwnedHelperLaunchAdapter;
     friend class GuestNoJobObserver;
+    friend class LinuxSshCreator;
+    friend class PrivateDesktopOwner;
+    friend class WindowsNativeOwnedLaunchContext;
     OwnedSuspendedProcess() = default;
     // Hoja sin entry productivo: el adapter debe aportar guards y sello admitidos.
     static std::shared_ptr<OwnedSuspendedProcess> CreateSuspendedOwn(

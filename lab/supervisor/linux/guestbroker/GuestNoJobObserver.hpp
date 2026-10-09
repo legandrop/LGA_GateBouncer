@@ -11,6 +11,7 @@
 namespace gb {
 class OwnedSuspendedProcess;
 class FixedGuestBrokerSource;
+class LinuxSshCreator;
 class GuestNoJobObserver final : public std::enable_shared_from_this<GuestNoJobObserver> {
 public:
     enum class State { Observing, Observed, ClosePending, Closed };
@@ -25,6 +26,7 @@ public:
     Snapshot CloseOwn();
 private:
     friend class FixedGuestBrokerSource;
+    friend class LinuxSshCreator;
     class Guard final {
         friend class GuestNoJobObserver;
         explicit Guard(std::shared_ptr<GuestNoJobObserver>);

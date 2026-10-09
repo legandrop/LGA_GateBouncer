@@ -3,14 +3,18 @@
 #define NOMINMAX
 #endif
 #include <Windows.h>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 namespace gb {
 class DesktopWorkerEntry;
 class LinuxSshCreator;
+class OwnedSuspendedProcess;
+class WindowsNativeOwnedLaunchContext;
 class PrivateDesktopOwner final : public std::enable_shared_from_this<PrivateDesktopOwner> {
 public:
     enum class State { Creating, StationOwned, DesktopOwned, ClosePending, Closed };
@@ -48,6 +52,8 @@ private:
     Guard GuardOwn(std::uint64_t);
     bool AcquireOwn();
     bool ReadSecurityOwn(HANDLE, DWORD);
+    std::wstring NamespaceOwn();
+    bool ReleaseChildOwn();
     void RevokeLocked();
     Snapshot ViewLocked() const { return {state_, generation_, revoked_}; }
     std::recursive_mutex mutex_;
@@ -60,6 +66,9 @@ private:
     std::vector<BYTE> user_, groups_;
     PSID userSid_ = nullptr, logonSid_ = nullptr;
     bool revoked_ = false, acquiring_ = false, closing_ = false;
+    std::atomic<bool> cancelRequested_{false};
+    std::shared_ptr<OwnedSuspendedProcess> child_;
+    std::shared_ptr<WindowsNativeOwnedLaunchContext> childJob_;
     unsigned guards_ = 0;
     static std::mutex registryMutex_;
     static std::map<PrivateDesktopOwner*, std::shared_ptr<PrivateDesktopOwner>> retained_;

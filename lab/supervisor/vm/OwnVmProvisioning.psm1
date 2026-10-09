@@ -69,7 +69,9 @@ function Get-VmOwnView($owner) {
         SwitchId=$script:VmBoundary.SwitchId;State=$state;Cause=$owner.Cause;
         Generation=$owner.Generation;Revoked=$owner.Revoked;CleanupPending=$owner.Pending;
         VmRemovalObserved=$owner.Removed;SwitchRemovalObserved=$false;
-        BootObserved=$false;EnrollmentObserved=$false;
+        BootObserved=[bool](-not $script:VmBoundary.Busy -and -not $owner.Revoked -and $owner.GuestObservation -and
+            $owner.GuestObservation.Confirmed -and $owner.GuestObservation.Observed -le $owner.Observed -and
+            $owner.Observed-$owner.GuestObservation.Observed -lt 5000);EnrollmentObserved=$false;
         StartSubmitted=[bool]($owner.Storage -and $owner.Storage.StartSubmitted)}
 }
 function Set-VmOwnRevoked($owner,[string]$cause) {
@@ -199,7 +201,8 @@ function Open-GbOwnVmProvisioning {
     $owner=@{Id=$id;Kind=$GuestKind;VmId=[guid]::Empty;Name=('GateBouncer-'+$GuestKind+'-'+$suffix);
         Path=(Join-Path $script:VmRoot $suffix);Created=$now;Observed=$now;Deadline=$now+10000;
         Generation=[long]0;Revoked=$false;State='Reserving';Cause='';Pending=$false;
-        Resources=[Collections.Generic.List[object]]::new();Removed=$false;RemoveSubmitted=$false;AdapterId='';Storage=$null}
+        Resources=[Collections.Generic.List[object]]::new();Removed=$false;RemoveSubmitted=$false;AdapterId='';Storage=$null;
+        GuestPackage=$null;GuestCredential=$null;GuestObservation=$null}
     $script:VmOwners[$id]=$owner
     try {
         & $script:VmPlatform
@@ -300,6 +303,10 @@ function Close-GbOwnVmProvisioning {
     $owner=Get-VmOwnRecord $OwnerId
     Set-VmOwnRevoked $owner 'Cancelled'
     if ($script:VmBoundary.Busy) { return Get-VmOwnView $owner }
+    if ($owner.GuestObservation) {
+        try { Close-VmGuestObservationOwn $owner }
+        catch { $owner.Cause=$_.Exception.Message; $owner.Pending=$true; return Get-VmOwnView $owner }
+    }
     # Un intento de almacenamiento conserva toda custodia; nunca usa el retiro noVHD.
     if ($owner.Storage) {
         $owner.State='CleanupPending'; $owner.Cause='StorageCustodyRetained'; $owner.Pending=$true
@@ -331,4 +338,5 @@ function Close-GbOwnVmProvisioning {
     Get-VmOwnView $owner
 }
 . (Join-Path $PSScriptRoot 'OwnVmBootAdapters.ps1')
+. (Join-Path $PSScriptRoot 'OwnVmGuestObservation.ps1')
 Export-ModuleMember -Function Open-GbOwnVmProvisioning,Get-GbOwnVmProvisioningState,Revoke-GbOwnVmProvisioning,Close-GbOwnVmProvisioning,Prepare-GbOwnVmBoot,Start-GbOwnVmBoot

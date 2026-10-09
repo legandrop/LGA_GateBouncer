@@ -3,6 +3,7 @@
 #define NOMINMAX
 #endif
 #include <Windows.h>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -10,6 +11,8 @@
 
 namespace gb {
 class LinuxSshCreator;
+class OwnedSuspendedProcess;
+class PrivateDesktopOwner;
 class WindowsNativeOwnedLaunchContext final
     : public std::enable_shared_from_this<WindowsNativeOwnedLaunchContext> {
 public:
@@ -28,11 +31,12 @@ public:
     Snapshot CloseOwn();
 private:
     friend class LinuxSshCreator;
+    friend class PrivateDesktopOwner;
     class Guard final {
         friend class WindowsNativeOwnedLaunchContext;
         explicit Guard(std::shared_ptr<WindowsNativeOwnedLaunchContext>, std::uint64_t);
         std::shared_ptr<WindowsNativeOwnedLaunchContext> owner_;
-        std::unique_lock<std::mutex> lock_;
+        std::unique_lock<std::recursive_mutex> lock_;
     public:
         Guard(const Guard&) = delete;
         Guard& operator=(const Guard&) = delete;
@@ -43,13 +47,17 @@ private:
     WindowsNativeOwnedLaunchContext() = default;
     Guard GuardCurrent(std::uint64_t);
     bool ReadLimitsOwn() const;
+    bool ReadMemberOwn() const;
     void RevokeLocked(Cause);
     Snapshot ViewLocked() const;
     static void Retain(const std::shared_ptr<WindowsNativeOwnedLaunchContext>&);
     static void ReleaseClosed(const std::shared_ptr<WindowsNativeOwnedLaunchContext>&);
     static std::mutex registryMutex_;
     static std::map<WindowsNativeOwnedLaunchContext*, std::shared_ptr<WindowsNativeOwnedLaunchContext>> retained_;
-    std::mutex mutex_;
+    std::recursive_mutex mutex_;
+    std::atomic<bool> cancelRequested_{false};
+    std::shared_ptr<OwnedSuspendedProcess> member_;
+    bool assigned_ = false, acquiring_ = false;
     HANDLE job_ = nullptr;
     State state_ = State::CreatingJob;
     Cause cause_ = Cause::None;

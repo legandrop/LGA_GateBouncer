@@ -1,4 +1,6 @@
 #include "PrivateDesktopOwner.hpp"
+#include "../helper/OwnedSuspendedProcess.hpp"
+#include "../WindowsNativeOwnedLaunchContext.hpp"
 #include <bcrypt.h>
 #include <limits>
 #include <stdexcept>
@@ -119,11 +121,12 @@ PrivateDesktopOwner::Snapshot PrivateDesktopOwner::InspectOwn() {
     std::lock_guard<std::recursive_mutex> lock(mutex_); return ViewLocked();
 }
 PrivateDesktopOwner::Snapshot PrivateDesktopOwner::CancelOwn() {
+    cancelRequested_.store(true);
     std::lock_guard<std::recursive_mutex> lock(mutex_); RevokeLocked(); return ViewLocked();
 }
 PrivateDesktopOwner::Guard::Guard(std::shared_ptr<PrivateDesktopOwner> owner, std::uint64_t generation)
     : owner_(std::move(owner)), lock_(owner_->mutex_) {
-    if (GetCurrentThreadId() != owner_->thread_ || owner_->revoked_ || owner_->state_ != State::DesktopOwned ||
+    if (GetCurrentThreadId() != owner_->thread_ || owner_->revoked_ || owner_->cancelRequested_.load() || owner_->state_ != State::DesktopOwned ||
         owner_->generation_ != generation || owner_->acquiring_ || owner_->closing_)
         throw std::runtime_error("DesktopGuardUnavailable");
     if (GetProcessWindowStation() != owner_->station_ || !owner_->ReadSecurityOwn(owner_->station_, stationAccess) ||
@@ -144,7 +147,40 @@ void PrivateDesktopOwner::ReleaseClosed(const std::shared_ptr<PrivateDesktopOwne
       if (found != retained_.end()) { release = std::move(found->second); retained_.erase(found); } }
     release.reset();
 }
+std::wstring PrivateDesktopOwner::NamespaceOwn() {
+    auto name = [](HANDLE object) {
+        DWORD bytes = 0, returned = 0;
+        if (GetUserObjectInformationW(object, UOI_NAME, nullptr, 0, &bytes) ||
+            GetLastError() != ERROR_INSUFFICIENT_BUFFER || bytes < sizeof(wchar_t) ||
+            bytes > 1024 || bytes % sizeof(wchar_t)) throw std::runtime_error("DesktopNameUnknown");
+        std::vector<wchar_t> data(bytes / sizeof(wchar_t), L'\0');
+        if (!GetUserObjectInformationW(object, UOI_NAME, data.data(), bytes, &returned) ||
+            returned != bytes || data.back() != L'\0') throw std::runtime_error("DesktopNameUnknown");
+        std::wstring value(data.data());
+        if (value.empty() || value.size() + 1 != data.size() || value.find(L'\\') != std::wstring::npos)
+            throw std::runtime_error("DesktopNameUnknown");
+        return value;
+    };
+    if (cancelRequested_.load() || revoked_ || GetCurrentThreadId() != thread_ ||
+        GetProcessWindowStation() != station_) throw std::runtime_error("DesktopCurrentLost");
+    return name(station_) + L"\\" + name(desktop_);
+}
+bool PrivateDesktopOwner::ReleaseChildOwn() {
+    if (!child_) return !childJob_;
+    // Orden unico: desktop -> Job -> hoja. NoJob se adquiere antes del desktop.
+    if (!childJob_) return false;
+    std::lock_guard<std::recursive_mutex> jobLock(childJob_->mutex_);
+    if (childJob_->acquiring_) return false;
+    child_->CancelOwn(); child_->CloseOwn();
+    std::lock_guard<std::recursive_mutex> childLock(child_->mutex_);
+    if (child_->state_ != OwnedSuspendedProcess::State::Closed || child_->process_ || child_->thread_ ||
+        !(childJob_->state_ == WindowsNativeOwnedLaunchContext::State::Closed || childJob_->ReadMemberOwn())) return false;
+    childJob_->member_.reset(); childJob_->assigned_ = false;
+    child_.reset(); childJob_.reset();
+    return true;
+}
 PrivateDesktopOwner::Snapshot PrivateDesktopOwner::CloseOwn() {
+    cancelRequested_.store(true);
     const auto live = shared_from_this(); Snapshot result{};
     {
         std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -152,7 +188,7 @@ PrivateDesktopOwner::Snapshot PrivateDesktopOwner::CloseOwn() {
         RevokeLocked();
         if (GetCurrentThreadId() != thread_ || acquiring_ || closing_ || guards_) return ViewLocked();
         closing_ = true;
-        // Corte sin hijos/Start: cero usuarios salvo guards propios; no recibe accounting DTO.
+        if (!ReleaseChildOwn()) { closing_ = false; return ViewLocked(); }
         const bool restored = !station_ || (SetProcessWindowStation(oldStation_) &&
             GetProcessWindowStation() == oldStation_ && SetThreadDesktop(oldDesktop_) &&
             GetThreadDesktop(thread_) == oldDesktop_);

@@ -1,4 +1,5 @@
 #include "WindowsNativeOwnedLaunchContext.hpp"
+#include "helper/OwnedSuspendedProcess.hpp"
 #include <limits>
 #include <stdexcept>
 
@@ -40,7 +41,7 @@ WindowsNativeOwnedLaunchContext::CreateJobOwn() {
     Retain(owner);
     bool close = false;
     {
-        std::lock_guard<std::mutex> lock(owner->mutex_);
+        std::lock_guard<std::recursive_mutex> lock(owner->mutex_);
         owner->job_ = CreateJobObjectW(nullptr, nullptr);
         if (!owner->job_) {
             owner->RevokeLocked(Cause::CreateFailed);
@@ -81,6 +82,30 @@ bool WindowsNativeOwnedLaunchContext::ReadLimitsOwn() const {
         information.BasicLimitInformation.ActiveProcessLimit == 1 &&
         information.JobMemoryLimit == memory && ui.UIRestrictionsClass == uiLimits;
 }
+bool WindowsNativeOwnedLaunchContext::ReadMemberOwn() const {
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
+    if (!job_ || !QueryInformationJobObject(job_, JobObjectBasicAccountingInformation,
+            &accounting, sizeof(accounting), nullptr)) return false;
+    DWORD expected = 0;
+    if (member_) {
+        std::lock_guard<std::recursive_mutex> memberLock(member_->mutex_);
+        if (member_->process_) {
+            FILETIME creation{}, exit{}, kernel{}, user{};
+            if (!member_->pid_ || !member_->creation_ || GetProcessId(member_->process_) != member_->pid_ ||
+                !GetProcessTimes(member_->process_, &creation, &exit, &kernel, &user) ||
+                ((static_cast<std::uint64_t>(creation.dwHighDateTime) << 32) | creation.dwLowDateTime) != member_->creation_)
+                return false;
+            const DWORD status = WaitForSingleObject(member_->process_, 0);
+            if (status != WAIT_OBJECT_0 && status != WAIT_TIMEOUT) return false;
+            if (status == WAIT_TIMEOUT && assigned_) {
+                BOOL own = FALSE;
+                if (!IsProcessInJob(member_->process_, job_, &own) || !own) return false;
+                expected = 1;
+            }
+        } else if (member_->state_ != OwnedSuspendedProcess::State::Closed) return false;
+    }
+    return accounting.ActiveProcesses == expected;
+}
 void WindowsNativeOwnedLaunchContext::RevokeLocked(Cause cause) {
     if (!revoked_) {
         revoked_ = true;
@@ -97,8 +122,8 @@ WindowsNativeOwnedLaunchContext::ViewLocked() const {
 }
 WindowsNativeOwnedLaunchContext::Snapshot
 WindowsNativeOwnedLaunchContext::InspectOwn() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (state_ == State::JobOwned && !ReadLimitsOwn()) {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    if (state_ == State::JobOwned && (cancelRequested_.load() || !ReadLimitsOwn() || (!acquiring_ && !ReadMemberOwn()))) {
         RevokeLocked(Cause::LimitsUnconfirmed);
         state_ = State::ClosePending;
     }
@@ -107,9 +132,9 @@ WindowsNativeOwnedLaunchContext::InspectOwn() {
 WindowsNativeOwnedLaunchContext::Guard::Guard(
     std::shared_ptr<WindowsNativeOwnedLaunchContext> owner, std::uint64_t generation)
     : owner_(std::move(owner)), lock_(owner_->mutex_) {
-    if (owner_->revoked_ || owner_->state_ != State::JobOwned ||
+    if (owner_->revoked_ || owner_->cancelRequested_.load() || owner_->state_ != State::JobOwned ||
         owner_->generation_ != generation) { throw std::runtime_error("JobGuardRevoked"); }
-    if (!owner_->ReadLimitsOwn()) {
+    if (!owner_->ReadLimitsOwn() || (!owner_->acquiring_ && !owner_->ReadMemberOwn())) {
         owner_->RevokeLocked(Cause::LimitsUnconfirmed);
         owner_->state_ = State::ClosePending;
         throw std::runtime_error("JobGuardUnconfirmed");
@@ -121,9 +146,10 @@ WindowsNativeOwnedLaunchContext::GuardCurrent(std::uint64_t generation) {
 }
 WindowsNativeOwnedLaunchContext::Snapshot
 WindowsNativeOwnedLaunchContext::CancelOwn() {
+    cancelRequested_.store(true);
     const auto live = shared_from_this();
     (void)live;
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
     if (state_ == State::Closed) { return ViewLocked(); }
     RevokeLocked(Cause::Cancelled);
     if (job_ && !TerminateJobObject(job_, ERROR_CANCELLED)) {
@@ -135,15 +161,21 @@ WindowsNativeOwnedLaunchContext::CancelOwn() {
 }
 WindowsNativeOwnedLaunchContext::Snapshot
 WindowsNativeOwnedLaunchContext::CloseOwn() {
+    cancelRequested_.store(true);
     const auto live = shared_from_this();
     Snapshot result{};
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::recursive_mutex> lock(mutex_);
         if (state_ != State::Closed) {
             RevokeLocked(cause_ == Cause::None ? Cause::Cancelled : cause_);
             state_ = State::ClosePending;
+            if (acquiring_) return ViewLocked();
+            if (member_) {
+                member_->CancelOwn(); member_->CloseOwn();
+                if (member_->InspectOwn().state != OwnedSuspendedProcess::State::Closed) return ViewLocked();
+            }
             JOBOBJECT_BASIC_ACCOUNTING_INFORMATION accounting{};
-            // Corte Job-only: nunca asigna procesos. Miembros desconocidos no son cierre.
+            // Salida propia y accounting exacto preceden cierre del Job.
             if (job_ && (!QueryInformationJobObject(job_, JobObjectBasicAccountingInformation,
                     &accounting, sizeof(accounting), nullptr) || accounting.ActiveProcesses != 0)) {
                 cause_ = Cause::AccountingUnconfirmed;

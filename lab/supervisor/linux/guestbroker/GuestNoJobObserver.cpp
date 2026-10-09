@@ -77,7 +77,8 @@ std::shared_ptr<GuestNoJobObserver> GuestNoJobObserver::ObserveChildOwn(
         if (!child) owner->RevokeLocked(Cause::IdentityUnconfirmed);
         else {
             std::lock_guard<std::recursive_mutex> childLock(child->mutex_);
-            if (child->state_ != OwnedSuspendedProcess::State::Suspended || child->revoked_ ||
+            if ((child->state_ != OwnedSuspendedProcess::State::Suspended &&
+                child->state_ != OwnedSuspendedProcess::State::Running) || child->revoked_ ||
                 child->cancelRequested_.load() || child->closing_ || child->acquiring_ ||
                 !child->process_ || child->noJobObservers_ == std::numeric_limits<unsigned>::max())
                 owner->RevokeLocked(Cause::IdentityUnconfirmed);
@@ -102,7 +103,8 @@ bool GuestNoJobObserver::CheckActualOwn() {
     if (!thread_ || thread_ != GetCurrentThreadId()) { RevokeLocked(Cause::WrongThread); return false; }
     if (cancelRequested_.load() || revoked_ ||
         (child_ && (!childUse_ || !childProcess_ || child_->process_ != childProcess_ ||
-        child_->state_ != OwnedSuspendedProcess::State::Suspended || child_->acquiring_ || child_->closing_ ||
+        (child_->state_ != OwnedSuspendedProcess::State::Suspended &&
+        child_->state_ != OwnedSuspendedProcess::State::Running) || child_->acquiring_ || child_->closing_ ||
         child_->revoked_ || child_->cancelRequested_.load()))) {
         RevokeLocked(Cause::Cancelled); return false;
     }

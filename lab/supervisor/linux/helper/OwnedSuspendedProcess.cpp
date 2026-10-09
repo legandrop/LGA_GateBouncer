@@ -92,7 +92,8 @@ bool OwnedSuspendedProcess::ReadIdentityOwn() const {
 }
 OwnedSuspendedProcess::Snapshot OwnedSuspendedProcess::InspectOwn() {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (state_ == State::Suspended && (cancelRequested_.load() || !ReadIdentityOwn()))
+    if ((state_ == State::Suspended || state_ == State::Running) &&
+        (cancelRequested_.load() || !ReadIdentityOwn()))
         RevokeLocked(cancelRequested_.load() ? Cause::Cancelled : Cause::IdentityUnconfirmed);
     return ViewLocked();
 }
