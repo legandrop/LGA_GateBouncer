@@ -54,6 +54,7 @@ bool GeneralSession::adopt(const Broker::Frame& frame,bool withPresentation){
             web=QString::fromUtf8(disclosure->body());
     }
     if(!current(stamp))return false;
+    if(view_&&!G::sameConfigurationView(*view_,*canonical))review_.reset();
     view_=canonical;presentation_=std::move(context);modelBody_=std::move(model);webBody_=std::move(web);return true;
 }
 bool GeneralSession::refresh(){
@@ -75,7 +76,7 @@ bool GeneralSession::refresh(){
 bool GeneralSession::mutate(C::ConfigurationMutation mutation,std::shared_ptr<Broker::SensitiveBytes> secret){
     if(busy_||!view_||!available())return false;
     const auto revision=view_->local.revision;
-    cancel();busy_=true;problem_.clear();const auto stamp=generation_;QPointer<GeneralSession> self(this);
+    review_.reset();cancel();busy_=true;problem_.clear();const auto stamp=generation_;QPointer<GeneralSession> self(this);
     Broker::Frame request;request.message=Broker::Message::ConfigurationIntent;
     request.fields[71]=Broker::integer(unsigned(mutation.verb),1);request.fields[73]=Broker::integer(revision,8);
     const bool sent=client_->control(std::move(request),[self,stamp,revision,mutation,secret](Broker::Frame reply) mutable {
@@ -139,17 +140,89 @@ bool GeneralSession::consent(C::ConsentTarget target,bool granted){
     }
     return mutate(mutation);
 }
+std::optional<G::FullBinding> GeneralSession::pendingBinding() const {
+    if(!pendingBinding_||!pendingCurrent_||!available())return {};
+    const auto binding=*pendingBinding_;const auto predicate=pendingCurrent_;const auto stamp=generation_;
+    QPointer<const GeneralSession> self(this);const bool valid=predicate(binding);
+    return self&&valid&&self->current(stamp)&&self->pendingBinding_&&*self->pendingBinding_==binding?
+        std::optional<G::FullBinding>(binding):std::nullopt;
+}
+bool GeneralSession::selectPending(const G::Id128& request,G::PendingServiceContext service){
+    if(busy_||!pendingCurrent_||!available()||!G::pendingQueryBytes(request)||!G::validPendingService(service))return false;
+    review_.reset();cancel();busy_=true;problem_.clear();const auto stamp=generation_;QPointer<GeneralSession> self(this);
+    const bool sent=client_->pendingStatus(request,service,[self,stamp]{return self&&self->current(stamp);},
+        [self,stamp,request,service](Broker::Frame frame){
+            if(!self||!self->current(stamp))return;
+            const auto pending=frame.fields.count(77)?G::pendingPresentationContext(frame.fields.at(77)):std::nullopt;
+            if(frame.message!=Broker::Message::ConfigurationStatusReply||!pending||pending->request()!=request||
+                !(pending->service()==service)||!self->adopt(frame,true)||!self->view_||!self->presentation_){
+                self->failed("The current pending request is unavailable. Your request remains undecided.");return;
+            }
+            const auto binding=G::pendingFullBinding(*pending,*self->presentation_,*self->view_,self->channel_->connection());
+            if(!binding){self->failed("The current request cannot be explained with this configuration.");return;}
+            const auto predicate=self->pendingCurrent_;const bool valid=predicate&&predicate(*binding);
+            if(!self||!self->current(stamp))return;
+            if(!valid){self->failed("The pending request changed. Your request remains undecided.");return;}
+            self->pendingPresentation_=pending;self->pendingBinding_=binding;self->busy_=false;emit self->changed();
+        });
+    if(!sent)failed("The current request could not be read. Your request remains undecided.");else emit changed();
+    return sent;
+}
+bool GeneralSession::publicReviewCurrent() const {
+    if(!review_||!view_||!presentation_||!pendingCurrent_||!available())return false;
+    const auto review=*review_;const auto stamp=generation_;const auto predicate=pendingCurrent_;
+    if(review.connection!=channel_->connection())return false;
+    const auto pending=G::pendingPresentationContext(review.pendingBytes);
+    const auto binding=pending?G::pendingFullBinding(*pending,*presentation_,*view_,review.connection):std::nullopt;
+    if(!binding||*binding!=review.binding||!G::validPublicFields(review.fields))return false;
+    QPointer<const GeneralSession> self(this);const bool valid=predicate(review.binding);
+    return self&&valid&&self->current(stamp)&&self->review_&&self->review_->binding==review.binding&&
+        self->review_->fields==review.fields&&self->review_->pendingBytes==review.pendingBytes;
+}
+bool GeneralSession::reviewPublicFields(G::PublicFields fields){
+    if(busy_||!pendingPresentation_||!G::validPublicFields(fields))return false;
+    QPointer<GeneralSession> self(this);const auto before=generation_;
+    const auto binding=pendingBinding();if(!self||!binding||before!=generation_||!pendingPresentation_)return false;
+    const auto bytes=G::pendingPresentationBytes(*pendingPresentation_);if(!bytes)return false;
+    cancel();if(!self||closed_)return false;
+    const auto stamp=generation_;
+    review_=PublicReview{*binding,std::move(fields),*bytes,channel_->connection()};
+    const bool valid=publicReviewCurrent();if(!self||stamp!=generation_)return false;
+    if(!valid){review_.reset();return false;}
+    // La revisión declara texto público; los consentimientos y derechos se comprueban aparte.
+    if(view_->local.mode==C::ModeChoice::Automatic)explainReviewed();
+    if(self&&stamp==generation_)emit changed();
+    return true;
+}
+bool GeneralSession::explainReviewed(){
+    if(busy_||!publicReviewCurrent()||!view_||!presentation_)return false;
+    const auto canonical=*view_;const auto& config=canonical.local;
+    const auto matching=[](const C::ConsentReceipt& actual,const std::optional<C::ConsentReceipt>& expected,std::uint64_t epoch){
+        if(!expected||!actual.granted||actual.epoch!=epoch||!C::validReceipt(actual))return false;
+        auto descriptor=actual;descriptor.granted=false;descriptor.epoch=0;return descriptor==*expected;
+    };
+    if(!matching(config.modelConsent,presentation_->expectedModel(),config.epochs.modelConsent)||
+        !matching(config.webConsent,presentation_->expectedWeb(),config.epochs.webConsent)||
+        !canonical.activation.technicallyAvailable||
+        (canonical.activation.cause!=C::ActivationCause::Ready&&canonical.activation.cause!=C::ActivationCause::PublicQueryApprovalMissing))return false;
+    const auto review=*review_;
+    // 23/24 registra el texto ya revisado para este snapshot: no solicita otra decisión del usuario.
+    return registerPublic(review.binding,review.fields,true);
+}
 bool GeneralSession::approvePublic(G::FullBinding binding,G::PublicFields fields){
+    return registerPublic(std::move(binding),std::move(fields),false);
+}
+bool GeneralSession::registerPublic(G::FullBinding binding,G::PublicFields fields,bool startAfterRegistration){
     if(!pendingCurrent_){failed("Connect to the current pending request before approving a public query.");return false;}
     if(busy_||!view_||!available())return false;
     const auto predicate=pendingCurrent_;const auto before=generation_;QPointer<GeneralSession> guarded(this);
     const bool valid=predicate(binding);if(!guarded||!valid||!guarded->current(before))return false;
     cancel();pendingBinding_=binding;busy_=true;approving_=true;problem_.clear();state_=G::State::Searching;const auto stamp=generation_;QPointer<GeneralSession> self(this);
-    const bool sent=client_->approve(binding,fields,[self,stamp](std::optional<G::ApprovedPublicContext> approval,G::Failure failure){
+    const bool sent=client_->approve(binding,fields,[self,stamp,startAfterRegistration](std::optional<G::ApprovedPublicContext> approval,G::Failure failure){
         if(!self||!self->current(stamp))return;
         if(!approval||failure!=G::Failure::None){self->state_=G::State::Failed;self->failed("The public query is no longer approved for this request.");return;}
         self->public_=std::move(approval);self->busy_=false;self->approving_=false;
-        if(self->view_&&self->view_->local.mode==C::ModeChoice::Automatic)self->explainApproved();
+        if(startAfterRegistration||(self->view_&&self->view_->local.mode==C::ModeChoice::Automatic))self->explainApproved();
         else {self->state_=G::State::Insufficient;emit self->changed();}
     });
     if(!sent){state_=G::State::Failed;failed("The public query could not be approved. Your request remains undecided.");}
@@ -175,10 +248,11 @@ bool GeneralSession::explainApproved(){
 bool GeneralSession::explain(G::FullBinding binding,G::PublicFields fields){return approvePublic(std::move(binding),std::move(fields));}
 void GeneralSession::cancel(){
     if(generation_==UINT64_MAX){close();return;}
-    ++generation_;busy_=false;approving_=false;result_.reset();public_.reset();pendingBinding_.reset();state_=G::State::Cancelled;
+    ++generation_;busy_=false;approving_=false;result_.reset();public_.reset();pendingBinding_.reset();pendingPresentation_.reset();state_=G::State::Cancelled;
     if(client_)client_->cancel();
 }
-void GeneralSession::invalidate(){cancel();view_.reset();presentation_.reset();modelBody_.clear();webBody_.clear();emit changed();}
+void GeneralSession::invalidate(){review_.reset();cancel();view_.reset();presentation_.reset();modelBody_.clear();webBody_.clear();emit changed();}
 void GeneralSession::close(){if(closed_)return;closed_=true;busy_=false;approving_=false;result_.reset();public_.reset();pendingBinding_.reset();view_.reset();presentation_.reset();
+    pendingPresentation_.reset();review_.reset();
     modelBody_.clear();webBody_.clear();if(client_)client_->close();client_.reset();channel_.reset();}
 }

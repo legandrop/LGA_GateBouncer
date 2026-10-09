@@ -1,5 +1,7 @@
 #include "PendingPresentationContext.h"
 #include "broker/BrokerWire.h"
+#include "GeneralWire.h"
+#include <QUuid>
 #include <algorithm>
 #include <cstring>
 namespace Gate::Assistance::General {
@@ -31,5 +33,25 @@ std::optional<QByteArray> pendingPresentationBytes(const PendingPresentationCont
     b+=Broker::integer(p.selectorRevision(),8);b+=Broker::integer(p.profileGeneration(),8);
     addId(b,p.snapshotToken());b+=Broker::integer(p.snapshotGeneration(),8);
     return pendingPresentationContext(b)?std::optional<QByteArray>(std::move(b)):std::nullopt;
+}
+std::optional<FullBinding> pendingFullBinding(const PendingPresentationContext& pending,
+    const PresentationContext& presentation,const ConfigurationView& configuration,const Id128& connection){
+    if(!pendingPresentationBytes(pending)||!presentationBytes(presentation,configuration,connection)||
+        !configuration.local.search||!presentation.searchReference())return {};
+    const auto& search=*configuration.local.search;const auto& observed=*presentation.searchReference();
+    if(search.provider!=observed.provider||search.configurationBinding!=observed.configurationBinding||
+        search.instanceToken!=observed.instanceToken)return {};
+    const auto& epochs=configuration.local.epochs;
+    FullBinding result;
+    result.requestId=QUuid::fromRfc4122(QByteArray(reinterpret_cast<const char*>(pending.request().data()),16)).toString().toStdString();
+    result.applicationToken=pending.selector();result.snapshotRevision=pending.requestRevision();
+    result.serviceEpoch=pending.service().engineBindingGeneration;result.generation=pending.profileGeneration();
+    result.localSnapshotToken=pending.snapshotToken();result.localSnapshotGeneration=pending.snapshotGeneration();
+    result.sessionEpoch=epochs.session;result.retrievalEpoch=epochs.retrieval;
+    result.providerPolicyEpoch=epochs.providerPolicy;result.credentialEpoch=epochs.credential;
+    result.modelConsentEpoch=epochs.modelConsent;result.webConsentEpoch=epochs.webConsent;
+    result.entitlementPolicyEpoch=epochs.entitlement;result.provider=Provider(search.provider);
+    result.providerConfiguration=search.configurationBinding;result.providerInstance=std::string(search.instanceToken.data(),38);
+    return validBinding(result,true)?std::optional<FullBinding>(std::move(result)):std::nullopt;
 }
 }

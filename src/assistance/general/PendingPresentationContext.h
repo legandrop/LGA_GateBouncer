@@ -4,6 +4,8 @@
 namespace Gate::Assistance::General {
 class GeneralBrokerHost;
 class GeneralFactory;
+class PresentationContext;
+struct ConfigurationView;
 struct PendingServiceContext {
     Id128 serviceEpoch{},boot{},engineContext{};
     std::uint64_t engineBindingGeneration=0;
@@ -37,6 +39,9 @@ std::optional<Id128> pendingQuery(const QByteArray&);
 std::optional<QByteArray> pendingQueryBytes(const Id128&);
 std::optional<PendingPresentationContext> pendingPresentationContext(const QByteArray&);
 std::optional<QByteArray> pendingPresentationBytes(const PendingPresentationContext&);
+// Construye una observación para el consumidor; el dueño canónico todavía debe validar Current.
+std::optional<FullBinding> pendingFullBinding(const PendingPresentationContext&,
+    const PresentationContext&,const ConfigurationView&,const Id128& connection);
 class OwnedPendingPresentation final {
 private:
     friend class GeneralBrokerHost;

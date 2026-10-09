@@ -20,6 +20,11 @@ public:
     bool consent(Configuration::ConsentTarget,bool);
     bool mode(Configuration::ModeChoice);
     bool selectSearch();
+    bool selectPending(const General::Id128&,General::PendingServiceContext);
+    std::optional<General::FullBinding> pendingBinding() const;
+    bool reviewPublicFields(General::PublicFields);
+    bool publicReviewCurrent() const;
+    bool explainReviewed();
     bool explain(General::FullBinding,General::PublicFields);
     bool approvePublic(General::FullBinding,General::PublicFields);
     bool explainApproved();
@@ -41,6 +46,7 @@ signals:
     void changed();
 private:
     bool current(quint64) const;
+    bool registerPublic(General::FullBinding,General::PublicFields,bool startAfterRegistration);
     void failed(const QString&);
     bool adopt(const Broker::Frame&,bool presentation);
     bool mutate(Configuration::ConfigurationMutation,std::shared_ptr<Broker::SensitiveBytes> = {});
@@ -55,6 +61,15 @@ private:
     std::optional<General::Result> result_;
     std::optional<General::ApprovedPublicContext> public_;
     std::optional<General::FullBinding> pendingBinding_;
+    std::optional<General::PendingPresentationContext> pendingPresentation_;
+    // Anotación del usuario para un snapshot exacto; nunca una identidad del archivo.
+    struct PublicReview {
+        General::FullBinding binding;
+        General::PublicFields fields;
+        QByteArray pendingBytes;
+        General::Id128 connection;
+    };
+    std::optional<PublicReview> review_;
     QString modelBody_,webBody_,problem_;
     quint64 generation_=1;
     General::State state_=General::State::Insufficient;
