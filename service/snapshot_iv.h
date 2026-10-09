@@ -3,6 +3,9 @@
 #include "snapshot_iii.h"
 #include <memory>
 
+namespace gatebouncer::service::windows::allapps::native {
+class CatalogStorageBuilder;
+}
 namespace gb::principal {
 struct Snapshot;
 constexpr std::size_t MaxSnapshotBytes = 33554432, MaxTargetBytes = 65696;
@@ -13,6 +16,7 @@ public:
   explicit ByteView(Bytes bytes);
   const std::uint8_t *data() const;
   std::size_t size() const { return size_; }
+  std::size_t ownedCapacityBytes() const noexcept;
   ByteView sub(std::size_t offset, std::size_t length) const;
   Bytes copy() const;
   bool operator==(const ByteView &other) const;
@@ -20,7 +24,13 @@ public:
 
 private:
   friend bool serialize(const Snapshot &, Bytes &);
-  std::shared_ptr<const Bytes> owner_;
+  friend class gatebouncer::service::windows::allapps::native::CatalogStorageBuilder;
+  using BudgetFactory = std::shared_ptr<const void> (*)(void *, std::size_t) noexcept;
+  enum class BudgetRetention { Attached, Existing, RegistryMismatch, Rejected };
+  BudgetRetention retainBudget(std::shared_ptr<const void> registry, void *context,
+                               BudgetFactory factory) const noexcept;
+  struct Storage;
+  std::shared_ptr<const Storage> owner_;
   std::size_t offset_ = 0, size_ = 0;
 };
 struct Target {

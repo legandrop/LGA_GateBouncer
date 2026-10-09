@@ -1,15 +1,60 @@
 #include "snapshot_iv.h"
 #include <algorithm>
 #include <bcrypt.h>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 
 namespace gb::principal {
+// El cargo sigue al buffer físico: ningún alias Store/sub devuelve memoria
+// viva al registro. El orden destruye bytes antes de soltar su cargo.
+struct ByteView::Storage {
+  mutable std::shared_ptr<const void> budget;
+  mutable std::shared_ptr<const void> registry;
+  mutable std::mutex mutex;
+  const Bytes *const borrowed = nullptr;
+  const Bytes bytes;
+  explicit Storage(Bytes value) : bytes(std::move(value)) {}
+  // Sólo serialize usa este préstamo durante parse; ninguna vista lo exporta.
+  explicit Storage(const Bytes *value) : borrowed(value) {}
+  const Bytes &readable() const noexcept { return borrowed ? *borrowed : bytes; }
+};
 ByteView::ByteView(Bytes b)
-    : owner_(std::make_shared<const Bytes>(std::move(b))),
-      size_(owner_->size()) {}
+    : owner_(std::make_shared<const Storage>(std::move(b))),
+      size_(owner_->bytes.size()) {}
 const std::uint8_t *ByteView::data() const {
-  return owner_ && !owner_->empty() ? owner_->data() + offset_ : nullptr;
+  return owner_ && !owner_->readable().empty()
+             ? owner_->readable().data() + offset_
+             : nullptr;
+}
+std::size_t ByteView::ownedCapacityBytes() const noexcept {
+  return owner_ && !owner_->borrowed ? owner_->bytes.capacity() : 0;
+}
+ByteView::BudgetRetention ByteView::retainBudget(
+    std::shared_ptr<const void> registry, void *context,
+    BudgetFactory factory) const noexcept {
+  if (!owner_ || owner_->borrowed || !registry || !factory)
+    return BudgetRetention::Rejected;
+  try {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (owner_->budget) {
+      const auto &prior = owner_->registry;
+      const bool same = prior.get() == registry.get() &&
+                        !prior.owner_before(registry) &&
+                        !registry.owner_before(prior);
+      return same ? BudgetRetention::Existing : BudgetRetention::RegistryMismatch;
+    }
+    // El factory liga una reserva REAL anterior a allocate/read/serialize.
+    // Comprueba aquí la capacidad física completa, aun si ésta es una subvista.
+    auto token = factory(context, owner_->bytes.capacity());
+    if (!token)
+      return BudgetRetention::Rejected;
+    owner_->registry = std::move(registry);
+    owner_->budget = std::move(token);
+    return BudgetRetention::Attached;
+  } catch (...) {
+    return BudgetRetention::Rejected;
+  }
 }
 ByteView ByteView::sub(std::size_t p, std::size_t n) const {
   if (p > size_ || n > size_ - p)
@@ -1087,11 +1132,11 @@ bool serialize(const Snapshot &s, Bytes &out) {
     append(b, s.journal);
     append(b, s.archive);
     append(b, native::digest(b));
-    // Validación sin copia de candidato/targets. La propiedad se transfiere al
-    // documento temporal.
+    // Validación sin copia: el préstamo privado termina antes de mover b.
+    // No posee capacidad física ni puede retener un cargo de catálogo.
     {
       ByteView borrowed;
-      borrowed.owner_ = std::shared_ptr<const Bytes>(&b, [](const Bytes *) {});
+      borrowed.owner_ = std::make_shared<const ByteView::Storage>(&b);
       borrowed.size_ = b.size();
       Snapshot checked;
       if (!parse(borrowed, checked))
