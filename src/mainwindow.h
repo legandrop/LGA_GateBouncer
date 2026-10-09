@@ -25,7 +25,8 @@ class MainWindow final : public QMainWindow {
   public:
     explicit MainWindow(QWidget *parent = nullptr, bool isolatedQa = false, const QString &qaRoot = {},
                         std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel = {},
-                        std::unique_ptr<ReviewBackend> reviewer = {});
+                        std::unique_ptr<ReviewBackend> reviewer = {},
+                        std::unique_ptr<gb::ipc::ii::SessionChannel> ordinaryChannel = {});
     ~MainWindow() override;
     ProductController *product() { return &product_; }
     void setMode(UiMode mode);
@@ -71,6 +72,7 @@ class MainWindow final : public QMainWindow {
     void saveViewState();
     void restoreViewState();
     void renderNotice();
+    void renderOrdinaryNotice();
     void positionOverlays();
     void edit(const QString &id, bool candidate = false);
     void cleanup();

@@ -15,10 +15,15 @@ qt_add_library(gatebouncer_wire STATIC common/wire_v1.cpp common/wire_ii.cpp com
 target_include_directories(gatebouncer_wire PUBLIC common)
 qt_add_library(gatebouncer_service_view_ui STATIC
     src/engine/DecisionViewClient.cpp src/engine/DecisionViewClient.h
+    src/engine/OrdinaryDecisionClient.cpp src/engine/OrdinaryDecisionClient.h
+    controller/ordinary_qt.cpp controller/ordinary_qt.h
     controller/session_qt.cpp controller/session_qt.h
 )
 target_link_libraries(gatebouncer_service_view_ui PUBLIC Qt6::Core gatebouncer_native_ii)
 target_include_directories(gatebouncer_service_view_ui PUBLIC src common controller)
+if(DEFINED ENV{GATEBOUNCER_ORDINARY_HEADER_DIR})
+    target_include_directories(gatebouncer_service_view_ui PRIVATE "$ENV{GATEBOUNCER_ORDINARY_HEADER_DIR}")
+endif()
 target_compile_definitions(gatebouncer_service_view_ui PRIVATE UNICODE _UNICODE NOMINMAX)
 target_compile_options(gatebouncer_service_view_ui PRIVATE -Wall -Wextra -Wpedantic)
 

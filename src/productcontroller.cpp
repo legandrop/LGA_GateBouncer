@@ -8,8 +8,12 @@
 
 namespace Gate {
 ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QObject *parent,
-                                     std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel)
-    : QObject(parent), isolatedQa_(isolatedQa), engine_(isolatedQa, this), records_(isolatedQa, this, std::move(decisionChannel)) {
+                                     std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel,
+                                     std::unique_ptr<gb::ipc::ii::SessionChannel> ordinaryChannel)
+    : QObject(parent), isolatedQa_(isolatedQa), engine_(isolatedQa, this), records_(isolatedQa, this, std::move(decisionChannel)),
+      ordinary_(isolatedQa, this, std::move(ordinaryChannel)) {
+    connect(&ordinary_, &OrdinaryDecisionClient::changed, this, &ProductController::changed);
+    if (!isolatedQa_) QTimer::singleShot(0, this, [this] { if (!simulation() && !stopped_) ordinary_.startAutomatic(); });
     if (isolatedQa && (qaRoot.isEmpty() || !QDir::isAbsolutePath(qaRoot)))
         reviewError_ = "Isolated QA requires an explicit review root";
     else loadReview(isolatedQa ? qaRoot : QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/review-live");
@@ -117,6 +121,8 @@ void ProductController::setMode(UiMode mode) {
     cancelImport();
     engine_.invalidate();
     records_.invalidate();
+    ordinary_.invalidate();
+    if (!simulation() && !isolatedQa_) ordinary_.startAutomatic();
     deriveImportedViews();
     if (!simulation()) refreshProcesses();
     emit changed();

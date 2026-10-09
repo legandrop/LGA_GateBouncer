@@ -6,6 +6,7 @@
 #include "platform/ProcessCatalog.h"
 #include "engine/EngineViewClient.h"
 #include "engine/DecisionViewClient.h"
+#include "engine/OrdinaryDecisionClient.h"
 #include <QObject>
 #include <QThread>
 #include <memory>
@@ -28,7 +29,8 @@ class ProductController final : public QObject {
     Q_OBJECT
   public:
     explicit ProductController(bool isolatedQa = false, const QString &qaRoot = {}, QObject *parent = nullptr,
-                               std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel = {});
+                               std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel = {},
+                               std::unique_ptr<gb::ipc::ii::SessionChannel> ordinaryChannel = {});
     ~ProductController() override;
     UiMode mode() const { return mode_; }
     bool simulation() const { return mode_ == UiMode::Simulation; }
@@ -62,14 +64,16 @@ class ProductController final : public QObject {
     const EngineStatus &engine() const { return recordsSelected_ ? records_.status() : engine_.status(); }
     DecisionViewClient *records() { return &records_; }
     const DecisionViewClient *records() const { return &records_; }
+    OrdinaryDecisionClient *ordinary() { return &ordinary_; }
+    const OrdinaryDecisionClient *ordinary() const { return &ordinary_; }
     bool recordsSelected() const { return recordsSelected_; }
     bool selectDecisionRecords();
     void selectStatusOnly();
     QString engineSummary() const;
     QString revisionSummary() const;
     quint64 generation() const { return generation_; }
-    void stop() { stopped_ = true; ++generation_; cancelImport(); semanticJob_ = QUuid{}; draftView_ = {}; reviewView_ = {}; engine_.invalidate(); records_.stop(); }
-    bool idle() const { return (!worker_ || !worker_->isRunning()) && (!semanticWorker_ || !semanticWorker_->isRunning()) && (!importWorker_ || !importWorker_->isRunning()) && engine_.idle() && records_.idle(); }
+    void stop() { stopped_ = true; ++generation_; cancelImport(); semanticJob_ = QUuid{}; draftView_ = {}; reviewView_ = {}; engine_.invalidate(); records_.stop(); ordinary_.stop(); }
+    bool idle() const { return (!worker_ || !worker_->isRunning()) && (!semanticWorker_ || !semanticWorker_->isRunning()) && (!importWorker_ || !importWorker_->isRunning()) && engine_.idle() && records_.idle() && ordinary_.idle(); }
   signals:
     void changed();
     void invalidated();
@@ -96,6 +100,7 @@ class ProductController final : public QObject {
     Data::ProcessCatalogResult catalog_;
     EngineViewClient engine_;
     DecisionViewClient records_;
+    OrdinaryDecisionClient ordinary_;
     bool recordsSelected_ = false, stopped_ = false;
     gb::wire::Id lastEpoch_{}, lastBoot_{};
     quint64 lastProfile_ = 0;

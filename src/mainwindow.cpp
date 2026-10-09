@@ -507,8 +507,9 @@ class RowsModel final : public QAbstractTableModel {
 
 MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
                        std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel,
-                       std::unique_ptr<ReviewBackend> reviewer)
-    : QMainWindow(parent), model_(this), explanation_(&model_), product_(isolatedQa, qaRoot, this, std::move(decisionChannel)),
+                       std::unique_ptr<ReviewBackend> reviewer,
+                       std::unique_ptr<gb::ipc::ii::SessionChannel> ordinaryChannel)
+    : QMainWindow(parent), model_(this), explanation_(&model_), product_(isolatedQa, qaRoot, this, std::move(decisionChannel), std::move(ordinaryChannel)),
       reviewer_(isolatedQa, this, std::move(reviewer)) {
     setObjectName("GateBouncer");
     setWindowTitle("LGA GateBouncer");
@@ -521,6 +522,7 @@ MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
     connect(&explanation_, &Explanation::changed, this, &MainWindow::renderNotice);
     connect(&product_, &ProductController::changed, this, &MainWindow::refresh);
     connect(&product_, &ProductController::changed, this, &MainWindow::updateLifecycle);
+    connect(product_.ordinary(), &OrdinaryDecisionClient::changed, this, &MainWindow::renderOrdinaryNotice);
     connect(&product_, &ProductController::importedViewsInvalidated, this, &MainWindow::closeStaleModal);
     connect(&model_, &Simulation::changed, this, &MainWindow::updateLifecycle);
     connect(&reviewer_, &ReviewGateway::changed, this, [this] {
@@ -572,7 +574,9 @@ void MainWindow::updateLifecycle() {
     // El perfil de cobertura validada aún no tiene evidencia consumible en esta GUI.
     snapshot.state = product_.engine().current
         ? Lifecycle::EngineState::Degraded : Lifecycle::EngineState::Unavailable;
-    if (!snapshot.simulation && product_.recordsSelected() && product_.records()->recordsCurrent())
+    if (!snapshot.simulation && product_.ordinary()->current())
+        snapshot.pendingCount = product_.ordinary()->observations().size();
+    else if (!snapshot.simulation && product_.recordsSelected() && product_.records()->recordsCurrent())
         snapshot.pendingCount = product_.records()->pending().size();
     lifecycle_->applyEngineSnapshot(snapshot);
 }
@@ -779,6 +783,7 @@ void MainWindow::buildPage() {
     for (auto it = navigation_.begin(); it != navigation_.end(); ++it)
         it.value()->setChecked(it.key() == view_);
     pendingCount_->setText(product_.simulation() ? QString::number(model_.state().pending.size())
+        : product_.ordinary()->current() ? QString::number(product_.ordinary()->observations().size())
         : product_.recordsSelected() && product_.records()->recordsCurrent()
             ? QString::number(product_.records()->pending().size()) : "—");
     pendingCount_->setVisible(!product_.simulation() || !model_.state().pending.isEmpty());
@@ -802,9 +807,13 @@ void MainWindow::buildPage() {
             status_->setText("Read only · decisions require administrator review\nCoverage not validated");
             footer_->setText("View II snapshots · WFP attempts only when present · no authorization or traffic evidence");
         }
+        if (product_.ordinary()->current()) {
+            status_->setText("Future rule review available\nCoverage not validated");
+            footer_->setText("Admitted blocked observations · permanent application + account rules · no held connection");
+        }
         const QMap<QString, QStringList> liveHeadings{
             {"processes", {"Processes", "Observed local processes · policy and network history are unknown."}},
-            {"pending", {"Pending decisions", "Service request snapshots · ordinary GUI cannot Allow or Block."}},
+            {"pending", {"Pending decisions", "Admitted observations · review future permanent rules."}},
             {"activity", {"Activity", "Observed attempts and gaps · authorization and traffic unavailable."}},
             {"rules", {"Rules", "Service policy records and inactive local review candidates."}},
             {"import", {"Import from NetLimiter", "Structural analysis only · compatibility not validated."}},
@@ -1146,6 +1155,14 @@ void MainWindow::refreshTable(bool newPage) {
                      {"Unknown · no collector", {}, {}}, {status, status, {}}, {"Review", "action", {}}}});
             }
         }
+        else if (view_ == "pending" && product_.ordinary()->current()) {
+            for (const auto &p : product_.ordinary()->observations())
+                result.push_back({"ordinary:" + QString::fromStdString(gb::wire::hex(p.observed)),
+                    {{recordText(p.display.name, "Unattributed application"), "strong", {}},
+                     {"Requested destination unknown", {}, {}},
+                     {recordUtc(p.lastUtc, p.presence & 2), {}, qulonglong(p.lastUtc)},
+                     {"Review future rule →", "action", {}}}});
+        }
         else if (view_ == "pending" && product_.recordsSelected() && product_.records()->recordsCurrent())
             for (const auto &p : product_.records()->pending())
                 result.push_back({engineRowId("pending", product_.engine().serviceEpoch, p.request),
@@ -1261,7 +1278,7 @@ void MainWindow::refreshTable(bool newPage) {
               : "Synthetic fixtures only. Enter opens the selected row where available.");
     if (emptyState_) {
         emptyState_->setText(!product_.simulation()
-            ? view_ == "pending" ? "Pending requests unavailable in this engine version"
+            ? view_ == "pending" ? product_.ordinary()->current() ? "No admitted observations awaiting a decision" : "Admitted observations unavailable · refresh to check the ordinary channel"
                 : view_ == "activity" ? "Network activity collector unavailable"
                 : view_ == "rules" ? "No local review candidates\nEngine rules unavailable in this version"
                 : view_ == "import" ? "Choose a migration file for structural analysis"
@@ -1364,7 +1381,98 @@ void MainWindow::openRequest(const QString &id) {
             b->setFocus();
     }
 }
+void MainWindow::renderOrdinaryNotice() {
+    if (product_.simulation()) return;
+    auto *client = product_.ordinary();
+    const QString focused = notice_ && notice_->isAncestorOf(QApplication::focusWidget())
+        ? QApplication::focusWidget()->objectName() : QString{};
+    if (notice_) { dispose(notice_); notice_.clear(); }
+    if (!client->visible() || !client->observed()) return;
+    const auto row = *client->observed();
+    const auto draft = client->draft();
+    const auto *submitted = client->submitted();
+    const auto display = draft ? draft->display : submitted ? submitted->display : row.display;
+    const auto package = draft ? draft->package : submitted
+        ? gb::wire::get(submitted->command, gb::wire::Tag::PackageMode) : 0;
+    const auto directionValue = submitted ? int(gb::wire::get(submitted->command, gb::wire::Tag::PolicyDirection))
+        : client->selectedDirection();
+    const auto selection = client->selection();
+    notice_ = new QFrame(root_); notice_->setObjectName("access-notice");
+    notice_->setAccessibleName("Future application rule review");
+    auto *l = new QVBoxLayout(notice_); l->setContentsMargins(15, 12, 15, 12); l->setSpacing(9);
+    auto *head = line(l); head->addWidget(label("LGA   GateBouncer · access request", "faint"), 1);
+    auto *close = button("×", "close-request", "ghost"); close->setFixedSize(25, 25);
+    close->setAccessibleName("Close review and keep the observation undecided"); head->addWidget(close);
+    connect(close, &QPushButton::clicked, client, &OrdinaryDecisionClient::closeNotice);
+    l->addWidget(label(recordText(display.name, "Unattributed application"), "heading", true));
+    auto *status = label(client->message(), "warning", true); status->setObjectName("ordinary-state"); l->addWidget(status);
+    if (submitted) l->addWidget(label(QString("Submitted decision: ") +
+        (gb::wire::get(submitted->command, gb::wire::Tag::Decision) == 2 ? "Allow" : "Block") +
+        " · retained for receipt verification", "faint", true));
+    auto *content = new QWidget; auto *body = new QVBoxLayout(content);
+    body->setContentsMargins(0, 0, 0, 0); body->setSpacing(9);
+    if (client->state() == OrdinaryDecisionClient::State::Preparing) body->addWidget(new Spinner, 0, Qt::AlignLeft);
+    definition(body, "Requested destination", "Unknown · not included in this observation");
+    definition(body, "Original attempt", "Blocked attempt observed · no held connection");
+    definition(body, "Application", recordText(display.name, "Unknown"));
+    definition(body, "Account", recordText(display.principal, "Unknown"));
+    definition(body, "Package", package == 1 ? "Unrestricted · any package" : recordText(display.package, "Unknown"));
+    if (!display.path.empty()) {
+        auto *path = new QPlainTextEdit(recordText(display.path, "Unknown")); path->setReadOnly(true);
+        path->setObjectName("ordinary-path"); path->setWordWrapMode(QTextOption::WrapAnywhere);
+        path->setMinimumHeight(52); path->setMaximumHeight(78); body->addWidget(path);
+    }
+    body->addWidget(label(QString(submitted ? "Submitted scope: " : "Effective scope: ") +
+        "this application and account, across matching instances. "
+        + QString(package == 1 ? "No package restriction applies. " : package == 2
+            ? "The displayed package is included. " : "Package restriction is unknown. ") +
+        "The rule applies to future attempts; it does not resume this attempt. Protection coverage has not been validated.", "muted", true));
+    l->addWidget(scrollArea(content), 1);
+    auto *fields = new QHBoxLayout; fields->setSpacing(9);
+    auto *sl = new QVBoxLayout; sl->setSpacing(5); sl->addWidget(label("Apply to", "faint"));
+    auto *scope = combo({"Application + account", "Current process", "Once"}, "decision-scope");
+    for (int i : {1, 2}) scope->setItemData(i, 0, Qt::UserRole - 1);
+    scope->setEnabled(client->ready()); sl->addWidget(scope); fields->addLayout(sl, 1);
+    auto *dl = new QVBoxLayout; dl->setSpacing(5); dl->addWidget(label("Keep this decision", "faint"));
+    auto *duration = combo({"Permanent", "For 15 minutes", "Until restart"}, "decision-duration");
+    for (int i : {1, 2}) duration->setItemData(i, 0, Qt::UserRole - 1);
+    duration->setEnabled(client->ready()); dl->addWidget(duration); fields->addLayout(dl, 1); l->addLayout(fields);
+    l->addWidget(label("Once, process and timed scopes are unavailable. Only a future permanent rule is supported.", "faint", true));
+    auto *direction = combo({"Outbound", "Inbound", "Both"}, "ordinary-direction");
+    direction->setCurrentIndex(directionValue - 1);
+    direction->setEnabled(client->ready()); l->addWidget(direction);
+    connect(direction, &QComboBox::currentIndexChanged, this, [client, selection, direction](int index) {
+        if (selection != client->selection() || !client->direction(index + 1)) {
+            const QSignalBlocker guard(direction); direction->setCurrentIndex(client->selectedDirection() - 1);
+        }
+    });
+    const QString network = directionValue == 1 ? "Outbound · Allow covers unicast destinations only"
+        : directionValue == 2 ? "Inbound · all destinations and protocols" : "Both · inbound and outbound; Allow includes non-unicast destinations";
+    l->addWidget(label(QString(submitted ? "Submitted network scope: " : "Effective network scope: ") + network, "muted", true));
+    auto *consent = new QCheckBox("I accept the effective scope shown above.");
+    consent->setObjectName("ordinary-consent"); consent->setEnabled(client->ready());
+    consent->setStyleSheet("QCheckBox { font-size: 11px; }"); l->addWidget(consent);
+    auto *actions = line(l); auto *keep = button("Keep pending", "keep-access-pending", "ghost"); actions->addWidget(keep);
+    connect(keep, &QPushButton::clicked, client, &OrdinaryDecisionClient::closeNotice); actions->addStretch();
+    auto *block = button("Block", "decide-block", "danger"); auto *allow = button("Allow", "decide-allow", "primary");
+    block->setEnabled(false); allow->setEnabled(false); actions->addWidget(block); actions->addWidget(allow);
+    connect(consent, &QCheckBox::toggled, this, [client, selection, block, allow](bool checked) {
+        const bool enabled = checked && selection == client->selection() && client->ready();
+        block->setEnabled(enabled); allow->setEnabled(enabled);
+    });
+    for (auto *b : {block, allow}) connect(b, &QPushButton::clicked, this, [client, selection, consent, allowAction = b == allow] {
+        client->decide(allowAction, consent->isChecked(), selection);
+    });
+    if (client->state() == OrdinaryDecisionClient::State::Uncertain) {
+        auto *check = button("Check same command", "ordinary-recover"); check->setEnabled(client->idle());
+        l->addWidget(check); connect(check, &QPushButton::clicked, client, &OrdinaryDecisionClient::recover);
+    }
+    positionOverlays(); notice_->show(); notice_->raise();
+    if (!focused.isEmpty()) if (auto *control = notice_->findChild<QWidget *>(focused)) control->setFocus();
+    if (modalOverlay_) modalOverlay_->raise();
+}
 void MainWindow::renderNotice() {
+    if (!product_.simulation()) { renderOrdinaryNotice(); return; }
     const auto id = explanation_.visibleId();
     const auto *p = model_.process(id);
     const QString focused = notice_ && notice_->isAncestorOf(QApplication::focusWidget())
@@ -1778,7 +1886,7 @@ void MainWindow::modeSelector(QVBoxLayout *layout) {
     layout->addWidget(panel);
 }
 void MainWindow::renderLive() {
-    if (view_ != "settings") pageLayout_->addWidget(note("Ordinary GUI is read only. Decisions require the separate administrator reviewer. Local candidates stay inactive.", true));
+    if (view_ != "settings") pageLayout_->addWidget(note("Process, activity and View records are read only. Admitted observations can be reviewed for future permanent rules. Coverage remains unvalidated.", true));
     if (view_ == "processes") {
         auto *bar = line(pageLayout_); auto *search = new QLineEdit(query_);
         search->setObjectName("process-search"); search->setPlaceholderText("Search observed processes and paths…");
@@ -1789,9 +1897,22 @@ void MainWindow::renderLive() {
         count_ = label({}, "faint"); pageLayout_->addWidget(count_);
         if (!product_.catalog().error.isEmpty()) pageLayout_->addWidget(label(product_.catalog().error, "warning", true));
     } else if (view_ == "pending") {
-        pageLayout_->addWidget(note(product_.recordsSelected() && product_.records()->recordsCurrent()
-            ? "Snapshot from the single eligible account/session. Current coverage is limited to the service and its own probe; other applications are not covered by this increment."
-            : "Request snapshots unavailable. Connect View II explicitly in Settings; observed processes are not requests."));
+        auto *bar = line(pageLayout_);
+        auto *refresh = button("Refresh admitted observations", "refresh-ordinary"); bar->addWidget(refresh);
+        refresh->setEnabled(product_.ordinary()->idle() && product_.ordinary()->state() != OrdinaryDecisionClient::State::Uncertain);
+        connect(refresh, &QPushButton::clicked, product_.ordinary(), &OrdinaryDecisionClient::refresh);
+        if (product_.ordinary()->state() == OrdinaryDecisionClient::State::Uncertain) {
+            auto *recover = button("Check same command", "ordinary-recover-page");
+            recover->setEnabled(product_.ordinary()->idle()); bar->addWidget(recover);
+            connect(recover, &QPushButton::clicked, product_.ordinary(), &OrdinaryDecisionClient::recover);
+        }
+        bar->addStretch();
+        pageLayout_->addWidget(label(product_.ordinary()->message(), "muted", true));
+        pageLayout_->addWidget(note(product_.ordinary()->current()
+            ? "Admitted blocked observations are available. Review future permanent application + account rules in the access request. Coverage remains unvalidated."
+            : product_.recordsSelected() && product_.records()->recordsCurrent()
+                ? "View request snapshot · read only. These requests use the separate administrator reviewer; coverage remains unvalidated."
+                : "No active observation snapshot. Refresh admitted observations to check the ordinary channel; observed processes are not requests."));
         makeTable({"Application", "Destination", "Last request", "Decision"}, {32, 31, 14, 23}, 57);
     } else if (view_ == "activity") {
         makeTable({"Time", "Process", "Event", "Destination", "Reason"}, {19, 22, 19, 20, 20}, 42);
@@ -1837,8 +1958,9 @@ void MainWindow::renderLive() {
         modeSelector(l);
         auto *panel = frame("panel"); auto *p = new QVBoxLayout(panel); p->setContentsMargins(16, 16, 16, 16); p->setSpacing(8);
         p->addWidget(label("Network engine", "heading"));
-        p->addWidget(label(product_.engine().current ? "Connected · reading service status" : "Not connected", "warning", true));
-        p->addWidget(label("Network protection has not been validated. This window lets you inspect requests; each decision needs a separate administrator confirmation.", "faint", true));
+        p->addWidget(label(product_.ordinary()->current() ? "Ordinary review connected · future permanent rules"
+            : product_.engine().current ? "View connected · reading service status" : "No current service snapshot", "warning", true));
+        p->addWidget(label("Network protection has not been validated. Admitted ordinary observations can be decided in the access request without administrator confirmation. View requests use the separate administrator reviewer.", "faint", true));
         auto *refresh = button("Refresh connection", "refresh-engine"); p->addWidget(refresh, 0, Qt::AlignLeft);
         connect(refresh, &QPushButton::clicked, &product_, &ProductController::refreshEngine);
         auto *connectRecords = button("Connect requests", "connect-view-ii"); p->addWidget(connectRecords, 0, Qt::AlignLeft);
@@ -1898,6 +2020,11 @@ void MainWindow::renderLive() {
     }
 }
 void MainWindow::openEngineRequest(const QString &rowId) {
+    if (!product_.simulation() && rowId.startsWith("ordinary:")) {
+        gb::wire::Id id{};
+        if (gb::wire::parseId(rowId.mid(9).toStdString(), id)) product_.ordinary()->select(id);
+        return;
+    }
     if (product_.simulation() || !product_.recordsSelected() || !product_.records()->recordsCurrent()) return;
     for (const auto &record : product_.records()->pending()) {
         if (rowId != engineRowId("pending", product_.engine().serviceEpoch, record.request)) continue;
@@ -2273,7 +2400,7 @@ void MainWindow::positionOverlays() {
     if (notice_) {
         const int w = small ? 400 : 420;
         const int h = qMin(root_->height() - 105,
-                           model_.review(explanation_.visibleId()).expanded ? 625 : 541);
+                           !product_.simulation() || model_.review(explanation_.visibleId()).expanded ? 625 : 541);
         notice_->setGeometry(root_->width() - w - 20, root_->height() - h - 20, w, h);
     }
     if (modalOverlay_)
@@ -2313,7 +2440,7 @@ bool MainWindow::eventFilter(QObject *object, QEvent *event) {
             if (modalOverlay_)
                 closeModal();
             else if (notice_)
-                explanation_.close();
+                product_.simulation() ? explanation_.close() : product_.ordinary()->closeNotice();
             else if (detail_) {
                 selected_.clear();
                 dispose(detail_);
