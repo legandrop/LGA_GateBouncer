@@ -66,6 +66,51 @@ QString semanticFacts(const ImportedReviewView &view, const Data::SemanticCandid
          << "Profile diagnostics: " + QStringList(view.facts.diagnostics.begin(), view.facts.diagnostics.end()).join(" · ");
     return text.join('\n');
 }
+QString qnameAction(const Data::QNameCandidateFacts *c) {
+    if (!c || !c->action.known()) return "Unknown";
+    switch (c->action.value) {
+    case Data::SourceFwAction::None: return "None (0)";
+    case Data::SourceFwAction::Ask: return "Ask (1)";
+    case Data::SourceFwAction::Allow: return "Allow (2)";
+    case Data::SourceFwAction::Deny: return "Deny (3)";
+    case Data::SourceFwAction::Block: return "Block (4)";
+    }
+    return "Unknown";
+}
+QString qnameFacts(const ImportedReviewView &view, const Data::QNameCandidateFacts *c) {
+    QStringList out{"Inactive · Unverified", "Profile: Explicit QName source subset", "Engine policy eligible: No"};
+    if (!c || !view.qname) { out << (view.busy ? "Deriving source facts… Reopen after analysis completes." : "QName facts unavailable"); return out.join('\n'); }
+    const auto &v = *view.qname;
+    out << "Source action: " + qnameAction(c) << "Source direction: " + (c->direction.known() ? Data::directionName(c->direction.value) : "Unknown")
+        << "Source enabled: " + (c->enabled.known() ? (c->enabled.value ? QString("True") : QString("False")) : QString("Unknown"))
+        << "Source weight: " + (c->weight.known() ? QString::number(c->weight.value) : "Unknown")
+        << "Reconstructed source subset complete: " + QString(c->complete ? "Yes" : "No · known fields retained")
+        << "Profile version known: " + QString(v.profileKnown ? "Yes" : "No")
+        << "Omissions / residues: " + QString::number(c->residues.size())
+        << "Conflict analysis complete: " + QString(v.conflictsComplete ? "Yes · within this profile" : "No · comparison limit or unresolved input")
+        << "Conflict: " + QString(c->potentialConflict ? "Potential" : "No confirmed conflict")
+        << "Subject scope: Source constraints only · Windows identity and service scope Unknown";
+    auto application = [&](const Data::ApplicationConstraint &a) {
+        out << "Path: " + (a.path.known() ? a.path.value : "Unknown")
+            << "Path exact predicate: " + QString(a.pathExact ? "True" : "Unknown or non-exact")
+            << "SID source bytes: " + (a.sidBytes.known() ? a.sidBytes.value : "Unknown")
+            << "Package: " + (a.packageId.known() ? a.packageId.value : "Unknown")
+            << "Service: " + (a.serviceName.known() ? a.serviceName.value : "Unknown");
+    };
+    if (c->filterIndex >= 0 && c->filterIndex < v.filters.size()) {
+        const auto &f = v.filters[c->filterIndex]; application(f.package);
+        int shown = 0;
+        for (const auto &p : f.predicates) {
+            if (++shown > 12) { out << "Additional predicates retained in source evidence"; break; }
+            out << "Predicate: " + p.kind + " · " + (p.complete ? "Known subset" : "Incomplete")
+                << "Match: " + (p.match.known() ? (p.match.value ? QString("True") : QString("False")) : QString("Unknown"));
+            for (const auto &a : p.applications) { if (out.size() >= 140) break; application(a); }
+            for (const auto &domain : p.domains) { if (out.size() >= 140) break; out << "Domain source: " + (domain.known() ? domain.value : "Unknown"); }
+        }
+    } else out << "Constraints: Unknown · unresolved filter";
+    out << "Profile diagnostics: " + QStringList(v.diagnostics.begin(), v.diagnostics.end()).join(" · ");
+    return out.join('\n').left(32000);
+}
 QString recordUtc(quint64 nanos, bool present) {
     return present ? QDateTime::fromMSecsSinceEpoch(qint64(nanos / 1000000), QTimeZone::UTC)
                          .toString("yyyy-MM-dd HH:mm:ss 'UTC'") : "Unknown";
@@ -475,14 +520,14 @@ MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
     connect(&explanation_, &Explanation::changed, this, &MainWindow::renderNotice);
     connect(&product_, &ProductController::changed, this, &MainWindow::refresh);
     connect(&product_, &ProductController::changed, this, &MainWindow::updateLifecycle);
-    connect(&product_, &ProductController::importedViewsInvalidated, this, &MainWindow::closeModal);
+    connect(&product_, &ProductController::importedViewsInvalidated, this, &MainWindow::closeStaleModal);
     connect(&model_, &Simulation::changed, this, &MainWindow::updateLifecycle);
     connect(&reviewer_, &ReviewGateway::changed, this, [this] {
         // Las páginas anteriores se retiran con deleteLater; actualizar también el aviso actual.
         for (auto *status : findChildren<QLabel *>("reviewer-status")) status->setText(reviewer_.status());
     });
     connect(&product_, &ProductController::invalidated, this, [this] {
-        explanation_.close(); reviewer_.invalidate(); closeModal(); selected_.clear();
+        explanation_.close(); reviewer_.invalidate(); closeStaleModal(); selected_.clear();
         if (detail_) { dispose(detail_); detail_.clear(); }
     });
     qApp->installEventFilter(this);
@@ -792,8 +837,7 @@ void MainWindow::refresh() {
     if (!selected_.isEmpty() && view_ == "processes" &&
         (product_.simulation() ? model_.process(selected_) != nullptr : product_.process(selected_) != nullptr))
         openDetail(selected_);
-    if (modalOverlay_ && !model_.available())
-        closeModal();
+    closeStaleModal();
 }
 QTableView *MainWindow::makeTable(const QStringList &headers, const QVector<int> &widths,
                                   int rowHeight) {
@@ -1066,17 +1110,18 @@ void MainWindow::refreshTable(bool newPage) {
             const auto &report = view_ == "import" ? product_.draft() : product_.review().report;
             for (const auto &c : report.candidates) {
                 const auto *derived = product_.derivedCandidate(view_ == "import", c.id);
+                const auto *qname = product_.derivedQNameCandidate(view_ == "import", c.id);
                 const auto &derivedView = product_.importedView(view_ == "import");
-                const QString status = derived ? reconstructionText(derived)
+                const QString status = qname ? (qname->complete ? "Known source subset" : "Incomplete · known fields retained") : derived ? reconstructionText(derived)
                     : derivedView.busy ? "Deriving facts" : "Derived facts unavailable";
                 const QString source = c.sourceId.isEmpty() ? c.source.name : c.sourceId;
-                const QString action = derived && derived->action ? Data::actionName(*derived->action) : "Unknown";
+                const QString action = qname ? qnameAction(qname) : derived && derived->action ? Data::actionName(*derived->action) : "Unknown";
                 if (view_ == "import") result.push_back({"candidate:" + report.digest + ":" + c.id,
                     {{source, "strong", {}}, {action, {}, {}}, {status, status, {}},
-                     {derived ? QStringList(derived->diagnostics.begin(), derived->diagnostics.end()).join(" · ")
+                     {qname ? "Inactive · QName source · omissions retained" : derived ? QStringList(derived->diagnostics.begin(), derived->diagnostics.end()).join(" · ")
                               : derivedView.busy ? "Source retained · deriving facts" : "Source retained · " + derivedView.facts.error, {}, {}}}});
                 else result.push_back({"candidate:" + report.digest + ":" + c.id,
-                    {{source, "strong", {}}, {"Inactive · Unverified", "inactive", {}}, {derived ? Data::directionName(derived->direction) : "Unknown", {}, {}},
+                    {{source, "strong", {}}, {"Inactive · Unverified", "inactive", {}}, {qname && qname->direction.known() ? Data::directionName(qname->direction.value) : derived ? Data::directionName(derived->direction) : "Unknown", {}, {}},
                      {"Unknown · no collector", {}, {}}, {status, status, {}}, {"Review", "action", {}}}});
             }
         }
@@ -1742,8 +1787,14 @@ void MainWindow::renderLive() {
     } else if (view_ == "import") {
         pageLayout_->addWidget(note("Structural analysis only · compatibility not validated. All rows are kept for inactive review; no rules are applied.", true));
         pageLayout_->addWidget(label("Inactive · Unverified · External unaccredited. Source fields may be known while subject scope, constraints and overlap remain unknown. No synthetic profile is selected automatically.", "muted", true));
+        auto *profiles = line(pageLayout_); profiles->addWidget(label("Source profile", "muted"));
+        auto *format = combo({"Structural XML · unknown semantics", "NetLimiter QName profile · source subset"}, "migration-format");
+        format->setCurrentIndex(product_.importFormat() == ImportFormat::QNameProfile ? 1 : 0); profiles->addWidget(format); profiles->addStretch();
+        connect(format, &QComboBox::currentIndexChanged, this, [this](int index) { product_.setImportFormat(index == 1 ? ImportFormat::QNameProfile : ImportFormat::Structural); });
         auto *bar = line(pageLayout_); auto *choose = button("Choose migration XML…", "choose-migration"); bar->addWidget(choose);
         auto *reset = button("Clear preview", "clear-preview", "ghost"); bar->addWidget(reset); bar->addStretch();
+        auto *cancel = button("Cancel analysis", "cancel-analysis", "ghost"); cancel->setEnabled(product_.importBusy()); bar->addWidget(cancel);
+        connect(cancel, &QPushButton::clicked, this, [this] { product_.cancelImport(); refresh(); });
         connect(reset, &QPushButton::clicked, &product_, &ProductController::clearDraft);
         connect(choose, &QPushButton::clicked, this, [this] {
             auto *dialog = new QFileDialog(this, "Choose migration XML", QString{}, "XML files (*.xml);;All files (*)");
@@ -1751,13 +1802,14 @@ void MainWindow::renderLive() {
             dialog->setAttribute(Qt::WA_DeleteOnClose); dialog->setFileMode(QFileDialog::ExistingFile);
             connect(dialog, &QFileDialog::fileSelected, &product_, &ProductController::analyzeChosenFile); dialog->open();
         });
+        if (product_.importBusy()) pageLayout_->addWidget(label("Analyzing the chosen file in the background · preview preserved", "muted", true));
         if (!product_.importError().isEmpty()) pageLayout_->addWidget(note("Preview preserved · " + product_.importError()));
         if (!product_.reviewError().isEmpty()) pageLayout_->addWidget(note(product_.reviewError()));
         makeTable({"Source target", "Original policy", "Mapping", "Review reason"}, {27, 17, 18, 38}, 38);
         auto *foot = line(pageLayout_);
         foot->addWidget(label(QString::number(product_.draft().candidates.size()) + " inactive rows · compatibility: not validated", "faint"), 1);
         auto *save = button("Save all inactive candidates", "save-candidates", "primary");
-        save->setEnabled(product_.reviewWritable() && product_.draft().accepted); foot->addWidget(save);
+        save->setEnabled(!product_.importBusy() && product_.reviewWritable() && product_.draft().accepted); foot->addWidget(save);
         connect(save, &QPushButton::clicked, this, [this] { if (product_.saveCandidates()) message("All candidates saved inactive. No firewall policy was changed."); });
     } else {
         auto *content = new QWidget; auto *l = new QVBoxLayout(content); l->setContentsMargins(0, 0, 0, 15); l->setSpacing(12); content->setMaximumWidth(830);
@@ -1828,7 +1880,7 @@ void MainWindow::openEngineRequest(const QString &rowId) {
         if (rowId != engineRowId("pending", product_.engine().serviceEpoch, record.request)) continue;
         const ReviewReference reference{product_.engine().serviceEpoch, record.request, record.profileGeneration};
         const auto generation = product_.generation();
-        auto *l = modal("Service request · read only");
+        auto *l = modal("Service request · read only", ModalOwner::Live);
         l->addWidget(label(recordText(record.name, "Unattributed request"), "heading", true));
         auto *path = new QPlainTextEdit(recordText(record.path, "Application path unknown"));
         path->setObjectName("request-readonly-path"); path->setReadOnly(true);
@@ -1879,11 +1931,12 @@ void MainWindow::reviewCandidate(const QString &rowId, bool draft) {
     if (product_.simulation()) return;
     const auto &report = draft ? product_.draft() : product_.review().report;
     for (const auto &c : report.candidates) if (rowId == "candidate:" + report.digest + ":" + c.id) {
-        auto *l = modal(draft ? "Imported source preview" : "Review inactive candidate");
+        auto *l = modal(draft ? "Imported source preview" : "Review inactive candidate", draft ? ModalOwner::ImportedDraft : ModalOwner::ImportedReview);
         l->addWidget(note("Inactive · Unverified. Compatibility not validated; this review cannot activate a rule.", true));
         auto *content = new QWidget; auto *body = new QVBoxLayout(content); body->setContentsMargins(0, 0, 0, 0); body->setSpacing(8);
         body->addWidget(label(c.sourceId + " · " + c.sourceType, "heading", true));
-        auto *facts = new QPlainTextEdit(semanticFacts(product_.importedView(draft), product_.derivedCandidate(draft, c.id)));
+        const auto &view = product_.importedView(draft);
+        auto *facts = new QPlainTextEdit(product_.importEvidence(draft) ? qnameFacts(view, product_.derivedQNameCandidate(draft, c.id)) : semanticFacts(view, product_.derivedCandidate(draft, c.id)));
         facts->setObjectName("candidate-derived-facts"); facts->setReadOnly(true); facts->setMinimumHeight(170); facts->setMaximumHeight(210); body->addWidget(facts);
         body->addWidget(label("Original source and dependencies · retained without activation", "muted", true));
         QString sourceText;
@@ -1897,6 +1950,19 @@ void MainWindow::reviewCandidate(const QString &rowId, bool draft) {
         append(c.source, 0);
         for (const auto &node : report.filters) append(node, 0);
         for (const auto &node : report.identities) append(node, 0);
+        if (const auto &evidence = product_.importEvidence(draft)) {
+            sourceText = "Projected Version / Rules / Filters / AppInfos only. Presentation excerpt; source evidence retained.\n";
+            std::function<void(int, int)> qappend = [&](int index, int depth) {
+                if (sourceText.size() >= 64000 || index < 0 || index >= evidence->nodes.size()) return;
+                const auto &node = evidence->nodes[index];
+                sourceText += QString(depth * 2, ' ') + "{" + node.name.uri + "}" + node.name.local + "\n";
+                for (const auto &a : node.attributes) sourceText += QString((depth + 1) * 2, ' ') + a.qualifiedName + " = " + a.value + "\n";
+                for (const auto &item : node.content) { if (sourceText.size() >= 64000) break; if (item.child >= 0) qappend(item.child, depth + 1); else sourceText += item.text.trimmed() + "\n"; }
+            };
+            const auto *candidate = product_.derivedQNameCandidate(draft, c.id);
+            if (candidate) qappend(candidate->node, 0);
+            for (int role : evidence->roles) qappend(role, 0);
+        }
         auto *source = new QPlainTextEdit; source->setObjectName("candidate-source-facts"); source->setReadOnly(true);
         source->setPlainText(sourceText.left(64000)); source->setMinimumHeight(100); source->setMaximumHeight(140); body->addWidget(source);
         auto *scroll = scrollArea(content); scroll->setMinimumHeight(300); scroll->setMaximumHeight(390); l->addWidget(scroll);
@@ -1906,15 +1972,20 @@ void MainWindow::reviewCandidate(const QString &rowId, bool draft) {
         const auto choice = c.reviewAction.value_or(derived ? derived->action.value_or(Data::Action::Ask) : Data::Action::Ask);
         policy->setCurrentIndex(choice == Data::Action::Allow ? 0 : choice == Data::Action::Block ? 1 : 2); l->addWidget(policy);
         auto *save = button("Save inactive review", "save-inactive-review", "primary"); save->setEnabled(!draft && product_.reviewWritable()); l->addWidget(save, 0, Qt::AlignRight);
-        connect(save, &QPushButton::clicked, this, [this, id = c.id, digest = report.digest, revision = product_.review().revision, generation = product_.generation(), policy] {
-            if (product_.generation() != generation || product_.review().report.digest != digest || product_.review().revision != revision) return;
+        connect(save, &QPushButton::clicked, this, [this, id = c.id, digest = report.digest, revision = product_.review().revision, generation = product_.importGeneration(), policy] {
+            if (product_.simulation() || product_.importGeneration() != generation || product_.review().report.digest != digest || product_.review().revision != revision) return;
             const auto action = policy->currentIndex() == 0 ? Data::Action::Allow : policy->currentIndex() == 1 ? Data::Action::Block : Data::Action::Ask;
             if (product_.updateCandidate(id, action)) { closeModal(); message("Local review saved. Candidate remains inactive."); }
         }); return;
     }
 }
-QVBoxLayout *MainWindow::modal(const QString &title) {
+QVBoxLayout *MainWindow::modal(const QString &title, ModalOwner owner) {
     closeModal();
+    modalOwner_ = owner;
+    const bool draft = owner == ModalOwner::ImportedDraft;
+    modalGeneration_ = owner == ModalOwner::ImportedDraft || owner == ModalOwner::ImportedReview ? product_.importGeneration() : product_.generation();
+    modalDigest_ = draft ? product_.draft().digest : product_.review().report.digest;
+    modalRevision_ = draft ? 0 : product_.review().revision;
     previousFocus_ = QApplication::focusWidget();
     modalOverlay_ = new QFrame(root_);
     modalOverlay_->setObjectName("modal-overlay");
@@ -1947,6 +2018,16 @@ QVBoxLayout *MainWindow::modal(const QString &title) {
     modalOverlay_->raise();
     return pl;
 }
+void MainWindow::closeStaleModal() {
+    if (!modalOverlay_) return;
+    const bool draft = modalOwner_ == ModalOwner::ImportedDraft;
+    const bool imported = draft || modalOwner_ == ModalOwner::ImportedReview;
+    if ((imported && (product_.simulation() || product_.importGeneration() != modalGeneration_ ||
+         modalDigest_ != (draft ? product_.draft().digest : product_.review().report.digest) ||
+         (!draft && modalRevision_ != product_.review().revision))) ||
+        (modalOwner_ == ModalOwner::Simulation && (!product_.simulation() || !model_.available())) ||
+        (modalOwner_ == ModalOwner::Live && (product_.simulation() || product_.generation() != modalGeneration_ || !product_.engine().current))) closeModal();
+}
 void MainWindow::closeModal() {
     if (modalOverlay_) {
         dispose(modalOverlay_);
@@ -1956,6 +2037,7 @@ void MainWindow::closeModal() {
             previousFocus_->setFocus();
         previousFocus_.clear();
     }
+    modalOwner_ = ModalOwner::General; modalDigest_.clear(); modalGeneration_ = modalRevision_ = 0;
 }
 void MainWindow::edit(const QString &id, bool candidate) {
     if (!model_.available())
@@ -1971,7 +2053,7 @@ void MainWindow::edit(const QString &id, bool candidate) {
     const auto epoch = model_.epoch();
     const QString name = p ? p->name : r->name;
     const QString scope = p ? p->scope : r->scope;
-    auto *l = modal(candidate ? "Review inactive demo candidate" : "Edit demo rule");
+    auto *l = modal(candidate ? "Review inactive demo candidate" : "Edit demo rule", ModalOwner::Simulation);
     l->addWidget(label(candidate ? "This candidate is inactive and grants no permission. Review "
                                    "the target, policy and scope before activation."
                                  : "Change the policy in this session only.",
@@ -2025,7 +2107,7 @@ void MainWindow::cleanup() {
         return;
     const auto epoch = model_.epoch();
     const auto candidates = model_.cleanupCandidates(cleanupDays_);
-    auto *l = modal("Review stale demo rules");
+    auto *l = modal("Review stale demo rules", ModalOwner::Simulation);
     l->addWidget(label("No rule is removed automatically. The sample history covers 310 days. Real "
                        "incomplete history would require a coverage warning.",
                        "muted", true));

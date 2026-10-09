@@ -5,6 +5,7 @@
 #include <QString>
 #include <QVector>
 #include <optional>
+#include "qnameevidence.h"
 
 namespace Gate::Data {
 enum class FieldStatus { Known, Unknown, AccessDenied, Gone, Unsupported };
@@ -103,6 +104,7 @@ struct ReviewDocument {
     quint64 revision = 0;
     ImportReport report;
     HistoryState history;
+    std::optional<QNameEvidence> qnameEvidence;
 };
 
 bool decimalUnsigned(const QString &text, quint64 *value = nullptr);

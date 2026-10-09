@@ -4,6 +4,7 @@
 #include <QDir>
 #include <QStandardPaths>
 #include <QMetaObject>
+#include <QBuffer>
 
 namespace Gate {
 ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QObject *parent,
@@ -34,9 +35,10 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
 }
 ProductController::~ProductController() {
     // La destrucción de miembros no emite hacia una ventana parcialmente destruida.
-    stopped_ = true; semanticJob_ = QUuid{};
+    stopped_ = true; cancelImport(); semanticJob_ = QUuid{};
     if (worker_) { worker_->wait(); delete worker_; }
     if (semanticWorker_) { semanticWorker_->wait(); delete semanticWorker_; }
+    if (importWorker_) { importWorker_->wait(); delete importWorker_; }
 }
 void ProductController::loadReview(const QString &root) {
     store_ = std::make_unique<Data::ReviewStore>(root);
@@ -48,8 +50,10 @@ void ProductController::loadReview(const QString &root) {
     deriveImportedViews();
 }
 void ProductController::deriveImportedViews() {
+    ++importGeneration_;
     semanticJob_ = QUuid::createUuid();
     draftView_ = {}; reviewView_ = {};
+    draftView_.job = reviewView_.job = semanticJob_;
     draftView_.busy = reviewView_.busy = !stopped_ && !simulation();
     emit importedViewsInvalidated();
     startImportedViews();
@@ -58,18 +62,26 @@ void ProductController::startImportedViews() {
     if (stopped_ || simulation() || semanticWorker_) return;
     const auto job = semanticJob_;
     const auto draft = draft_;
+    const auto evidence = draftEvidence_;
     const auto saved = review_;
-    semanticWorker_ = QThread::create([this, job, draft, saved] {
+    semanticWorker_ = QThread::create([this, job, draft, evidence, saved] {
         ImportedReviewView preview, review;
         preview.digest = draft.digest; preview.job = job;
         review.digest = saved.report.digest; review.revision = saved.revision; review.job = job;
-        preview.facts = Data::NetLimiterSemantics::describe(draft, Data::SemanticProfile::ExternalUnaccredited);
-        review.facts = Data::NetLimiterSemantics::describe(saved.report, Data::SemanticProfile::ExternalUnaccredited);
-        preview.current = preview.facts.accepted; review.current = review.facts.accepted;
+        if (evidence) preview.qname = Data::deriveQNameProfile(*evidence);
+        else preview.facts = Data::NetLimiterSemantics::describe(draft, Data::SemanticProfile::ExternalUnaccredited);
+        if (saved.qnameEvidence) review.qname = Data::deriveQNameProfile(*saved.qnameEvidence);
+        else review.facts = Data::NetLimiterSemantics::describe(saved.report, Data::SemanticProfile::ExternalUnaccredited);
+        preview.current = preview.qname ? preview.qname->valid : preview.facts.accepted;
+        review.current = review.qname ? review.qname->valid : review.facts.accepted;
         for (int i = 0; i < preview.facts.candidates.size(); ++i)
             preview.candidates.insert(preview.facts.candidates[i].candidateId, i);
         for (int i = 0; i < review.facts.candidates.size(); ++i)
             review.candidates.insert(review.facts.candidates[i].candidateId, i);
+        if (preview.qname) for (int i = 0; i < preview.qname->candidates.size(); ++i)
+            preview.candidates.insert(preview.qname->candidates[i].candidateId, i);
+        if (review.qname) for (int i = 0; i < review.qname->candidates.size(); ++i)
+            review.candidates.insert(review.qname->candidates[i].candidateId, i);
         QMetaObject::invokeMethod(this, [this, job, preview, review] {
             if (stopped_ || simulation() || job != semanticJob_ || preview.digest != draft_.digest ||
                 review.digest != review_.report.digest || review.revision != review_.revision) return;
@@ -86,14 +98,23 @@ void ProductController::startImportedViews() {
 const Data::SemanticCandidate *ProductController::derivedCandidate(bool draft, const QString &id) const {
     const auto &view = importedView(draft);
     const auto &report = draft ? draft_ : review_.report;
-    if (!view.current || view.job != semanticJob_ || view.digest != report.digest ||
+    if (view.qname || !view.current || view.job != semanticJob_ || view.digest != report.digest ||
         (!draft && view.revision != review_.revision)) return nullptr;
     const auto found = view.candidates.constFind(id);
     return found == view.candidates.cend() ? nullptr : &view.facts.candidates[*found];
 }
+const Data::QNameCandidateFacts *ProductController::derivedQNameCandidate(bool draft, const QString &id) const {
+    const auto &view = importedView(draft);
+    const auto &report = draft ? draft_ : review_.report;
+    if (!view.qname || !view.current || view.job != semanticJob_ || view.digest != report.digest ||
+        (!draft && view.revision != review_.revision)) return nullptr;
+    const auto found = view.candidates.constFind(id);
+    return found == view.candidates.cend() ? nullptr : &view.qname->candidates[*found];
+}
 void ProductController::setMode(UiMode mode) {
     if (stopped_ || mode_ == mode) return;
     mode_ = mode; ++generation_; emit invalidated();
+    cancelImport();
     engine_.invalidate();
     records_.invalidate();
     deriveImportedViews();
@@ -141,16 +162,58 @@ const Data::ProcessObservation *ProductController::process(const QString &id) co
 }
 bool ProductController::analyzeChosenFile(const QString &path) {
     if (stopped_ || simulation() || path.isEmpty()) return false;
-    QFile file(path);
-    if (!file.open(QIODevice::ReadOnly)) { importError_ = "Could not read the chosen migration file"; emit changed(); return false; }
-    auto report = Data::NetLimiterImport::analyze(file);
-    if (!report.accepted) { importError_ = report.error; emit changed(); return false; }
-    draft_ = std::move(report); importError_.clear(); deriveImportedViews(); emit changed(); return true;
+    importJob_ = QUuid::createUuid(); importPath_ = path; pendingFormat_ = importFormat_;
+    if (importWorker_) importWorker_->requestInterruption();
+    importError_.clear(); startImport(); emit changed(); return true;
 }
-void ProductController::clearDraft() { if (stopped_) return; draft_ = {}; importError_.clear(); deriveImportedViews(); emit changed(); }
+void ProductController::cancelImport() {
+    importJob_ = QUuid{}; importPath_.clear();
+    if (importWorker_) importWorker_->requestInterruption();
+}
+void ProductController::startImport() {
+    if (stopped_ || simulation() || importWorker_ || importJob_.isNull()) return;
+    const auto job = importJob_; const auto path = importPath_; const auto format = pendingFormat_;
+    importWorker_ = QThread::create([this, job, path, format] {
+        Data::ImportReport report; std::optional<Data::QNameEvidence> evidence;
+        try {
+            QFile file(path); QByteArray bytes; const Data::ImportLimits limits;
+            if (!file.open(QIODevice::ReadOnly)) report.error = "Could not read the chosen migration file";
+            else if (file.size() > limits.bytes) report.error = "Migration file exceeds the 8 MiB limit";
+            else {
+                while (!file.atEnd() && !QThread::currentThread()->isInterruptionRequested()) {
+                    auto chunk = file.read(qMin<qint64>(65536, limits.bytes + 1 - bytes.size()));
+                    if (chunk.isEmpty() && file.error() != QFileDevice::NoError) { report.error = "Could not read the chosen migration file"; break; }
+                    bytes += chunk;
+                    if (bytes.size() > limits.bytes) { report.error = "Migration file exceeds the 8 MiB limit"; break; }
+                }
+                if (report.error.isEmpty() && !QThread::currentThread()->isInterruptionRequested()) {
+                    if (format == ImportFormat::QNameProfile) {
+                        auto result = Data::importQNameProfile(bytes, limits);
+                        report = std::move(result.report); evidence = std::move(result.evidence);
+                    } else { QBuffer input(&bytes); input.open(QIODevice::ReadOnly); report = Data::NetLimiterImport::analyze(input, limits); }
+                }
+            }
+        } catch (...) { report.error = "Migration analysis failed within the selected profile"; }
+        QMetaObject::invokeMethod(this, [this, job, report, evidence] {
+            if (stopped_ || simulation() || job != importJob_) return;
+            importJob_ = QUuid{}; importPath_.clear();
+            if (!report.accepted) importError_ = report.error;
+            else { draft_ = report; draftEvidence_ = evidence; importError_.clear(); deriveImportedViews(); }
+            emit changed();
+        }, Qt::QueuedConnection);
+    });
+    auto *thread = importWorker_;
+    connect(thread, &QThread::finished, this, [this, thread, job] {
+        importWorker_ = nullptr; thread->deleteLater();
+        if (job != importJob_) startImport();
+    });
+    thread->start();
+}
+void ProductController::clearDraft() { if (stopped_) return; cancelImport(); draft_ = {}; draftEvidence_.reset(); importError_.clear(); deriveImportedViews(); emit changed(); }
 bool ProductController::saveCandidates() {
-    if (stopped_ || !reviewWritable() || !store_ || !draft_.accepted) return false;
+    if (stopped_ || importBusy() || !reviewWritable() || !store_ || !draft_.accepted) return false;
     auto next = review_; next.report = draft_;
+    next.qnameEvidence = draftEvidence_;
     const auto result = store_->save(next, review_.revision);
     if (!result.ok() || !result.document) {
         reviewWritable_ = false; reviewError_ = "Candidates were not saved: " + result.error;

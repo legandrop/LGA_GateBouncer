@@ -1,4 +1,5 @@
 #include "reviewstore.h"
+#include "qnamereviewcodec.h"
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
@@ -331,13 +332,21 @@ bool boundedJson(const QJsonValue &value, int depth, int &count) {
 }
 bool documentRead(const QJsonObject &object, ReviewDocument &document) {
     int count = 0;
-    return boundedJson(object, 0, count) && object["schemaVersion"] == 1 &&
+    const bool qname = object["schemaVersion"] == 2;
+    if (!(boundedJson(object, 0, count) && (object["schemaVersion"] == 1 || qname) &&
            decimalUnsigned(object["storeRevision"].toString(), &document.revision) &&
-           reportRead(object["report"], document.report) && historyRead(object["history"], document.history);
+           reportRead(object["report"], document.report) && historyRead(object["history"], document.history))) return false;
+    if (!qname) return true;
+    QNameEvidence evidence;
+    if (!qnameEvidenceRead(object["qnameEvidence"], evidence)) return false;
+    document.qnameEvidence = std::move(evidence);
+    return rebuildQNameReport(document);
 }
 QJsonObject documentJson(const ReviewDocument &document) {
-    return {{"schemaVersion", 1}, {"storeRevision", QString::number(document.revision)},
+    QJsonObject object{{"schemaVersion", document.qnameEvidence ? 2 : 1}, {"storeRevision", QString::number(document.revision)},
             {"report", reportJson(document.report)}, {"history", historyJson(document.history)}};
+    if (document.qnameEvidence) object["qnameEvidence"] = qnameEvidenceJson(*document.qnameEvidence);
+    return object;
 }
 bool safeNode(const XmlNode &node, int depth, int &count) {
     if (depth > 32 || ++count > 200000 || node.attributes.size() > 32 ||
@@ -382,12 +391,15 @@ StoreResult ReviewStore::load() {
     const auto bytes = file.read(storeByteLimit + 1);
     if (file.error() != QFileDevice::NoError) return failure(StoreStatus::IoError, "Read did not complete");
     if (bytes.size() > storeByteLimit) return failure(StoreStatus::Corrupt, "Review exceeds the size limit");
+    const auto preflight = scanReviewJson(bytes);
+    if (!preflight.syntax || (preflight.schema == 2 && !preflight.schema2Budget))
+        return failure(StoreStatus::Corrupt, "Review failed preflight; the file has been preserved");
     QJsonParseError error;
     const auto parsed = QJsonDocument::fromJson(bytes, &error);
     if (error.error != QJsonParseError::NoError || !parsed.isObject())
         return failure(StoreStatus::Corrupt, "Review is corrupt; the file has been preserved");
     const auto object = parsed.object();
-    if (object["schemaVersion"].isDouble() && object["schemaVersion"].toDouble() > 1)
+    if (object["schemaVersion"].isDouble() && object["schemaVersion"].toDouble() > 2)
         return failure(StoreStatus::FutureSchema, "Review uses a newer format; the file has been preserved");
     ReviewDocument document;
     if (!documentRead(object, document)) return failure(StoreStatus::Corrupt, "Review is invalid; the file has been preserved");
@@ -395,19 +407,26 @@ StoreResult ReviewStore::load() {
 }
 StoreResult ReviewStore::save(const ReviewDocument &document, quint64 expectedRevision) {
     if (!safeDocument(document)) return failure(StoreStatus::Invalid, "Data exceeds the limits");
+    if (document.qnameEvidence && !budgetQNameReview(document))
+        return failure(StoreStatus::Invalid, "Review exceeds the preflight limits");
     const auto previous = load();
     if (!previous.ok() && previous.status != StoreStatus::Missing) return previous;
+    if (previous.document && previous.document->qnameEvidence && !document.qnameEvidence)
+        return failure(StoreStatus::Invalid, "Review evidence cannot be discarded");
     if ((previous.document ? previous.document->revision : 0) != expectedRevision ||
         document.revision != expectedRevision) return failure(StoreStatus::StaleRevision, "Review has changed; reload it before saving");
     if (expectedRevision == std::numeric_limits<quint64>::max())
         return failure(StoreStatus::Invalid, "Revision is out of range");
     auto next = document;
     next.revision = expectedRevision + 1;
+    qint64 jsonBound = storeByteLimit;
+    if (next.qnameEvidence && (!rebuildQNameReport(next) || !budgetQNameReview(next, &jsonBound)))
+        return failure(StoreStatus::Invalid, "Invalid QName review data");
     const auto object = documentJson(next);
     ReviewDocument validated;
     if (!documentRead(object, validated)) return failure(StoreStatus::Invalid, "Invalid review data");
     const auto bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
-    if (bytes.size() > storeByteLimit) return failure(StoreStatus::Invalid, "Review exceeds the size limit");
+    if (bytes.size() > storeByteLimit || bytes.size() > jsonBound) return failure(StoreStatus::Invalid, "Review exceeds the size limit");
     QSaveFile file(path_);
     file.setDirectWriteFallback(false);
     if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())

@@ -70,7 +70,9 @@ class MainWindow final : public QMainWindow {
     void updateLifecycle();
     void openEngineRequest(const QString &rowId);
     void finishShutdownWhenIdle();
-    QVBoxLayout *modal(const QString &title);
+    enum class ModalOwner { General, Simulation, Live, ImportedDraft, ImportedReview };
+    QVBoxLayout *modal(const QString &title, ModalOwner owner = ModalOwner::General);
+    void closeStaleModal();
     void closeModal();
     void message(const QString &text);
     QTableView *makeTable(const QStringList &headers, const QVector<int> &widths,
@@ -109,6 +111,9 @@ class MainWindow final : public QMainWindow {
     QPointer<QFrame> detail_, notice_, modalOverlay_, message_;
     QPointer<QWidget> modalPanel_;
     QPointer<QWidget> previousFocus_;
+    ModalOwner modalOwner_ = ModalOwner::General;
+    QString modalDigest_;
+    quint64 modalGeneration_ = 0, modalRevision_ = 0;
     bool refreshing_ = false;
     int cleanupDays_ = 180;
     QPoint dragStart_;

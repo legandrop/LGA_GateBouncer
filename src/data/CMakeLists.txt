@@ -4,6 +4,9 @@ qt_add_library(gatebouncer_data STATIC
     netlimitersemantics.cpp netlimitersemantics.h
     activityhistory.cpp activityhistory.h
     reviewstore.cpp reviewstore.h
+    qnameevidence.h qnamexmlreader.cpp qnamexmlreader.h
+    netlimiterxmlprofile.cpp netlimiterxmlprofile.h
+    qnamereviewcodec.cpp qnamereviewcodec.h
     ../platform/ProcessCatalog.cpp ../platform/ProcessCatalog.h
 )
 target_link_libraries(gatebouncer_data PUBLIC Qt6::Core)
