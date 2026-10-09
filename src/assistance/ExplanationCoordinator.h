@@ -39,6 +39,7 @@ private:
     void maybeAutomatic();
     void markUncertain();
     bool uncertainRequest() const;
+    bool attemptedRequest() const;
     IExplanationTransport &transport_;
     Clock clock_;
     QTimer deadline_;
@@ -52,6 +53,7 @@ private:
     std::optional<ExplanationText> text_;
     std::deque<Cached> cache_;
     std::deque<RequestContext> uncertain_;
+    std::deque<RequestContext> attempted_;
     qint64 started_ = 0, lastAttempt_ = -10000, blockedUntil_ = 0;
     int attempts_ = 0, failures_ = 0;
 };

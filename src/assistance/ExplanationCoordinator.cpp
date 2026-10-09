@@ -60,6 +60,14 @@ bool ExplanationCoordinator::uncertainRequest() const {
     }
     return false;
 }
+bool ExplanationCoordinator::attemptedRequest() const {
+    for (const auto &request : attempted_) {
+        const auto &current = binding_.context;
+        if (request.requestId == current.requestId && request.applicationIdentity == current.applicationIdentity &&
+            request.snapshotRevision == current.snapshotRevision && request.sessionEpoch == current.sessionEpoch) return true;
+    }
+    return false;
+}
 void ExplanationCoordinator::maybeAutomatic() {
     if (!automatic_ || !eligible()) return;
     const auto generation = binding_.generation;
@@ -79,13 +87,16 @@ bool ExplanationCoordinator::start() {
             error_ = Error::None; emit changed(); return true;
         }
     }
-    if (attempts_ >= 60 || now < blockedUntil_ || now < lastAttempt_ || now - lastAttempt_ < 10000) {
+    if (attemptedRequest() || attempts_ >= 60 || now < blockedUntil_ || now < lastAttempt_ || now - lastAttempt_ < 10000) {
         status_ = Status::Limited; error_ = Error::RateLimited; emit changed(); return false;
     }
     const auto payload = buildSamplePayload(PublicAppFacts::sample(entry_));
     if (!payload) { fail(Error::InvalidResponse, Status::Error); return false; }
     invalidate(Status::Loading); started_ = now; lastAttempt_ = now; ++attempts_;
     const auto submitted = binding_;
+    // La API no confirma envio: consumir antes de start, aun si retorna null o falla.
+    // Maximo 60 registros; cerrar, settings y vencer cache no habilitan otro intento.
+    attempted_.push_back(submitted.context);
     deadline_.start(20000);
     QPointer<ExplanationCoordinator> self(this);
     auto operation = transport_.start(submitted, *payload, [self](TransportReply reply) {
