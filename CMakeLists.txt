@@ -6,6 +6,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets)
 qt_standard_project_setup(REQUIRES 6.8)
+add_subdirectory(src/data)
+add_subdirectory(src/assistance)
 
 qt_add_executable(GateBouncer WIN32
     src/main.cpp
@@ -15,10 +17,16 @@ qt_add_executable(GateBouncer WIN32
     src/simulation.h
     src/mainwindow.cpp
     src/mainwindow.h
+    src/productcontroller.cpp
+    src/productcontroller.h
+    src/engine/EngineViewClient.cpp
+    src/engine/EngineViewClient.h
+    common/wire_v1.cpp
+    common/wire_v1.h
     resources/app.rc
 )
-target_link_libraries(GateBouncer PRIVATE Qt6::Widgets)
-target_include_directories(GateBouncer PRIVATE src)
+target_link_libraries(GateBouncer PRIVATE Qt6::Widgets gatebouncer_data gatebouncer_assistance advapi32)
+target_include_directories(GateBouncer PRIVATE src common)
 target_compile_options(GateBouncer PRIVATE -Wall -Wextra -Wpedantic)
 qt_add_resources(GateBouncer "gatebouncer_assets"
     PREFIX "/gatebouncer"

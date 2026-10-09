@@ -146,6 +146,13 @@ void Simulation::reset() {
         {"sample-helper.exe", EventKind::Attempt, 46, "[2001:db8::24]:443",
          "Unmatched · awaiting a decision"},
         {"System", EventKind::Attempt, 520, "198.51.100.60:443", "System identity · demo policy"}};
+    history_ = Data::ActivityHistory{};
+    eventSequence_ = 0;
+    history_.addSyntheticSource("simulation", QString::number(epoch_), "Offline sample events");
+    for (auto &event : data_.events) {
+        event.id = "simulation-event:" + QString::number(epoch_) + ":" + QString::number(++eventSequence_);
+        recordHistory(event);
+    }
     emit invalidated();
     emit changed();
 }
@@ -169,7 +176,32 @@ bool Simulation::setReview(const QString &id, quint64 e, const Review &review) {
     return true;
 }
 void Simulation::recordDecision(const QString &name, const QString &reason) {
-    data_.events.prepend({name, EventKind::Decision, 0, "—", reason});
+    Event event{name, EventKind::Decision, 0, "—", reason,
+                "simulation-event:" + QString::number(epoch_) + ":" + QString::number(++eventSequence_)};
+    data_.events.prepend(event);
+    if (data_.events.size() > 4096) {
+        data_.events.removeLast();
+        history_.gap("simulation", history_.state().coverage.front().sourceEpoch, "DetailRetention", 1);
+    }
+    recordHistory(event);
+}
+void Simulation::recordHistory(const Event &event) {
+    Data::ActivityEvent fact;
+    fact.sourceId = "simulation"; fact.sourceEpoch = history_.state().coverage.front().sourceEpoch;
+    fact.sequence = QString::number(eventSequence_); fact.subjectId = event.name;
+    fact.synthetic = true; fact.observedAtUtc = sampleNow().addSecs(-event.age).toUTC();
+    fact.receivedAtUtc = sampleNow().toUTC(); fact.endpoint = event.destination;
+    fact.kind = event.kind == EventKind::Attempt ? Data::ActivityKind::Attempt
+              : event.kind == EventKind::Authorization ? Data::ActivityKind::Authorization
+              : event.kind == EventKind::Traffic ? Data::ActivityKind::Traffic : Data::ActivityKind::HumanDecision;
+    if (event.kind == EventKind::Authorization) fact.action = Data::Action::Allow;
+    history_.ingest(fact);
+    if (history_.flushDue(fact.receivedAtUtc)) history_.checkpoint(fact.receivedAtUtc);
+    data_.history = history_.state();
+}
+void Simulation::setEnabled(bool enabled) {
+    if (enabled_ == enabled) return;
+    enabled_ = enabled; ++epoch_; emit invalidated(); emit changed();
 }
 bool Simulation::decide(const QString &id, quint64 e, Policy policy) {
     if (!writable(e) || !isPending(id) || !process(id) || policy == Policy::Ask)
@@ -314,6 +346,8 @@ bool Simulation::restore(quint64 e) {
     if (!writable(e) || !backup_)
         return false;
     data_ = *backup_;
+    history_.restore(data_.history);
+    data_.history = history_.state();
     backup_.reset();
     ++epoch_;
     emit invalidated();
@@ -329,91 +363,66 @@ void Simulation::setService(Service s) {
     emit changed();
 }
 
-Explanation::Explanation(Simulation *model) : QObject(model), model_(model) {
-    connect(model_, &Simulation::invalidated, this, [this] {
-        invalidate();
-        if (!model_->isPending(visible_))
-            visible_.clear();
-        emit changed();
-    });
+Explanation::Explanation(Simulation *model)
+    : QObject(model), model_(model), transport_(this), coordinator_(transport_, this) {
+    connect(&coordinator_, &Assistance::ExplanationCoordinator::changed, this, &Explanation::changed);
+    connect(model_, &Simulation::invalidated, this, &Explanation::close);
     connect(model_, &Simulation::requestResolved, this, [this](const QString &id) {
-        if (visible_ == id)
-            close();
+        if (visible_ == id) close();
     });
+    setFixture(ExplanationState::Known);
 }
-void Explanation::invalidate() {
-    ++generation_;
-    status_ = ExplanationState::Idle;
+Assistance::RequestContext Explanation::context() const {
+    return {"simulation:" + visible_, "sample-public-catalog", model_->epoch(), model_->epoch(),
+            demoGeneration_, model_->isPending(visible_), model_->available()};
 }
-void Explanation::configure(bool on) {
-    invalidate();
-    configured_ = on;
-    if (!on) {
-        consent_ = false;
-        automatic_ = false;
+ExplanationState Explanation::status() const {
+    using S = Assistance::Status;
+    switch (coordinator_.status()) {
+    case S::Loading: return ExplanationState::Loading;
+    case S::Known: return ExplanationState::Known;
+    case S::Unclear: return ExplanationState::Unclear;
+    case S::Idle: case S::Cancelled: return ExplanationState::Idle;
+    default: return ExplanationState::Error;
     }
-    emit changed();
 }
-void Explanation::setConsent(bool on) {
-    invalidate();
-    consent_ = configured_ && on;
-    automatic_ = consent_;
-    emit changed();
+QString Explanation::text() const {
+    const auto result = coordinator_.explanation();
+    return result ? "Possible purpose\n" + result->possiblePurpose + "\n\nPossible network reason\n" +
+                    result->possibleNetworkReason + "\n\n" + result->caution : QString{};
 }
-void Explanation::setAutomatic(bool on) {
-    invalidate();
-    automatic_ = configured_ && consent_ && on;
-    emit changed();
+QString Explanation::problem() const {
+    return coordinator_.status() == Assistance::Status::Uncertain
+        ? "The sample outcome is uncertain. This sample request will not be retried. The access request remains pending."
+        : coordinator_.status() == Assistance::Status::Limited
+        ? "Sample explanation limit reached. The access request remains pending."
+        : "The sample explanation could not be loaded. The access request remains pending.";
 }
+void Explanation::configure(bool on) { coordinator_.configureDemo(on, on && consent()); }
+void Explanation::setConsent(bool on) { coordinator_.configureDemo(configured(), on); }
+void Explanation::setAutomatic(bool on) { coordinator_.setAutomatic(on); }
 void Explanation::setFixture(ExplanationState fixture) {
-    invalidate();
     fixture_ = fixture;
-    emit changed();
+    coordinator_.cancel();
+    ++demoGeneration_;
+    Assistance::MockExplanationTransport::Fixture response;
+    response.delayMs = 1100;
+    response.body = Assistance::MockExplanationTransport::sampleEnvelope(fixture == ExplanationState::Unclear);
+    if (fixture == ExplanationState::Error) response.error = Assistance::Error::Unavailable;
+    transport_.setFixture(std::move(response));
+    coordinator_.updateContext(context());
 }
 bool Explanation::open(const QString &id) {
-    if (!model_->available() || !model_->isPending(id))
-        return false;
-    invalidate();
+    if (!model_->available() || !model_->isPending(id)) return false;
     visible_ = id;
-    emit changed();
-    if (configured_ && consent_ && automatic_)
-        start();
+    coordinator_.open(context(), Assistance::CatalogEntry::SampleEditor);
     return true;
 }
-void Explanation::close() {
-    invalidate();
-    visible_.clear();
-    emit changed();
-}
-void Explanation::cancel() {
-    invalidate();
-    emit changed();
-}
-bool Explanation::start() {
-    if (visible_.isEmpty() || !configured_ || !consent_ || !model_->available() ||
-        !model_->isPending(visible_) || status_ == ExplanationState::Loading)
-        return false;
-    invalidate();
-    status_ = ExplanationState::Loading;
-    const auto id = visible_;
-    const auto generation = generation_;
-    const auto epoch = model_->epoch();
-    const auto result = fixture_;
-    emit changed();
-    QTimer::singleShot(1100, this, [this, id, generation, epoch, result] {
-        complete(id, generation, epoch, result);
-    });
-    return true;
-}
-bool Explanation::complete(const QString &id, quint64 g, quint64 e, ExplanationState result) {
-    if (g != generation_ || e != model_->epoch() || id != visible_ || !model_->isPending(id) ||
-        !model_->available() || !configured_ || !consent_ || status_ != ExplanationState::Loading)
-        return false;
-    if (result != ExplanationState::Known && result != ExplanationState::Unclear &&
-        result != ExplanationState::Error)
-        return false;
-    status_ = result;
-    emit changed();
-    return true;
+void Explanation::close() { visible_.clear(); coordinator_.close(); }
+void Explanation::cancel() { coordinator_.cancel(); }
+bool Explanation::start() { coordinator_.updateContext(context()); return coordinator_.start(); }
+bool Explanation::complete(const QString &, quint64, quint64, ExplanationState) {
+    // Las respuestas solo ingresan por el transporte local y el coordinador vinculante.
+    return false;
 }
 } // namespace Gate

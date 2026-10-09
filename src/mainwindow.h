@@ -1,5 +1,6 @@
 #pragma once
 #include "simulation.h"
+#include "productcontroller.h"
 #include <QMainWindow>
 #include <QPointer>
 
@@ -17,7 +18,9 @@ class RowsModel;
 class MainWindow final : public QMainWindow {
     Q_OBJECT
   public:
-    explicit MainWindow(QWidget *parent = nullptr);
+    explicit MainWindow(QWidget *parent = nullptr, bool isolatedQa = false, const QString &qaRoot = {});
+    ProductController *product() { return &product_; }
+    void setMode(UiMode mode);
     Simulation *simulation() { return &model_; }
     Explanation *explanation() { return &explanation_; }
     QString view() const { return view_; }
@@ -26,6 +29,7 @@ class MainWindow final : public QMainWindow {
     void openDetail(const QString &id);
 
   protected:
+    void closeEvent(QCloseEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     bool eventFilter(QObject *object, QEvent *event) override;
 
@@ -33,13 +37,20 @@ class MainWindow final : public QMainWindow {
     void buildShell();
     void buildPage();
     void refresh();
-    void refreshTable();
+    void refreshTable(bool newPage = false);
     void renderProcesses();
     void renderPending();
     void renderActivity();
     void renderRules();
     void renderImport();
     void renderSettings();
+    void renderLive();
+    void renderLiveDetail(const QString &id);
+    void reviewCandidate(const QString &id, bool draft = false);
+    void restoreFocus();
+    void modeSelector(QVBoxLayout *layout);
+    void saveViewState();
+    void restoreViewState();
     void renderNotice();
     void positionOverlays();
     void edit(const QString &id, bool candidate = false);
@@ -53,6 +64,16 @@ class MainWindow final : public QMainWindow {
     void tableAction(const QModelIndex &index);
     Simulation model_;
     Explanation explanation_;
+    ProductController product_;
+    struct ViewState {
+        QString selectedId, focusName, query, activityQuery, policy = "All", running = "All", event = "All";
+        int sortColumn = 0, currentColumn = 0, scroll = 0;
+        Qt::SortOrder order = Qt::AscendingOrder;
+    };
+    QMap<QString, ViewState> viewStates_;
+    QString stateKey() const;
+    bool restoringState_ = false;
+    bool closing_ = false;
     QString view_ = "processes", selected_;
     QString query_, activityQuery_, policyFilter_ = "All", runningFilter_ = "All",
                                     eventFilter_ = "All";

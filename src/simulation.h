@@ -6,6 +6,9 @@
 #include <QSet>
 #include <QVector>
 #include <optional>
+#include "data/activityhistory.h"
+#include "assistance/ExplanationCoordinator.h"
+#include "assistance/MockExplanationTransport.h"
 
 namespace Gate {
 enum class Policy { Ask, Allow, Block };
@@ -47,6 +50,7 @@ struct Event {
     EventKind kind;
     qint64 age;
     QString destination, reason;
+    QString id = {};
 };
 struct ImportRow {
     QString id, name;
@@ -61,6 +65,7 @@ struct Snapshot {
     QSet<QString> pending;
     QMap<QString, Review> reviews;
     bool importLoaded = false, importApplied = false;
+    Data::HistoryState history;
 };
 
 class Simulation final : public QObject {
@@ -71,7 +76,8 @@ class Simulation final : public QObject {
     const QVector<ImportRow> &sampleImport() const { return import_; }
     const Process *process(const QString &id) const;
     const Rule *rule(const QString &id) const;
-    bool available() const { return service_ != Service::Unavailable; }
+    bool available() const { return enabled_ && service_ != Service::Unavailable; }
+    void setEnabled(bool enabled);
     Service service() const { return service_; }
     quint64 epoch() const { return epoch_; }
     bool isPending(const QString &id) const { return data_.pending.contains(id); }
@@ -102,6 +108,10 @@ class Simulation final : public QObject {
     std::optional<Snapshot> backup_;
     Service service_ = Service::Available;
     quint64 epoch_ = 0;
+    quint64 eventSequence_ = 0;
+    bool enabled_ = false;
+    Data::ActivityHistory history_;
+    void recordHistory(const Event &event);
 };
 
 enum class ExplanationState { Idle, Loading, Known, Unclear, Error };
@@ -109,12 +119,16 @@ class Explanation final : public QObject {
     Q_OBJECT
   public:
     explicit Explanation(Simulation *model);
-    bool configured() const { return configured_; }
-    bool consent() const { return consent_; }
-    bool automatic() const { return automatic_; }
+    bool configured() const { return coordinator_.configured(); }
+    bool consent() const { return coordinator_.consent(); }
+    bool automatic() const { return coordinator_.automatic(); }
     QString visibleId() const { return visible_; }
-    ExplanationState status() const { return status_; }
-    quint64 generation() const { return generation_; }
+    ExplanationState status() const;
+    quint64 generation() const { return coordinator_.binding().generation; }
+    QString text() const;
+    QString problem() const;
+    QString disclosure() const { return coordinator_.disclosure(); }
+    QString disclaimer() const { return coordinator_.disclaimer(); }
     void configure(bool on);
     void setConsent(bool on);
     void setAutomatic(bool on);
@@ -129,11 +143,12 @@ class Explanation final : public QObject {
     void changed();
 
   private:
-    void invalidate();
+    Assistance::RequestContext context() const;
     Simulation *model_;
+    Assistance::MockExplanationTransport transport_;
+    Assistance::ExplanationCoordinator coordinator_;
     QString visible_;
-    bool configured_ = false, consent_ = false, automatic_ = false;
-    quint64 generation_ = 0;
-    ExplanationState status_ = ExplanationState::Idle, fixture_ = ExplanationState::Known;
+    ExplanationState fixture_ = ExplanationState::Known;
+    quint64 demoGeneration_ = 1;
 };
 } // namespace Gate
