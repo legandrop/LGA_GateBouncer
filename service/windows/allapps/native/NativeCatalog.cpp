@@ -49,7 +49,7 @@ CatalogStorageBuilder::CatalogStorageBuilder(CatalogRegistry &registry, std::siz
                      sizeof(CatalogSnapshot) + ControlBudget;
     if (aux > MaxCatalogAuxBytes)
         throw std::length_error("Auxiliares de catálogo");
-    auto charge = registry.reserve(arenaBytes + aux);
+    auto charge = registry.reserve(arenaBytes + MaxCatalogAuxBytes);
     auto storage = std::shared_ptr<CatalogSnapshot>(new CatalogSnapshot);
     storage->charge_ = std::move(charge);
     storage->rules_.resize(rules);
