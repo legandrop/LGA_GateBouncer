@@ -145,7 +145,7 @@ bool exchange(ViewByteChannel &channel, const Frame &request, Type expected, Fra
         if (!frames.empty()) {
             if (frames.size() != 1 || decoder.incomplete()) return false;
             reply = std::move(frames.front());
-            return reply.type == expected && reply.correlation == request.correlation &&
+            return reply.minor == request.minor && reply.type == expected && reply.correlation == request.correlation &&
                    reply.sequence == request.sequence &&
                    (expected == Type::HelloAck ? !zero(reply.connection)
                                               : reply.connection == request.connection);

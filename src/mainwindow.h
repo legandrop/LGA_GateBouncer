@@ -1,6 +1,9 @@
 #pragma once
 #include "simulation.h"
 #include "productcontroller.h"
+#include "lifecycle/LifecycleController.h"
+#include "lifecycle/StartupPreference.h"
+#include "engine/ReviewGateway.h"
 #include <QMainWindow>
 #include <QPointer>
 
@@ -18,7 +21,9 @@ class RowsModel;
 class MainWindow final : public QMainWindow {
     Q_OBJECT
   public:
-    explicit MainWindow(QWidget *parent = nullptr, bool isolatedQa = false, const QString &qaRoot = {});
+    explicit MainWindow(QWidget *parent = nullptr, bool isolatedQa = false, const QString &qaRoot = {},
+                        std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel = {},
+                        std::unique_ptr<ReviewBackend> reviewer = {});
     ProductController *product() { return &product_; }
     void setMode(UiMode mode);
     Simulation *simulation() { return &model_; }
@@ -27,6 +32,12 @@ class MainWindow final : public QMainWindow {
     void selectView(const QString &view);
     void openRequest(const QString &id);
     void openDetail(const QString &id);
+    void startLifecycle(std::unique_ptr<Lifecycle::TraySurface> tray, bool minimized,
+                        std::unique_ptr<Lifecycle::StartupPreference> startup = {});
+    Lifecycle::LifecycleController *lifecycle() const { return lifecycle_; }
+    void requestGuiShutdown();
+    bool guiDrained() const { return closing_ && product_.idle() && reviewer_.idle(); }
+    ReviewGateway *reviewer() { return &reviewer_; }
 
   protected:
     void closeEvent(QCloseEvent *event) override;
@@ -56,6 +67,9 @@ class MainWindow final : public QMainWindow {
     void edit(const QString &id, bool candidate = false);
     void cleanup();
     void about();
+    void updateLifecycle();
+    void openEngineRequest(const QString &rowId);
+    void finishShutdownWhenIdle();
     QVBoxLayout *modal(const QString &title);
     void closeModal();
     void message(const QString &text);
@@ -65,6 +79,11 @@ class MainWindow final : public QMainWindow {
     Simulation model_;
     Explanation explanation_;
     ProductController product_;
+    ReviewGateway reviewer_;
+    QPointer<Lifecycle::LifecycleController> lifecycle_;
+    std::unique_ptr<Lifecycle::StartupPreference> startup_;
+    Lifecycle::StartupResult startupResult_{Lifecycle::StartupState::Error,
+                                          "Startup registration has not been inspected"};
     struct ViewState {
         QString selectedId, focusName, query, activityQuery, policy = "All", running = "All", event = "All";
         int sortColumn = 0, currentColumn = 0, scroll = 0;

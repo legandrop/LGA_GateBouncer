@@ -1,5 +1,6 @@
 #include "pipe_transport.h"
 #include "wfp_backend.h"
+#include "runtime_ii.h"
 #include <iostream>
 #include <memory>
 #include <string>
@@ -22,7 +23,8 @@ Id bootIdentity(){
     // La subclave volatil desaparece al reiniciar Windows y persiste al caer el servicio.
     PSECURITY_DESCRIPTOR descriptor=nullptr;if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;KA;;;SY)(A;;KA;;;BA)",SDDL_REVISION_1,&descriptor,nullptr))throw std::runtime_error("ACL de arranque invalida");
     SECURITY_ATTRIBUTES attributes{sizeof(attributes),descriptor,FALSE};HKEY key=nullptr;DWORD disposition=0;
-    auto error=RegCreateKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab\\BootSession",0,nullptr,REG_OPTION_VOLATILE,KEY_QUERY_VALUE|KEY_SET_VALUE,&attributes,&key,&disposition);LocalFree(descriptor);if(error!=ERROR_SUCCESS)throw std::runtime_error("Identidad de arranque no disponible");
+    auto error=RegCreateKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab\\BootSession",0,nullptr,REG_OPTION_VOLATILE,KEY_QUERY_VALUE|KEY_SET_VALUE|READ_CONTROL,&attributes,&key,&disposition);LocalFree(descriptor);if(error!=ERROR_SUCCESS)throw std::runtime_error("Identidad de arranque no disponible");
+    if(!native::protectedRegistry(key)){RegCloseKey(key);throw std::runtime_error("Configuracion de arranque no protegida");}
     Id id{};DWORD type=0,bytes=16;error=RegQueryValueExW(key,L"Id",nullptr,&type,id.data(),&bytes);
     if(error==ERROR_FILE_NOT_FOUND&&disposition==REG_CREATED_NEW_KEY){id=randomId();error=RegSetValueExW(key,L"Id",0,REG_BINARY,id.data(),16);type=REG_BINARY;bytes=16;}
     RegCloseKey(key);if(error!=ERROR_SUCCESS||type!=REG_BINARY||bytes!=16||zero(id))throw std::runtime_error("Identidad de arranque invalida");return id;
@@ -32,16 +34,23 @@ void WINAPI serviceMain(DWORD,wchar_t**){
     stopEvent=CreateEventW(nullptr,TRUE,FALSE,nullptr);if(!stopEvent){report(SERVICE_STOPPED,GetLastError());return;}
     try{
         if(!guestActivationAuthorized()||!deploymentReady()){report(SERVICE_STOPPED,ERROR_ACCESS_DENIED);CloseHandle(stopEvent);stopEvent=nullptr;return;}
-        wchar_t programData[32768]{},viewSid[256]{};DWORD bytes=sizeof(viewSid),session=0,sessionBytes=sizeof(session);
+        HKEY config=nullptr;
+        if(RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",0,KEY_QUERY_VALUE|READ_CONTROL,&config)!=ERROR_SUCCESS||!native::protectedRegistry(config)){if(config)RegCloseKey(config);throw std::runtime_error("Configuracion no protegida");}
+        wchar_t programData[32768]{},viewSid[256]{};DWORD bytes=sizeof(viewSid),session=0,sessionBytes=sizeof(session),enabled=0,enabledBytes=sizeof(enabled);
         auto n=GetEnvironmentVariableW(L"ProgramData",programData,32768);
         if(n<3||n>=32768||programData[1]!=L':'||GetDriveTypeW(std::wstring(programData,programData+3).c_str())!=DRIVE_FIXED||
-            RegGetValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",L"ViewSid",RRF_RT_REG_SZ,nullptr,viewSid,&bytes)!=ERROR_SUCCESS||
-            RegGetValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",L"ViewSessionId",RRF_RT_REG_DWORD,nullptr,&session,&sessionBytes)!=ERROR_SUCCESS)throw std::runtime_error("Configuracion de invitado incompleta");
-        PSID sid=nullptr;if(!ConvertStringSidToSidW(viewSid,&sid))throw std::runtime_error("SID de lectura invalido");LocalFree(sid);auto boot=bootIdentity();
+            RegGetValueW(config,nullptr,L"ViewSid",RRF_RT_REG_SZ,nullptr,viewSid,&bytes)!=ERROR_SUCCESS||
+            RegGetValueW(config,nullptr,L"ViewSessionId",RRF_RT_REG_DWORD,nullptr,&session,&sessionBytes)!=ERROR_SUCCESS||
+            RegGetValueW(config,nullptr,L"EnableWfp",RRF_RT_REG_DWORD,nullptr,&enabled,&enabledBytes)!=ERROR_SUCCESS||enabled!=1){RegCloseKey(config);throw std::runtime_error("Configuracion de invitado incompleta");}
+        RegCloseKey(config);
+        PSID sid=nullptr;if(!ConvertStringSidToSidW(viewSid,&sid))throw std::runtime_error("SID de lectura invalido");Bytes account(static_cast<BYTE*>(sid),static_cast<BYTE*>(sid)+GetLengthSid(sid));LocalFree(sid);auto boot=bootIdentity();
+        auto root=std::filesystem::path(programData)/L"LGAGateBouncerLab";native::ProtectedDirectory protectedStore(root);if(!protectedStore.acquire())throw std::runtime_error("Store no protegido");
         SelectorRegistry registry;WfpBackend backend(registry);if(!backend.connectGuest())throw std::runtime_error("Backend no conectado");
-        PolicyStore store(std::filesystem::path(programData)/L"LGAGateBouncerLab");Coordinator coordinator(store,backend,registry);coordinator.initialize();
-        // Este corte no publica un perfil validado ni inventa eventos de trafico.
-        PipeServer server(coordinator,randomId(),boot,viewSid,session);report(SERVICE_RUNNING);server.run(stopEvent);report(SERVICE_STOPPED);
+        PolicyStore store(root);Coordinator coordinator(store,backend,registry);
+        decisions::NativeRuntime runtime(coordinator,backend,registry,root,std::move(account),randomId(),boot);
+        if(!coordinator.initialize()||!runtime.initialize())throw std::runtime_error("Recuperacion de stores pendiente");
+        // El perfil único limita revisión; no afirma cobertura completa ni autoriza kernel scopes.
+        decisions::NativeServer server(runtime);report(SERVICE_RUNNING);server.run(stopEvent);report(SERVICE_STOPPED);
     }catch(...){report(SERVICE_STOPPED,ERROR_SERVICE_SPECIFIC_ERROR);}
     CloseHandle(stopEvent);stopEvent=nullptr;
 }

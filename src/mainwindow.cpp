@@ -6,6 +6,7 @@
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QEvent>
+#include <QDateTime>
 #include <QFileDialog>
 #include <QFontMetrics>
 #include <QFrame>
@@ -33,6 +34,45 @@
 
 namespace Gate {
 namespace {
+QString recordText(const gb::wire::Bytes &bytes, const QString &fallback) {
+    return bytes.empty() ? fallback : QString::fromUtf8(reinterpret_cast<const char *>(bytes.data()), qsizetype(bytes.size()));
+}
+QString reconstructionText(const Data::SemanticCandidate *candidate) {
+    if (!candidate) return "Analysis pending";
+    switch (candidate->reconstruction) {
+    case Data::Reconstruction::ReconstructedSubset: return "Reconstructed subset";
+    case Data::Reconstruction::Unsupported: return "Unsupported type";
+    default: return "Incomplete · known fields retained";
+    }
+}
+QString semanticFacts(const ImportedReviewView &view, const Data::SemanticCandidate *candidate) {
+    QStringList text{"Inactive · Unverified", "Profile: External · unaccredited", "Engine policy eligible: No"};
+    if (!candidate) {
+        text << (view.busy ? "Deriving source facts… Reopen after analysis completes."
+                          : "Derived facts unavailable: " + view.facts.error);
+        return text.join('\n');
+    }
+    text << "Reconstruction: " + reconstructionText(candidate)
+         << "Source action: " + (candidate->action ? Data::actionName(*candidate->action) : "Unknown")
+         << "Source direction: " + Data::directionName(candidate->direction)
+         << QString("Source enabled: ") + (candidate->sourceEnabled ? (*candidate->sourceEnabled ? "True" : "False") : "Unknown")
+         << "Source weight: " + (candidate->sourceWeight ? QString::number(*candidate->sourceWeight) : "Unknown")
+         << "Subject scope: Unknown · no automatic path or instance mapping"
+         << "Constraints: Unknown · dependencies retained below"
+         << "Conflicts: " + QString(candidate->potentialConflict ? "Potential conflict" : "No confirmed conflict")
+         << "Overlap: " + QString(candidate->overlapUnknown ? "Unknown" : "No unresolved overlap reported")
+         << "Conflict analysis complete: " + QString(view.facts.conflictsComplete ? "Yes · within this profile" : "No")
+         << "Diagnostics: " + QStringList(candidate->diagnostics.begin(), candidate->diagnostics.end()).join(" · ")
+         << "Profile diagnostics: " + QStringList(view.facts.diagnostics.begin(), view.facts.diagnostics.end()).join(" · ");
+    return text.join('\n');
+}
+QString recordUtc(quint64 nanos, bool present) {
+    return present ? QDateTime::fromMSecsSinceEpoch(qint64(nanos / 1000000), QTimeZone::UTC)
+                         .toString("yyyy-MM-dd HH:mm:ss 'UTC'") : "Unknown";
+}
+QString engineRowId(const QString &kind, const gb::wire::Id &epoch, const gb::wire::Id &id) {
+    return kind + ":" + QString::fromStdString(gb::wire::hex(epoch)) + ":" + QString::fromStdString(gb::wire::hex(id));
+}
 constexpr int IdRole = Qt::UserRole + 1, KindRole = Qt::UserRole + 2, SortRole = Qt::UserRole + 3;
 struct Cell {
     QString text, kind;
@@ -419,8 +459,11 @@ class RowsModel final : public QAbstractTableModel {
     Qt::SortOrder sortOrder_ = Qt::AscendingOrder;
 };
 
-MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot)
-    : QMainWindow(parent), model_(this), explanation_(&model_), product_(isolatedQa, qaRoot, this) {
+MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
+                       std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel,
+                       std::unique_ptr<ReviewBackend> reviewer)
+    : QMainWindow(parent), model_(this), explanation_(&model_), product_(isolatedQa, qaRoot, this, std::move(decisionChannel)),
+      reviewer_(isolatedQa, this, std::move(reviewer)) {
     setObjectName("GateBouncer");
     setWindowTitle("LGA GateBouncer");
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
@@ -431,12 +474,66 @@ MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot)
     connect(&model_, &Simulation::changed, this, &MainWindow::refresh);
     connect(&explanation_, &Explanation::changed, this, &MainWindow::renderNotice);
     connect(&product_, &ProductController::changed, this, &MainWindow::refresh);
+    connect(&product_, &ProductController::changed, this, &MainWindow::updateLifecycle);
+    connect(&product_, &ProductController::importedViewsInvalidated, this, &MainWindow::closeModal);
+    connect(&model_, &Simulation::changed, this, &MainWindow::updateLifecycle);
+    connect(&reviewer_, &ReviewGateway::changed, this, [this] {
+        // Las páginas anteriores se retiran con deleteLater; actualizar también el aviso actual.
+        for (auto *status : findChildren<QLabel *>("reviewer-status")) status->setText(reviewer_.status());
+    });
     connect(&product_, &ProductController::invalidated, this, [this] {
-        explanation_.close(); closeModal(); selected_.clear();
+        explanation_.close(); reviewer_.invalidate(); closeModal(); selected_.clear();
         if (detail_) { dispose(detail_); detail_.clear(); }
     });
     qApp->installEventFilter(this);
     QTimer::singleShot(0, &product_, &ProductController::refreshProcesses);
+}
+void MainWindow::startLifecycle(std::unique_ptr<Lifecycle::TraySurface> tray, bool minimized,
+                                std::unique_ptr<Lifecycle::StartupPreference> startup) {
+    if (lifecycle_ || closing_) return;
+    startup_ = std::move(startup);
+    lifecycle_ = new Lifecycle::LifecycleController(this, std::move(tray), windowIcon(), this);
+    connect(lifecycle_, &Lifecycle::LifecycleController::pendingRequested, this,
+            [this] { selectView("pending"); });
+    connect(lifecycle_, &Lifecycle::LifecycleController::settingsRequested, this,
+            [this] { selectView("settings"); });
+    connect(lifecycle_, &Lifecycle::LifecycleController::quitRequested, this,
+            &MainWindow::requestGuiShutdown);
+    updateLifecycle();
+    lifecycle_->start(minimized);
+}
+void MainWindow::updateLifecycle() {
+    if (!lifecycle_) return;
+    Lifecycle::EngineSnapshot snapshot;
+    snapshot.simulation = product_.simulation();
+    snapshot.current = snapshot.simulation || product_.engine().current;
+    // El perfil de cobertura validada aún no tiene evidencia consumible en esta GUI.
+    snapshot.state = product_.engine().current
+        ? Lifecycle::EngineState::Degraded : Lifecycle::EngineState::Unavailable;
+    if (!snapshot.simulation && product_.recordsSelected() && product_.records()->recordsCurrent())
+        snapshot.pendingCount = product_.records()->pending().size();
+    lifecycle_->applyEngineSnapshot(snapshot);
+}
+void MainWindow::requestGuiShutdown() {
+    if (closing_) return;
+    if (lifecycle_ && !lifecycle_->quitPending()) { lifecycle_->requestQuit(); return; }
+    closing_ = true;
+    explanation_.close();
+    model_.setEnabled(false);
+    product_.stop();
+    reviewer_.stop();
+    setEnabled(false);
+    // Terminar el Close interceptado antes de solicitar el cierre efectivo.
+    QTimer::singleShot(0, this, &MainWindow::finishShutdownWhenIdle);
+}
+void MainWindow::finishShutdownWhenIdle() {
+    if (!closing_) return;
+    if (!product_.idle() || !reviewer_.idle()) {
+        QTimer::singleShot(50, this, &MainWindow::finishShutdownWhenIdle);
+        return;
+    }
+    if (lifecycle_) lifecycle_->finishGuiShutdown();
+    close();
 }
 void MainWindow::buildShell() {
     root_ = new QWidget;
@@ -583,9 +680,9 @@ void MainWindow::selectView(const QString &view) {
 }
 void MainWindow::closeEvent(QCloseEvent *event) {
     if (!closing_) {
-        closing_ = true; explanation_.close(); model_.setEnabled(false); product_.stop();
+        closing_ = true; explanation_.close(); model_.setEnabled(false); product_.stop(); reviewer_.stop();
     }
-    if (!product_.idle()) {
+    if (!product_.idle() || !reviewer_.idle()) {
         event->ignore(); setEnabled(false);
         QTimer::singleShot(50, this, [this] { close(); });
         return;
@@ -615,7 +712,9 @@ void MainWindow::buildPage() {
     emptyState_.clear();
     for (auto it = navigation_.begin(); it != navigation_.end(); ++it)
         it.value()->setChecked(it.key() == view_);
-    pendingCount_->setText(product_.simulation() ? QString::number(model_.state().pending.size()) : "—");
+    pendingCount_->setText(product_.simulation() ? QString::number(model_.state().pending.size())
+        : product_.recordsSelected() && product_.records()->recordsCurrent()
+            ? QString::number(product_.records()->pending().size()) : "—");
     pendingCount_->setVisible(!product_.simulation() || !model_.state().pending.isEmpty());
     sideStatus_->setText(model_.available()
                              ? (model_.service() == Service::UiClosed
@@ -633,11 +732,15 @@ void MainWindow::buildPage() {
     if (!product_.simulation()) {
         sideStatus_->setText(product_.engineSummary() + "\nCoverage not validated");
         status_->setText("Read only · no administrator control\nNetwork collector unavailable");
+        if (product_.recordsSelected() && product_.records()->recordsCurrent()) {
+            status_->setText("Read only · decisions require administrator review\nCoverage not validated");
+            footer_->setText("View II snapshots · WFP attempts only when present · no authorization or traffic evidence");
+        }
         const QMap<QString, QStringList> liveHeadings{
             {"processes", {"Processes", "Observed local processes · policy and network history are unknown."}},
-            {"pending", {"Pending decisions", "Request records are unavailable in this engine version."}},
-            {"activity", {"Activity", "Network activity collection is unavailable."}},
-            {"rules", {"Rules", "Inactive local review candidates · engine rules unavailable."}},
+            {"pending", {"Pending decisions", "Service request snapshots · ordinary GUI cannot Allow or Block."}},
+            {"activity", {"Activity", "Observed attempts and gaps · authorization and traffic unavailable."}},
+            {"rules", {"Rules", "Service policy records and inactive local review candidates."}},
             {"import", {"Import from NetLimiter", "Structural analysis only · compatibility not validated."}},
             {"settings", {"Settings", "Read only engine status and local sample preferences."}}};
         title_->setText(liveHeadings[view_][0]); subtitle_->setText(liveHeadings[view_][1]);
@@ -951,19 +1054,49 @@ void MainWindow::refreshTable(bool newPage) {
                 {"Unknown", {}, {}}, {status, {}, {}}}});
         }
         else if (view_ == "import" || view_ == "rules") {
+            if (view_ == "rules" && product_.recordsSelected() && product_.records()->recordsCurrent())
+                for (const auto &r : product_.records()->rules()) {
+                    const auto name = recordText(r.name, "Selector " + QString::fromStdString(gb::wire::hex(r.selector)));
+                    result.push_back({engineRowId("rule", product_.engine().serviceEpoch, r.rule),
+                        {{name, "strong", {}}, {r.action == 2 ? "Allow · soft" : "Block", {}, {}},
+                         {"Both · permanent path", {}, {}}, {"Unknown", {}, {}},
+                         {r.effective == 1 ? "Applied revision" : "Effect unknown", {}, {}}, {"Read only", {}, {}}}});
+                }
             const auto &report = view_ == "import" ? product_.draft() : product_.review().report;
             for (const auto &c : report.candidates) {
-                const QString status = c.status == Data::CandidateStatus::NeedsReview ? "Needs review" : "Unsupported";
+                const auto *derived = product_.derivedCandidate(view_ == "import", c.id);
+                const auto &derivedView = product_.importedView(view_ == "import");
+                const QString status = derived ? reconstructionText(derived)
+                    : derivedView.busy ? "Deriving facts" : "Derived facts unavailable";
                 const QString source = c.sourceId.isEmpty() ? c.source.name : c.sourceId;
-                const QString action = c.action ? Data::actionName(*c.action) : "Unknown";
+                const QString action = derived && derived->action ? Data::actionName(*derived->action) : "Unknown";
                 if (view_ == "import") result.push_back({"candidate:" + report.digest + ":" + c.id,
                     {{source, "strong", {}}, {action, {}, {}}, {status, status, {}},
-                     {QStringList(c.diagnostics.begin(), c.diagnostics.end()).join(" · "), {}, {}}}});
+                     {derived ? QStringList(derived->diagnostics.begin(), derived->diagnostics.end()).join(" · ")
+                              : derivedView.busy ? "Source retained · deriving facts" : "Source retained · " + derivedView.facts.error, {}, {}}}});
                 else result.push_back({"candidate:" + report.digest + ":" + c.id,
-                    {{source, "strong", {}}, {"Inactive", "inactive", {}}, {Data::directionName(c.direction), {}, {}},
+                    {{source, "strong", {}}, {"Inactive · Unverified", "inactive", {}}, {derived ? Data::directionName(derived->direction) : "Unknown", {}, {}},
                      {"Unknown · no collector", {}, {}}, {status, status, {}}, {"Review", "action", {}}}});
             }
         }
+        else if (view_ == "pending" && product_.recordsSelected() && product_.records()->recordsCurrent())
+            for (const auto &p : product_.records()->pending())
+                result.push_back({engineRowId("pending", product_.engine().serviceEpoch, p.request),
+                    {{recordText(p.name, "Unattributed request"), "strong", {}},
+                     {p.flow == 2 ? "Outbound attempt · destination unknown" : "Inbound attempt · destination unknown", {}, {}},
+                     {recordUtc(p.lastUtc, p.presence & 8), {}, qulonglong(p.lastUtc)},
+                     {"Review in administrator window →", "action", {}}}});
+        else if (view_ == "activity" && product_.recordsSelected() && product_.engine().current)
+            for (const auto &e : product_.records()->events()) {
+                const auto sequence = gb::wire::get(e, gb::wire::Tag::EventSeq);
+                const auto request = gb::wire::idValue(e, gb::wire::Tag::RequestId);
+                const bool gap = e.type == gb::wire::Type::ObservationGap;
+                result.push_back({"event:" + QString::fromStdString(gb::wire::hex(product_.engine().serviceEpoch)) + ":" + QString::number(sequence),
+                    {{recordUtc(gb::wire::get(e, gb::wire::Tag::Timestamp), gb::wire::get(e, gb::wire::Tag::Presence) & (1ull << 19)), {}, qulonglong(sequence)},
+                     {gb::wire::zero(request) ? "Unattributed" : QString::fromStdString(gb::wire::hex(request)), {}, {}},
+                     {gap ? "Observation gap" : "Blocked attempt observed", gap ? "warning" : "", {}},
+                     {"Unknown", {}, {}}, {gap ? "Coverage incomplete" : "WFP source · no traffic evidence", {}, {}}}});
+            }
         if (count_) count_->setText(QString("%1 of %2 observed processes").arg(result.size()).arg(product_.catalog().processes.size()));
     } else if (view_ == "processes") {
         for (const auto &p : state.processes) {
@@ -1078,6 +1211,7 @@ void MainWindow::tableAction(const QModelIndex &index) {
     const QString id = index.data(IdRole).toString();
     if (!product_.simulation()) {
         if (view_ == "processes") renderLiveDetail(id);
+        else if (view_ == "pending") openEngineRequest(id);
         else if (view_ == "rules" || view_ == "import") reviewCandidate(id, view_ == "import");
         return;
     }
@@ -1576,7 +1710,7 @@ void MainWindow::modeSelector(QVBoxLayout *layout) {
     layout->addWidget(panel);
 }
 void MainWindow::renderLive() {
-    if (view_ != "settings") pageLayout_->addWidget(note("Administrator control is not available in this build. Local candidates stay inactive.", true));
+    if (view_ != "settings") pageLayout_->addWidget(note("Ordinary GUI is read only. Decisions require the separate administrator reviewer. Local candidates stay inactive.", true));
     if (view_ == "processes") {
         auto *bar = line(pageLayout_); auto *search = new QLineEdit(query_);
         search->setObjectName("process-search"); search->setPlaceholderText("Search observed processes and paths…");
@@ -1587,19 +1721,25 @@ void MainWindow::renderLive() {
         count_ = label({}, "faint"); pageLayout_->addWidget(count_);
         if (!product_.catalog().error.isEmpty()) pageLayout_->addWidget(label(product_.catalog().error, "warning", true));
     } else if (view_ == "pending") {
-        pageLayout_->addWidget(note("Pending requests unavailable in this engine version. Observed processes are not requests."));
+        pageLayout_->addWidget(note(product_.recordsSelected() && product_.records()->recordsCurrent()
+            ? "Snapshot from the single eligible account/session. Current coverage is limited to the service and its own probe; other applications are not covered by this increment."
+            : "Request snapshots unavailable. Connect View II explicitly in Settings; observed processes are not requests."));
         makeTable({"Application", "Destination", "Last request", "Decision"}, {32, 31, 14, 23}, 57);
     } else if (view_ == "activity") {
         makeTable({"Time", "Process", "Event", "Destination", "Reason"}, {19, 22, 19, 20, 20}, 42);
         pageLayout_->addWidget(label("Coverage: Unavailable · a service heartbeat does not report traffic.", "faint", true));
+        pageLayout_->addWidget(label("History is incomplete: no observations before subscription, source gaps may occur, and only 4096 events are retained. No authorization or traffic events are supported.", "faint", true));
     } else if (view_ == "rules") {
-        pageLayout_->addWidget(label("Engine rules: Unavailable in this version · local candidates: " + QString::number(product_.review().report.candidates.size()) + " inactive", "muted", true));
+        pageLayout_->addWidget(label("Engine rules: " + (product_.recordsSelected() && product_.records()->recordsCurrent()
+            ? QString::number(product_.records()->rules().size()) + " read only" : "Unavailable") +
+            " · local candidates: " + QString::number(product_.review().report.candidates.size()) + " inactive", "muted", true));
         if (!product_.reviewError().isEmpty()) pageLayout_->addWidget(note(product_.reviewError()));
         makeTable({"Source target", "State", "Direction", "Last request", "Mapping", "Candidate"}, {24, 15, 20, 20, 12, 9});
         auto *review = button("Review selected candidate", "review-candidate"); pageLayout_->addWidget(review, 0, Qt::AlignRight);
         connect(review, &QPushButton::clicked, this, [this] { if (table_) reviewCandidate(table_->currentIndex().data(IdRole).toString()); });
     } else if (view_ == "import") {
         pageLayout_->addWidget(note("Structural analysis only · compatibility not validated. All rows are kept for inactive review; no rules are applied.", true));
+        pageLayout_->addWidget(label("Inactive · Unverified · External unaccredited. Source fields may be known while subject scope, constraints and overlap remain unknown. No synthetic profile is selected automatically.", "muted", true));
         auto *bar = line(pageLayout_); auto *choose = button("Choose migration XML…", "choose-migration"); bar->addWidget(choose);
         auto *reset = button("Clear preview", "clear-preview", "ghost"); bar->addWidget(reset); bar->addStretch();
         connect(reset, &QPushButton::clicked, &product_, &ProductController::clearDraft);
@@ -1626,7 +1766,19 @@ void MainWindow::renderLive() {
         if (!product_.engine().error.isEmpty()) p->addWidget(label(product_.engine().error, "muted", true));
         auto *refresh = button("Refresh engine status", "refresh-engine"); p->addWidget(refresh, 0, Qt::AlignLeft);
         connect(refresh, &QPushButton::clicked, &product_, &ProductController::refreshEngine);
-        p->addWidget(label("Administrator control, rule records and request records are unavailable. Coverage has not been validated.", "faint", true)); l->addWidget(panel);
+        auto *connectRecords = button("Connect service request records", "connect-view-ii"); p->addWidget(connectRecords, 0, Qt::AlignLeft);
+        connect(connectRecords, &QPushButton::clicked, &product_, &ProductController::selectDecisionRecords);
+        auto *statusOnly = button("Use status-only connection", "select-view-i", "ghost"); p->addWidget(statusOnly, 0, Qt::AlignLeft);
+        connect(statusOnly, &QPushButton::clicked, &product_, &ProductController::selectStatusOnly);
+        p->addWidget(label(product_.recordsSelected() ? "Selected source: service records · connection failure makes records unavailable" : "Selected source: engine status only", "faint", true));
+        p->addWidget(label("Coverage has not been validated. Both directions / permanent path spans every matching instance and account; outbound attempts never imply an inbound permission. Once, duration and instance scopes are unavailable.", "faint", true)); l->addWidget(panel);
+        auto *reviewPanel = frame("panel"); auto *rp = new QVBoxLayout(reviewPanel); rp->setContentsMargins(16, 16, 16, 16); rp->setSpacing(8);
+        rp->addWidget(label("Administrator reviewer", "heading"));
+        rp->addWidget(label("Enable the protected reviewer once for this session with an explicit administrator prompt. Each request still requires confirmation in its own window. An ordinary queue entry never chooses Allow or Block.", "muted", true));
+        auto *reviewStatus = label(reviewer_.status(), "warning", true); reviewStatus->setObjectName("reviewer-status"); rp->addWidget(reviewStatus);
+        auto *enableReviewer = button("Enable administrator reviewer…", "enable-reviewer"); rp->addWidget(enableReviewer, 0, Qt::AlignLeft);
+        connect(enableReviewer, &QPushButton::clicked, &reviewer_, &ReviewGateway::launch);
+        rp->addWidget(label("A protected installed package is required. The portable development build cannot establish it. Enabling does not install or activate the firewall service.", "faint", true)); l->addWidget(reviewPanel);
         auto *sample = frame("panel"); auto *s = new QVBoxLayout(sample); s->setContentsMargins(16, 16, 16, 16); s->setSpacing(8);
         s->addWidget(label("Sample explanation · no data sent", "heading"));
         s->addWidget(label("Public facts for installed processes are unavailable. Choose Simulation to explore explanations from the synthetic public catalog.", "muted", true));
@@ -1636,9 +1788,63 @@ void MainWindow::renderLive() {
         auto *consent = new QCheckBox("I consent to the local sample explanation demo · no data sent"); consent->setObjectName("lookup-consent"); consent->setChecked(explanation_.consent()); consent->setEnabled(explanation_.configured()); s->addWidget(consent);
         connect(consent, &QCheckBox::toggled, this, [this](bool on) { explanation_.setConsent(on); buildPage(); });
         s->addWidget(label(explanation_.disclaimer(), "faint", true)); l->addWidget(sample);
-        l->addWidget(note("Tray icon and start at login: Not enabled in this build.", true));
+        auto *lifecyclePanel = frame("panel");
+        auto *lp = new QVBoxLayout(lifecyclePanel);
+        lp->setContentsMargins(16, 16, 16, 16); lp->setSpacing(8);
+        lp->addWidget(label("Window and startup", "heading"));
+        lp->addWidget(label(lifecycle_ && lifecycle_->recoverableTray()
+            ? "Close hides this window. Use Quit in the tray menu to drain GUI clients and exit."
+            : "A recoverable tray is unavailable. Close drains GUI clients and exits.", "muted", true));
+        lp->addWidget(label("Closing or quitting the GUI never decides a pending request or stops the engine service.", "faint", true));
+        lp->addWidget(label(startupResult_.detail.isEmpty() && startupResult_.state == Lifecycle::StartupState::Absent
+            ? "GUI startup registration absent" : startupResult_.detail, "muted", true));
+        auto *startupActions = line(lp);
+        auto *inspectStartup = button("Inspect startup registration", "inspect-startup");
+        auto *enableStartup = button("Register GUI at login", "enable-startup");
+        auto *disableStartup = button("Remove GUI registration", "disable-startup", "ghost");
+        for (auto *b : {inspectStartup, enableStartup, disableStartup}) {
+            b->setEnabled(bool(startup_)); startupActions->addWidget(b);
+        }
+        connect(inspectStartup, &QPushButton::clicked, this, [this] {
+            if (startup_) { startupResult_ = startup_->inspect(); buildPage(); }
+        });
+        connect(enableStartup, &QPushButton::clicked, this, [this] {
+            if (startup_) { startupResult_ = startup_->setEnabled(true); buildPage(); }
+        });
+        connect(disableStartup, &QPushButton::clicked, this, [this] {
+            if (startup_) { startupResult_ = startup_->setEnabled(false); buildPage(); }
+        });
+        lp->addWidget(label("This registers the ordinary GUI for this account. Registration does not guarantee launch at login and does not start an elevated reviewer or install protection.", "faint", true));
+        l->addWidget(lifecyclePanel);
         if (!product_.reviewError().isEmpty()) l->addWidget(note(product_.reviewError()));
         l->addStretch(); pageLayout_->addWidget(scrollArea(content), 1);
+    }
+}
+void MainWindow::openEngineRequest(const QString &rowId) {
+    if (product_.simulation() || !product_.recordsSelected() || !product_.records()->recordsCurrent()) return;
+    for (const auto &record : product_.records()->pending()) {
+        if (rowId != engineRowId("pending", product_.engine().serviceEpoch, record.request)) continue;
+        const ReviewReference reference{product_.engine().serviceEpoch, record.request, record.profileGeneration};
+        const auto generation = product_.generation();
+        auto *l = modal("Service request · read only");
+        l->addWidget(label(recordText(record.name, "Unattributed request"), "heading", true));
+        auto *path = new QPlainTextEdit(recordText(record.path, "Application path unknown"));
+        path->setObjectName("request-readonly-path"); path->setReadOnly(true);
+        path->setMinimumHeight(54); path->setMaximumHeight(80);
+        path->setWordWrapMode(QTextOption::WrapAnywhere); l->addWidget(path);
+        l->addWidget(label("Attempt direction: " + QString(record.flow == 2 ? "Outbound" : "Inbound") +
+            "\nPermanent policy scope: Both directions · this path · all matching users and instances", "muted", true));
+        l->addWidget(note("Queueing grants no permission. Confirm only in the administrator reviewer.", true));
+        l->addWidget(label("The reviewer fetches the current service request.\nClosing this dialog keeps the request undecided.", "muted", true));
+        auto *queue = button("Queue administrator review", "queue-admin-review", "primary"); l->addWidget(queue, 0, Qt::AlignRight);
+        auto *status = label(reviewer_.status(), "muted", true); status->setObjectName("reviewer-status");
+        status->setMinimumHeight(3 * status->fontMetrics().lineSpacing()); l->addWidget(status);
+        connect(queue, &QPushButton::clicked, this, [this, reference, generation] {
+            if (product_.generation() == generation && product_.engine().current &&
+                product_.engine().serviceEpoch == reference.epoch && product_.records()->profile() == reference.profile)
+                reviewer_.open(reference);
+        });
+        return;
     }
 }
 void MainWindow::renderLiveDetail(const QString &id) {
@@ -1666,8 +1872,13 @@ void MainWindow::reviewCandidate(const QString &rowId, bool draft) {
     if (product_.simulation()) return;
     const auto &report = draft ? product_.draft() : product_.review().report;
     for (const auto &c : report.candidates) if (rowId == "candidate:" + report.digest + ":" + c.id) {
-        auto *l = modal(draft ? "Structural candidate preview" : "Review inactive candidate"); l->addWidget(note("Compatibility not validated. This review cannot activate a rule. Dependencies are retained for review.", true));
-        l->addWidget(label(c.sourceId + " · " + c.sourceType + "\n" + QStringList(c.diagnostics.begin(), c.diagnostics.end()).join("\n"), "muted", true));
+        auto *l = modal(draft ? "Imported source preview" : "Review inactive candidate");
+        l->addWidget(note("Inactive · Unverified. Compatibility not validated; this review cannot activate a rule.", true));
+        auto *content = new QWidget; auto *body = new QVBoxLayout(content); body->setContentsMargins(0, 0, 0, 0); body->setSpacing(8);
+        body->addWidget(label(c.sourceId + " · " + c.sourceType, "heading", true));
+        auto *facts = new QPlainTextEdit(semanticFacts(product_.importedView(draft), product_.derivedCandidate(draft, c.id)));
+        facts->setObjectName("candidate-derived-facts"); facts->setReadOnly(true); facts->setMinimumHeight(170); facts->setMaximumHeight(210); body->addWidget(facts);
+        body->addWidget(label("Original source and dependencies · retained without activation", "muted", true));
         QString sourceText;
         std::function<void(const Data::XmlNode &, int)> append = [&](const Data::XmlNode &node, int depth) {
             if (sourceText.size() >= 64000) return;
@@ -1677,13 +1888,19 @@ void MainWindow::reviewCandidate(const QString &rowId, bool draft) {
             for (const auto &child : node.children) append(child, depth + 1);
         };
         append(c.source, 0);
+        for (const auto &node : report.filters) append(node, 0);
+        for (const auto &node : report.identities) append(node, 0);
         auto *source = new QPlainTextEdit; source->setObjectName("candidate-source-facts"); source->setReadOnly(true);
-        source->setPlainText(sourceText.left(64000)); source->setMinimumHeight(100); source->setMaximumHeight(180); l->addWidget(source);
+        source->setPlainText(sourceText.left(64000)); source->setMinimumHeight(100); source->setMaximumHeight(140); body->addWidget(source);
+        auto *scroll = scrollArea(content); scroll->setMinimumHeight(300); scroll->setMaximumHeight(390); l->addWidget(scroll);
+        l->addWidget(label("Local review choice: " + (c.reviewAction ? Data::actionName(*c.reviewAction) : "Not reviewed") + ". Source facts remain unchanged.\nLast authorization and traffic: Unknown.", "faint", true));
         auto *policy = combo({"Allow (review only)", "Block (review only)", "Ask (review only)"}, "candidate-review-action");
-        const auto choice = c.reviewAction.value_or(c.action.value_or(Data::Action::Ask));
+        const auto *derived = product_.derivedCandidate(draft, c.id);
+        const auto choice = c.reviewAction.value_or(derived ? derived->action.value_or(Data::Action::Ask) : Data::Action::Ask);
         policy->setCurrentIndex(choice == Data::Action::Allow ? 0 : choice == Data::Action::Block ? 1 : 2); l->addWidget(policy);
         auto *save = button("Save inactive review", "save-inactive-review", "primary"); save->setEnabled(!draft && product_.reviewWritable()); l->addWidget(save, 0, Qt::AlignRight);
-        connect(save, &QPushButton::clicked, this, [this, id = c.id, policy] {
+        connect(save, &QPushButton::clicked, this, [this, id = c.id, digest = report.digest, revision = product_.review().revision, generation = product_.generation(), policy] {
+            if (product_.generation() != generation || product_.review().report.digest != digest || product_.review().revision != revision) return;
             const auto action = policy->currentIndex() == 0 ? Data::Action::Allow : policy->currentIndex() == 1 ? Data::Action::Block : Data::Action::Ask;
             if (product_.updateCandidate(id, action)) { closeModal(); message("Local review saved. Candidate remains inactive."); }
         }); return;
@@ -1873,7 +2090,7 @@ void MainWindow::cleanup() {
 void MainWindow::about() {
     auto *l = modal("About LGA GateBouncer");
     if (!product_.simulation()) {
-        l->addWidget(note("Live process catalog and inactive migration review. Administrator control, request records and network collection are unavailable in this build. Coverage has not been validated.", true));
+        l->addWidget(note("Live process catalog and inactive migration review. Service snapshots require an explicit connection. This window is read only; decisions require the separate protected administrator reviewer. Network protection and coverage have not been validated.", true));
         l->addWidget(label("Executable contents, publishers and signatures are not inspected. Only the migration file you choose is analyzed. Simulation is an explicit offline sample mode.", "muted", true));
         auto *close = button("Close", "about-close"); l->addWidget(close, 0, Qt::AlignRight);
         connect(close, &QPushButton::clicked, this, &MainWindow::closeModal); return;

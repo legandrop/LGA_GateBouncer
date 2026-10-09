@@ -25,7 +25,14 @@ int main(int argc, char **argv) {
         return result;
 #else
     Gate::MainWindow window;
+    auto startup = std::make_unique<Gate::Lifecycle::StartupPreference>(
+        QCoreApplication::applicationFilePath(), Gate::Lifecycle::makeNativeRunBackend(),
+        Gate::Lifecycle::makeOrdinaryGuiDeploymentValidator());
+    window.startLifecycle(Gate::Lifecycle::makeNativeTraySurface(),
+                          app.arguments().contains("--start-minimized"), std::move(startup));
 #endif
+#ifdef GATEBOUNCER_OBSERVER
     window.show();
+#endif
     return app.exec();
 }

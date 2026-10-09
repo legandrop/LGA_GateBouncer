@@ -172,6 +172,7 @@ Status Coordinator::statusUnlocked(){
     return s;
 }
 Status Coordinator::status(){std::lock_guard<std::mutex> guard(mutex_);return statusUnlocked();}
+Snapshot Coordinator::snapshot()const{std::lock_guard<std::mutex> guard(mutex_);return snapshot_;}
 Outcome Coordinator::mutate(const Frame& f,bool admin){
     std::lock_guard<std::mutex> guard(mutex_);auto outcome=[&](State state,Error e){
         auto actual=statusUnlocked();

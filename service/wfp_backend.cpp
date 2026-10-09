@@ -1,4 +1,5 @@
 #include "wfp_backend.h"
+#include "collector_ii.h"
 #include <sddl.h>
 #include <shlobj.h>
 #include <algorithm>
@@ -94,12 +95,15 @@ bool WfpBackend::connectGuest(){
     return !ownTools_.empty();
 }
 void CALLBACK WfpBackend::eventCallback(void* context,const FWPM_NET_EVENT1* event){
-    auto self=static_cast<WfpBackend*>(context);if(!event||event->type!=FWPM_NET_EVENT_TYPE_CLASSIFY_DROP||!event->classifyDrop||!(event->header.flags&FWPM_NET_EVENT_FLAG_APP_ID_SET)||!event->header.appId.data||event->header.appId.size>32768)return;
+    auto self=static_cast<WfpBackend*>(context);std::lock_guard<std::mutex> guard(self->callbackMutex_);
+    if(self->collector_){try{self->collector_->capture(event);}catch(...){self->collector_->unavailable(7);}return;}
+    if(!event||event->type!=FWPM_NET_EVENT_TYPE_CLASSIFY_DROP||!event->classifyDrop||!(event->header.flags&FWPM_NET_EVENT_FLAG_APP_ID_SET)||!event->header.appId.data||event->header.appId.size>32768)return;
     FWPM_FILTER0* filter=nullptr;if(FwpmFilterGetById0(self->engine_,event->classifyDrop->filterId,&filter)!=ERROR_SUCCESS)return;
     bool own=filter->providerKey&&same(*filter->providerKey,Provider)&&same(filter->subLayerKey,Sublayer)&&filter->action.type==FWP_ACTION_BLOCK;
     FwpmFreeMemory0(reinterpret_cast<void**>(&filter));if(!own)return;
     try{Bytes native(event->header.appId.data,event->header.appId.data+event->header.appId.size);if(std::find(self->ownTools_.begin(),self->ownTools_.end(),native)==self->ownTools_.end())return;auto digest=sha256(native);Id candidate{};std::copy_n(digest.begin(),16,candidate.begin());bool existing=self->registry_.lookup(candidate).has_value();auto id=self->registry_.registerNative(native);if(!zero(id)&&!existing)std::clog<<"Selector nativo local registrado: "<<hex(id)<<'\n';}catch(...){/* El evento perdido no cambia filtros. */}
 }
+void WfpBackend::attachCollector(decisions::NativeCollector* collector){std::lock_guard<std::mutex> lock(callbackMutex_);collector_=collector;if(collector_){collector_->whitelist(ownTools_);if(!subscription_)collector_->unavailable(2);}}
 bool WfpBackend::apply(const std::vector<Rule>& rules,std::uint64_t revision){
     if(!available()||!guestActivationAuthorized()||rules.size()>MaxRules)return false;
     for(const auto& r:rules)if(std::find(ownTools_.begin(),ownTools_.end(),r.appId)==ownTools_.end())return false;
@@ -114,11 +118,19 @@ bool WfpBackend::apply(const std::vector<Rule>& rules,std::uint64_t revision){
 }
 bool WfpBackend::matches(const std::vector<Rule>& rules,std::uint64_t revision){
     if(!available()||!objectIdentity(engine_))return false;auto wanted=specs(rules);std::vector<GUID> actual;if(!enumerate(engine_,actual)||actual.size()!=wanted.size())return false;
-    auto meta=metadata(revision);
+    auto meta=metadata(revision);std::vector<decisions::LedgerFilter> ledger;
     for(const auto& s:wanted){FWPM_FILTER0* f=nullptr;if(FwpmFilterGetByKey0(engine_,&s.id,&f)!=ERROR_SUCCESS)return false;FWP_BYTE_BLOB blob{};auto c=conditions(s,blob);
         bool ok=f->providerKey&&same(*f->providerKey,Provider)&&same(f->subLayerKey,Sublayer)&&same(f->layerKey,s.layer)&&f->flags==s.flags&&f->action.type==s.action&&f->weight.type==FWP_UINT64&&f->weight.uint64&&*f->weight.uint64==s.weight&&f->numFilterConditions==c.size()&&f->providerData.size==meta.size()&&f->providerData.data&&std::memcmp(f->providerData.data,meta.data(),meta.size())==0;
         if(ok)for(std::size_t i=0;i<c.size();++i)if(!conditionSame(f->filterCondition[i],c[i])){ok=false;break;}
+        if(ok&&revision!=UINT64_MAX){FWPM_LAYER0* layer=nullptr;ok=FwpmLayerGetByKey0(engine_,&f->layerKey,&layer)==ERROR_SUCCESS;
+            if(ok){std::uint8_t flow=0;if(same(f->layerKey,FWPM_LAYER_ALE_AUTH_CONNECT_V4)||same(f->layerKey,FWPM_LAYER_ALE_AUTH_CONNECT_V6))flow=2;
+                if(same(f->layerKey,FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4)||same(f->layerKey,FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6))flow=1;
+                ledger.push_back({f->filterId,revision+1,revision,decisions::canonicalGuid(f->filterKey),layer->layerId,flow,f->action.type==FWP_ACTION_BLOCK});}
+            if(layer)FwpmFreeMemory0(reinterpret_cast<void**>(&layer));}
         FwpmFreeMemory0(reinterpret_cast<void**>(&f));if(!ok)return false;
-    } return true;
+    }
+    std::lock_guard<std::mutex> lock(callbackMutex_);if(collector_){FILETIME clock{};GetSystemTimeAsFileTime(&clock);auto ft=(std::uint64_t(clock.dwHighDateTime)<<32)|clock.dwLowDateTime;
+        if(!subscription_||!collector_->publish(std::move(ledger),ft))collector_->unavailable(7);}
+    return true;
 }
 }

@@ -52,6 +52,7 @@ public:
     virtual bool available() const=0;
     virtual bool apply(const std::vector<Rule>& rules,std::uint64_t revision)=0;
     virtual bool matches(const std::vector<Rule>& rules,std::uint64_t revision)=0;
+    virtual bool actualOs()const{return false;}
 };
 struct Status {
     std::uint64_t desired=0,effective=0,capabilities=ReadStatus;
@@ -65,6 +66,7 @@ public:
     Coordinator(PolicyStore& store,Backend& backend,SelectorRegistry& registry);
     bool initialize();
     Status status();
+    Snapshot snapshot()const;
     Outcome mutate(const Frame& command,bool administrator);
 private:
     Status statusUnlocked();

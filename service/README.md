@@ -1,72 +1,37 @@
-# Windows policy service foundation
+# Experimental Windows policy service
 
-This separate MSVC target contains a bounded IPC codec, a native policy store,
-and a WFP user mode backend. It is an experimental laboratory component. The
-desktop application remains a separate Qt/MinGW build; the two processes share
-serialized bytes, never C++ objects or a runtime ABI.
+This separate MSVC target contains native policy storage, authenticated local IPC, bounded decision records and a WFP user mode backend. It is an experimental laboratory component with **no validated protection profile**. The desktop application is a separate Qt/MinGW build; the processes exchange serialized bytes, never C++ objects or a runtime ABI.
 
-Build with the existing Windows SDK, MSVC and Ninja toolchain. Set
-`GATEBOUNCER_SERVICE_BUILD_DIR` to an exclusive build directory, then run
-`compilar.bat --no-run` from this directory. Building does not run the executable,
-install a service, or change filtering policy. Running with no arguments also
-does not activate a backend. There is no installer in this component.
+Build with the existing Windows SDK, MSVC and Ninja toolchain. Set `GATEBOUNCER_SERVICE_BUILD_DIR` to an exclusive build directory, then run `compilar.bat --no-run` from this directory. Building does not run the executable, install a service or change filtering policy. Running without arguments does not activate a backend. This component has no installer.
 
-The service name is `LGAGateBouncerLab`. View and Control use separate local
-named pipes, `LGA.GateBouncer.View.v1` and `LGA.GateBouncer.Control.v1`.
-View accepts the configured user and session for status only. Control requires
-an elevated administrator token for each command. Clients verify the running
-SCM process, its LocalSystem identity and its enabled service SID. A process
-with the same ordinary user identity has no policy mutation authority.
+## Deployment and channels
 
-Activation requires an explicitly prepared disposable guest, an auto-start own
-process service with its service SID enabled, protected binaries and policy
-directory, and the administrative guest marker under
-`HKLM\SOFTWARE\LGA\GateBouncerLab`. The component checks `EnableWfp=1`,
-`ViewSid` and `ViewSessionId`; it does not create that deployment or marker.
-The service entry point requires both `--service` and `--guest-wfp`. These
-requirements are laboratory gates, not proof that a computer is protected.
+Activation requires an explicitly prepared disposable Windows guest, an auto-start own-process service named `LGAGateBouncerLab` with its service SID enabled, protected binaries and policy directory, and protected configuration under `HKLM\SOFTWARE\LGA\GateBouncerLab`. The component checks `EnableWfp=1`, `ViewSid` and `ViewSessionId`; it does not create that deployment or configuration. The service entry point requires both `--service` and `--guest-wfp`. These checks are laboratory prerequisites, not proof that a computer is protected.
 
-The backend generates its own provider and sublayer, persistent and boot-time
-Block baselines, and soft permanent path rules at IPv4/IPv6 ALE connect,
-receive-accept and listen layers. Resource-assignment filters separately deny
-raw endpoints and the three promiscuous modes. Each path rule has both inbound
-and outbound scope at those ALE layers; Allow requires a new attempt where the
-original attempt was already blocked. No bandwidth control is included.
+View and Control use separate local named pipes, `LGA.GateBouncer.View.v1` and `LGA.GateBouncer.Control.v1`. Wire v1.0 remains read-only on View for status. Wire v1.1 provides bounded pending/rule snapshots and attempt/gap observations on View; it provides decision and command-status operations on Control. Each channel verifies its peer and each command rechecks authority. Control requires the elevated administrator role; ordinary View clients have no policy mutation authority.
 
-CreateRule accepts an opaque selector registered by the service from a real
-drop attributed to one of its own fixed local laboratory tools. It accepts no
-path, PID, hash or native blob supplied by a client. The optional sibling
-`GateBouncerProbe.exe` belongs to the separately prepared guest harness; this
-target does not supply or run it. If collection or registration is unavailable,
-the selector remains unavailable. A native APP_ID identifies a path, not file
-content, a process instance or the original caller of a broker.
+The current review profile requires one unambiguous active user session. Missing, changed or ambiguous identity invalidates the profile and review references. This restriction does not implement review for other accounts, services running as SYSTEM or all process identities.
 
-The store caps rules at 4,096 and snapshots at 16 MiB. A desired revision is
-stored only in objects owned by System or Administrators, with a protected
-System/Administrators DACL checked on the opened directory, snapshot and
-temporary file handles. Ancestor handles remain open without delete sharing;
-their owner and effective ACEs must also prevent ordinary substitution or
-security changes. Windows TrustedInstaller ownership is accepted for ancestors
-only. Existing unsafe objects are rejected; the component does not repair their
-security. Binary, dependency and administrative registry deployment security
-remains a separate prerequisite checked by the guest harness.
+The separate `GateBouncerDecisionBootstrap.exe` verifies a protected deployment before loading the Qt review stage. The ordinary desktop can explicitly request administrator enablement, then queue only a request reference on `LGA.GateBouncer.ReviewOpen.v1`. It cannot send Allow/Block through that queue. Queue acknowledgments do not confirm a decision, focus change or filtering effect. Protected binaries, Qt dependencies, configuration and operating-system authentication remain deployment and validation prerequisites.
 
-A desired revision is
-durable before a WFP transaction. Applied requires successful commit, exact
-readback and a durable final snapshot. A final store failure after readback
-reports AppliedUnrecorded. Corrupt or mismatched state enters recovery and
-does not restore old permissions. Status rechecks the backend rather than
-presenting cached effective policy as current. The boot identifier is retained
-in a volatile registry key across service restarts; the service epoch changes
-on every start. A Windows resumed kernel, including Fast Startup, retains that
-kernel boot identity until a new kernel boot.
+## Current policy scope
 
-Only Hello, HelloAck, GetStatus, Status, CreateRule, RevokeRule, MutationAck and
-ProtocolError are enabled in wire v1.0. Rule pages, pending reviews, traffic
-events, temporary permissions, content pinning and a kernel driver are not
-implemented. The component never announces a validated protection profile.
-Compilation and pure codec/store tests do not establish WFP enforcement,
-startup coverage, pipe ACL behavior, coexistence, or resistance to an
-administrator or kernel component. A third-party hard permit can affect
-declarative arbitration; weights do not guarantee precedence over another
-firewall provider.
+The backend creates its own provider and sublayer, persistent and boot-time Block baselines, and soft permanent path rules at IPv4/IPv6 ALE connect, receive-accept and listen layers. Resource-assignment filters separately deny raw endpoints and promiscuous modes. Each permanent path rule currently has **both inbound and outbound scope**. Allow requires a new attempt where the original attempt was already blocked. No bandwidth control is included.
+
+Selectors originate from native drops attributed to the component's fixed local laboratory tools. The optional sibling `GateBouncerProbe.exe` belongs to a separately prepared guest harness; this target does not supply or run it. Clients cannot register a path, PID, hash or native APP_ID blob as authority. If collection or registration is unavailable, the selector remains unavailable. APP_ID identifies a path, not file content, a process instance or the original caller of a broker. Arbitrary application collection and narrower direction/identity scopes are still required.
+
+Observed attempts and gaps do not establish authorization or traffic. Pages and queues are bounded snapshots with their own identity and revisions; stale records cannot become a current decision merely by being displayed. Temporary permissions, Once, process-instance rules, content pinning and a kernel driver are not implemented.
+
+## Storage and recovery
+
+The policy store caps rules at 4,096 and snapshots at 16 MiB. It checks System/Administrators ownership and protected DACLs on opened directories, snapshots and temporary files. Ancestor handles remain open without delete sharing; ordinary principals must not be able to substitute objects or change their security. TrustedInstaller ownership is accepted for ancestors only. Unsafe existing objects are rejected, rather than repaired. Binary and registry deployment security are separate prerequisites.
+
+A desired policy revision is persisted before its WFP transaction. Applied requires successful commit, exact readback and a durable final policy snapshot; a final store failure after readback reports AppliedUnrecorded and requires recovery. The decision journal records admission and command outcome separately. An uncertain command retains its identity for status queries; reconnecting does not automatically submit it again. Corrupt or mismatched state does not restore old permissions. Status rechecks the backend instead of presenting a cached effective policy as current.
+
+The boot identifier uses a protected volatile registry key retained across service restarts; the service epoch changes on every start. A resumed kernel, including Fast Startup, retains that kernel boot identity until a new kernel boot. The single-snapshot direction-aware storage format and its migration remain a subsequent increment.
+
+## Validation limits
+
+The native runtime, server, journal/effect adapters and Qt reviewer are implemented, with laboratory activation gates. Compilation, codec/store tests and local doubles do not establish WFP enforcement, pre-user startup coverage, SYSTEM/service-SID authentication, effective pipe permissions, elevated input handling or coexistence with another firewall.
+
+Weights do not guarantee precedence over another firewall provider; a third-party hard permit can affect declarative arbitration. Coverage for all applications/accounts, multicast/broadcast, boot and failure recovery, indirect egress, temporal scopes and protected distribution remains unvalidated. There is no guarantee against an administrator or kernel component.

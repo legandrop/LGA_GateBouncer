@@ -84,6 +84,8 @@ void PipeServer::channel(bool control,HANDLE stop){
         if(!ready){DisconnectNamedPipe(pipe.h);continue;}
         Frame request;Error parse=Error::Ok;std::uint64_t expected=1,outgoing=1;Id connection{};bool hello=false;
         while(WaitForSingleObject(stop,0)!=WAIT_OBJECT_0&&receive(pipe.h,request,stop,parse)){
+            // El endpoint A no negocia II hasta probar perfil, MIC y almacenamiento.
+            if(request.minor!=0)break;
             if(!authority(pipe.h,control))break;
             if(request.sequence!=expected||expected==UINT64_MAX)break;
             if(!hello){if(parse!=Error::Ok||request.type!=Type::Hello||get(request,Tag::ClientRole)!=(control?2u:1u))break;connection=randomId();Frame ack=response(request,Type::HelloAck,outgoing++);ack.connection=connection;statusFields(ack,coordinator_.status(),epoch_,boot_);if(!send(pipe.h,ack,stop))break;hello=true;++expected;continue;}

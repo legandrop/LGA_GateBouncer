@@ -1,6 +1,7 @@
 qt_add_library(gatebouncer_data STATIC
     contracts.cpp contracts.h
     netlimiterimport.cpp netlimiterimport.h
+    netlimitersemantics.cpp netlimitersemantics.h
     activityhistory.cpp activityhistory.h
     reviewstore.cpp reviewstore.h
     ../platform/ProcessCatalog.cpp ../platform/ProcessCatalog.h
