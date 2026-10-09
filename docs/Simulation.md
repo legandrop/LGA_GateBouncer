@@ -1,6 +1,6 @@
 # Simulation behavior
 
-The fixed message `Simulation · Firewall engine not connected` applies to every screen and request. Names, publishers, paths, signatures, process states and destinations are fixtures, including familiar application names. They are not inspected on this computer.
+This document describes Simulation mode. Its fixed message `Simulation · no network filtering` identifies sample data on every screen and request. Names, publishers, paths, signatures, process states and destinations are fixtures, including familiar application names. They are not inspected on this computer. Live mode is separate: it reads the local process catalog and saves inactive reviews, while engine and network observations remain unavailable unless their sources are authenticated.
 
 ## Requests and decisions
 

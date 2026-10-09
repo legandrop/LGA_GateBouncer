@@ -34,7 +34,7 @@ class LocalViewChannel final : public ViewByteChannel {
   public:
     explicit LocalViewChannel(std::atomic_bool &cancelled) : cancelled_(cancelled) {}
     bool authenticate() override {
-        pipe_.value = CreateFileW(ViewPipe, FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE, 0, nullptr,
+        pipe_.value = CreateFileW(ViewPipe, FILE_READ_DATA | FILE_WRITE_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE, 0, nullptr,
             OPEN_EXISTING, FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
         if (pipe_.value == INVALID_HANDLE_VALUE || cancelled_) return false;
         ULONG pid = 0;

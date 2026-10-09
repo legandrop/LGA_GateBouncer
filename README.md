@@ -1,8 +1,10 @@
 # LGA GateBouncer
 
-LGA GateBouncer is a native Windows desktop prototype for reviewing application access policies. The current build is an **offline simulation**: it does not protect your computer, filter traffic or connect to a firewall engine.
+LGA GateBouncer is a native Windows desktop application under development for reviewing application access policies. The current build **does not protect your computer or filter traffic**. Firewall enforcement, service deployment and coverage validation are still in development.
 
-Its six views — Processes, Pending, Activity, Rules, Import and Settings — operate on synthetic fixtures in session memory. Search, filtering, sorting, request review, sample decisions, inactive import candidates and reversible cleanup can be explored without reading your processes or network configuration. Closing the application discards every demo change.
+Live mode lists running processes with the available local metadata and lets you search, filter and sort them. Import analyzes a file you choose and saves reviewed candidates locally, always inactive. Saved reviews survive reopening. Network history and engine status remain explicitly unavailable when their sources cannot be authenticated; an empty list does not prove that no connections occurred.
+
+The six views — Processes, Pending, Activity, Rules, Import and Settings — also offer a separate Simulation mode. Its synthetic fixtures, sample decisions and reversible cleanup stay in session memory. Closing the application discards these demo changes.
 
 The NVIDIA explanation workflow uses local sample responses. No API key can be entered, no credentials are read or saved, and no external request is made. An explanation never decides whether to allow an application or verifies its safety.
 
