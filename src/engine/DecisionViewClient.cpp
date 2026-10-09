@@ -16,7 +16,7 @@ Id correlationId() {
 } // namespace
 DecisionViewClient::DecisionViewClient(bool isolatedQa, QObject *parent,
                                        std::unique_ptr<gb::ipc::ii::SessionChannel> channel)
-    : QObject(parent), blocked_(isolatedQa && !channel), session_(this, std::move(channel), 2) {
+    : QObject(parent), blocked_(isolatedQa && !channel), session_(this, std::move(channel), 3) {
     connect(&session_, &gb::controller::Session::opened, this, &DecisionViewClient::opened);
     connect(&session_, &gb::controller::Session::received, this, &DecisionViewClient::received);
     connect(&session_, &gb::controller::Session::observation, this,
@@ -49,6 +49,8 @@ bool DecisionViewClient::refresh() {
 void DecisionViewClient::invalidate() {
     poll_.stop();
     status_.current = false;
+    serviceContext_.reset();
+    readPeer_.reset();
     recordsCurrent_ = false;
     pending_.clear();
     rules_.clear();
@@ -73,13 +75,42 @@ void DecisionViewClient::fail(const QString &reason) {
     status_.error = reason;
     emit changed();
 }
+std::optional<iv::ServiceContext> DecisionViewClient::serviceContext() const {
+    if (!status_.current || !serviceContext_ || !readPeer_ ||
+        readPeer_->checkLive() != gb::ipc::ii::ReadPeerState::Current ||
+        readPeer_->connection() != status_.connection)
+        return {};
+    return serviceContext_;
+}
+void DecisionViewClient::statusOnly() {
+    recordsCurrent_ = false;
+    pending_.clear(); rules_.clear(); pendingDraft_.clear(); rulesDraft_.clear();
+    expected_ = {}; busy_ = false; subscribed_ = false;
+    status_.error = "Pending request records are not available in this service version.";
+    poll_.start();
+    emit changed();
+}
 bool DecisionViewClient::adoptStatus(const Frame &f) {
-    if ((f.minor != 1 && f.minor != 2) || (connected_ && f.minor != minor_) || validate(f) != Error::Ok ||
+    if ((f.minor != 1 && f.minor != 2 && f.minor != 3) || (connected_ && f.minor != minor_) || validate(f) != Error::Ok ||
         (f.type != Type::Status && f.type != Type::HelloAck))
         return false;
+    std::optional<iv::ServiceContext> context;
+    std::shared_ptr<const gb::ipc::ii::ReadPeerLease> peer;
+    bool contextChanged = false;
+    if (f.minor == 3) {
+        iv::ServiceContext decoded;
+        if (iv::decodeServiceContext(f, decoded) != Error::Ok) return false;
+        peer = session_.readonlyPeer();
+        if (peer && peer->checkLive() == gb::ipc::ii::ReadPeerState::Current && peer->connection() == f.connection) {
+            context = decoded;
+            contextChanged = !serviceContext_ || decoded.serviceEpoch != serviceContext_->serviceEpoch ||
+                decoded.boot != serviceContext_->boot || decoded.engineContext != serviceContext_->engineContext ||
+                decoded.engineBindingGeneration != serviceContext_->engineBindingGeneration;
+        } else contextChanged = serviceContext_.has_value();
+    }
     const auto epoch = idValue(f, Tag::ServiceEpoch), boot = idValue(f, Tag::BootId);
     const auto profile = get(f, Tag::ProfileGeneration);
-    if (epoch != status_.serviceEpoch || boot != status_.bootId || profile != profile_) {
+    if (contextChanged || epoch != status_.serviceEpoch || boot != status_.bootId || profile != profile_) {
         pending_.clear();
         rules_.clear();
         events_.clear();
@@ -88,6 +119,8 @@ bool DecisionViewClient::adoptStatus(const Frame &f) {
         lastEvent_ = 0;
         subscribed_ = false;
     }
+    serviceContext_ = std::move(context);
+    readPeer_ = std::move(peer);
     status_.current = true;
     status_.serviceEpoch = epoch;
     status_.bootId = boot;
@@ -164,6 +197,9 @@ void DecisionViewClient::received(bool ok, Frame f, Id correlation) {
         return;
     }
     if (f.type == Type::ProtocolError) {
+        if (minor_ == 3 && expectedType_ == Type::ListPending && get(f, Tag::ErrorCode) == std::uint16_t(Error::Unsupported)) {
+            statusOnly(); return;
+        }
         fail("View II request rejected (" + QString::number(get(f, Tag::ErrorCode)) + ")");
         return;
     }
@@ -173,6 +209,8 @@ void DecisionViewClient::received(bool ok, Frame f, Id correlation) {
             return;
         }
         emit changed();
+        if (stopping_ || !busy_ || !connected_) return;
+        if (!supported(Type::ListPending, minor_)) { statusOnly(); return; }
         startPages(false);
         return;
     }

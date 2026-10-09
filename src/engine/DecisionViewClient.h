@@ -1,5 +1,5 @@
 #pragma once
-#include "../../common/wire_ii.h"
+#include "../../common/wire_iv.h"
 #include "../../controller/session_qt.h"
 #include "EngineViewClient.h"
 #include <QElapsedTimer>
@@ -7,13 +7,15 @@
 #include <set>
 
 namespace Gate {
-// Cliente ordinary minor2: sólo status, páginas y observaciones. No verbos de mutación.
+// Cliente ordinary minor3: sólo status, páginas y observaciones. No verbos de mutación.
 class DecisionViewClient final : public QObject {
     Q_OBJECT
   public:
     explicit DecisionViewClient(bool isolatedQa, QObject *parent = nullptr,
                                 std::unique_ptr<gb::ipc::ii::SessionChannel> channel = {});
     bool refresh();
+    // Copia de presentación: no demuestra vigencia del motor ni de un pendiente.
+    std::optional<gb::wire::iv::ServiceContext> serviceContext() const;
     void invalidate();
     void stop();
     bool idle() const { return session_.idle(); }
@@ -35,6 +37,7 @@ class DecisionViewClient final : public QObject {
     void received(bool ok, gb::wire::Frame frame, gb::wire::Id correlation);
     void observation(gb::wire::Frame frame);
     void fail(const QString &reason);
+    void statusOnly();
     bool adoptStatus(const gb::wire::Frame &frame);
     bool send(gb::wire::Type type);
     void startPages(bool rules);
@@ -42,6 +45,8 @@ class DecisionViewClient final : public QObject {
     bool blocked_;
     gb::controller::Session session_;
     EngineStatus status_;
+    std::optional<gb::wire::iv::ServiceContext> serviceContext_;
+    std::shared_ptr<const gb::ipc::ii::ReadPeerLease> readPeer_;
     QTimer poll_;
     QElapsedTimer pageAge_;
     bool stopping_ = false, connected_ = false, busy_ = false;

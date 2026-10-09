@@ -6,6 +6,8 @@
 #include "engine/ReviewGateway.h"
 #include <QMainWindow>
 #include <QPointer>
+#include "assistance/ui/GeneralSession.h"
+#include "assistance/ui/GeneralConnection.h"
 
 class QVBoxLayout;
 class QHBoxLayout;
@@ -24,6 +26,7 @@ class MainWindow final : public QMainWindow {
     explicit MainWindow(QWidget *parent = nullptr, bool isolatedQa = false, const QString &qaRoot = {},
                         std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel = {},
                         std::unique_ptr<ReviewBackend> reviewer = {});
+    ~MainWindow() override;
     ProductController *product() { return &product_; }
     void setMode(UiMode mode);
     Simulation *simulation() { return &model_; }
@@ -36,8 +39,13 @@ class MainWindow final : public QMainWindow {
                         std::unique_ptr<Lifecycle::StartupPreference> startup = {});
     Lifecycle::LifecycleController *lifecycle() const { return lifecycle_; }
     void requestGuiShutdown();
-    bool guiDrained() const { return closing_ && product_.idle() && reviewer_.idle(); }
+    bool guiDrained() const { return closing_ && product_.idle() && reviewer_.idle() && (!assistanceConnection_ || assistanceConnection_->idle()); }
     ReviewGateway *reviewer() { return &reviewer_; }
+    void setAssistance(std::unique_ptr<Assistance::Ui::GeneralSession> session);
+    Assistance::Ui::GeneralSession* assistance() const {return assistance_.get();}
+    void enableNativeAssistance();
+  signals:
+    void assistanceConnectRequested();
 
   protected:
     void closeEvent(QCloseEvent *event) override;
@@ -80,6 +88,8 @@ class MainWindow final : public QMainWindow {
     void tableAction(const QModelIndex &index);
     Simulation model_;
     Explanation explanation_;
+    std::unique_ptr<Assistance::Ui::GeneralSession> assistance_;
+    std::unique_ptr<Assistance::Ui::GeneralConnection> assistanceConnection_;
     ProductController product_;
     ReviewGateway reviewer_;
     QPointer<Lifecycle::LifecycleController> lifecycle_;

@@ -10,7 +10,7 @@ Direction-aware service records distinguish outbound attempts, inbound attempts 
 
 The six views — Processes, Pending, Activity, Rules, Import and Settings — also offer a separate Simulation mode. Its synthetic fixtures, sample decisions and reversible cleanup stay in session memory. Closing the application discards these demo changes.
 
-The NVIDIA explanation workflow in this desktop build uses local sample responses. No API key can be entered, no credentials are read or saved, and no external request is made. An explanation never decides whether to allow an application or verifies its safety.
+Live Settings can connect to a separate local helper to store or forget your API key, select an explanation mode and review separate model and web search consents. Configuration changes are confirmed by reading the stored state back. The current reviewed provider catalog has no operational entries, so external explanations remain unavailable. The current service context reports status but cannot yet supply an authenticated pending request to this explanation workflow. Automatic explanations, web results and sources remain incomplete. Simulation retains local sample responses. An explanation never grants access or verifies an application's safety.
 
 When a tray is available, closing hides the window in the notification area. If the tray is unavailable, closing exits after active local work finishes. Quit also waits for that work to finish. The desktop startup preference concerns this window, separately from deployment and startup of the policy service. These controls do not establish that a service is running or that filtering is active.
 
@@ -22,7 +22,7 @@ The existing development configuration uses Qt 6.8.2 (MinGW 64-bit), MinGW 13.1,
 compilar.bat --no-run
 ```
 
-The script builds `build\GateBouncer.exe` and separate decision-review components, without starting them. Set `GATEBOUNCER_BUILD_DIR` to choose another build directory. Qt runtime libraries and its Windows platform plugin are required to run the resulting executable; this repository does not include a runtime distribution or installer. Elevated review additionally requires a protected, verified deployment, rather than binaries copied into an arbitrary directory.
+The script builds `build\GateBouncer.exe`, the local assistance helper and separate decision-review components, without starting them. Set `GATEBOUNCER_BUILD_DIR` to choose another build directory. Qt runtime libraries and its Windows platform plugin are required to run the resulting executable; this repository does not include a runtime distribution or installer. Elevated review additionally requires a protected, verified deployment, rather than binaries copied into an arbitrary directory.
 
 The experimental policy service uses a separate MSVC build and serialized IPC. See its [build and scope](service/README.md). Tests and compilation do not establish enforcement, boot coverage or coexistence with another firewall.
 

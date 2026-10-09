@@ -8,9 +8,19 @@ find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets)
 qt_standard_project_setup(REQUIRES 6.8)
 add_subdirectory(src/data)
 add_subdirectory(src/assistance)
+add_subdirectory(src/localfacts)
+set_target_properties(GateBouncerSignatureHelper PROPERTIES EXCLUDE_FROM_ALL TRUE)
 add_subdirectory(src/lifecycle)
 qt_add_library(gatebouncer_wire STATIC common/wire_v1.cpp common/wire_ii.cpp common/wire_iv.cpp common/review_open.cpp)
 target_include_directories(gatebouncer_wire PUBLIC common)
+qt_add_library(gatebouncer_service_view_ui STATIC
+    src/engine/DecisionViewClient.cpp src/engine/DecisionViewClient.h
+    controller/session_qt.cpp controller/session_qt.h
+)
+target_link_libraries(gatebouncer_service_view_ui PUBLIC Qt6::Core gatebouncer_native_ii)
+target_include_directories(gatebouncer_service_view_ui PUBLIC src common controller)
+target_compile_definitions(gatebouncer_service_view_ui PRIVATE UNICODE _UNICODE NOMINMAX)
+target_compile_options(gatebouncer_service_view_ui PRIVATE -Wall -Wextra -Wpedantic)
 
 qt_add_executable(GateBouncer WIN32
     src/main.cpp
@@ -24,15 +34,11 @@ qt_add_executable(GateBouncer WIN32
     src/productcontroller.h
     src/engine/EngineViewClient.cpp
     src/engine/EngineViewClient.h
-    src/engine/DecisionViewClient.cpp
-    src/engine/DecisionViewClient.h
     src/engine/ReviewGateway.cpp
     src/engine/ReviewGateway.h
-    controller/session_qt.cpp
-    controller/session_qt.h
     resources/app.rc
 )
-target_link_libraries(GateBouncer PRIVATE Qt6::Widgets gatebouncer_data gatebouncer_assistance gatebouncer_wire gatebouncer_lifecycle advapi32)
+target_link_libraries(GateBouncer PRIVATE Qt6::Widgets gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle advapi32)
 target_include_directories(GateBouncer PRIVATE src common)
 target_compile_options(GateBouncer PRIVATE -Wall -Wextra -Wpedantic)
 qt_add_resources(GateBouncer "gatebouncer_assets"
@@ -78,6 +84,9 @@ target_compile_options(GateBouncerDecisionStage PRIVATE -Wall -Wextra -Wpedantic
 target_compile_definitions(GateBouncerDecisionStage PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00)
 set_target_properties(GateBouncerDecisionStage PROPERTIES PREFIX "")
 target_link_libraries(GateBouncer PRIVATE gatebouncer_native_ii shell32)
+qt_add_executable(GateBouncerAssistant WIN32 src/assistance/broker/BrokerMain.cpp)
+target_link_libraries(GateBouncerAssistant PRIVATE gatebouncer_general_live)
+target_compile_options(GateBouncerAssistant PRIVATE -Wall -Wextra -Wpedantic)
 foreach(target gatebouncer_wire gatebouncer_review gatebouncer_decisions)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic)
 endforeach()

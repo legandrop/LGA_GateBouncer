@@ -25,6 +25,7 @@ int main(int argc, char **argv) {
         return result;
 #else
     Gate::MainWindow window;
+    window.enableNativeAssistance();
     auto startup = std::make_unique<Gate::Lifecycle::StartupPreference>(
         QCoreApplication::applicationFilePath(), Gate::Lifecycle::makeNativeRunBackend(),
         Gate::Lifecycle::makeOrdinaryGuiDeploymentValidator());

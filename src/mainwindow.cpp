@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "assistance/ui/SettingsWidget.h"
 #include <QAbstractTableModel>
 #include <QApplication>
 #include <QButtonGroup>
@@ -527,11 +528,27 @@ MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
         for (auto *status : findChildren<QLabel *>("reviewer-status")) status->setText(reviewer_.status());
     });
     connect(&product_, &ProductController::invalidated, this, [this] {
+        if(assistance_)assistance_->invalidate();
         explanation_.close(); reviewer_.invalidate(); closeStaleModal(); selected_.clear();
         if (detail_) { dispose(detail_); detail_.clear(); }
     });
     qApp->installEventFilter(this);
     QTimer::singleShot(0, &product_, &ProductController::refreshProcesses);
+}
+MainWindow::~MainWindow(){
+    if(assistanceConnection_)assistanceConnection_->close();
+    if(assistance_)assistance_->close();
+    assistanceConnection_.reset();
+}
+void MainWindow::enableNativeAssistance(){
+    if(closing_||assistanceConnection_)return;
+    assistanceConnection_=std::make_unique<Assistance::Ui::GeneralConnection>(*this);
+    connect(assistanceConnection_.get(),&Assistance::Ui::GeneralConnection::failed,this,&MainWindow::message);
+}
+void MainWindow::setAssistance(std::unique_ptr<Assistance::Ui::GeneralSession> session) {
+    if(assistance_)assistance_->close();
+    assistance_=std::move(session);
+    buildPage();
 }
 void MainWindow::startLifecycle(std::unique_ptr<Lifecycle::TraySurface> tray, bool minimized,
                                 std::unique_ptr<Lifecycle::StartupPreference> startup) {
@@ -563,6 +580,8 @@ void MainWindow::requestGuiShutdown() {
     if (closing_) return;
     if (lifecycle_ && !lifecycle_->quitPending()) { lifecycle_->requestQuit(); return; }
     closing_ = true;
+    if(assistanceConnection_)assistanceConnection_->close();
+    if(assistance_)assistance_->close();
     explanation_.close();
     model_.setEnabled(false);
     product_.stop();
@@ -573,7 +592,7 @@ void MainWindow::requestGuiShutdown() {
 }
 void MainWindow::finishShutdownWhenIdle() {
     if (!closing_) return;
-    if (!product_.idle() || !reviewer_.idle()) {
+    if (!guiDrained()) {
         QTimer::singleShot(50, this, &MainWindow::finishShutdownWhenIdle);
         return;
     }
@@ -705,6 +724,7 @@ void MainWindow::buildShell() {
     rootLayout->addWidget(shell, 1);
 }
 void MainWindow::selectView(const QString &view) {
+    if(assistance_)assistance_->cancel();
     if (!navigation_.contains(view))
         return;
     saveViewState();
@@ -725,9 +745,10 @@ void MainWindow::selectView(const QString &view) {
 }
 void MainWindow::closeEvent(QCloseEvent *event) {
     if (!closing_) {
-        closing_ = true; explanation_.close(); model_.setEnabled(false); product_.stop(); reviewer_.stop();
+        if(assistanceConnection_)assistanceConnection_->close();
+        closing_ = true; if(assistance_)assistance_->close(); explanation_.close(); model_.setEnabled(false); product_.stop(); reviewer_.stop();
     }
-    if (!product_.idle() || !reviewer_.idle()) {
+    if (!guiDrained()) {
         event->ignore(); setEnabled(false);
         QTimer::singleShot(50, this, [this] { close(); });
         return;
@@ -787,7 +808,7 @@ void MainWindow::buildPage() {
             {"activity", {"Activity", "Observed attempts and gaps · authorization and traffic unavailable."}},
             {"rules", {"Rules", "Service policy records and inactive local review candidates."}},
             {"import", {"Import from NetLimiter", "Structural analysis only · compatibility not validated."}},
-            {"settings", {"Settings", "Read only engine status and local sample preferences."}}};
+            {"settings", {"Settings", "Engine status and assistance configuration with separate consents."}}};
         title_->setText(liveHeadings[view_][0]); subtitle_->setText(liveHeadings[view_][1]);
         renderLive(); refreshing_ = false; refreshTable(true); restoreFocus(); positionOverlays(); return;
     }
@@ -1815,33 +1836,35 @@ void MainWindow::renderLive() {
         auto *content = new QWidget; auto *l = new QVBoxLayout(content); l->setContentsMargins(0, 0, 0, 15); l->setSpacing(12); content->setMaximumWidth(830);
         modeSelector(l);
         auto *panel = frame("panel"); auto *p = new QVBoxLayout(panel); p->setContentsMargins(16, 16, 16, 16); p->setSpacing(8);
-        p->addWidget(label("Engine status · View only", "heading")); p->addWidget(label(product_.engineSummary(), "warning", true));
-        p->addWidget(label(product_.revisionSummary(), "muted", true));
-        if (!product_.engine().error.isEmpty()) p->addWidget(label(product_.engine().error, "muted", true));
-        auto *refresh = button("Refresh engine status", "refresh-engine"); p->addWidget(refresh, 0, Qt::AlignLeft);
+        p->addWidget(label("Network engine", "heading"));
+        p->addWidget(label(product_.engine().current ? "Connected · reading service status" : "Not connected", "warning", true));
+        p->addWidget(label("Network protection has not been validated. This window lets you inspect requests; each decision needs a separate administrator confirmation.", "faint", true));
+        auto *refresh = button("Refresh connection", "refresh-engine"); p->addWidget(refresh, 0, Qt::AlignLeft);
         connect(refresh, &QPushButton::clicked, &product_, &ProductController::refreshEngine);
-        auto *connectRecords = button("Connect service request records", "connect-view-ii"); p->addWidget(connectRecords, 0, Qt::AlignLeft);
+        auto *connectRecords = button("Connect requests", "connect-view-ii"); p->addWidget(connectRecords, 0, Qt::AlignLeft);
         connect(connectRecords, &QPushButton::clicked, &product_, &ProductController::selectDecisionRecords);
-        auto *statusOnly = button("Use status-only connection", "select-view-i", "ghost"); p->addWidget(statusOnly, 0, Qt::AlignLeft);
+        auto *advancedToggle = button("Advanced", "engine-advanced", "ghost");
+        advancedToggle->setCheckable(true);p->addWidget(advancedToggle, 0, Qt::AlignLeft);
+        auto *advanced = new QWidget(panel);auto *advancedLayout = new QVBoxLayout(advanced);
+        advancedLayout->setContentsMargins(0, 0, 0, 0);advanced->hide();p->addWidget(advanced);
+        connect(advancedToggle, &QPushButton::toggled, advanced, &QWidget::setVisible);
+        advancedLayout->addWidget(label(product_.engineSummary(), "muted", true));
+        advancedLayout->addWidget(label(product_.revisionSummary(), "muted", true));
+        if (!product_.engine().error.isEmpty()) advancedLayout->addWidget(label(product_.engine().error, "muted", true));
+        auto *statusOnly = button("Use status-only connection", "select-view-i", "ghost"); advancedLayout->addWidget(statusOnly, 0, Qt::AlignLeft);
         connect(statusOnly, &QPushButton::clicked, &product_, &ProductController::selectStatusOnly);
-        p->addWidget(label(product_.recordsSelected() ? "Selected source: service records · connection failure makes records unavailable" : "Selected source: engine status only", "faint", true));
-        p->addWidget(label("Coverage has not been validated. Permanent path rules span every matching instance and account. Outbound Allow is limited to unicast destinations; Both also opens inbound and removes that limit only after explicit review. Once, duration and instance scopes are unavailable.", "faint", true)); l->addWidget(panel);
+        advancedLayout->addWidget(label(product_.recordsSelected() ? "Selected source: service records · connection failure makes records unavailable" : "Selected source: engine status only", "faint", true));
+        advancedLayout->addWidget(label("Coverage has not been validated. Permanent path rules span every matching instance and account. Outbound Allow is limited to unicast destinations; Both also opens inbound and removes that limit only after explicit review. Once, duration and instance scopes are unavailable.", "faint", true)); l->addWidget(panel);
         auto *reviewPanel = frame("panel"); auto *rp = new QVBoxLayout(reviewPanel); rp->setContentsMargins(16, 16, 16, 16); rp->setSpacing(8);
         rp->addWidget(label("Administrator reviewer", "heading"));
-        rp->addWidget(label("Enable the protected reviewer once for this session with an explicit administrator prompt. Each request still requires confirmation in its own window. An ordinary queue entry never chooses Allow or Block.", "muted", true));
+        rp->addWidget(label("Enable the reviewer to decide each request in a separate administrator window.", "muted", true));
         auto *reviewStatus = label(reviewer_.status(), "warning", true); reviewStatus->setObjectName("reviewer-status"); rp->addWidget(reviewStatus);
         auto *enableReviewer = button("Enable administrator reviewer…", "enable-reviewer"); rp->addWidget(enableReviewer, 0, Qt::AlignLeft);
         connect(enableReviewer, &QPushButton::clicked, &reviewer_, &ReviewGateway::launch);
-        rp->addWidget(label("A protected installed package is required. The portable development build cannot establish it. Enabling does not install or activate the firewall service.", "faint", true)); l->addWidget(reviewPanel);
-        auto *sample = frame("panel"); auto *s = new QVBoxLayout(sample); s->setContentsMargins(16, 16, 16, 16); s->setSpacing(8);
-        s->addWidget(label("Sample explanation · no data sent", "heading"));
-        s->addWidget(label("Public facts for installed processes are unavailable. Choose Simulation to explore explanations from the synthetic public catalog.", "muted", true));
-        auto *key = new QLineEdit; key->setObjectName("nvidia-demo-key"); key->setReadOnly(true); key->setPlaceholderText("Real API keys are not supported in this build"); s->addWidget(key);
-        auto *configured = button(explanation_.configured() ? "Remove sample configuration" : "Use sample configured state", "sample-configuration"); s->addWidget(configured, 0, Qt::AlignLeft);
-        connect(configured, &QPushButton::clicked, this, [this] { explanation_.configure(!explanation_.configured()); buildPage(); });
-        auto *consent = new QCheckBox("I consent to the local sample explanation demo · no data sent"); consent->setObjectName("lookup-consent"); consent->setChecked(explanation_.consent()); consent->setEnabled(explanation_.configured()); s->addWidget(consent);
-        connect(consent, &QCheckBox::toggled, this, [this](bool on) { explanation_.setConsent(on); buildPage(); });
-        s->addWidget(label(explanation_.disclaimer(), "faint", true)); l->addWidget(sample);
+        rp->addWidget(label("Unavailable in this portable build. A protected installation is required.", "faint", true)); l->addWidget(reviewPanel);
+        auto* assistancePanel=new Assistance::Ui::SettingsWidget(assistance_.get(),content);
+        connect(assistancePanel,&Assistance::Ui::SettingsWidget::connectRequested,this,&MainWindow::assistanceConnectRequested);
+        l->addWidget(assistancePanel);
         auto *lifecyclePanel = frame("panel");
         auto *lp = new QVBoxLayout(lifecyclePanel);
         lp->setContentsMargins(16, 16, 16, 16); lp->setSpacing(8);
@@ -2029,6 +2052,7 @@ void MainWindow::closeStaleModal() {
         (modalOwner_ == ModalOwner::Live && (product_.simulation() || product_.generation() != modalGeneration_ || !product_.engine().current))) closeModal();
 }
 void MainWindow::closeModal() {
+    if(modalOwner_==ModalOwner::Live&&assistance_)assistance_->cancel();
     if (modalOverlay_) {
         dispose(modalOverlay_);
         modalOverlay_.clear();

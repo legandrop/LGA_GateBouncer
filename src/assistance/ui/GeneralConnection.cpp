@@ -1,0 +1,75 @@
+#include "GeneralConnection.h"
+#include "../broker/BrokerLauncher.h"
+#include "../../mainwindow.h"
+#include <QCoreApplication>
+#include <QTimer>
+
+namespace Gate::Assistance::Ui {
+struct GeneralConnection::LaunchResult {std::unique_ptr<Broker::PipeSession> session;};
+struct GeneralConnection::SettingsView {
+    Broker::Id nonce{},connection{};
+    std::uint64_t generation=0;
+    QPointer<MainWindow> window;
+    std::weak_ptr<General::FrameChannel> channel;
+    bool retired=false;
+    bool current(const Broker::Id& captured,std::uint64_t revision) const {
+        const auto live=channel.lock();
+        return !retired&&window&&Broker::nonzero(nonce)&&nonce==captured&&generation==revision&&
+            live&&live->connection()==connection&&live->peerCurrent()&&!retired&&window;
+    }
+};
+GeneralConnection::GeneralConnection(MainWindow& window):QObject(&window),window_(&window){
+    connect(&window,&MainWindow::assistanceConnectRequested,this,&GeneralConnection::connectBroker);
+}
+GeneralConnection::~GeneralConnection(){
+    close();
+    // Launcher tiene un deadline propio de cinco segundos; no queda un hijo sin dueño.
+    if(worker_){worker_->disconnect(this);worker_->wait();delete worker_;worker_=nullptr;}
+    if(launch_&&launch_->session)launch_->session->stop();
+}
+bool GeneralConnection::idle() const{return !worker_||!worker_->isRunning();}
+void GeneralConnection::close(){
+    closed_=true;
+    if(settings_){settings_->retired=true;if(const auto live=settings_->channel.lock())live->stop();settings_.reset();}
+    if(launch_&&idle()&&launch_->session)launch_->session->stop();
+}
+void GeneralConnection::connectBroker(){
+    if(closed_||worker_||!window_)return;
+    if(settings_){settings_->retired=true;if(const auto live=settings_->channel.lock())live->stop();settings_.reset();}
+    window_->setAssistance({});
+    if(generation_==UINT64_MAX){close();emit failed("The assistance connection must be restarted.");return;}
+    const auto serial=++generation_;
+    launch_=std::make_shared<LaunchResult>();const auto result=launch_;
+    auto* guiThread=QCoreApplication::instance()->thread();
+    worker_=QThread::create([result,guiThread]{
+        result->session=Broker::launchSiblingBroker(Broker::WireVersion::General3);
+        if(result->session)result->session->moveToThread(guiThread);
+    });
+    const auto thread=worker_;
+    connect(thread,&QThread::finished,this,[this,thread,result,serial]{
+        worker_=nullptr;thread->deleteLater();launch_.reset();
+        if(closed_||!window_||serial!=generation_){if(result->session)result->session->stop();return;}
+        if(!result->session){emit failed("Assistance could not connect. Try connecting again.");return;}
+        auto view=std::make_shared<SettingsView>();view->window=window_;view->generation=serial;
+        if(!Broker::randomId(view->nonce)){result->session->stop();emit failed("Assistance could not create a safe connection.");return;}
+        view->connection=result->session->connection();
+        auto channel=std::make_shared<General::PipeFrameChannel>(std::move(result->session));view->channel=channel;
+        settings_=view;const auto nonce=view->nonce;
+        const std::weak_ptr<SettingsView> weak=view;
+        auto session=std::make_unique<GeneralSession>(std::move(channel),GeneralSession::Current{},[weak,nonce,serial]{
+            const auto owner=weak.lock();return owner&&owner->current(nonce,serial);
+        },Broker::generalSearchConfiguration());
+        window_->setAssistance(std::move(session));
+        // La configuración no depende de que exista un registro pendiente canónico.
+        QPointer<GeneralSession> observed=window_->assistance();auto* initial=new QTimer(this);initial->setInterval(50);
+        connect(initial,&QTimer::timeout,this,[this,initial,observed,weak,nonce,serial,attempts=0]() mutable {
+            const auto owner=weak.lock();
+            if(closed_||serial!=generation_||!observed||!owner||owner->retired||observed->configuration()){
+                initial->stop();initial->deleteLater();return;
+            }
+            if(++attempts>60){initial->stop();initial->deleteLater();emit failed("Connected, but settings could not be read. Refresh to try again.");return;}
+            if(owner->current(nonce,serial)&&!observed->busy())observed->refresh();
+        });initial->start();
+    });worker_->start();
+}
+}
