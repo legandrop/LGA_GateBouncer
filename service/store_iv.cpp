@@ -57,6 +57,40 @@ bool SnapshotStore::uncertain() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return uncertain_;
 }
+StoreWrite SnapshotStore::completeOwned(std::uint64_t sequence, std::uint64_t desired,
+    std::uint64_t completed, void *context, BeforeSeal before, AfterSeal after) noexcept {
+  StoreWrite result;
+  try {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!loaded_ || !lease_ || uncertain_ || !context || !before || !after ||
+        read_.kind != StoredImage::Principal || read_.snapshot.sequence != sequence ||
+        read_.snapshot.desired != desired || read_.snapshot.storedState != State::Prepared ||
+        sequence == UINT64_MAX) return result;
+    bool same = false, exists = false;
+    // Exacta preimagen Prepared bajo el MISMO lease y mutex hasta compare final.
+    if (!file_->compare(active_.data(), active_.size(), same, exists) || !exists || !same) {
+      uncertain_ = true; result.error = Error::Stale; return result;
+    }
+    if (!before(context)) { result.error = Error::RecoveryRequired; return result; }
+    read_ = {}; // Destruir subviews, incluido el alias encoded, antes de editar B.
+    Snapshot final;
+    if (!active_.sealApplied(completed, final)) {
+      uncertain_ = true; result.error = Error::RecoveryRequired; return result;
+    }
+    if (!after(context, active_)) {
+      uncertain_ = true; result.error = Error::RecoveryRequired; return result;
+    }
+    const bool saved = file_->replaceView(active_.data(), active_.size());
+    const bool compared = file_->compare(active_.data(), active_.size(), same, exists);
+    if (!saved || !compared || !exists || !same) {
+      uncertain_ = true; return result; // No tercer read, replay ni ACK por compare=true.
+    }
+    read_.kind = StoredImage::Principal; read_.snapshot = std::move(final);
+    result.error = Error::Ok; result.physicallyConfirmed = true;
+    result.observed = StoredImage::Principal; result.observedSequence = sequence + 1;
+    return result;
+  } catch (...) { uncertain_ = true; return result; }
+}
 StoreWrite SnapshotStore::replace(std::uint64_t sequence, std::uint64_t desired,
                                   Bytes candidate) {
   return replaceOwned(sequence, desired, ByteView(std::move(candidate)), true);

@@ -4,6 +4,7 @@
 #endif
 #include "policy.h"
 #include "coordinator_iii.h"
+#include "catalog_plan_iv.h"
 #include <windows.h>
 #include <fwpmu.h>
 #include <atomic>
@@ -27,6 +28,11 @@ public:
     bool directionalCoverageValidated() const { return false; }
     void attachCollector(decisions::NativeCollector* collector);
 private:
+    friend class decisions::NativeRuntime;
+    decisions::CatalogPlanBuilder::WriteOutcome applyPrincipalPlan(
+        decisions::CatalogPlanBuilder &,
+        const std::shared_ptr<const decisions::allnative::CatalogSnapshot> &,
+        decisions::CatalogPlanBuilder::VerifyBeforeWrite, void *) noexcept;
     static void CALLBACK eventCallback(void* context,const FWPM_NET_EVENT1* event);
     SelectorRegistry& registry_;
     HANDLE engine_=nullptr,subscription_=nullptr;

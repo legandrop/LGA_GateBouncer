@@ -84,6 +84,23 @@ bool guestActivationAuthorized(){
 }
 WfpBackend::~WfpBackend(){if(subscription_)FwpmNetEventUnsubscribe0(engine_,subscription_);if(engine_)FwpmEngineClose0(engine_);}
 bool WfpBackend::available()const{if(!engine_)return false;FWP_VALUE0* value=nullptr;auto error=FwpmEngineGetOption0(engine_,FWPM_ENGINE_COLLECT_NET_EVENTS,&value);if(value)FwpmFreeMemory0(reinterpret_cast<void**>(&value));return error==ERROR_SUCCESS;}
+decisions::CatalogPlanBuilder::WriteOutcome WfpBackend::applyPrincipalPlan(
+    decisions::CatalogPlanBuilder &plan,
+    const std::shared_ptr<const decisions::allnative::CatalogSnapshot> &before,
+    decisions::CatalogPlanBuilder::VerifyBeforeWrite verify, void *context) noexcept {
+    if (!engine_ || !guestActivationAuthorized() || !verify || !context) return {};
+    struct Check {
+        HANDLE engine;
+        decisions::CatalogPlanBuilder::VerifyBeforeWrite verify;
+        void *context;
+    } check{engine_, verify, context};
+    auto inside = [](void *raw) noexcept {
+        auto &check = *static_cast<Check *>(raw);
+        try { return objectIdentity(check.engine) && check.verify(check.context); }
+        catch (...) { return false; }
+    };
+    return plan.transact(engine_, decisions::CatalogPlanBuilder::WriteApi{}, before, inside, &check);
+}
 bool WfpBackend::connectGuest(){
     if(!guestActivationAuthorized()||engine_)return false;
     FWPM_SESSION0 session{};session.displayData.name=const_cast<wchar_t*>(L"LGA GateBouncer lab");session.txnWaitTimeoutInMSec=5000;

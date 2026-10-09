@@ -43,6 +43,11 @@ constexpr std::size_t MetadataEnvelope =
     4 * 2 * allnative::MaxCatalogRules * (sizeof(principal::Rule) + sizeof(principal::ByteView)) +
     allnative::MaxCatalogRules * 128;
 constexpr std::size_t WorkspaceEnvelope = 64 * 1024, ControlEnvelope = 4096;
+// Serializer directo: índice de reglas32KiB, entrada nueva≤4KiB, comparación
+// APP/SID temporal≤66KiB y testigo/headers/hash/control acotados. Las cuatro
+// metadata completas ya están cargadas en MetadataEnvelope; nunca payload32.
+constexpr std::size_t WriterEnvelope = 192 * 1024 +
+    sizeof(principal::Entry) + sizeof(principal::Snapshot) + sizeof(principal::Legacy) + 64;
 bool slice(const principal::ByteView &whole, const principal::ByteView &part,
            allnative::ArenaSlice &out) noexcept {
   out = {};
@@ -64,7 +69,7 @@ CatalogPlanBuilder::CatalogPlanBuilder(allnative::CatalogRegistry &registry,
     : storage_(registry, capacity, rules, slots), maxRules_(rules), maxSlots_(slots) {
   const auto &s = *storage_.storage_;
   const auto aux = sizeof(*this) + sizeof(s) + sizeof(allnative::NativeSource) +
-                   ControlEnvelope + MetadataEnvelope + WorkspaceEnvelope +
+                   ControlEnvelope + MetadataEnvelope + WorkspaceEnvelope + WriterEnvelope +
                    s.rules_.capacity() * sizeof(allnative::RuleSnapshot) +
                    s.slots_.capacity() * sizeof(allnative::SlotRecord) +
                    (s.keyIndex_.capacity() + s.idIndex_.capacity()) * sizeof(std::uint32_t);
@@ -232,6 +237,123 @@ Reason CatalogPlanBuilder::expected(std::size_t index, recipe::RecipeWorkspace &
   out = {};
   return phase_ == Phase::Staged && storage_.storage_
              ? storage_.storage_->expectedSlot(index, workspace, out) : Reason::StaleStamp;
+}
+bool CatalogPlanBuilder::detachOutcomeArena() noexcept {
+  if (phase_ != Phase::Staged || !storage_.storage_ || outcomePointer_ ||
+      observed_ != storage_.storage_->slots_.size() || !storage_.storage_->arena_) return false;
+  const auto &arena = storage_.storage_->arena_;
+  outcomePointer_ = arena->data(); outcomeSize_ = arena->size(); outcomeCapacity_ = arena->ownedCapacityBytes();
+  storage_.storage_->arena_.reset();
+  return true;
+}
+bool CatalogPlanBuilder::attachOutcomeArena(const principal::ByteView &bytes) noexcept {
+  if (phase_ != Phase::Staged || !storage_.storage_ || !outcomePointer_ ||
+      storage_.storage_->arena_ || bytes.data() != outcomePointer_ || bytes.size() != outcomeSize_ ||
+      bytes.ownedCapacityBytes() != outcomeCapacity_) return false;
+  try {
+    auto arena = allnative::CatalogStorageBuilder::fromView(bytes);
+    if (arena->retainBudget(storage_.storage_->charge_->state, &storage_,
+          &allnative::CatalogStorageBuilder::budgetFactory) != allnative::BudgetRetention::Existing) return false;
+    storage_.storage_->arena_ = std::move(arena);
+    outcomePointer_ = nullptr; outcomeSize_ = outcomeCapacity_ = 0;
+    return true;
+  } catch (...) { return false; }
+}
+CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transact(
+    HANDLE engine, const WriteApi &api,
+    const std::shared_ptr<const allnative::CatalogSnapshot> &before,
+    VerifyBeforeWrite verify, void *context) noexcept {
+  WriteOutcome result;
+  if (phase_ != Phase::Staged || !storage_.storage_ || writeAttempted_ ||
+      !engine || !before || !verify || !context || !api.begin || !api.commit ||
+      !api.abort || !api.erase || !api.add)
+    return result;
+  const auto &after = *storage_.storage_;
+  if (!after.binding_ || !before->binding_ ||
+      after.binding_->epoch != before->binding_->epoch ||
+      after.binding_->generation != before->binding_->generation ||
+      before->desired_ == UINT64_MAX ||
+      after.desired_ != before->desired_ + 1 ||
+      after.provider_ != before->provider_ || after.sublayer_ != before->sublayer_)
+    return result;
+  // Consumir el intento antes de Begin: un fallo o excepción no habilita replay.
+  writeAttempted_ = true;
+  result.attempted = true;
+  bool transaction = false;
+  struct Abort {
+    HANDLE engine; const WriteApi &api; bool &open; WriteOutcome &result;
+    ~Abort() noexcept {
+      if (open) {
+        open = false;
+        if (api.abort(engine) != ERROR_SUCCESS) result.cleanupUnknown = true;
+      }
+    }
+  } abort{engine, api, transaction, result};
+  try {
+    result.error = api.begin(engine, 0);
+    if (result.error != ERROR_SUCCESS) return result;
+    transaction = true;
+    // El owner verifica inventario A, objetos propios y lease duradero Prepared
+    // dentro de esta transacción; HANDLE/DTO no sustituyen esas adquisiciones.
+    if (!verify(context)) {
+      result.error = ERROR_INVALID_STATE;
+    } else {
+      for (const auto &old : before->slots_) {
+        GUID key{};
+        std::memcpy(&key, old.key.data(), sizeof(key));
+        result.error = api.erase(engine, &key);
+        if (result.error != ERROR_SUCCESS) break;
+      }
+      recipe::RecipeWorkspace workspace{};
+      for (std::size_t i = 0; result.error == ERROR_SUCCESS && i < after.slots_.size(); ++i) {
+        recipe::ExpectedFilterView expected;
+        if (after.expectedSlot(i, workspace, expected) != Reason::None) {
+          result.error = ERROR_INVALID_DATA;
+          break;
+        }
+        FWPM_FILTER0 filter{};
+        auto provider = expected.provider;
+        auto weight = expected.weight;
+        filter.filterKey = expected.key;
+        filter.displayData.name = const_cast<wchar_t *>(expected.name);
+        filter.flags = expected.flags;
+        filter.providerKey = &provider;
+        filter.providerData = {static_cast<UINT32>(expected.providerData.size),
+                              const_cast<UINT8 *>(expected.providerData.data)};
+        filter.layerKey = expected.layer;
+        filter.subLayerKey = expected.sublayer;
+        filter.weight.type = expected.weightType;
+        filter.weight.uint64 = &weight;
+        filter.numFilterConditions = expected.conditionCount;
+        filter.filterCondition = const_cast<FWPM_FILTER_CONDITION0 *>(expected.conditions);
+        filter.action.type = expected.action;
+        filter.action.filterType = expected.actionKey;
+        filter.rawContext = expected.rawContext;
+        // IDs retornados por Add son sólo hints: confirmInventory adquirirá los
+        // IDs y metadata SDK verdaderos antes de freeze/receipt/AppliedCAS.
+        UINT64 ignored = 0;
+        result.error = api.add(engine, &filter, nullptr, &ignored);
+      }
+    }
+    if (result.error == ERROR_SUCCESS) {
+      result.error = api.commit(engine);
+      if (result.error == ERROR_SUCCESS) {
+        transaction = false;
+        result.committed = true;
+      }
+    }
+    if (transaction) {
+      transaction = false;
+      if (api.abort(engine) != ERROR_SUCCESS) result.cleanupUnknown = true;
+    }
+  } catch (...) {
+    result.error = ERROR_INVALID_STATE;
+    if (transaction) {
+      transaction = false;
+      if (api.abort(engine) != ERROR_SUCCESS) result.cleanupUnknown = true;
+    }
+  }
+  return result;
 }
 Reason CatalogPlanBuilder::observe(const FWPM_FILTER0 *borrowed, recipe::ReadBytes read,
                                    recipe::RecipeWorkspace &workspace) noexcept {

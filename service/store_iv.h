@@ -37,6 +37,10 @@ private:
   using RetainRead = bool (*)(void *, const ByteView &) noexcept;
   bool loadRetained(StoreRead &, void *, RetainRead);
   StoreWrite replaceOwned(std::uint64_t, std::uint64_t, ByteView, bool rereadFailure = false);
+  using BeforeSeal = bool (*)(void *) noexcept;
+  using AfterSeal = bool (*)(void *, const ByteView &) noexcept;
+  StoreWrite completeOwned(std::uint64_t sequence, std::uint64_t desired,
+      std::uint64_t completedAt, void *, BeforeSeal, AfterSeal) noexcept;
   bool observe(StoreRead &out);
   std::shared_ptr<directional::SnapshotFile> file_;
   mutable std::mutex mutex_;

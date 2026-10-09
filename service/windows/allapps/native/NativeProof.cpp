@@ -87,6 +87,26 @@ bool NativeSource::readOptions()
 }
 Reason NativeSource::readInventory(const CatalogReceipt &receipt)
 {
+    return readInventory(engine_.engine_, receipt);
+}
+bool NativeSource::retainedCause(const NativeCopiedMetadata &event, const NativeProof &proof,
+    const CatalogReceipt &receipt, Stage required) const noexcept
+{
+    const auto snapshot = std::atomic_load(&catalog_);
+    if ((required != Stage::Active && required != Stage::Drained) || stage() != required ||
+        poisoned_.load() || !snapshot || receipt.snapshot_ != snapshot || receipt.binding_ != binding_ ||
+        event.binding_ != binding_ || event.snapshot_ != snapshot || proof.binding_ != event.binding_ ||
+        proof.snapshot_ != event.snapshot_ || !(proof.stamp_ == event.event_.acquired) ||
+        proof.loss_ != event.event_.acquiredLossRevision ||
+        source_.health().lossRevision != proof.loss_ || proof.view_.role != Role::UnknownAppGate ||
+        proof.view_.action != Action::Block) return false;
+    // Drained conserva sólo la causa adquirida; no recrea Current, cobertura
+    // temporal ni una solicitud retenida en el socket.
+    return required == Stage::Drained || valid(event);
+}
+Reason NativeSource::readInventory(HANDLE engine, const CatalogReceipt &receipt)
+{
+    if (!engine) return Reason::SourceGap;
     if (receipt.binding_ != binding_ || receipt.snapshot_ != std::atomic_load(&catalog_))
         return Reason::StaleStamp;
     const auto &catalog = *receipt.snapshot_;
@@ -112,8 +132,8 @@ Reason NativeSource::readInventory(const CatalogReceipt &receipt)
             pattern.flags = FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME | FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED;
             pattern.actionMask = 0xffffffffu;
         }
-        Enumeration enumeration{sdk_, engine_.engine_, nullptr, cleanupFault, poisoned_};
-        if (sdk_.createEnum(engine_.engine_, layer ? &pattern : nullptr, &enumeration.handle) != ERROR_SUCCESS ||
+        Enumeration enumeration{sdk_, engine, nullptr, cleanupFault, poisoned_};
+        if (sdk_.createEnum(engine, layer ? &pattern : nullptr, &enumeration.handle) != ERROR_SUCCESS ||
             !enumeration.handle)
             return Reason::SourceGap;
         bool terminal = false;
@@ -123,7 +143,7 @@ Reason NativeSource::readInventory(const CatalogReceipt &receipt)
                 return Reason::Exhausted;
             Memory memory{sdk_};
             UINT32 returned = 0;
-            if (sdk_.enumerate(engine_.engine_, enumeration.handle, 16,
+            if (sdk_.enumerate(engine, enumeration.handle, 16,
                                reinterpret_cast<FWPM_FILTER0 ***>(&memory.value), &returned) != ERROR_SUCCESS ||
                 returned > 16 || (returned && !memory.value))
                 return Reason::SourceGap;

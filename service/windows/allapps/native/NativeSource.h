@@ -126,6 +126,9 @@ class NativeSource : public std::enable_shared_from_this<NativeSource>
     bool pushCopied(NativeCopiedMetadata &&) noexcept;
     void clearCopied() noexcept;
     Reason readInventory(const CatalogReceipt &);
+    Reason readInventory(HANDLE, const CatalogReceipt &);
+    bool retainedCause(const NativeCopiedMetadata &, const NativeProof &,
+                       const CatalogReceipt &, Stage) const noexcept;
     Reason reconcile(const CatalogReceipt &);
     bool readOptions();
     EngineLease engine_;

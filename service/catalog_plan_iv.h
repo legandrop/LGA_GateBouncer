@@ -3,10 +3,29 @@
 #include "windows/allapps/native/NativeCatalog.h"
 #include "windows/allapps/native/NativeSdk.h"
 
+namespace gb { class WfpBackend; }
 namespace gb::decisions {
 namespace allnative = gatebouncer::service::windows::allapps::native;
 class CatalogPlanBuilder final {
   friend class NativeRuntime;
+  friend class gb::WfpBackend;
+  struct WriteApi {
+    decltype(&FwpmTransactionBegin0) begin = &FwpmTransactionBegin0;
+    decltype(&FwpmTransactionCommit0) commit = &FwpmTransactionCommit0;
+    decltype(&FwpmTransactionAbort0) abort = &FwpmTransactionAbort0;
+    decltype(&FwpmFilterDeleteByKey0) erase = &FwpmFilterDeleteByKey0;
+    decltype(&FwpmFilterAdd0) add = &FwpmFilterAdd0;
+  };
+  struct WriteOutcome {
+    bool attempted = false, committed = false, cleanupUnknown = false;
+    DWORD error = ERROR_INVALID_STATE;
+  };
+  using VerifyBeforeWrite = bool (*)(void *) noexcept;
+  WriteOutcome transact(HANDLE writeEngine, const WriteApi &,
+      const std::shared_ptr<const allnative::CatalogSnapshot> &before,
+      VerifyBeforeWrite, void *) noexcept;
+  bool detachOutcomeArena() noexcept;
+  bool attachOutcomeArena(const principal::ByteView &) noexcept;
   CatalogPlanBuilder(allnative::CatalogRegistry &, std::size_t arenaCapacity,
                      std::size_t maxRules, std::size_t maxSlots);
   gatebouncer::service::windows::allapps::Reason reservationStatus() const noexcept;
@@ -32,6 +51,9 @@ class CatalogPlanBuilder final {
   gatebouncer::service::windows::allapps::Reason reason_ = gatebouncer::service::windows::allapps::Reason::None;
   enum class Phase { Reserved, Staged, Failed, Frozen };
   Phase phase_ = Phase::Reserved;
+  bool writeAttempted_ = false;
+  const std::uint8_t *outcomePointer_ = nullptr;
+  std::size_t outcomeSize_ = 0, outcomeCapacity_ = 0;
   CatalogPlanBuilder(const CatalogPlanBuilder &) = delete;
   CatalogPlanBuilder &operator=(const CatalogPlanBuilder &) = delete;
 };

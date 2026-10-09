@@ -31,6 +31,198 @@ Frame readOnlyII(Frame f) {
     return f;
 }
 } // namespace
+// Ningún DTO crea esta admisión. El productor canónico futuro debe adquirir
+// y registrar estas capacidades privadas; hasta entonces la tabla está vacía
+// y ListPending3/dispatch de mutaciones permanece cerrado.
+struct NativeRuntime::PrincipalAdmission {
+    Id request{}, binding{};
+    std::uint64_t revision = 0, profile = 0;
+    Digest target{};
+    std::shared_ptr<allnative::NativeSource> source;
+    std::optional<allnative::NativeCopiedMetadata> event;
+    std::optional<allnative::NativeProof> proof;
+    std::optional<principal::Rule> revocation;
+    native::ProcessEvidence actor;
+    native::TokenEvidence identity;
+    bool consumed = false, cancelled = false;
+};
+bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admission,
+    const principal::Entry &command, allnative::Stage requiredStage) const noexcept {
+    try {
+        const auto found = principalAdmissions_.find(admission.request);
+        if (found == principalAdmissions_.end() || found->second.get() != &admission ||
+            admission.cancelled || !admission.revision || admission.source != principalSource_ ||
+            !principalCatalog_ || !admission.source || admission.source->stage() != requiredStage ||
+            admission.source->poisoned_.load() ||
+            (requiredStage != allnative::Stage::Active && requiredStage != allnative::Stage::Drained) ||
+            !admission.actor.current() || !profile_.accepts(admission.identity, false) ||
+            admission.profile != profile_.value().generation || command.command.commandEpoch != epoch_ ||
+            command.command.boot != boot_ || command.command.profileGeneration != admission.profile ||
+            command.command.accountSid != admission.identity.account ||
+            command.command.logonSid != admission.identity.logon ||
+            command.command.sessionId != admission.identity.session) return false;
+        native::Handle token; HANDLE raw = nullptr;
+        if (!OpenProcessToken(admission.actor.process.value, TOKEN_QUERY, &raw)) return false;
+        token.reset(raw); native::TokenEvidence current;
+        if (!native::tokenEvidence(token.value, current) || current.account != admission.identity.account ||
+            current.logon != admission.identity.logon || current.session != admission.identity.session ||
+            !profile_.accepts(current, false)) return false;
+        Frame frame;
+        if (decode(command.command.payload, frame) != Error::Ok ||
+            !find(frame, Tag::TargetDigest) || find(frame, Tag::TargetDigest)->bytes !=
+                Bytes(admission.target.begin(), admission.target.end())) return false;
+        if (frame.type == Type::RevokePrincipalRule) {
+            if (!admission.revocation) return false;
+            const auto &rule = *admission.revocation;
+            const auto currentRule = std::find_if(principalCatalog_->rules_.begin(), principalCatalog_->rules_.end(),
+                [&](const auto &r) { return r.rule == rule.id; });
+            principal::Target target;
+            if (currentRule == principalCatalog_->rules_.end() || rule.kind != 1 ||
+                !principal::parseTarget(rule.target, target)) return false;
+            const auto view = principalCatalog_->ruleView(static_cast<std::size_t>(
+                currentRule - principalCatalog_->rules_.begin()));
+            auto exact = [](const principal::ByteView &bytes, allnative::recipe::ByteView current) {
+                return bytes.size() == current.size && (!current.size ||
+                    std::equal(bytes.data(), bytes.data() + bytes.size(), current.data));
+            };
+            return view.targetKind == 1 && view.packageMode == target.packageMode &&
+                exact(target.app, view.app) && exact(target.user, view.user) && exact(target.package, view.package) &&
+                currentRule->ruleRevision == rule.revision && currentRule->targetRevision == rule.targetRevision &&
+                idValue(frame, Tag::RuleId) == rule.id && get(frame, Tag::RuleRevision) == rule.revision &&
+                get(frame, Tag::TargetRevision) == rule.targetRevision &&
+                principal::targetDigest(rule.target) == admission.target &&
+                target.user == principal::ByteView(current.account);
+        }
+        if (frame.type != Type::CommitFuturePolicy || !admission.event || !admission.proof ||
+            !admission.source->retainedCause(*admission.event, *admission.proof,
+                allnative::CatalogReceipt(principalCatalog_), requiredStage) ||
+            idValue(frame, Tag::SourceEpoch) != admission.source->binding_->epoch ||
+            idValue(frame, Tag::DraftId) != admission.request || get(frame, Tag::DraftVersion) != admission.revision ||
+            idValue(frame, Tag::CaptureBindingId) != admission.binding || get(frame, Tag::AcceptedScope) == 0)
+            return false;
+        return true;
+    } catch (...) { return false; }
+}
+directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &target,
+    const principal::Entry &command, const std::shared_ptr<PrincipalAdmission> &admission) {
+    using Reason = gatebouncer::service::windows::allapps::Reason;
+    directional::Result result;
+    if (!admission || admission->consumed || principalWriteFault_ || !principalMode_ ||
+        !principalStore_ || principalStore_->uncertain() || !observationEngine_ ||
+        !principalAdmissionCurrent(*admission, command) ||
+        principalRead_.kind != principal::StoredImage::Principal ||
+        principalRead_.snapshot.sequence == UINT64_MAX ||
+        target.sequence != principalRead_.snapshot.sequence + 1 ||
+        principalRead_.snapshot.desired == UINT64_MAX ||
+        target.desired != principalRead_.snapshot.desired + 1 ||
+        inventoryRevision_ == UINT64_MAX) return result;
+    admission->consumed = true; // Un resultado incierto nunca admite retransacción.
+    const auto oldCatalog = principalCatalog_;
+    const auto oldSource = principalSource_;
+    try {
+        CatalogPlanBuilder plan(catalogRegistry_, allnative::MaxPolicyArenaBytes,
+                                allnative::MaxCatalogRules, allnative::MaxCatalogSlots);
+        principal::ByteView bytes;
+        if (!principal::ByteView::prepareOwned(target, command, bytes) || !plan.retain(bytes)) return result;
+        principal::Snapshot checked;
+        if (!principal::parse(bytes, checked) ||
+            !principal::validTransition(principalRead_.snapshot.encoded, checked)) return result;
+        const auto rule = std::find_if(checked.rules.begin(), checked.rules.end(), [&](const auto &r) {
+            return r.id == command.command.id;
+        });
+        principal::Target principalTarget;
+        Frame canonicalCommand;
+        if (decode(command.command.payload, canonicalCommand) != Error::Ok) return result;
+        if (canonicalCommand.type == Type::CommitFuturePolicy) {
+        const auto &identity = admission->event->owned().identity;
+        if (rule == checked.rules.end() || !principal::parseTarget(rule->target, principalTarget) ||
+            identity.appId.state != gatebouncer::appidentity::FieldState::Copied ||
+            identity.userSid.state != gatebouncer::appidentity::FieldState::Copied ||
+            principalTarget.app != principal::ByteView(identity.appId.bytes) ||
+            principalTarget.user != principal::ByteView(identity.userSid.bytes) ||
+            identity.userSid.bytes != admission->identity.account ||
+            (principalTarget.packageMode == 2 &&
+             (identity.packageSid.state != gatebouncer::appidentity::FieldState::Copied ||
+              principalTarget.package != principal::ByteView(identity.packageSid.bytes)))) return result;
+        }
+        // Retiro irreversible A antes de crear B: conservar A y sus eventos,
+        // jamás construir un segundo Source bajo RPC/callback/fault pendiente.
+        if (oldSource->stop() != allnative::Stage::Drained) {
+            principalWriteFault_ = true; return result;
+        }
+        auto sdk = allnative::systemSdk();
+        auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
+            allnative::EngineLease(observationEngine_->handle(), observationEngine_->pin()),
+            allnative::BindReceipt(observationEngine_->context_, observationEngine_->generation_), sdk));
+        std::array<std::uint16_t, 8> domain{};
+        std::array<allnative::recipe::SupportField, 32> support{};
+        std::size_t count = 0;
+        if (observationEngine_->readDomain(domain, support, count) != Reason::None ||
+            plan.stage(bytes, source->binding_, inventoryRevision_ + 1, domain,
+                       {support.data(), count}) != Reason::None) return result;
+        const auto sequence = principalRead_.snapshot.sequence;
+        const auto desired = principalRead_.snapshot.desired;
+        auto prepared = principalStore_->replaceOwned(sequence, desired, bytes);
+        if (!prepared.physicallyConfirmed) { principalWriteFault_ = true; return result; }
+        principalRead_ = principalStore_->read_;
+        principalDesired_ = target.desired;
+        result.state = State::Prepared; result.desired = target.desired;
+        result.observedSequence = sequence + 1; result.observed = directional::Observed::Prepared;
+        struct BeforeEffect { NativeRuntime &runtime; PrincipalAdmission &admission;
+            const principal::Entry &command; std::shared_ptr<allnative::NativeSource> source;
+            std::shared_ptr<const allnative::CatalogSnapshot> catalog; } before{
+                *this, *admission, command, oldSource, oldCatalog};
+        auto verify = [](void *raw) noexcept {
+            auto &b = *static_cast<BeforeEffect *>(raw);
+            // El Source A está Drained y conserva catálogo; el read exacto se
+            // ejecuta en engine NO-DYNAMIC dentro de su write transaction.
+            try { b.runtime.profile_.refresh();
+                return b.runtime.principalAdmissionCurrent(b.admission, b.command, allnative::Stage::Drained) &&
+                b.source->readInventory(b.runtime.backend_.engine_,
+                    allnative::CatalogReceipt(b.catalog)) == Reason::None; }
+            catch (...) { return false; }
+        };
+        auto effect = backend_.applyPrincipalPlan(plan, oldCatalog, verify, &before);
+        if (!effect.committed || effect.cleanupUnknown ||
+            plan.confirmInventory(observationEngine_->handle(), sdk, &allnative::guardedRead) != Reason::None) {
+            principalWriteFault_ = true; result.state = State::RecoveryRequired; return result;
+        }
+        result.appliedReal = true; result.state = State::AppliedUnrecorded;
+        profile_.refresh();
+        if (!principalAdmissionCurrent(*admission, command, allnative::Stage::Drained)) {
+            principalWriteFault_ = true; return result;
+        }
+        struct Seal { CatalogPlanBuilder &plan; principal::ByteView &bytes;
+            principal::StoreRead &runtimeRead;
+            principal::Snapshot &parsed; std::shared_ptr<const allnative::CatalogSnapshot> catalog;
+            static bool before(void *raw) noexcept { auto &s = *static_cast<Seal *>(raw);
+                s.bytes = {}; s.parsed = {}; s.runtimeRead = {}; return s.plan.detachOutcomeArena(); }
+            static bool after(void *raw, const principal::ByteView &bytes) noexcept {
+                auto &s = *static_cast<Seal *>(raw);
+                if (!s.plan.attachOutcomeArena(bytes)) return false;
+                s.catalog = s.plan.freeze(); return bool(s.catalog); }
+        } seal{plan, bytes, principalRead_, checked, {}};
+        const auto final = principalStore_->completeOwned(sequence + 1, target.desired,
+            GetTickCount64(), &seal, &Seal::before, &Seal::after);
+        if (!final.physicallyConfirmed) { principalWriteFault_ = true; return result; }
+        principalRead_ = principalStore_->read_;
+        principalCatalog_ = std::move(seal.catalog); principalSource_ = std::move(source);
+        ++inventoryRevision_;
+        const auto started = principalSource_->start(allnative::CatalogReceipt(principalCatalog_));
+        result.durable = true; result.state = State::Applied; result.error = Error::Ok;
+        result.observed = directional::Observed::FinalApplied; result.observedSequence = sequence + 2;
+        // Read-accessible sólo prueba forma. Ningún outcome anuncia protección,
+        // coverageReady ni un permiso efectivo para el cliente.
+        profile_.refresh();
+        if (started != Reason::None || !admission->actor.current() ||
+            admission->cancelled || !profile_.accepts(admission->identity, false) ||
+            profile_.value().generation != admission->profile) {
+            principalWriteFault_ = true;
+            result.state = State::RecoveryRequired; result.error = Error::RecoveryRequired;
+        }
+        return result;
+    } catch (...) { principalWriteFault_ = true; return result; }
+}
 NativeRuntime::NativeRuntime(WfpBackend &b, SelectorRegistry &r,
                              std::filesystem::path store, Bytes account, Id epoch, Id boot)
     : file_(std::move(store)), directions_(b), coordinator_(file_, directions_, r, epoch),
@@ -154,6 +346,7 @@ bool NativeRuntime::loadPrincipalImage() {
             return true;
         }
         principalMode_ = true;
+        principalDesired_ = principalRead_.snapshot.desired;
         if (principalRead_.kind == principal::StoredImage::Principal)
             bindPrincipalObservation(plan);
         // Un archivo histórico, Missing o un fallo de lectura actual no crea
@@ -242,7 +435,7 @@ Frame NativeRuntime::status(Type type, std::uint16_t minor) const {
         frame.type = type;
         frame.fields = {value(Tag::ServiceEpoch, epoch_), value(Tag::BootId, boot_),
             value(Tag::Capabilities, ReadStatus),
-            value(Tag::DesiredRev, principalMode_ ? principalRead_.snapshot.desired : coordinator_.snapshot().desired),
+            value(Tag::DesiredRev, principalMode_ ? principalDesired_ : coordinator_.snapshot().desired),
             value(Tag::EffectiveRev, 0), value(Tag::EffectiveKnown, 0, 1),
             value(Tag::EngineState, unsigned(EngineState::RecoveryRequired), 1)};
         if (type == Type::Status) frame.fields.push_back(value(Tag::GapCount, collector_.gaps()));
@@ -254,7 +447,7 @@ Frame NativeRuntime::status(Type type, std::uint16_t minor) const {
         return frame; // View: sólo identidad/readback accesible, sin permiso ni efecto conocido.
     }
     auto s = coordinator_.snapshot();
-    if (principalMode_) s.desired = principalRead_.snapshot.desired;
+    if (principalMode_) s.desired = principalDesired_;
     auto known = !principalMode_ && loaded_ && !coordinator_.recovery() && directions_.ready() &&
                  coordinator_.currentReadback(s.desired);
     auto active = known && !engine_.recoveryRequired() && engine_.profile().state == 1 &&

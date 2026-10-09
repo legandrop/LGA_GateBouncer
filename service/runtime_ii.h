@@ -32,6 +32,14 @@ class NativeRuntime {
     mutable std::mutex mutex;
 
   private:
+    struct PrincipalAdmission;
+    directional::Result writePrincipal(const principal::Snapshot &, const principal::Entry &,
+        const std::shared_ptr<PrincipalAdmission> &);
+    bool principalAdmissionCurrent(const PrincipalAdmission &, const principal::Entry &,
+        allnative::Stage requiredStage = allnative::Stage::Active) const noexcept;
+    std::map<Id, std::shared_ptr<PrincipalAdmission>> principalAdmissions_;
+    bool principalWriteFault_ = false;
+    std::uint64_t principalDesired_ = 0;
     std::vector<ii::RuleRecord> rules() const;
     Frame error(Error error) const;
     ServiceContext readServiceContext() const noexcept;

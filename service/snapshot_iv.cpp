@@ -14,10 +14,15 @@ struct ByteView::Storage {
   mutable std::mutex mutex;
   const Bytes *const borrowed = nullptr;
   const Bytes bytes;
+  // Sólo el writer privado crea este allocation. Sus vistas siguen siendo
+  // readonly; el sello exige último alias real antes de acceder al vector.
+  const std::unique_ptr<Bytes> exclusive;
+  mutable bool outcomeClosed = false;
   explicit Storage(Bytes value) : bytes(std::move(value)) {}
+  explicit Storage(std::unique_ptr<Bytes> value) : exclusive(std::move(value)) {}
   // Sólo serialize usa este préstamo durante parse; ninguna vista lo exporta.
   explicit Storage(const Bytes *value) : borrowed(value) {}
-  const Bytes &readable() const noexcept { return borrowed ? *borrowed : bytes; }
+  const Bytes &readable() const noexcept { return borrowed ? *borrowed : exclusive ? *exclusive : bytes; }
 };
 ByteView::ByteView(Bytes b)
     : owner_(std::make_shared<const Storage>(std::move(b))),
@@ -28,7 +33,7 @@ const std::uint8_t *ByteView::data() const {
              : nullptr;
 }
 std::size_t ByteView::ownedCapacityBytes() const noexcept {
-  return owner_ && !owner_->borrowed ? owner_->bytes.capacity() : 0;
+  return owner_ && !owner_->borrowed ? owner_->readable().capacity() : 0;
 }
 ByteView::BudgetRetention ByteView::retainBudget(
     std::shared_ptr<const void> registry, void *context,
@@ -46,7 +51,7 @@ ByteView::BudgetRetention ByteView::retainBudget(
     }
     // El factory liga una reserva REAL anterior a allocate/read/serialize.
     // Comprueba aquí la capacidad física completa, aun si ésta es una subvista.
-    auto token = factory(context, owner_->bytes.capacity());
+    auto token = factory(context, owner_->readable().capacity());
     if (!token)
       return BudgetRetention::Rejected;
     owner_->registry = std::move(registry);
@@ -1147,6 +1152,135 @@ bool serialize(const Snapshot &s, Bytes &out) {
   } catch (...) {
     return false;
   }
+}
+bool ByteView::prepareOwned(const Snapshot &s, const Entry &command, ByteView &out) noexcept {
+  try {
+    if (!s.sequence || zero(s.writerEpoch) || s.storedState != State::Prepared ||
+        s.storedKnown || s.effective || s.entries.size() >= 4096 ||
+        command.command.state != State::Prepared || command.command.desired != s.desired ||
+        !rulesValid(s.rules)) return false;
+    std::size_t policySize = 24, journalSize = 96;
+    for (const auto &rule : s.rules) {
+      if (rule.target.size() + 72 > MaxSnapshotBytes - policySize) return false;
+      policySize += rule.target.size() + 72;
+    }
+    for (const auto &entry : s.entries) {
+      if (entry.size() > decisions::MaxJournalBytes - journalSize) return false;
+      journalSize += entry.size();
+    }
+    const auto newEntrySize = 8 + 304 + command.command.payload.size() + 160 +
+        command.command.accountSid.size() + command.command.logonSid.size();
+    if (newEntrySize > decisions::MaxJournalBytes - journalSize) return false;
+    journalSize += newEntrySize;
+    const auto directionSize = 24 + 40 * s.rules.size();
+    const auto total = 256ull + policySize + directionSize + journalSize + s.archive.size();
+    if (total > MaxSnapshotBytes) return false;
+    auto allocation = std::make_unique<Bytes>(static_cast<std::size_t>(total), std::uint8_t(0));
+    auto &b = *allocation;
+    if (b.capacity() > MaxSnapshotBytes) return false;
+    std::copy_n("GBS4", 4, b.begin()); put(b, 4, 4, 2); put(b, 8, total, 4);
+    put(b, 12, 224, 4); put(b, 16, s.sequence, 8); put(b, 24, s.desired, 8);
+    b[41] = static_cast<std::uint8_t>(State::Prepared);
+    put(b, 48, command.command.id); put(b, 96, policySize, 4);
+    put(b, 100, directionSize, 4); put(b, 104, journalSize, 4);
+    put(b, 108, s.archive.size(), 4); put(b, 176, s.archiveDigest); put(b, 208, s.migrationBase, 8);
+    const auto policyAt = std::size_t(224), directionAt = policyAt + policySize;
+    const auto journalAt = directionAt + directionSize, archiveAt = journalAt + journalSize;
+    std::copy_n("PRL4", 4, b.begin() + policyAt);
+    put(b, policyAt + 4, 1, 2); put(b, policyAt + 6, 24, 2);
+    put(b, policyAt + 8, policySize, 4); put(b, policyAt + 12, s.rules.size(), 4);
+    put(b, policyAt + 16, 1, 2);
+    std::copy_n("DIR1", 4, b.begin() + directionAt);
+    put(b, directionAt + 4, 1, 2); put(b, directionAt + 6, 40, 2);
+    put(b, directionAt + 8, s.rules.size(), 4); put(b, directionAt + 16, s.desired, 8);
+    std::vector<const Rule *> ordered; ordered.reserve(s.rules.size());
+    for (const auto &rule : s.rules) ordered.push_back(&rule);
+    std::sort(ordered.begin(), ordered.end(), [](auto a, auto b) { return a->id < b->id; });
+    std::size_t at = policyAt + 24, direction = directionAt + 24;
+    for (const auto *rule : ordered) {
+      put(b, at, rule->target.size() + 64, 4); put(b, at + 4, rule->kind, 2); put(b, at + 6, 1, 2);
+      const auto row = at + 8;
+      put(b, row, rule->id); put(b, row + 16, rule->selector);
+      put(b, row + 32, rule->revision, 8); put(b, row + 40, rule->targetRevision, 8);
+      b[row + 48] = rule->action; b[row + 49] = rule->kind == 1 ? 1 : 0;
+      put(b, row + 56, rule->target.size(), 4);
+      if (rule->target.size()) std::copy_n(rule->target.data(), rule->target.size(), b.begin() + row + 64);
+      at += 72 + rule->target.size();
+      put(b, direction, rule->id); put(b, direction + 16, rule->selector);
+      b[direction + 32] = rule->direction; b[direction + 33] = rule->mode; direction += 40;
+    }
+    // El préstamo no sale de este scope ni recibe cargo; las secciones son
+    // slices del allocation final, no vectores grandes intermedios.
+    ByteView borrowed; borrowed.owner_ = std::make_shared<const Storage>(&b); borrowed.size_ = b.size();
+    const auto set = targetSetDigest(s.desired, borrowed.sub(policyAt, policySize),
+                                    borrowed.sub(directionAt, directionSize));
+    Entry last = command;
+    if (!bindEntry(last, set)) return false;
+    put(b, 64, last.projection); put(b, 112, last.admission); put(b, 144, set);
+    std::copy_n("GBJ4", 4, b.begin() + journalAt);
+    put(b, journalAt + 4, 1, 2); put(b, journalAt + 6, 64, 2);
+    put(b, journalAt + 8, journalSize, 4); put(b, journalAt + 12, s.entries.size() + 1, 4);
+    put(b, journalAt + 16, s.sequence, 8); put(b, journalAt + 24, s.desired, 8);
+    put(b, journalAt + 32, s.writerEpoch);
+    at = journalAt + 64;
+    for (const auto &entry : s.entries) {
+      std::copy_n(entry.data(), entry.size(), b.begin() + at); at += entry.size();
+    }
+    Bytes entryBuffer = prefix(last);
+    entryBuffer.insert(entryBuffer.end(), last.command.payload.begin(), last.command.payload.end());
+    entryBuffer.insert(entryBuffer.end(), last.projected.begin(), last.projected.end());
+    entryBuffer.insert(entryBuffer.end(), last.command.accountSid.begin(), last.command.accountSid.end());
+    entryBuffer.insert(entryBuffer.end(), last.command.logonSid.begin(), last.command.logonSid.end());
+    if (entryBuffer.size() + 8 != newEntrySize || entryBuffer.capacity() > 4096) return false;
+    put(b, at, entryBuffer.size(), 4); put(b, at + 4, 1, 2); put(b, at + 6, 1, 2);
+    std::copy(entryBuffer.begin(), entryBuffer.end(), b.begin() + at + 8);
+    Hash journalHash; journalHash.add(borrowed.sub(journalAt, journalSize - 32));
+    put(b, journalAt + journalSize - 32, journalHash.end());
+    if (s.archive.size()) std::copy_n(s.archive.data(), s.archive.size(), b.begin() + archiveAt);
+    Hash hash; hash.add(borrowed.sub(0, b.size() - 32)); put(b, b.size() - 32, hash.end());
+    Snapshot checked;
+    if (!parse(borrowed, checked)) return false;
+    ByteView result; result.owner_ = std::make_shared<const Storage>(std::move(allocation));
+    result.size_ = b.size(); out = std::move(result); return true;
+  } catch (...) { return false; }
+}
+bool ByteView::sealApplied(std::uint64_t completed, Snapshot &out) noexcept {
+  if (!owner_ || owner_.use_count() != 1 || owner_->borrowed || !owner_->exclusive ||
+      offset_ || size_ != owner_->readable().size() || !owner_->budget || !completed) return false;
+  try {
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+    if (owner_.use_count() != 1 || owner_->outcomeClosed) return false;
+    Snapshot prior;
+    if (!parse(*this, prior) || prior.storedState != State::Prepared || prior.sequence == UINT64_MAX ||
+        prior.writerEpoch == Id{} || prior.active == Id{}) return false;
+    auto found = std::find_if(prior.entries.begin(), prior.entries.end(), [&](const auto &entry) {
+      return array<16>(entry, 8) == prior.active;
+    });
+    if (found == prior.entries.end()) return false;
+    Entry active;
+    if (!decodeEntry(*found, active) || active.legacyEnvelope.size() ||
+        active.command.state != State::Prepared || active.command.effectiveKnown ||
+        active.command.effective || active.command.completedAt || active.command.error != Error::Ok) return false;
+    const auto journalAt = static_cast<std::size_t>(prior.journal.data() - data());
+    const auto outcomeAt = static_cast<std::size_t>(found->data() - data()) + 8;
+    const auto sequence = prior.sequence + 1, desired = prior.desired, journalSize = prior.journal.size();
+    // Único testigo de transición: posiciones derivadas del parser y outcome
+    // Prepared exacto. Los restantes bytes no reciben escritura alguna.
+    prior = {}; active = {};
+    if (owner_.use_count() != 1) return false;
+    owner_->outcomeClosed = true;
+    auto &b = *owner_->exclusive;
+    const auto pointer = b.data();
+    const auto size = b.size(), capacity = b.capacity();
+    put(b, 16, sequence, 8); put(b, 32, desired, 8); b[40] = 1; b[41] = std::uint8_t(State::Applied);
+    put(b, journalAt + 16, sequence, 8);
+    put(b, outcomeAt + 80, desired, 8); put(b, outcomeAt + 88, completed, 8);
+    b[outcomeAt + 112] = std::uint8_t(State::Applied); b[outcomeAt + 113] = 1;
+    Hash journal; journal.add(sub(journalAt, journalSize - 32));
+    put(b, journalAt + journalSize - 32, journal.end());
+    Hash hash; hash.add(sub(0, size - 32)); put(b, size - 32, hash.end());
+    return b.data() == pointer && b.size() == size && b.capacity() == capacity && parse(*this, out);
+  } catch (...) { return false; }
 }
 bool validTransition(const ByteView &before, const Snapshot &after) {
   try {

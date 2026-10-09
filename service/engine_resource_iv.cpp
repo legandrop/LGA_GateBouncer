@@ -114,10 +114,8 @@ EngineResource::acquire(std::uint64_t generation, const Api &api,
         state->engine = nullptr;
       return {};
     }
-    if (api.begin(state->engine, FWPM_TXN_READ_ONLY) != ERROR_SUCCESS)
-      return {};
-    bool transaction = true;
-    auto abort = onExit([&] { if (transaction) api.abort(state->engine); });
+    // El SDK prohíbe SessionCreateEnumHandle dentro de una transacción.
+    // Esta enumeración observa identidad de sesión, no inventario de filtros.
     HANDLE enumeration = nullptr;
     if (api.create(state->engine, nullptr, &enumeration) != ERROR_SUCCESS || !enumeration)
       return {};
@@ -156,9 +154,7 @@ EngineResource::acquire(std::uint64_t generation, const Api &api,
       return {};
     const auto destroyed = api.destroy(state->engine, enumeration);
     enumOpen = false;
-    const auto aborted = api.abort(state->engine);
-    transaction = false;
-    if (destroyed != ERROR_SUCCESS || aborted != ERROR_SUCCESS)
+    if (destroyed != ERROR_SUCCESS)
       return {};
     verified = true;
     return std::shared_ptr<EngineResource>(new EngineResource(std::move(state), context, generation));

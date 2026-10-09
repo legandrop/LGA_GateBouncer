@@ -6,8 +6,11 @@
 namespace gatebouncer::service::windows::allapps::native {
 class CatalogStorageBuilder;
 }
+namespace gb::decisions { class NativeRuntime; }
 namespace gb::principal {
 struct Snapshot;
+struct Entry;
+class SnapshotStore;
 constexpr std::size_t MaxSnapshotBytes = 33554432, MaxTargetBytes = 65696;
 // Vistas inmutables fuertes: ningún APP_ID o archivo se copia por cada regla.
 class ByteView {
@@ -23,6 +26,10 @@ public:
   bool operator!=(const ByteView &other) const { return !(*this == other); }
 
 private:
+  friend class gb::decisions::NativeRuntime;
+  friend class SnapshotStore;
+  static bool prepareOwned(const Snapshot &, const Entry &, ByteView &) noexcept;
+  bool sealApplied(std::uint64_t completedAt, Snapshot &) noexcept;
   friend bool serialize(const Snapshot &, Bytes &);
   friend class gatebouncer::service::windows::allapps::native::CatalogStorageBuilder;
   using BudgetFactory = std::shared_ptr<const void> (*)(void *, std::size_t) noexcept;
