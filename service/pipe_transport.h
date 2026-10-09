@@ -7,6 +7,13 @@
 namespace gb {
 constexpr wchar_t ViewPipe[]=L"\\\\.\\pipe\\LGA.GateBouncer.View.v1";
 constexpr wchar_t ControlPipe[]=L"\\\\.\\pipe\\LGA.GateBouncer.Control.v1";
+constexpr DWORD PipeClientRights=FILE_READ_DATA|FILE_WRITE_DATA|FILE_READ_ATTRIBUTES|SYNCHRONIZE;
+constexpr wchar_t PipeClientRightsSddl[]=L"0x100083";
+static_assert(FILE_READ_DATA==0x1&&FILE_WRITE_DATA==0x2&&FILE_READ_ATTRIBUTES==0x80&&SYNCHRONIZE==0x100000);
+static_assert(PipeClientRights==0x00100083);
+static_assert((PipeClientRights&(FILE_CREATE_PIPE_INSTANCE|READ_CONTROL|WRITE_DAC|WRITE_OWNER|
+    FILE_WRITE_ATTRIBUTES|FILE_WRITE_EA|DELETE|GENERIC_READ|GENERIC_WRITE|GENERIC_EXECUTE|GENERIC_ALL))==0);
+// La mascara declarada no prueba GrantedAccess ni capacidad de crear otra instancia.
 bool elevatedAdministrator(HANDLE token);
 bool serviceTokenIdentity(HANDLE token);
 class PipeServer {

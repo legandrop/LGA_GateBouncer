@@ -75,8 +75,8 @@ bool PipeServer::authority(HANDLE pipe,bool control){
 void PipeServer::run(HANDLE stop){std::thread view([&]{channel(false,stop);});std::thread control([&]{channel(true,stop);});view.join();control.join();}
 void PipeServer::channel(bool control,HANDLE stop){
     Local descriptor;std::wstring acl=L"D:P(D;;GA;;;NU)(A;;GA;;;SY)";
-    // Derechos datos concretos: 0x100003 no incluye FILE_CREATE_PIPE_INSTANCE.
-    acl+=control?L"(A;;0x100003;;;BA)":L"(A;;0x100003;;;"+viewSid_+L")";
+    // Derechos individuales de datos/atributos; no conceden autoridad de Control.
+    acl+=L"(A;;"+std::wstring(PipeClientRightsSddl)+L";;;"+(control?std::wstring(L"BA"):viewSid_)+L")";
     if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(acl.c_str(),SDDL_REVISION_1,reinterpret_cast<PSECURITY_DESCRIPTOR*>(&descriptor.p),nullptr)){SetEvent(stop);return;}
     SECURITY_ATTRIBUTES sa{sizeof(sa),descriptor.p,FALSE};Handle pipe;pipe.h=CreateNamedPipeW(control?ControlPipe:ViewPipe,PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED|FILE_FLAG_FIRST_PIPE_INSTANCE,PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,4096,4096,5000,&sa);if(pipe.h==INVALID_HANDLE_VALUE){SetEvent(stop);return;}
     while(WaitForSingleObject(stop,0)!=WAIT_OBJECT_0){Handle connected;connected.h=CreateEventW(nullptr,TRUE,FALSE,nullptr);OVERLAPPED operation{};operation.hEvent=connected.h;bool ready=ConnectNamedPipe(pipe.h,&operation)!=FALSE;auto error=ready?ERROR_SUCCESS:GetLastError();if(error==ERROR_PIPE_CONNECTED)ready=true;
@@ -101,7 +101,7 @@ void PipeServer::channel(bool control,HANDLE stop){
 PipeClient::~PipeClient(){if(pipe_!=INVALID_HANDLE_VALUE)CloseHandle(pipe_);}
 bool PipeClient::open(bool control){
     if(pipe_!=INVALID_HANDLE_VALUE)return false;
-    pipe_=CreateFileW(control?ControlPipe:ViewPipe,FILE_READ_DATA|FILE_WRITE_DATA|SYNCHRONIZE,0,nullptr,OPEN_EXISTING,FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,nullptr);
+    pipe_=CreateFileW(control?ControlPipe:ViewPipe,PipeClientRights,0,nullptr,OPEN_EXISTING,FILE_FLAG_OVERLAPPED|SECURITY_SQOS_PRESENT|SECURITY_IDENTIFICATION,nullptr);
     if(pipe_==INVALID_HANDLE_VALUE||!verifyServer(pipe_))return false;
     Frame hello;hello.type=Type::Hello;hello.correlation=randomId();hello.fields={value(Tag::ClientRole,control?2:1,1)};Frame ack;Error error;
     if(!send(pipe_,hello,nullptr)||!receive(pipe_,ack,nullptr,error)||error!=Error::Ok||ack.type!=Type::HelloAck||ack.correlation!=hello.correlation||ack.sequence!=1||zero(ack.connection))return false;connection_=ack.connection;send_=receive_=2;return true;
