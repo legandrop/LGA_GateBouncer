@@ -1,4 +1,4 @@
-#include "deployment_prepare_win.h"
+#include "deployment_maintenance_win.h"
 #include "../common/token_ii_win.h"
 #include <algorithm>
 #include <set>
@@ -105,10 +105,94 @@ bool stringValue(HKEY key,const wchar_t *name,const std::wstring &value) {
     return RegGetValueW(key,nullptr,name,RRF_RT_REG_SZ,nullptr,actual,&size) == ERROR_SUCCESS &&
         size == (value.size()+1)*sizeof(wchar_t) && std::equal(value.begin(),value.end(),actual) && !actual[value.size()];
 }
+bool stringMatches(HKEY key,const wchar_t *name,const std::wstring &value) {
+    wchar_t actual[32768]{}; DWORD size = sizeof(actual);
+    return RegGetValueW(key,nullptr,name,RRF_RT_REG_SZ,nullptr,actual,&size) == ERROR_SUCCESS &&
+        size == (value.size()+1)*sizeof(wchar_t) && std::equal(value.begin(),value.end(),actual) && !actual[value.size()];
+}
+}
+namespace deployment_detail {
+bool setString(HKEY key,const wchar_t *name,const std::wstring &value) { return stringValue(key,name,value); }
+bool setDword(HKEY key,const wchar_t *name,DWORD value) {
+    DWORD read = 0, size = sizeof(read);
+    return native::protectedRegistry(key) &&
+        RegSetValueExW(key,name,0,REG_DWORD,reinterpret_cast<const BYTE *>(&value),sizeof(value)) == ERROR_SUCCESS &&
+        RegFlushKey(key) == ERROR_SUCCESS &&
+        RegGetValueW(key,nullptr,name,RRF_RT_REG_DWORD,nullptr,&read,&size) == ERROR_SUCCESS &&
+        size == sizeof(read) && read == value && native::protectedRegistry(key);
+}
+bool mark(HKEY key,DWORD state,DWORD expectedState,const AdministrativeLease &lease) {
+    bool present = false; DWORD prior = 0;
+    return state <= 4 && maintenanceState(key,present,prior) && present &&
+        prior == expectedState && lease.ownsConfiguration(key) &&
+        setDword(key,L"MaintenanceState",state);
+}
+bool disjoint(const std::filesystem::path &a,const std::filesystem::path &b) {
+    if (!native::fixedPath(a) || !native::fixedPath(b) || a == a.root_path() || b == b.root_path()) return false;
+    auto x = a.native(), y = b.native();
+    for (auto *text : {&x,&y}) for (auto &c : *text) if (c >= L'A' && c <= L'Z') c += L'a'-L'A';
+    return x != y && x.rfind(y+L"\\",0) != 0 && y.rfind(x+L"\\",0) != 0;
+}
+bool pinSource(const std::filesystem::path &source,std::vector<native::Handle> &inputs) {
+    native::ProtectedDirectory root(source,true);
+    const auto &names = deploymentFiles(DeploymentRole::Service);
+    const std::set<std::wstring> expected(names.begin(),names.end());
+    std::set<std::wstring> seen;
+    if (!root.acquire() || !parents(source,inputs) ||
+        !sourceClosure(source,{},expected,seen,inputs) || seen != expected) return false;
+    native::Handle directory(CreateFileW(source.c_str(),READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+    if (!directory || !native::protectedObject(directory.value,false,true,true)) return false;
+    inputs.push_back(std::move(directory));
+    for (const auto &name : names) {
+        native::Handle h; wire::Bytes bytes;
+        if (!sourceFile(source/name,h,bytes)) return false;
+        inputs.push_back(std::move(h));
+    }
+    return true;
+}
+bool stagePackage(const std::filesystem::path &source,const std::filesystem::path &package,
+                  std::shared_ptr<Deployment> &owner) {
+    if (owner || !disjoint(source,package)) return false;
+    std::vector<native::Handle> held, inputs;
+    if (!parents(package,held) || !pinSource(source,inputs)) return false;
+    const auto attr = GetFileAttributesW(package.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) return false;
+    Descriptor readable(L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;BU)");
+    if (!readable.value || !createDirectory(package,readable.value,held,true)) return false;
+    const auto &names = deploymentFiles(DeploymentRole::Service);
+    std::set<std::filesystem::path> directories; Inventory inventory;
+    // pinSource conserva todos los files al final, después de los directorios.
+    const auto first = inputs.size()-names.size();
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        const auto relative = std::filesystem::path(names[i]);
+        std::vector<std::filesystem::path> dirs;
+        for (auto p = relative.parent_path(); !p.empty(); p = p.parent_path()) dirs.push_back(p);
+        for (auto p = dirs.rbegin(); p != dirs.rend(); ++p)
+            if (directories.insert(*p).second && !createDirectory(package / *p,readable.value,held,true)) return false;
+        LARGE_INTEGER begin{}, size{}; DWORD done = 0;
+        auto &input = inputs[first+i];
+        if (!native::protectedObject(input.value,false,false,true) ||
+            !SetFilePointerEx(input.value,begin,nullptr,FILE_BEGIN) ||
+            !GetFileSizeEx(input.value,&size) || size.QuadPart <= 0 || size.QuadPart > 32*1024*1024) return false;
+        wire::Bytes bytes(static_cast<std::size_t>(size.QuadPart));
+        if (!ReadFile(input.value,bytes.data(),static_cast<DWORD>(bytes.size()),&done,nullptr) || done != bytes.size() ||
+            !createFile(package/relative,bytes,readable.value,held)) return false;
+        inventory.emplace(names[i],native::digest(bytes));
+    }
+    wire::Bytes manifest;
+    if (!encodeInventory(inventory,manifest) || !createFile(package/L"deployment.gbd",manifest,readable.value,held)) return false;
+    auto candidate = std::make_shared<Deployment>(package);
+    if (!candidate->verify(package/L"GateBouncerService.exe",DeploymentRole::Service) || !candidate->current()) return false;
+    owner = std::move(candidate); return true;
+}
 }
 bool prepareGuestDeployment(const std::filesystem::path &source,const std::filesystem::path &package,
     const std::filesystem::path &store,const std::wstring &accountSid) {
     try {
+        deployment_detail::AdministrativeLease lease;
+        if (!lease.acquire() || lease.image() != source/L"GateBouncerService.exe") return false;
         native::Handle token; HANDLE raw = nullptr;
         if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw)) return false;
         token.reset(raw); native::TokenEvidence identity;
@@ -154,66 +238,57 @@ bool prepareGuestDeployment(const std::filesystem::path &source,const std::files
         Descriptor registry(L"O:BAG:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;BU)");
         Descriptor scm(L"O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;BU)");
         if (!readable.value || !privateObject.value || !registry.value || !scm.value) return false;
-        // Leer/pinear todas las entradas constantes ANTES de crear un destino.
-        const auto &names = deploymentFiles(DeploymentRole::Service);
-        const std::set<std::wstring> expected(names.begin(),names.end());
-        std::set<std::wstring> seen;
-        if (!sourceClosure(source,{},expected,seen,held) || seen != expected) return false;
-        std::vector<native::Handle> inputs;
-        for (const auto &name : names) {
-            native::Handle h; wire::Bytes bytes;
-            if (!sourceFile(source/name,h,bytes)) return false;
-            inputs.push_back(std::move(h));
-        }
-        if (!createDirectory(package,readable.value,held,true) ||
+        std::shared_ptr<Deployment> packageOwner;
+        if (!deployment_detail::stagePackage(source,package,packageOwner) ||
             !createDirectory(store,privateObject.value,held,false)) return false;
-        std::set<std::filesystem::path> directories;
-        Inventory inventory;
-        for (std::size_t i = 0; i < names.size(); ++i) {
-            const auto relative = std::filesystem::path(names[i]);
-            std::vector<std::filesystem::path> parents;
-            for (auto p = relative.parent_path(); !p.empty(); p = p.parent_path()) parents.push_back(p);
-            for (auto p = parents.rbegin(); p != parents.rend(); ++p)
-                if (directories.insert(*p).second && !createDirectory(package / *p,readable.value,held,true)) return false;
-            LARGE_INTEGER begin{}, size{}; DWORD done = 0;
-            if (!SetFilePointerEx(inputs[i].value,begin,nullptr,FILE_BEGIN) ||
-                !GetFileSizeEx(inputs[i].value,&size) || size.QuadPart <= 0 || size.QuadPart > 32 * 1024 * 1024)
-                return false;
-            wire::Bytes bytes(static_cast<std::size_t>(size.QuadPart));
-            if (!ReadFile(inputs[i].value,bytes.data(),static_cast<DWORD>(bytes.size()),&done,nullptr) || done != bytes.size() ||
-                !createFile(package/relative,bytes,readable.value,held)) return false;
-            inventory.emplace(names[i],native::digest(bytes));
-        }
-        wire::Bytes manifest;
-        if (!encodeInventory(inventory,manifest) || !createFile(package/L"deployment.gbd",manifest,readable.value,held)) return false;
-        auto packageOwner = std::make_shared<Deployment>(package);
-        if (!packageOwner->verify(package/L"GateBouncerService.exe",DeploymentRole::Service) || !packageOwner->current()) return false;
         const auto command = L"\"" + (package/L"GateBouncerService.exe").native() + L"\" --service --guest-wfp";
+        Key configuration; DWORD disposition = 0;
+        SECURITY_ATTRIBUTES attributes{sizeof(attributes),registry.value,FALSE};
+        if (!lease.current() || RegCreateKeyExW(gate.value,L"DeploymentVIII",0,nullptr,REG_OPTION_NON_VOLATILE,
+            KEY_QUERY_VALUE | KEY_SET_VALUE | READ_CONTROL,&attributes,&configuration.value,&disposition) != ERROR_SUCCESS ||
+            disposition != REG_CREATED_NEW_KEY || !native::protectedRegistry(configuration.value) ||
+            !deployment_detail::setDword(configuration.value,L"MaintenanceVersion",1) ||
+            !deployment_detail::setDword(configuration.value,L"MaintenanceState",1)) return false;
         service.value = CreateServiceW(manager.value,L"LGAGateBouncerLab",L"LGA GateBouncer laboratory",
             SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
-            SERVICE_WIN32_OWN_PROCESS,SERVICE_AUTO_START,SERVICE_ERROR_NORMAL,command.c_str(),nullptr,nullptr,nullptr,L"LocalSystem",nullptr);
+            SERVICE_WIN32_OWN_PROCESS,SERVICE_DISABLED,SERVICE_ERROR_NORMAL,command.c_str(),nullptr,nullptr,nullptr,L"LocalSystem",nullptr);
         SERVICE_SID_INFO sid{SERVICE_SID_TYPE_UNRESTRICTED};
         if (!service.value || !ChangeServiceConfig2W(service.value,SERVICE_CONFIG_SERVICE_SID_INFO,&sid) ||
             !SetServiceObjectSecurity(service.value,OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,scm.value) ||
-            !serviceConfiguration(service.value,package/L"GateBouncerService.exe") || !packageOwner->current()) return false;
-        Key configuration; DWORD disposition = 0;
-        SECURITY_ATTRIBUTES attributes{sizeof(attributes),registry.value,FALSE};
-        if (RegCreateKeyExW(gate.value,L"DeploymentVIII",0,nullptr,REG_OPTION_NON_VOLATILE,
-            KEY_QUERY_VALUE | KEY_SET_VALUE | READ_CONTROL,&attributes,&configuration.value,&disposition) != ERROR_SUCCESS ||
-            disposition != REG_CREATED_NEW_KEY || !native::protectedRegistry(configuration.value) ||
+            !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED) || !packageOwner->current()) return false;
+        if (!native::protectedRegistry(configuration.value) ||
             !stringValue(configuration.value,L"PackageRoot",package.native()) ||
             !stringValue(configuration.value,L"OrdinaryImage",(package/L"GateBouncer.exe").native()) ||
             !stringValue(configuration.value,L"StoreRoot",store.native()) ||
             !stringValue(configuration.value,L"ViewSid",accountSid) ||
-            !serviceConfiguration(service.value,package/L"GateBouncerService.exe") || !packageOwner->current() ||
+            !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED) || !packageOwner->current() ||
             !native::protectedRegistry(gate.value)) return false;
         DWORD initial = 1, repeated = 0, repeatedSize = sizeof(repeated);
-        return RegSetValueExW(configuration.value,L"ProvisionPrincipal",0,REG_DWORD,
+        const bool recorded = RegSetValueExW(configuration.value,L"ProvisionPrincipal",0,REG_DWORD,
             reinterpret_cast<const BYTE *>(&initial),sizeof(initial)) == ERROR_SUCCESS &&
             RegFlushKey(configuration.value) == ERROR_SUCCESS &&
             RegGetValueW(configuration.value,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&repeated,&repeatedSize) == ERROR_SUCCESS &&
-            repeated == 1 && native::protectedRegistry(configuration.value) && packageOwner->current();
+            repeated == 1 && repeatedSize == sizeof(repeated) && native::protectedRegistry(configuration.value) &&
+            packageOwner->current() && lease.current();
+        DWORD marker = 1;
+        if (recorded && deployment_detail::mark(configuration.value,0,marker,lease)) marker = 0;
+        else return false; // Flush/readback incierto: no escribir otro marker ni reintentar.
+        if (!ChangeServiceConfigW(service.value,SERVICE_NO_CHANGE,SERVICE_AUTO_START,SERVICE_NO_CHANGE,
+                nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr) ||
+            !serviceConfiguration(service.value,package/L"GateBouncerService.exe") || !lease.current() || !packageOwner->current()) {
+            DWORD actual = 0, size = sizeof(actual);
+            if (packageOwner->current() && lease.ownsConfiguration(configuration.value) &&
+                stringMatches(configuration.value,L"PackageRoot",package.native()) &&
+                stringMatches(configuration.value,L"OrdinaryImage",(package/L"GateBouncer.exe").native()) &&
+                stringMatches(configuration.value,L"StoreRoot",store.native()) &&
+                stringMatches(configuration.value,L"ViewSid",accountSid) &&
+                RegGetValueW(configuration.value,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&actual,&size) == ERROR_SUCCESS &&
+                size == sizeof(actual) && actual == 1)
+                deployment_detail::mark(configuration.value,4,marker,lease);
+            return false;
+        }
+        return true;
     } catch (...) { return false; }
 }
 }

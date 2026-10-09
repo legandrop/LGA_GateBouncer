@@ -11,6 +11,10 @@ enum class DeploymentRole { DecisionController, OrdinaryGui, Service };
 const std::vector<std::wstring> &deploymentFiles(DeploymentRole);
 bool serviceDescriptor(PSECURITY_DESCRIPTOR);
 bool serviceConfiguration(SC_HANDLE, const std::filesystem::path &, DWORD expectedPid = 0);
+// El mantenimiento exige su fase exacta; la admisión normal sigue AUTO_START.
+bool serviceConfigurationPhase(SC_HANDLE, const std::filesystem::path &, DWORD startType,
+                               DWORD expectedPid = 0);
+bool maintenanceState(HKEY, bool &present, DWORD &state);
 class Deployment {
   public:
     explicit Deployment(std::filesystem::path root);

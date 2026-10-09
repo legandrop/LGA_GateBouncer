@@ -8,6 +8,7 @@ namespace gb::decisions
 {
 class NativeRuntime;
 class CatalogPlanBuilder;
+class MaintenanceRuntime;
 } // namespace gb::decisions
 namespace gb::principal
 {
@@ -73,6 +74,7 @@ static_assert(sizeof(SlotRecord) <= 128);
 // El registro cuenta storage vivo, incluso cuando perdió autoridad y sigue retenido.
 class CatalogRegistry
 {
+    friend class gb::decisions::MaintenanceRuntime;
     friend class gb::decisions::NativeRuntime;
     friend class gb::decisions::CatalogPlanBuilder;
     friend class CatalogStorageBuilder;
@@ -101,6 +103,7 @@ class CatalogRegistry
 };
 class CatalogSnapshot
 {
+    friend class gb::decisions::MaintenanceRuntime;
     friend class gb::decisions::NativeRuntime;
     friend class gb::decisions::CatalogPlanBuilder;
     friend class CatalogStorageBuilder;
@@ -132,6 +135,7 @@ class CatalogSnapshot
 };
 class CatalogStorageBuilder
 {
+    friend class gb::decisions::MaintenanceRuntime;
     friend class gb::decisions::NativeRuntime;
     friend class gb::decisions::CatalogPlanBuilder;
     std::shared_ptr<CatalogSnapshot> storage_;

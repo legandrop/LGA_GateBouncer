@@ -2,6 +2,7 @@
 #include "wfp_backend.h"
 #include "runtime_ii.h"
 #include "../controller/deployment_prepare_win.h"
+#include "../controller/deployment_maintenance_win.h"
 #include <iostream>
 #include <memory>
 #include <string>
@@ -58,6 +59,16 @@ int wmain(int argc,wchar_t** argv){
     try{
         if(argc==6 && std::wstring(argv[1])==L"--prepare-guest-deployment")
             return controller::prepareGuestDeployment(argv[2],argv[3],argv[4],argv[5]) ? 0 : 2;
+        if ((argc == 5 && std::wstring(argv[1]) == L"--update-guest-deployment") ||
+            (argc == 3 && std::wstring(argv[1]) == L"--uninstall-guest-deployment")) {
+            const auto result = argc == 5 ? controller::updateGuestDeployment(argv[2],argv[3],argv[4]) :
+                controller::uninstallGuestDeployment(argv[2]);
+            std::cout << "Mantenimiento resultado=" << static_cast<unsigned>(result.outcome) <<
+                " fase=" << static_cast<unsigned>(result.phase) << " error=" << result.error <<
+                " recuperacion_confirmada=" << result.recoveryRecorded << '\n';
+            return result.outcome == controller::MaintenanceOutcome::UpdatedPrepared ||
+                result.outcome == controller::MaintenanceOutcome::UninstalledRetained ? 0 : 2;
+        }
         if(argc==3&&std::wstring(argv[1])==L"--service"&&std::wstring(argv[2])==L"--guest-wfp"){
             if(!guestActivationAuthorized()){std::cerr<<"Activacion invitada no autorizada\n";return 2;}
             SERVICE_TABLE_ENTRYW table[]={{const_cast<wchar_t*>(ServiceName),serviceMain},{nullptr,nullptr}};

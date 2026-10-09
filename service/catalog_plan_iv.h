@@ -8,6 +8,7 @@ namespace gb::decisions {
 namespace allnative = gatebouncer::service::windows::allapps::native;
 class CatalogPlanBuilder final {
   friend class NativeRuntime;
+  friend class MaintenanceRuntime;
   friend class gb::WfpBackend;
   struct WriteApi {
     decltype(&FwpmTransactionBegin0) begin = &FwpmTransactionBegin0;
@@ -47,6 +48,8 @@ class CatalogPlanBuilder final {
   std::shared_ptr<const allnative::CatalogSnapshot> freeze() noexcept;
   gatebouncer::service::windows::allapps::Reason confirmInventory(
       HANDLE, const allnative::SdkApi &, allnative::recipe::ReadBytes) noexcept;
+  gatebouncer::service::windows::allapps::Reason confirmInventoryBody(
+      HANDLE, const allnative::SdkApi &, allnative::recipe::ReadBytes, bool ownTransaction) noexcept;
   gatebouncer::service::windows::allapps::Reason fail(gatebouncer::service::windows::allapps::Reason) noexcept;
   allnative::CatalogStorageBuilder storage_;
   std::array<std::uint8_t, (allnative::MaxCatalogSlots + 7) / 8> seen_{};

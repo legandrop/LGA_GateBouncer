@@ -418,10 +418,16 @@ std::shared_ptr<const allnative::CatalogSnapshot> CatalogPlanBuilder::freeze() n
 }
 Reason CatalogPlanBuilder::confirmInventory(HANDLE engine, const allnative::SdkApi &api,
                                             recipe::ReadBytes read) noexcept {
+  return confirmInventoryBody(engine,api,read,true);
+}
+Reason CatalogPlanBuilder::confirmInventoryBody(HANDLE engine, const allnative::SdkApi &api,
+                                               recipe::ReadBytes read, bool ownTransaction) noexcept {
   if (phase_ != Phase::Staged || !engine || !read || !api.begin || !api.abort ||
       !api.layer || !api.createEnum || !api.enumerate || !api.destroyEnum || !api.freeMemory)
     return fail(Reason::SourceGap);
   try {
+    // Cada lectura coteja todos los slots; ningún seen de una lectura anterior la abrevia.
+    seen_ = {}; observed_ = 0;
     auto &catalog = *storage_.storage_;
     recipe::RecipeWorkspace workspace{};
     std::array<std::uint8_t, (allnative::MaxCatalogSlots + 7) / 8> globalSeen{};
@@ -430,9 +436,9 @@ Reason CatalogPlanBuilder::confirmInventory(HANDLE engine, const allnative::SdkA
       const allnative::SdkApi &api; HANDLE engine; bool &open, &fault;
       ~Cleanup() { if (open && api.abort(engine) != ERROR_SUCCESS) fault = true; }
     } cleanup{api, engine, transaction, cleanupFault};
-    if (api.begin(engine, FWPM_TXN_READ_ONLY) != ERROR_SUCCESS)
+    if (ownTransaction && api.begin(engine, FWPM_TXN_READ_ONLY) != ERROR_SUCCESS)
       return fail(Reason::SourceGap);
-    transaction = true;
+    transaction = ownTransaction;
     // Cotejar IDs de capa y soporte tipado en la misma transacción del inventario.
     for (std::uint8_t layer = 0; layer < 8; ++layer) {
       FWPM_LAYER0 *borrowed = nullptr;
@@ -530,7 +536,7 @@ Reason CatalogPlanBuilder::confirmInventory(HANDLE engine, const allnative::SdkA
     if (result == Reason::None && observed_ != catalog.slots_.size()) result = Reason::ForeignFilter;
     if (result == Reason::None) result = scan(nullptr);
     if (result == Reason::None && globalOwn != catalog.slots_.size()) result = Reason::ForeignFilter;
-    if (api.abort(engine) != ERROR_SUCCESS) cleanupFault = true;
+    if (ownTransaction && api.abort(engine) != ERROR_SUCCESS) cleanupFault = true;
     transaction = false;
     if (cleanupFault) result = Reason::SourceGap;
     return result == Reason::None ? result : fail(result);

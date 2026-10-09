@@ -12,6 +12,7 @@ class NativeRuntime;
 using ServiceContext = wire::iv::ServiceContext;
 class EngineResource final {
   friend class NativeRuntime;
+  friend class MaintenanceRuntime;
   struct Api;
   struct State;
   static std::shared_ptr<EngineResource> acquire(std::uint64_t generation);

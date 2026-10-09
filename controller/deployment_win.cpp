@@ -18,7 +18,7 @@ bool name(const std::wstring &s) {
         return false;
     for (auto c : s)
         if (!((c >= L'a' && c <= L'z') || (c >= L'A' && c <= L'Z') || (c >= L'0' && c <= L'9') ||
-              c == L'.' || c == L'_' || c == L'-' || c == L'\\'))
+              c == L'.' || c == L'_' || c == L'-' || c == L'+' || c == L'\\'))
             return false;
     return true;
 }
@@ -98,6 +98,9 @@ bool serviceDescriptor(PSECURITY_DESCRIPTOR descriptor) {
     return fullSy && fullBa;
 }
 bool serviceConfiguration(SC_HANDLE service, const std::filesystem::path &image, DWORD pid) {
+    return serviceConfigurationPhase(service,image,SERVICE_AUTO_START,pid);
+}
+bool serviceConfigurationPhase(SC_HANDLE service, const std::filesystem::path &image, DWORD startType, DWORD pid) {
     if (!service || !native::fixedPath(image)) return false;
     DWORD needed = 0;
     QueryServiceConfigW(service, nullptr, 0, &needed);
@@ -115,7 +118,8 @@ bool serviceConfiguration(SC_HANDLE service, const std::filesystem::path &image,
         return n < count && std::wstring(p, n) == expected;
     };
     SERVICE_SID_INFO sid{}; SERVICE_STATUS_PROCESS status{}; DWORD done = 0;
-    if (config->dwServiceType != SERVICE_WIN32_OWN_PROCESS || config->dwStartType != SERVICE_AUTO_START ||
+    if ((startType != SERVICE_AUTO_START && startType != SERVICE_DISABLED) ||
+        config->dwServiceType != SERVICE_WIN32_OWN_PROCESS || config->dwStartType != startType ||
         !text(config->lpBinaryPathName, L"\"" + image.native() + L"\" --service --guest-wfp") ||
         !text(config->lpServiceStartName, L"LocalSystem") ||
         !QueryServiceConfig2W(service, SERVICE_CONFIG_SERVICE_SID_INFO, reinterpret_cast<BYTE *>(&sid), sizeof(sid), &done) ||
@@ -130,6 +134,16 @@ bool serviceConfiguration(SC_HANDLE service, const std::filesystem::path &image,
     bytes.resize(needed);
     return QueryServiceObjectSecurity(service, information, bytes.data(), needed, &done) && serviceDescriptor(bytes.data());
 }
+bool maintenanceState(HKEY key, bool &present, DWORD &state) {
+    DWORD version = 0, vSize = sizeof(version), sSize = sizeof(state);
+    state = 0; present = false;
+    const auto v = RegGetValueW(key,nullptr,L"MaintenanceVersion",RRF_RT_REG_DWORD,nullptr,&version,&vSize);
+    const auto s = RegGetValueW(key,nullptr,L"MaintenanceState",RRF_RT_REG_DWORD,nullptr,&state,&sSize);
+    if (v == ERROR_FILE_NOT_FOUND && s == ERROR_FILE_NOT_FOUND) { state = 0; return true; }
+    if (v != ERROR_SUCCESS || s != ERROR_SUCCESS || vSize != sizeof(version) ||
+        sSize != sizeof(state) || version != 1 || state > 4) return false;
+    present = true; return true;
+}
 struct Deployment::Registration {
     HKEY key = nullptr, gate = nullptr;
     SC_HANDLE service = nullptr;
@@ -137,6 +151,7 @@ struct Deployment::Registration {
     wire::Bytes account;
     std::wstring sid;
     bool provision = false;
+    bool marker = false;
     ~Registration() { if (key) RegCloseKey(key); if (gate) RegCloseKey(gate); if (service) CloseServiceHandle(service); }
     bool read(const wchar_t *name, std::wstring &out) const {
         wchar_t text[32768]{}; DWORD size = sizeof(text);
@@ -147,8 +162,10 @@ struct Deployment::Registration {
     }
     bool current() const {
         DWORD enabled = 0, size = sizeof(enabled), initial = 0, initialSize = sizeof(initial);
+        bool present = false; DWORD state = 0;
         std::wstring packageText, storeText, ordinaryText, sidText;
         return native::protectedRegistry(key) && native::protectedRegistry(gate) &&
+            maintenanceState(key,present,state) && present == marker && !state &&
             RegGetValueW(gate,nullptr,L"EnableWfp",RRF_RT_REG_DWORD,nullptr,&enabled,&size) == ERROR_SUCCESS && enabled == 1 &&
             RegGetValueW(key,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&initial,&initialSize) == ERROR_SUCCESS &&
             initial == (provision ? 1u : 0u) && read(L"PackageRoot", packageText) && packageText == root.native() &&
@@ -341,6 +358,8 @@ bool Deployment::admitServiceConfiguration(wire::Bytes &account, std::filesystem
         !native::protectedRegistry(candidate->gate) || !native::protectedRegistry(candidate->key)) return false;
     std::wstring root, ordinary, storeText;
     DWORD initial = 0, size = sizeof(initial);
+    DWORD state = 0;
+    if (!maintenanceState(candidate->key,candidate->marker,state) || state) return false;
     if (!candidate->read(L"PackageRoot",root) || root != root_.native() ||
         !candidate->read(L"OrdinaryImage",ordinary) || ordinary != (root_ / L"GateBouncer.exe").native() ||
         !candidate->read(L"StoreRoot",storeText) || !candidate->read(L"ViewSid",candidate->sid) ||

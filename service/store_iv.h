@@ -2,7 +2,7 @@
 #include "coordinator_iii.h"
 #include "snapshot_iv.h"
 
-namespace gb::decisions { class NativeRuntime; }
+namespace gb::decisions { class NativeRuntime; class MaintenanceRuntime; }
 
 namespace gb::principal {
 enum class StoredImage { Missing, LegacyReadOnly, Principal, Uncertain };
@@ -34,6 +34,7 @@ public:
 
 private:
   friend class decisions::NativeRuntime;
+  friend class decisions::MaintenanceRuntime;
   using RetainRead = bool (*)(void *, const ByteView &) noexcept;
   bool loadRetained(StoreRead &, void *, RetainRead);
   StoreWrite replaceOwned(std::uint64_t, std::uint64_t, ByteView, bool rereadFailure = false);

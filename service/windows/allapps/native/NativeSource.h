@@ -8,6 +8,7 @@
 namespace gb::decisions
 {
 class NativeRuntime;
+class MaintenanceRuntime;
 }
 namespace gatebouncer::service::windows::allapps::native
 {
@@ -31,6 +32,7 @@ class BindReceipt
 class BindingState
 {
     friend class NativeSource;
+    friend class gb::decisions::MaintenanceRuntime;
     BindingState(gb::wire::Id e, std::uint64_t i, std::uint64_t g) : epoch(e), index(i), generation(g)
     {
     }
@@ -131,6 +133,7 @@ class NativeSource : public std::enable_shared_from_this<NativeSource>
                        const CatalogReceipt &, Stage) const noexcept;
     Reason reconcile(const CatalogReceipt &);
     bool readOptions();
+    bool prerequisites();
     EngineLease engine_;
     SdkApi sdk_;
     const std::shared_ptr<const BindingState> binding_;

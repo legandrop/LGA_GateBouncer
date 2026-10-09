@@ -64,9 +64,7 @@ Reason NativeSource::start(const CatalogReceipt &catalog) noexcept
     try
     {
         auto keep = shared_from_this();
-        if (catalog.binding_ != binding_ || !sdk_.copy || !sdk_.subscribe || !sdk_.unsubscribe || !sdk_.module ||
-            !sdk_.option || !sdk_.filter || !sdk_.layer || !sdk_.freeMemory || !sdk_.begin || !sdk_.abort ||
-            !sdk_.createEnum || !sdk_.enumerate || !sdk_.destroyEnum)
+        if (catalog.binding_ != binding_ || !prerequisites())
             return Reason::Unsupported;
         if (!control_.begin())
             return Reason::SourceGap;

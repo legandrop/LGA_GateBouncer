@@ -4,6 +4,7 @@
 namespace gatebouncer::service::windows::allapps::native {
 // Firmas del SDK real. La sustitución sólo entra por el owner privado del source.
 struct SdkApi {
+    decltype(&guardedRead) read = &guardedRead;
     decltype(&copySdk) copy = &copySdk;
     decltype(&AllocateLocallyUniqueId) allocate = &AllocateLocallyUniqueId;
     decltype(&FwpmNetEventSubscribe2) subscribe = nullptr;

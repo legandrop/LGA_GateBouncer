@@ -18,6 +18,8 @@ add_library(gatebouncer_native_ii STATIC ../common/protected_file_win.cpp ../com
 target_link_libraries(gatebouncer_native_ii PUBLIC gatebouncer_decisions gatebouncer_policy gatebouncer_allapps_native bcrypt advapi32 wtsapi32 fwpuclnt)
 target_sources(gatebouncer_native_ii PRIVATE principal_producer_vii.cpp)
 target_sources(gatebouncer_native_ii PRIVATE ../controller/deployment_prepare_win.cpp)
+target_sources(gatebouncer_native_ii PRIVATE maintenance_iv.cpp ../controller/deployment_maintenance_win.cpp)
+target_link_libraries(gatebouncer_native_ii PRIVATE onecore)
 add_executable(GateBouncerService main.cpp pipe_transport.cpp wfp_backend.cpp)
 target_link_libraries(GateBouncerService PRIVATE gatebouncer_policy gatebouncer_native_ii fwpuclnt shell32 ws2_32)
 foreach(target gatebouncer_wire gatebouncer_policy gatebouncer_decisions gatebouncer_native_ii GateBouncerService)

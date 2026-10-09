@@ -6,7 +6,11 @@
 #ifdef GATEBOUNCER_OBSERVER
 int runObserver(QApplication &app, Gate::MainWindow &window);
 #endif
+#ifdef GATEBOUNCER_OBSERVER
+int GateBouncerGuiMain(int argc, char **argv) {
+#else
 int main(int argc, char **argv) {
+#endif
     QApplication app(argc, argv);
     if (!Gate::initialize(app)) {
         std::fprintf(stderr, "No se pudo cargar la fuente del producto.\n");

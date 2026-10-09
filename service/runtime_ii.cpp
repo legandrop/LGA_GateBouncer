@@ -397,6 +397,7 @@ bool NativeRuntime::provisionPrincipalImage(CatalogPlanBuilder &plan) {
         auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
             allnative::EngineLease(observationEngine_->handle(),observationEngine_->pin()),
             allnative::BindReceipt(observationEngine_->context_,observationEngine_->generation_),sdk));
+        if (!source->prerequisites()) return false;
         std::array<std::uint16_t,8> domain{}; std::array<allnative::recipe::SupportField,32> support{};
         std::size_t count = 0;
         if (observationEngine_->readDomain(domain,support,count) != Reason::None ||
@@ -405,12 +406,13 @@ bool NativeRuntime::provisionPrincipalImage(CatalogPlanBuilder &plan) {
         const auto saved = principalStore_->replaceOwned(0,0,bytes);
         if (!saved.physicallyConfirmed) return false;
         principalRead_ = principalStore_->read_;
-        struct Before { NativeRuntime &runtime; const principal::ByteView &bytes; } before{*this,bytes};
+        struct Before { NativeRuntime &runtime; const principal::ByteView &bytes;
+            std::shared_ptr<allnative::NativeSource> source; } before{*this,bytes,source};
         const auto verify = [](void *raw) noexcept {
             auto &b = *static_cast<Before *>(raw);
             try {
                 bool same = false, exists = false;
-                return b.runtime.deploymentCurrent() && b.runtime.principalStore_ &&
+                return b.runtime.deploymentCurrent() && b.source->prerequisites() && b.runtime.principalStore_ &&
                     !b.runtime.principalStore_->uncertain() &&
                     b.runtime.file_.compare(b.bytes.data(),b.bytes.size(),same,exists) && same && exists;
             } catch (...) { return false; }

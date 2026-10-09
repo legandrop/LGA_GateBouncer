@@ -72,6 +72,7 @@ struct Enumeration
 } // namespace
 bool NativeSource::readOptions()
 {
+    if (!sdk_.option || !sdk_.freeMemory || !sdk_.read || !engine_.engine_) return false;
     Memory collect{sdk_}, keywords{sdk_};
     if (sdk_.option(engine_.engine_, FWPM_ENGINE_COLLECT_NET_EVENTS, reinterpret_cast<FWP_VALUE0 **>(&collect.value)) !=
             ERROR_SUCCESS ||
@@ -79,11 +80,17 @@ bool NativeSource::readOptions()
                     reinterpret_cast<FWP_VALUE0 **>(&keywords.value)) != ERROR_SUCCESS)
         return false;
     FWP_VALUE0 c{}, k{};
-    if (!guardedRead(&c, collect.value, sizeof(c)) || !guardedRead(&k, keywords.value, sizeof(k)) ||
+    if (!sdk_.read(&c, collect.value, sizeof(c)) || !sdk_.read(&k, keywords.value, sizeof(k)) ||
         c.type != FWP_UINT32 || k.type != FWP_UINT32 || c.uint32 != 1)
         return false;
     keywords_.store(k.uint32); // Raw: no reinterpretar keywords como cobertura o ausencia de tráfico.
     return true;
+}
+bool NativeSource::prerequisites()
+{
+    return sdk_.copy && sdk_.read && sdk_.subscribe && sdk_.unsubscribe && sdk_.module &&
+        sdk_.filter && sdk_.layer && sdk_.begin && sdk_.abort && sdk_.createEnum &&
+        sdk_.enumerate && sdk_.destroyEnum && readOptions();
 }
 Reason NativeSource::readInventory(const CatalogReceipt &receipt)
 {
