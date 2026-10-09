@@ -80,14 +80,50 @@ bool NativeRuntime::initialize() {
 }
 ServiceContext NativeRuntime::serviceContext() const {
     std::lock_guard<std::mutex> lock(mutex);
-    ServiceContext context;
-    context.serviceEpoch = epoch_;
-    context.boot = boot_;
-    if (observationEngine_) {
-        context.engineContext = observationEngine_->context_;
-        context.engineBindingGeneration = observationEngine_->generation_;
+    return readServiceContext();
+}
+ServiceContext NativeRuntime::readServiceContext() const noexcept {
+    ServiceContext unavailable{epoch_, boot_, {}, 0};
+    const auto source = principalSource_;
+    const auto catalog = principalCatalog_;
+    const auto engine = observationEngine_;
+    bool worker = false;
+    try {
+      if (!source || !catalog || !engine || source->stage() != allnative::Stage::Active ||
+        source->binding_ != catalog->binding_ ||
+        source->binding_->epoch != engine->context_ ||
+        source->binding_->generation != engine->generation_ ||
+        std::atomic_load(&source->catalog_) != catalog ||
+        !source->control_.beginWorker()) return unavailable;
+        worker = true;
+        const auto before = source->source_.health();
+        allnative::CatalogReceipt receipt(catalog);
+        const auto result = source->reconcile(receipt); // READ actual completo; el cache status no lo sustituye.
+        auto handle = source->control_.finishWorker();
+        worker = false;
+        if (handle) source->cancel(handle);
+        source->finalize();
+        const auto after = source->source_.health();
+        if (result != gatebouncer::service::windows::allapps::Reason::None ||
+            source->stage() != allnative::Stage::Active ||
+            before.health != gatebouncer::service::windows::allapps::Health::Ready ||
+            after.health != gatebouncer::service::windows::allapps::Health::Ready ||
+            before.lossRevision != after.lossRevision ||
+            std::atomic_load(&source->catalog_) != catalog) {
+            source->source_.lost();
+            return unavailable;
+        }
+        return {epoch_, boot_, engine->context_, engine->generation_};
+    } catch (...) {
+        if (source) {
+            source->source_.lost();
+            if (worker) {
+                if (auto handle = source->control_.finishWorker()) source->cancel(handle);
+            }
+            source->finalize();
+        }
+        return unavailable;
     }
-    return context;
 }
 bool NativeRuntime::acquireObservationEngine() {
     if (observationEngine_) return true;
@@ -192,7 +228,31 @@ Frame NativeRuntime::error(Error e) const {
     f.fields = {value(Tag::ErrorCode, unsigned(e), 2)};
     return f;
 }
-Frame NativeRuntime::status(Type type) const {
+Frame NativeRuntime::status(Type type, std::uint16_t minor) const {
+    if (minor == 3) {
+        const auto context = readServiceContext();
+        Bytes payload;
+        if (wire::iv::encodeServiceContext(context, payload) != Error::Ok) {
+            auto failed = error(Error::IdentityUnavailable);
+            failed.minor = 3;
+            return failed;
+        }
+        Frame frame;
+        frame.minor = 3;
+        frame.type = type;
+        frame.fields = {value(Tag::ServiceEpoch, epoch_), value(Tag::BootId, boot_),
+            value(Tag::Capabilities, ReadStatus),
+            value(Tag::DesiredRev, principalMode_ ? principalRead_.snapshot.desired : coordinator_.snapshot().desired),
+            value(Tag::EffectiveRev, 0), value(Tag::EffectiveKnown, 0, 1),
+            value(Tag::EngineState, unsigned(EngineState::RecoveryRequired), 1)};
+        if (type == Type::Status) frame.fields.push_back(value(Tag::GapCount, collector_.gaps()));
+        frame.fields.insert(frame.fields.end(), {value(Tag::BackendMode, 1, 1),
+            value(Tag::ProfileGeneration, profile_.value().generation),
+            value(Tag::ReviewProfileState, profile_.value().state, 1),
+            value(Tag::SourceEpoch, context.engineContext), value(Tag::IVProfile, 0, 1),
+            {Tag::ServiceContext, true, std::move(payload)}});
+        return frame; // View: sólo identidad/readback accesible, sin permiso ni efecto conocido.
+    }
     auto s = coordinator_.snapshot();
     if (principalMode_) s.desired = principalRead_.snapshot.desired;
     auto known = !principalMode_ && loaded_ && !coordinator_.recovery() && directions_.ready() &&
@@ -485,7 +545,7 @@ void NativeServer::channel(bool control, HANDLE stop) {
             VerifiedControl peer;
             bool authenticated = false;
             if (ipc::ii::receive(pipe.value, hello, stop) &&
-                (hello.minor == 2 || hello.minor == 1 || (!control && hello.minor == 0)) && hello.type == Type::Hello &&
+                (hello.minor == 2 || hello.minor == 1 || (!control && (hello.minor == 0 || hello.minor == 3))) && hello.type == Type::Hello &&
                 zero(hello.connection) && hello.sequence == 1 &&
                 get(hello, Tag::ClientRole) == (control ? 2 : 1)) {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
@@ -501,7 +561,7 @@ void NativeServer::channel(bool control, HANDLE stop) {
             Frame ack;
             {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
-                ack = runtime_.status(Type::HelloAck);
+                ack = runtime_.status(Type::HelloAck, hello.minor == 3 ? 3 : 2);
             }
             ack.connection = connection;
             ack.correlation = hello.correlation;
@@ -572,7 +632,15 @@ void NativeServer::channel(bool control, HANDLE stop) {
                     if (runtime_.profileGeneration() != profile ||
                         !runtime_.peer(pipe.value, control, peer, false))
                         break;
-                    if (!hello.minor) {
+                    if (hello.minor == 3) {
+                        response = runtime_.status(Type::Status, 3);
+                        if (f.type != Type::GetStatus) {
+                            response = {};
+                            response.minor = 3;
+                            response.type = Type::ProtocolError;
+                            response.fields = {value(Tag::ErrorCode, unsigned(Error::Unsupported), 2)};
+                        }
+                    } else if (!hello.minor) {
                         response = runtime_.status(Type::Status);
                         if (f.type != Type::GetStatus) {
                             response = {};

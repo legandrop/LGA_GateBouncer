@@ -17,7 +17,7 @@ class NativeRuntime {
     bool initialize();
     ServiceContext serviceContext() const;
     void tick();
-    Frame status(Type type) const;
+    Frame status(Type type, std::uint16_t minor = 2) const;
     Frame dispatch(const Frame &request, const VerifiedControl &peer, Pages &pages);
     bool peer(HANDLE pipe, bool control, VerifiedControl &evidence, bool activate);
     bool principals(ipc::ii::Principals &principals) const;
@@ -34,6 +34,7 @@ class NativeRuntime {
   private:
     std::vector<ii::RuleRecord> rules() const;
     Frame error(Error error) const;
+    ServiceContext readServiceContext() const noexcept;
     bool acquireObservationEngine();
     bool loadPrincipalImage();
     bool bindPrincipalObservation(CatalogPlanBuilder &);

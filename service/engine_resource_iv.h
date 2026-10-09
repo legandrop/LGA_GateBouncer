@@ -1,5 +1,5 @@
 #pragma once
-#include "../common/wire_v1.h"
+#include "../common/wire_iv.h"
 #include <memory>
 #include <windows.h>
 
@@ -9,10 +9,7 @@
 namespace gb::decisions {
 class NativeRuntime;
 // Identidad de generación: no es una capacidad de control ni prueba de filtro.
-struct ServiceContext {
-  wire::Id serviceEpoch{}, boot{}, engineContext{};
-  std::uint64_t engineBindingGeneration = 0;
-};
+using ServiceContext = wire::iv::ServiceContext;
 class EngineResource final {
   friend class NativeRuntime;
   struct Api;

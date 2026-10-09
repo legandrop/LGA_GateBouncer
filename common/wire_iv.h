@@ -3,6 +3,13 @@
 
 namespace gb::wire::iv {
 constexpr std::size_t MaxRecordsBytes = 57344;
+// Identidad readonly; no prueba continuidad, efecto ni derechos.
+struct ServiceContext {
+  Id serviceEpoch{}, boot{}, engineContext{};
+  std::uint64_t engineBindingGeneration = 0;
+};
+Error encodeServiceContext(const ServiceContext &, Bytes &);
+Error decodeServiceContext(const Frame &, ServiceContext &);
 enum class Proof : std::uint8_t {
   Unknown = 0,
   CurrentShapeUnproven = 1,

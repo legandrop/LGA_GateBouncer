@@ -17,6 +17,9 @@ class Session : public QObject {
     void stop();
     bool idle() const { return pending_ == 0; }
     bool actualOsAuthenticated() const { return nativeAuthenticated_; }
+    std::shared_ptr<const ipc::ii::ReadPeerLease> readonlyPeer() const {
+        return stopping_ ? nullptr : std::atomic_load(&readonlyPeer_);
+    }
   signals:
     void opened(bool authenticated, gb::wire::Frame status);
     void received(bool authenticated, gb::wire::Frame response, gb::wire::Id correlation);
@@ -28,6 +31,7 @@ class Session : public QObject {
     QThread thread_;
     QObject *worker_ = nullptr;
     std::unique_ptr<ipc::ii::SessionChannel> client_;
+    std::shared_ptr<const ipc::ii::ReadPeerLease> readonlyPeer_;
     std::atomic<bool> nativeAuthenticated_{false};
     std::atomic<unsigned> pending_{0};
     std::atomic<bool> stopping_{false};

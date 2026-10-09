@@ -381,6 +381,31 @@ bool supported(Type t) {
          t == Type::Status || t == Type::ProtocolError ||
          (t >= Type::ListObserved && t <= Type::ReviewQueued);
 }
+Error encodeServiceContext(const ServiceContext &context, Bytes &out) {
+  out.clear();
+  if (zero(context.serviceEpoch) || zero(context.boot) ||
+      zero(context.engineContext) != (context.engineBindingGeneration == 0))
+    return Error::Malformed;
+  out.resize(56);
+  put(out, 0, context.serviceEpoch);
+  put(out, 16, context.boot);
+  put(out, 32, context.engineContext);
+  put(out, 48, context.engineBindingGeneration, 8);
+  return Error::Ok;
+}
+Error decodeServiceContext(const Frame &frame, ServiceContext &out) {
+  out = {};
+  if (frame.minor != 3 ||
+      (frame.type != Type::HelloAck && frame.type != Type::Status))
+    return Error::Unsupported;
+  const auto error = iv::validate(frame);
+  if (error != Error::Ok) return error;
+  if (get(frame, T::IVProfile) != 0 || (get(frame, T::Capabilities) & FuturePolicyControl))
+    return Error::Malformed;
+  const auto &bytes = find(frame, T::ServiceContext)->bytes;
+  out = {array<16>(bytes, 0), array<16>(bytes, 16), array<16>(bytes, 32), n(bytes, 48, 8)};
+  return Error::Ok;
+}
 bool valid(const ObservedRecord &r) {
   auto reason = static_cast<unsigned>(r.reason);
   return !zero(r.observed) && r.revision && !zero(r.source) && r.state >= 1 &&
@@ -468,7 +493,8 @@ Error validate(const Frame &f) {
   unsigned previous = 0;
   for (const auto &v : f.fields) {
     auto tag = static_cast<unsigned>(v.tag);
-    if (tag < 1 || tag > 87 || tag == 57)
+    if (tag < 1 || tag > 88 || tag == 57 ||
+        (v.tag == T::ServiceContext && f.type != Type::HelloAck && f.type != Type::Status))
       return Error::Unsupported;
     if (tag <= previous)
       return Error::Malformed;
@@ -484,11 +510,18 @@ Error validate(const Frame &f) {
     bool status = f.type == Type::HelloAck || f.type == Type::Status;
     if (status) {
       auto source = find(f, T::SourceEpoch), profile = find(f, T::IVProfile),
-           caps = find(f, T::Capabilities);
+           caps = find(f, T::Capabilities), context = find(f, T::ServiceContext);
       if (!source || source->bytes.size() != 16 || !source->required ||
           !profile || profile->bytes.size() != 1 || !profile->required ||
-          number(*profile) > 1 || !caps || caps->bytes.size() != 8)
+          number(*profile) > 1 || !caps || caps->bytes.size() != 8 ||
+          !context || !context->required || context->bytes.size() != 56)
         return Error::Malformed;
+      const auto epoch = array<16>(context->bytes, 0), boot = array<16>(context->bytes, 16),
+                 engine = array<16>(context->bytes, 32);
+      const auto generation = n(context->bytes, 48, 8);
+      if (zero(epoch) || zero(boot) || epoch != idValue(f, T::ServiceEpoch) ||
+          boot != idValue(f, T::BootId) || engine != idValue(f, T::SourceEpoch) ||
+          zero(engine) != (generation == 0)) return Error::Malformed;
       auto c = number(*caps);
       if ((c >> 25) || (c & ((0x3full << 6) | (1ull << 16))) ||
           ((c & FuturePolicyControl) && !number(*profile)))
@@ -496,7 +529,8 @@ Error validate(const Frame &f) {
       base.fields.erase(std::remove_if(base.fields.begin(), base.fields.end(),
                                        [](const auto &v) {
                                          return v.tag == T::SourceEpoch ||
-                                                v.tag == T::IVProfile;
+                                                v.tag == T::IVProfile ||
+                                                v.tag == T::ServiceContext;
                                        }),
                         base.fields.end());
       for (auto &v : base.fields)

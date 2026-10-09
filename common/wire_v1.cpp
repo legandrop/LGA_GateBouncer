@@ -82,6 +82,7 @@ bool validUtf8(const Bytes& b) {
 }
 Error validate(const Frame& f) {
     if(f.minor==3) return iv::validate(f);
+    if (f.minor <= 2 && find(f, Tag::ServiceContext)) return Error::Unsupported;
     if(f.minor==1||f.minor==2) return ii::validate(f);
     if(f.minor!=0) return Error::VersionMismatch;
     auto t=static_cast<unsigned>(f.type);

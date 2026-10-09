@@ -11,6 +11,8 @@ Session::Session(QObject *parent, std::unique_ptr<ipc::ii::SessionChannel> chann
 }
 Session::~Session() {
     stopping_ = true;
+    if (auto peer = std::atomic_exchange(&readonlyPeer_, std::shared_ptr<const ipc::ii::ReadPeerLease>{}))
+        peer->revoke();
     thread_.quit();
     thread_.wait();
 }
@@ -26,6 +28,15 @@ bool Session::open(bool control, std::filesystem::path image) {
     QMetaObject::invokeMethod(worker_, [this, control, image = std::move(image)] {
         bool ok = !stopping_ && client_->open(control, image);
         nativeAuthenticated_ = ok && client_->actualOsAuthenticated();
+        // Un double no puede tomar prestado el lease de otro Client nativo.
+        auto nativeClient = dynamic_cast<ipc::ii::Client *>(client_.get());
+        std::atomic_store(&readonlyPeer_, ok && nativeClient ? nativeClient->readonlyPeer() : nullptr);
+        if (stopping_) {
+            if (auto peer = std::atomic_exchange(&readonlyPeer_, std::shared_ptr<const ipc::ii::ReadPeerLease>{}))
+                peer->revoke();
+            client_->close();
+            ok = false;
+        }
         emit opened(ok, ok ? client_->hello() : wire::Frame{});
         done();
     });
@@ -39,7 +50,7 @@ bool Session::request(wire::Frame f) {
         wire::Frame reply;
         auto request = f;
         request.minor = client_->hello().minor;
-        bool ok = !stopping_ && (request.minor == 1 || request.minor == 2) && client_->transact(request, reply);
+        bool ok = !stopping_ && (request.minor == 1 || request.minor == 2 || request.minor == 3) && client_->transact(request, reply);
         emit received(ok, std::move(reply), f.correlation);
         if (ok) {
             std::vector<wire::Frame> events;
@@ -58,6 +69,8 @@ bool Session::request(wire::Frame f) {
 void Session::stop() {
     if (stopping_.exchange(true))
         return;
+    if (auto peer = std::atomic_exchange(&readonlyPeer_, std::shared_ptr<const ipc::ii::ReadPeerLease>{}))
+        peer->revoke();
     ++pending_;
     QMetaObject::invokeMethod(worker_, [this] {
         nativeAuthenticated_ = false;
