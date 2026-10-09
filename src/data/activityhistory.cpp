@@ -99,7 +99,9 @@ bool ActivityHistory::ingest(const ActivityEvent &event) {
 void ActivityHistory::gap(const QString &id, const QString &epoch, const QString &reason, quint64 lost) {
     auto *coverage = source(id, epoch);
     if (!coverage) return;
-    coverage->status = CoverageStatus::Partial;
+    // Una discontinuidad no convierte una fuente sin validar en observacion disponible.
+    if (coverage->status != CoverageStatus::Unavailable)
+        coverage->status = CoverageStatus::Partial;
     const auto safeReason = reason.left(32768);
     if (!coverage->gaps.isEmpty() && coverage->gaps.back().reason == safeReason) {
         auto &count = coverage->gaps.back().lost;
@@ -125,6 +127,7 @@ bool ActivityHistory::flushDue(const QDateTime &nowUtc) const {
                              stagedSince_.msecsTo(nowUtc) >= 2000);
 }
 bool ActivityHistory::restore(const HistoryState &state) {
+    // El consumidor entrega el HistoryState validado por ReviewStore, no entradas externas.
     if (state.events.size() > eventLimit_ || state.coverage.size() > 128 ||
         state.subjects.size() > 20000 || state.ruleHits.size() > 20000) return false;
     QMap<QString, quint64> sequences;
