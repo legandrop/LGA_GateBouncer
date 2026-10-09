@@ -42,6 +42,16 @@ the selector remains unavailable. A native APP_ID identifies a path, not file
 content, a process instance or the original caller of a broker.
 
 The store caps rules at 4,096 and snapshots at 16 MiB. A desired revision is
+stored only in objects owned by System or Administrators, with a protected
+System/Administrators DACL checked on the opened directory, snapshot and
+temporary file handles. Ancestor handles remain open without delete sharing;
+their owner and effective ACEs must also prevent ordinary substitution or
+security changes. Windows TrustedInstaller ownership is accepted for ancestors
+only. Existing unsafe objects are rejected; the component does not repair their
+security. Binary, dependency and administrative registry deployment security
+remains a separate prerequisite checked by the guest harness.
+
+A desired revision is
 durable before a WFP transaction. Applied requires successful commit, exact
 readback and a durable final snapshot. A final store failure after readback
 reports AppliedUnrecorded. Corrupt or mismatched state enters recovery and

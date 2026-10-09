@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <sddl.h>
+#include <aclapi.h>
 #include <algorithm>
 #include <set>
 #include <stdexcept>
@@ -31,10 +32,44 @@ bool noReparse(const std::filesystem::path& p,bool allowMissing){
     if(a==INVALID_FILE_ATTRIBUTES)return allowMissing&&GetLastError()==ERROR_FILE_NOT_FOUND;
     return (a&FILE_ATTRIBUTE_REPARSE_POINT)==0;
 }
-bool flushCommitted(const std::filesystem::path& path){
-    Handle file;file.h=CreateFileW(path.c_str(),GENERIC_WRITE,0,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_WRITE_THROUGH,nullptr);
-    if(file.h==INVALID_HANDLE_VALUE)return false;FILE_ATTRIBUTE_TAG_INFO info{};
-    return GetFileInformationByHandleEx(file.h,FileAttributeTagInfo,&info,sizeof(info))&&!(info.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)&&FlushFileBuffers(file.h);
+bool objectShape(HANDLE file,bool directory){
+    FILE_ATTRIBUTE_TAG_INFO info{};
+    return GetFileInformationByHandleEx(file,FileAttributeTagInfo,&info,sizeof(info))&&
+        !(info.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)&&bool(info.FileAttributes&FILE_ATTRIBUTE_DIRECTORY)==directory;
+}
+bool trustedSecurity(HANDLE object,bool ancestor){
+    BYTE system[SECURITY_MAX_SID_SIZE]{},admin[SECURITY_MAX_SID_SIZE]{};DWORD sn=sizeof(system),an=sizeof(admin);
+    if(!CreateWellKnownSid(WinLocalSystemSid,nullptr,system,&sn)||!CreateWellKnownSid(WinBuiltinAdministratorsSid,nullptr,admin,&an))return false;
+    // TrustedInstaller es autoridad de Windows sobre ancestros, no dueño del store.
+    PSID installer=nullptr;if(ancestor&&!ConvertStringSidToSidW(L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",&installer))return false;
+    auto trusted=[&](PSID sid){return sid&&IsValidSid(sid)&&(EqualSid(sid,system)||EqualSid(sid,admin)||(ancestor&&EqualSid(sid,installer)));};
+    PSECURITY_DESCRIPTOR sd=nullptr;PSID owner=nullptr;PACL acl=nullptr;
+    auto error=GetSecurityInfo(object,SE_FILE_OBJECT,OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION,&owner,nullptr,&acl,nullptr,&sd);
+    SECURITY_DESCRIPTOR_CONTROL control=0;DWORD revision=0;bool ok=error==ERROR_SUCCESS&&trusted(owner)&&acl&&IsValidAcl(acl)&&
+        GetSecurityDescriptorControl(sd,&control,&revision)&&(ancestor||(control&SE_DACL_PROTECTED));
+    bool fullSystem=false,fullAdmin=false;
+    GENERIC_MAPPING mapping{FILE_GENERIC_READ,FILE_GENERIC_WRITE,FILE_GENERIC_EXECUTE,FILE_ALL_ACCESS};
+    constexpr DWORD unsafeAncestor=FILE_WRITE_DATA|FILE_WRITE_EA|FILE_WRITE_ATTRIBUTES|FILE_DELETE_CHILD|DELETE|WRITE_DAC|WRITE_OWNER;
+    for(DWORD i=0;ok&&i<acl->AceCount;++i){void* raw=nullptr;if(!GetAce(acl,i,&raw)){ok=false;break;}auto header=static_cast<ACE_HEADER*>(raw);if(header->AceFlags&INHERIT_ONLY_ACE)continue;
+        if(header->AceType==ACCESS_DENIED_ACE_TYPE){if(!ancestor)ok=false;continue;}
+        if(header->AceType!=ACCESS_ALLOWED_ACE_TYPE){ok=false;break;}
+        auto ace=static_cast<ACCESS_ALLOWED_ACE*>(raw);PSID sid=&ace->SidStart;DWORD mask=ace->Mask;
+        if(!IsValidSid(sid)||(mask&MAXIMUM_ALLOWED)){ok=false;break;}MapGenericMask(&mask,&mapping);
+        if(!trusted(sid)&&(!ancestor||(mask&unsafeAncestor))){ok=false;break;}
+        if((mask&FILE_ALL_ACCESS)==FILE_ALL_ACCESS){fullSystem|=EqualSid(sid,system)!=FALSE;fullAdmin|=EqualSid(sid,admin)!=FALSE;}
+    }
+    if(!ancestor)ok=ok&&fullSystem&&fullAdmin;
+    if(sd)LocalFree(sd);if(installer)LocalFree(installer);return ok;
+}
+bool trustedFile(HANDLE file,bool fixture){return objectShape(file,false)&&(fixture||trustedSecurity(file,false));}
+bool existingFile(const std::filesystem::path& path,bool fixture,bool& exists){
+    Handle file;file.h=CreateFileW(path.c_str(),READ_CONTROL|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    if(file.h==INVALID_HANDLE_VALUE){exists=false;return GetLastError()==ERROR_FILE_NOT_FOUND;}
+    exists=true;return trustedFile(file.h,fixture);
+}
+bool flushCommitted(const std::filesystem::path& path,bool fixture){
+    Handle file;file.h=CreateFileW(path.c_str(),GENERIC_WRITE|READ_CONTROL|FILE_READ_ATTRIBUTES,0,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_WRITE_THROUGH,nullptr);
+    return file.h!=INVALID_HANDLE_VALUE&&trustedFile(file.h,fixture)&&FlushFileBuffers(file.h);
 }
 }
 Id randomId(){Id id{};if(BCryptGenRandom(nullptr,id.data(),16,BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)throw std::runtime_error("No se pudo crear identidad de sesion");return id;}
@@ -63,28 +98,42 @@ bool parseSnapshot(const Bytes& input,Snapshot& out){
     if(!r.ok||r.p!=body.size())return false;out=std::move(s);return true;
 }
 PolicyStore::PolicyStore(std::filesystem::path root,bool fixture):root_(std::move(root)),fixture_(fixture){}
+PolicyStore::~PolicyStore(){for(auto handle:directoryHandles_)CloseHandle(handle);}
 bool PolicyStore::prepareDirectory(){
-    auto native=root_.native();if(!root_.is_absolute()||native.size()<3||native[1]!=L':'||native[2]!=L'\\'||GetDriveTypeW(native.substr(0,3).c_str())!=DRIVE_FIXED)return false;
-    // El padre es parte del despliegue protegido, no se crean arboles arbitrarios.
+    auto native=root_.native();if(!root_.is_absolute()||root_!=root_.lexically_normal()||native.size()<3||native[1]!=L':'||native[2]!=L'\\'||GetDriveTypeW(native.substr(0,3).c_str())!=DRIVE_FIXED)return false;
+    if(!directoryHandles_.empty()){
+        for(std::size_t i=0;i<directoryHandles_.size();++i)if(!objectShape(directoryHandles_[i],true)||!trustedSecurity(directoryHandles_[i],i+1<directoryHandles_.size()))return false;
+        return true;
+    }
     std::vector<std::filesystem::path> ancestors;
     for(auto p=root_;!p.empty();p=p.parent_path()){ancestors.push_back(p);if(p==p.parent_path())break;}
+    if(!fixture_){
+        // Ancestros adquiridos de raiz a hoja y retenidos SIN SHARE_DELETE: no sustitucion.
+        auto fail=[&](){for(auto handle:directoryHandles_)CloseHandle(handle);directoryHandles_.clear();return false;};
+        for(auto p=ancestors.rbegin();p!=ancestors.rend();++p){bool leaf=std::next(p)==ancestors.rend();
+            Handle directory;directory.h=CreateFileW(p->c_str(),READ_CONTROL|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+            if(directory.h==INVALID_HANDLE_VALUE){
+                auto openError=GetLastError();if(!leaf||(openError!=ERROR_FILE_NOT_FOUND&&openError!=ERROR_PATH_NOT_FOUND))return fail();
+                PSECURITY_DESCRIPTOR sd=nullptr;if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;SY)(A;;FA;;;BA)",SDDL_REVISION_1,&sd,nullptr))return fail();
+                SECURITY_ATTRIBUTES sa{sizeof(sa),sd,FALSE};bool created=CreateDirectoryW(root_.c_str(),&sa)!=FALSE;auto createError=GetLastError();LocalFree(sd);if(!created&&createError!=ERROR_ALREADY_EXISTS)return fail();
+                directory.h=CreateFileW(root_.c_str(),READ_CONTROL|FILE_READ_ATTRIBUTES,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+            }
+            if(directory.h==INVALID_HANDLE_VALUE||!objectShape(directory.h,true)||!trustedSecurity(directory.h,!leaf))return fail();
+            directoryHandles_.push_back(directory.h);directory.h=INVALID_HANDLE_VALUE;
+        }
+        return !directoryHandles_.empty();
+    }
+    // Fixture local: conserva pruebas funcionales, nunca acredita seguridad de produccion.
     for(auto p=ancestors.rbegin();p!=ancestors.rend();++p){if(!noReparse(*p,true))return false;}
-    PSECURITY_DESCRIPTOR sd=nullptr;
-    if(!fixture_&&!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;SY)(A;;FA;;;BA)",SDDL_REVISION_1,&sd,nullptr))return false;
-    SECURITY_ATTRIBUTES sa{sizeof(sa),sd,FALSE};
-    bool ok=CreateDirectoryW(root_.c_str(),fixture_?nullptr:&sa)||GetLastError()==ERROR_ALREADY_EXISTS;
-    if(sd)LocalFree(sd);
+    bool ok=CreateDirectoryW(root_.c_str(),nullptr)||GetLastError()==ERROR_ALREADY_EXISTS;
     if(!ok||!noReparse(root_,false))return false;
-    // Para produccion el directorio ya existente debe tener DACL protegida correcta.
-    if(!fixture_){PSECURITY_DESCRIPTOR current=nullptr;DWORD need=0;GetFileSecurityW(root_.c_str(),DACL_SECURITY_INFORMATION,nullptr,0,&need);if(!need)return false;Bytes buf(need);current=buf.data();if(!GetFileSecurityW(root_.c_str(),DACL_SECURITY_INFORMATION,current,need,&need))return false;LPWSTR text=nullptr;if(!ConvertSecurityDescriptorToStringSecurityDescriptorW(current,SDDL_REVISION_1,DACL_SECURITY_INFORMATION,&text,nullptr))return false;std::wstring actual(text);LocalFree(text);if(actual!=L"D:P(A;;FA;;;SY)(A;;FA;;;BA)"&&actual!=L"D:P(A;;FA;;;BA)(A;;FA;;;SY)")return false;}
     return true;
 }
 bool PolicyStore::load(Snapshot& out,bool& exists){
     exists=false;if(!prepareDirectory())return false;auto path=root_/L"policy.bin";
-    if(!noReparse(path,true))return false;
-    Handle file;file.h=CreateFileW(path.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
+    Handle file;file.h=CreateFileW(path.c_str(),GENERIC_READ|READ_CONTROL,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
     if(file.h==INVALID_HANDLE_VALUE){if(GetLastError()==ERROR_FILE_NOT_FOUND)return true;return false;}
-    exists=true;FILE_ATTRIBUTE_TAG_INFO info{};if(!GetFileInformationByHandleEx(file.h,FileAttributeTagInfo,&info,sizeof(info))||(info.FileAttributes&FILE_ATTRIBUTE_REPARSE_POINT))return false;
+    exists=true;if(!trustedFile(file.h,fixture_))return false;
     LARGE_INTEGER size{};if(!GetFileSizeEx(file.h,&size)||size.QuadPart<0||size.QuadPart>MaxStoreBytes)return false;
     Bytes b(static_cast<std::size_t>(size.QuadPart));DWORD read=0;if(!ReadFile(file.h,b.data(),static_cast<DWORD>(b.size()),&read,nullptr)||read!=b.size())return false;return parseSnapshot(b,out);
 }
@@ -92,15 +141,13 @@ bool PolicyStore::save(const Snapshot& s){
     if(!prepareDirectory())return false;Bytes b;try{b=serializeSnapshot(s);}catch(...){return false;}
     auto final=root_/L"policy.bin",backup=root_/L"policy.previous.bin",temp=root_/std::filesystem::path(L"prepared-"+std::wstring(32,L'0'));
     auto id=hex(randomId());temp=root_/std::filesystem::path(L"prepared-"+std::wstring(id.begin(),id.end())+L".bin");
-    if(!noReparse(final,true)||!noReparse(backup,true))return false;
+    bool finalExists=false,backupExists=false;if(!existingFile(final,fixture_,finalExists)||!existingFile(backup,fixture_,backupExists))return false;
     PSECURITY_DESCRIPTOR sd=nullptr;if(!fixture_&&!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;SY)(A;;FA;;;BA)",SDDL_REVISION_1,&sd,nullptr))return false;SECURITY_ATTRIBUTES sa{sizeof(sa),sd,FALSE};
-    Handle file;file.h=CreateFileW(temp.c_str(),GENERIC_WRITE,0,fixture_?nullptr:&sa,CREATE_NEW,FILE_FLAG_WRITE_THROUGH,nullptr);if(sd)LocalFree(sd);if(file.h==INVALID_HANDLE_VALUE)return false;
+    Handle file;file.h=CreateFileW(temp.c_str(),GENERIC_WRITE|READ_CONTROL|FILE_READ_ATTRIBUTES,0,fixture_?nullptr:&sa,CREATE_NEW,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_WRITE_THROUGH,nullptr);if(sd)LocalFree(sd);if(file.h==INVALID_HANDLE_VALUE||!trustedFile(file.h,fixture_))return false;
     DWORD written=0;bool ok=WriteFile(file.h,b.data(),static_cast<DWORD>(b.size()),&written,nullptr)&&written==b.size()&&FlushFileBuffers(file.h);CloseHandle(file.h);file.h=INVALID_HANDLE_VALUE;
     if(!ok)return false;
-    auto attributes=GetFileAttributesW(final.c_str());
-    if(attributes==INVALID_FILE_ATTRIBUTES&&GetLastError()==ERROR_FILE_NOT_FOUND)return MoveFileExW(temp.c_str(),final.c_str(),MOVEFILE_WRITE_THROUGH)&&flushCommitted(final);
-    if(attributes==INVALID_FILE_ATTRIBUTES)return false;
-    return ReplaceFileW(final.c_str(),temp.c_str(),backup.c_str(),0,nullptr,nullptr)&&flushCommitted(final);
+    if(!finalExists)return MoveFileExW(temp.c_str(),final.c_str(),MOVEFILE_WRITE_THROUGH)&&flushCommitted(final,fixture_);
+    return ReplaceFileW(final.c_str(),temp.c_str(),backup.c_str(),0,nullptr,nullptr)&&flushCommitted(final,fixture_);
 }
 Id SelectorRegistry::registerNative(const Bytes& blob){
     if(!blobValid(blob))return{};auto digest=sha256(blob);Id id{};std::copy_n(digest.begin(),16,id.begin());std::lock_guard<std::mutex> guard(mutex_);if(native_.size()>=MaxRules&&!native_.count(id))return{};auto p=native_.find(id);if(p!=native_.end()&&p->second!=blob)return{};native_[id]=blob;return id;
@@ -126,7 +173,12 @@ Status Coordinator::statusUnlocked(){
 }
 Status Coordinator::status(){std::lock_guard<std::mutex> guard(mutex_);return statusUnlocked();}
 Outcome Coordinator::mutate(const Frame& f,bool admin){
-    std::lock_guard<std::mutex> guard(mutex_);auto outcome=[&](State state,Error e){return Outcome{state,e,statusUnlocked()};};
+    std::lock_guard<std::mutex> guard(mutex_);auto outcome=[&](State state,Error e){
+        auto actual=statusUnlocked();
+        // Una segunda lectura puede detectar drift entre commit/guardado y el ACK.
+        if((state==State::Applied||state==State::AppliedUnrecorded)&&(!actual.effectiveKnown||actual.effective!=actual.desired))return Outcome{State::RecoveryRequired,e==Error::Ok?Error::RecoveryRequired:e,actual};
+        return Outcome{state,e,actual};
+    };
     if(!admin)return outcome(State::Failed,Error::Unauthorized);
     if(wire::validate(f)!=Error::Ok)return outcome(State::Failed,Error::Malformed);
     if(f.type!=Type::CreateRule&&f.type!=Type::RevokeRule)return outcome(State::Failed,Error::Unsupported);

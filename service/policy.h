@@ -25,7 +25,9 @@ bool parseSnapshot(const Bytes& bytes,Snapshot& snapshot);
 class PolicyStore {
 public:
     explicit PolicyStore(std::filesystem::path root,bool fixture=false);
-    virtual ~PolicyStore()=default;
+    virtual ~PolicyStore();
+    PolicyStore(const PolicyStore&)=delete;
+    PolicyStore& operator=(const PolicyStore&)=delete;
     virtual bool load(Snapshot& out,bool& exists);
     virtual bool save(const Snapshot& snapshot);
     const std::filesystem::path& root() const { return root_; }
@@ -33,6 +35,7 @@ private:
     bool prepareDirectory();
     std::filesystem::path root_;
     bool fixture_;
+    std::vector<void*> directoryHandles_;
 };
 class SelectorRegistry {
 public:

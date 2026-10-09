@@ -100,10 +100,15 @@ Error validate(const Frame& f) {
     for(auto [tag,width]:expected){(void)width;if(!seen.count(tag))return Error::Malformed;}
     if(f.type==Type::CreateRule && zero(idValue(f,Tag::SelectorId)))return Error::Malformed;
     if(f.type==Type::RevokeRule && zero(idValue(f,Tag::RuleId)))return Error::Malformed;
-    if(f.type==Type::MutationAck && get(f,Tag::CommandState)==2 &&
-        (get(f,Tag::ErrorCode)!=0||get(f,Tag::EffectiveKnown)!=1))return Error::Malformed;
-    if((f.type==Type::Status||f.type==Type::HelloAck||f.type==Type::MutationAck)&&
-        get(f,Tag::EffectiveKnown)==0&&get(f,Tag::EffectiveRev)!=0)return Error::Malformed;
+    if(f.type==Type::Status||f.type==Type::HelloAck||f.type==Type::MutationAck){
+        const auto desired=get(f,Tag::DesiredRev),effective=get(f,Tag::EffectiveRev),known=get(f,Tag::EffectiveKnown);
+        if(effective>desired||(!known&&effective!=0))return Error::Malformed;
+        if(f.type==Type::MutationAck){
+            const auto state=get(f,Tag::CommandState),error=get(f,Tag::ErrorCode);
+            if(state==2&&(error!=0||!known||effective!=desired))return Error::Malformed;
+            if(state==5&&(error!=8||!known||effective!=desired))return Error::Malformed;
+        }
+    }
     return Error::Ok;
 }
 Error encode(const Frame& f,Bytes& out) {
