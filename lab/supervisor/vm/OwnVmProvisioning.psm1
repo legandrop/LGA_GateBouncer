@@ -69,7 +69,8 @@ function Get-VmOwnView($owner) {
         SwitchId=$script:VmBoundary.SwitchId;State=$state;Cause=$owner.Cause;
         Generation=$owner.Generation;Revoked=$owner.Revoked;CleanupPending=$owner.Pending;
         VmRemovalObserved=$owner.Removed;SwitchRemovalObserved=$false;
-        BootObserved=$false;EnrollmentObserved=$false;StartSubmitted=$false}
+        BootObserved=$false;EnrollmentObserved=$false;
+        StartSubmitted=[bool]($owner.Storage -and $owner.Storage.StartSubmitted)}
 }
 function Set-VmOwnRevoked($owner,[string]$cause) {
     if ($cause -in @('LeaseLost','LeaseMissing','RootCustodyUnconfirmed')) { $script:VmBoundary.Lost=$true }
@@ -100,13 +101,14 @@ function Test-VmOwnCurrent($owner,[long]$generation) {
 function Enter-VmOwnFrame($owner,[bool]$cleanup) {
     $peers=@($script:VmOwners.Values | Where-Object { $_.Id -ne $owner.Id -and $_.VmId -ne [guid]::Empty -and -not $_.Removed } |
         ForEach-Object { @{Ref=$_;Generation=$_.Generation} })
-    $script:VmBoundary.Frame=@{Owner=$owner;Generation=$owner.Generation;Version=$script:VmBoundary.Version;Cleanup=$cleanup;Peers=$peers}
+    $script:VmBoundary.Frame=@{Owner=$owner;Generation=$owner.Generation;Version=$script:VmBoundary.Version;Cleanup=$cleanup;Peers=$peers;Attempt=$null;PreparingStorage=$null}
 }
 function Test-VmOwnFrame {
     $frame=$script:VmBoundary.Frame
     if (-not $frame -or $script:VmBoundary.Version -ne $frame.Version -or $script:VmBoundary.Lost) { throw 'FrameRevoked' }
     $null=Read-VmOwnClock $frame.Cleanup
-    if (-not $frame.Cleanup -and $frame.Owner.State -cne 'Reserving' -and $script:VmBoundary.UnknownEffect) { throw 'EffectUnobserved' }
+    if (-not $frame.Cleanup -and $frame.Owner.State -cne 'Reserving' -and $script:VmBoundary.UnknownEffect -and
+        -not (Test-VmStorageAttemptFrame $frame)) { throw 'EffectUnobserved' }
     & $script:VmPlatform
     if ($frame.Cleanup) {
         if (-not $script:VmBoundary.Lease) { throw 'LeaseMissing' }
@@ -165,12 +167,14 @@ function Confirm-VmOwnMachine($owner,[long]$expectedCpu=4) {
     $prefix=[IO.Path]::GetFullPath($owner.Path).TrimEnd('\')+'\'
     $actual=[IO.Path]::GetFullPath([string]$vm.Path).TrimEnd('\')+'\'
     if (-not $actual.StartsWith($prefix,[StringComparison]::OrdinalIgnoreCase) -or
-        [string]$vm.Name -cne $owner.Name -or -not ([string]$vm.ComputerName).Equals([Environment]::MachineName,[StringComparison]::OrdinalIgnoreCase) -or [string]$vm.State -cne 'Off' -or
+        [string]$vm.Name -cne $owner.Name -or -not ([string]$vm.ComputerName).Equals([Environment]::MachineName,[StringComparison]::OrdinalIgnoreCase) -or
         [int]$vm.Generation -ne 2 -or [long]$vm.MemoryStartup -ne 8589934592 -or
         [bool]$vm.DynamicMemoryEnabled -or [long]$vm.ProcessorCount -ne $expectedCpu) { throw 'VmConfigurationChanged' }
     Read-VmOwnPort $script:VmPathCheck @($owner.Path,$true) | Out-Null
     Read-VmOwnPort $script:VmPathCheck @([string]$vm.Path,$true) | Out-Null
-    if (@(Read-VmOwnPort $script:VmDisks @($resource.Ref)).Count -ne 0 -or @(Read-VmOwnPort $script:VmSnapshots @($resource.Ref)).Count -ne 0) { throw 'VmStorageChanged' }
+    if (@(Read-VmOwnPort $script:VmSnapshots @($resource.Ref)).Count -ne 0) { throw 'VmStorageChanged' }
+    if ($owner.Storage) { Confirm-VmStorageOwn $owner $vm }
+    elseif ([string]$vm.State -cne 'Off' -or @(Read-VmOwnPort $script:VmDisks @($resource.Ref)).Count -ne 0) { throw 'VmStorageChanged' }
     $adapters=@(Read-VmOwnPort $script:VmAdapters @($resource.Ref))
     if ($adapters.Count -ne 1 -or -not (& $script:VmType $adapters[0] 'VMNetworkAdapter') -or
         [guid]$adapters[0].VMId -ne $owner.VmId -or [guid]$adapters[0].SwitchId -ne $script:VmBoundary.SwitchId -or [string]$adapters[0].Id -cne $owner.AdapterId) { throw 'VmTopologyChanged' }
@@ -195,7 +199,7 @@ function Open-GbOwnVmProvisioning {
     $owner=@{Id=$id;Kind=$GuestKind;VmId=[guid]::Empty;Name=('GateBouncer-'+$GuestKind+'-'+$suffix);
         Path=(Join-Path $script:VmRoot $suffix);Created=$now;Observed=$now;Deadline=$now+10000;
         Generation=[long]0;Revoked=$false;State='Reserving';Cause='';Pending=$false;
-        Resources=[Collections.Generic.List[object]]::new();Removed=$false;RemoveSubmitted=$false;AdapterId=''}
+        Resources=[Collections.Generic.List[object]]::new();Removed=$false;RemoveSubmitted=$false;AdapterId='';Storage=$null}
     $script:VmOwners[$id]=$owner
     try {
         & $script:VmPlatform
@@ -296,6 +300,11 @@ function Close-GbOwnVmProvisioning {
     $owner=Get-VmOwnRecord $OwnerId
     Set-VmOwnRevoked $owner 'Cancelled'
     if ($script:VmBoundary.Busy) { return Get-VmOwnView $owner }
+    # Un intento de almacenamiento conserva toda custodia; nunca usa el retiro noVHD.
+    if ($owner.Storage) {
+        $owner.State='CleanupPending'; $owner.Cause='StorageCustodyRetained'; $owner.Pending=$true
+        return Get-VmOwnView $owner
+    }
     $script:VmBoundary.Busy=$true
     try {
         Enter-VmOwnFrame $owner $true
@@ -321,4 +330,5 @@ function Close-GbOwnVmProvisioning {
     finally { $script:VmBoundary.Frame=$null; $script:VmBoundary.Busy=$false }
     Get-VmOwnView $owner
 }
-Export-ModuleMember -Function Open-GbOwnVmProvisioning,Get-GbOwnVmProvisioningState,Revoke-GbOwnVmProvisioning,Close-GbOwnVmProvisioning
+. (Join-Path $PSScriptRoot 'OwnVmBootAdapters.ps1')
+Export-ModuleMember -Function Open-GbOwnVmProvisioning,Get-GbOwnVmProvisioningState,Revoke-GbOwnVmProvisioning,Close-GbOwnVmProvisioning,Prepare-GbOwnVmBoot,Start-GbOwnVmBoot
