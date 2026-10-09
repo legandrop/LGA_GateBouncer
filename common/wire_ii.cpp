@@ -82,12 +82,13 @@ Schema schema(const Frame &f, Schema &optional) {
     case Type::Hello:
         return {{T::ClientRole, 1}};
     case Type::HelloAck:
-        return status();
+        {auto s = status(); if (f.minor == 2 && (get(f,T::Capabilities) & DirectionalPath)) s[T::DirectionProfile] = 1; return s;}
     case Type::GetStatus:
         return {};
     case Type::Status: {
         auto s = status();
         s[T::GapCount] = 8;
+        if (f.minor == 2 && (get(f,T::Capabilities) & DirectionalPath)) s[T::DirectionProfile] = 1;
         optional = {{T::CollectorState, 1}, {T::SourceCoverage, 1}};
         return s;
     }
@@ -191,6 +192,7 @@ Schema schema(const Frame &f, Schema &optional) {
             s[T::RequestVersion] = 8;
             s[T::ObservationRevision] = 8;
         }
+        if (f.minor == 2 && (p & (1ull << 20))) s[T::DirectionOrigin] = 1;
         if (f.type == Type::Authorization)
             s[T::ObservedResult] = 1;
         return s;
@@ -199,7 +201,7 @@ Schema schema(const Frame &f, Schema &optional) {
         return {};
     }
 }
-bool enumValid(T tag, std::uint64_t v) {
+bool enumValid(T tag, std::uint64_t v, std::uint16_t minor) {
     switch (tag) {
     case T::ClientRole:
     case T::Decision:
@@ -214,7 +216,11 @@ bool enumValid(T tag, std::uint64_t v) {
     case T::ObservedResult:
         return v == 1;
     case T::PolicyDirection:
-        return v == 3;
+        return minor == 2 ? v >= 1 && v <= 3 : v == 3;
+    case T::DirectionOrigin:
+        return minor == 2 && v >= 1 && v <= 3;
+    case T::DirectionProfile:
+        return minor == 2 && v == 1;
     case T::SourceAccountMatched:
         return v == 1;
     case T::EngineState:
@@ -237,7 +243,7 @@ bool enumValid(T tag, std::uint64_t v) {
     case T::ErrorCode:
         return v <= 17;
     case T::Capabilities:
-        return (v >> 22) == 0 && (v & ((0x3full << 6) | (1ull << 16))) == 0;
+        return (v >> (minor == 2 ? 23 : 22)) == 0 && (v & ((0x3full << 6) | (1ull << 16))) == 0;
     case T::EventMask:
         return v >= 1 && v <= 3;
     case T::OriginalCommandType:
@@ -251,18 +257,18 @@ bool enumValid(T tag, std::uint64_t v) {
     }
 }
 } // namespace
-bool valid(const RuleRecord &r) {
+bool valid(const RuleRecord &r, std::uint16_t minor) {
     return !zero(r.rule) && !zero(r.selector) && r.revision && r.selectorRevision && r.action >= 1 &&
            r.action <= 2 && r.scope == 1 && r.admin >= 1 && r.admin <= 2 && r.effective <= 2 &&
-           !(r.admin == 2 && r.effective == 1) && r.direction == 3 && r.identity == 1 && !(r.presence >> 5) &&
+           !(r.admin == 2 && r.effective == 1) && (minor == 1 ? r.direction == 3 && r.mode == 0 : minor == 2 && r.direction >= 1 && r.direction <= 3 && r.mode == (r.action == 1 || r.direction == 2 ? 0 : r.direction == 1 ? 1 : 2)) && r.identity == 1 && !(r.presence >> 5) &&
            strings(r.path, r.name, r.presence) && ((r.presence & 4) || !r.created) &&
            ((r.presence & 8) || !r.updated) && known(r.presence, 4, r.filterGeneration);
 }
-bool valid(const PendingRecord &r) {
+bool valid(const PendingRecord &r, std::uint16_t minor) {
     auto s = static_cast<unsigned>(r.state);
     return !zero(r.request) && r.authority && r.observation && r.profileGeneration && s >= 1 && s <= 4 &&
-           r.selectorState <= 2 && r.flow >= 1 && r.flow <= 2 && r.scope == 1 && r.source >= 1 &&
-           r.source <= 4 && r.identity == 1 && r.direction == 3 && !(r.presence >> 8) &&
+           r.selectorState <= 2 && (minor == 1 ? r.flow >= 1 && r.flow <= 2 && !r.origin && !r.recommendedMode : minor == 2 && r.flow <= 2 && r.origin <= 3) && r.scope == 1 && r.source >= 1 &&
+           r.source <= 4 && r.identity == 1 && (minor == 1 ? r.direction == 3 && !(r.presence >> 8) : minor == 2 && !(r.presence >> 10) && bool(r.presence & 512) == (r.origin != 0) && bool(r.presence & 256) == (r.flow != 0) && r.direction == (r.origin == 1 ? 1 : 2) && r.recommendedMode == (r.origin == 1 ? 1 : 0) && (r.origin == 0 || r.flow == (r.origin == 1 ? 2 : r.origin == 2 ? 1 : 0))) &&
            strings(r.path, r.name, r.presence) && ((r.presence & 4) || !r.firstUtc) &&
            ((r.presence & 8) || !r.lastUtc) && known(r.presence, 4, r.attempt) &&
            known(r.presence, 5, r.filterId) && known(r.presence, 6, r.filterGeneration) &&
@@ -270,16 +276,17 @@ bool valid(const PendingRecord &r) {
            ((r.presence & 128) ? r.selectorRevision != 0 : r.selectorRevision == 0) &&
            (s == 1 ? (r.ttl >= 1 && r.ttl <= 600000) : r.ttl == 0);
 }
-bool eligible(const PendingRecord &r) {
-    return valid(r) && r.state == RequestState::Pending && r.selectorState == 1 &&
+bool eligible(const PendingRecord &r, std::uint16_t minor) {
+    return valid(r, minor) && (minor == 1 || (r.origin != 0 && (r.presence & 512))) && r.state == RequestState::Pending && r.selectorState == 1 &&
            (r.presence & 0xf1) == 0xf1 && r.source == 1 && r.accountMatched;
 }
-Error pack(const std::vector<RuleRecord> &records, Bytes &out) {
+Error pack(const std::vector<RuleRecord> &records, Bytes &out, std::uint16_t minor) {
+    if (minor != 1 && minor != 2) return Error::VersionMismatch;
     if (records.size() > 32)
         return Error::Capacity;
     Bytes b;
     for (const auto &r : records) {
-        if (!valid(r))
+        if (!valid(r, minor))
             return Error::Malformed;
         Bytes p(104);
         put(p, 0, r.rule);
@@ -293,6 +300,7 @@ Error pack(const std::vector<RuleRecord> &records, Bytes &out) {
         p[59] = r.effective;
         p[60] = r.direction;
         p[61] = r.identity;
+        p[62] = r.mode;
         put(p, 64, r.presence, 8);
         put(p, 72, r.created, 8);
         put(p, 80, r.updated, 8);
@@ -303,17 +311,18 @@ Error pack(const std::vector<RuleRecord> &records, Bytes &out) {
         p.insert(p.end(), r.name.begin(), r.name.end());
         if (p.size() + 8 > MaxRecordsBytes - b.size())
             return Error::Capacity;
-        envelope(b, p, 1, 1);
+        envelope(b, p, 1, minor == 2 ? 2 : 1);
     }
     out = std::move(b);
     return Error::Ok;
 }
-Error pack(const std::vector<PendingRecord> &records, Bytes &out) {
+Error pack(const std::vector<PendingRecord> &records, Bytes &out, std::uint16_t minor) {
+    if (minor != 1 && minor != 2) return Error::VersionMismatch;
     if (records.size() > 32)
         return Error::Capacity;
     Bytes b;
     for (const auto &r : records) {
-        if (!valid(r))
+        if (!valid(r, minor))
             return Error::Malformed;
         Bytes p(160);
         put(p, 0, r.request);
@@ -337,6 +346,7 @@ Error pack(const std::vector<PendingRecord> &records, Bytes &out) {
         p[129] = r.identity;
         p[130] = r.direction;
         p[131] = r.accountMatched ? 1 : 0;
+        p[152] = r.origin; p[153] = r.recommendedMode;
         put(p, 132, r.path.size(), 2);
         put(p, 134, r.name.size(), 2);
         put(p, 136, r.observation, 8);
@@ -345,19 +355,20 @@ Error pack(const std::vector<PendingRecord> &records, Bytes &out) {
         p.insert(p.end(), r.name.begin(), r.name.end());
         if (p.size() + 8 > MaxRecordsBytes - b.size())
             return Error::Capacity;
-        envelope(b, p, 2, 2);
+        envelope(b, p, 2, minor == 2 ? 3 : 2);
     }
     out = std::move(b);
     return Error::Ok;
 }
-Error unpack(const Bytes &b, std::size_t count, std::vector<RuleRecord> &out) {
+Error unpack(const Bytes &b, std::size_t count, std::vector<RuleRecord> &out, std::uint16_t minor) {
+    if (minor != 1 && minor != 2) return Error::VersionMismatch;
     if (b.size() > MaxRecordsBytes || count > 32)
         return Error::Capacity;
     std::vector<RuleRecord> rows;
     std::size_t offset = 0;
     for (std::size_t i = 0; i < count; ++i) {
         Bytes p;
-        if (!record(b, offset, 1, 1, 104, p) || n(p, 62, 2) || n(p, 100, 4))
+        if (!record(b, offset, 1, minor == 2 ? 2 : 1, 104, p) || (minor == 1 ? n(p, 62, 2) : p[63]) || n(p, 100, 4))
             return Error::Malformed;
         auto path = n(p, 96, 2), name = n(p, 98, 2);
         if (path > 4096 || name > 256 || 104 + path + name != p.size())
@@ -374,13 +385,14 @@ Error unpack(const Bytes &b, std::size_t count, std::vector<RuleRecord> &out) {
         r.effective = p[59];
         r.direction = p[60];
         r.identity = p[61];
+        r.mode = p[62];
         r.presence = n(p, 64, 8);
         r.created = n(p, 72, 8);
         r.updated = n(p, 80, 8);
         r.filterGeneration = n(p, 88, 8);
         r.path.assign(p.begin() + 104, p.begin() + 104 + path);
         r.name.assign(p.begin() + 104 + path, p.end());
-        if (!valid(r))
+        if (!valid(r, minor))
             return Error::Malformed;
         rows.push_back(std::move(r));
     }
@@ -389,14 +401,15 @@ Error unpack(const Bytes &b, std::size_t count, std::vector<RuleRecord> &out) {
     out = std::move(rows);
     return Error::Ok;
 }
-Error unpack(const Bytes &b, std::size_t count, std::vector<PendingRecord> &out) {
+Error unpack(const Bytes &b, std::size_t count, std::vector<PendingRecord> &out, std::uint16_t minor) {
+    if (minor != 1 && minor != 2) return Error::VersionMismatch;
     if (b.size() > MaxRecordsBytes || count > 32)
         return Error::Capacity;
     std::vector<PendingRecord> rows;
     std::size_t offset = 0;
     for (std::size_t i = 0; i < count; ++i) {
         Bytes p;
-        if (!record(b, offset, 2, 2, 160, p) || n(p, 152, 8) || p[131] > 1)
+        if (!record(b, offset, 2, minor == 2 ? 3 : 2, 160, p) || (minor == 1 ? n(p, 152, 8) : n(p,154,6)) || p[131] > 1)
             return Error::Malformed;
         auto path = n(p, 132, 2), name = n(p, 134, 2);
         if (path > 4096 || name > 256 || 160 + path + name != p.size())
@@ -425,9 +438,10 @@ Error unpack(const Bytes &b, std::size_t count, std::vector<PendingRecord> &out)
         r.accountMatched = p[131] == 1;
         r.observation = n(p, 136, 8);
         r.profileGeneration = n(p, 144, 8);
+        r.origin = p[152]; r.recommendedMode = p[153];
         r.path.assign(p.begin() + 160, p.begin() + 160 + path);
         r.name.assign(p.begin() + 160 + path, p.end());
-        if (!valid(r))
+        if (!valid(r, minor))
             return Error::Malformed;
         rows.push_back(std::move(r));
     }
@@ -437,9 +451,9 @@ Error unpack(const Bytes &b, std::size_t count, std::vector<PendingRecord> &out)
     return Error::Ok;
 }
 Error validate(const Frame &f) {
-    if (f.minor != 1)
+    if (f.minor != 1 && f.minor != 2)
         return Error::VersionMismatch;
-    if (!supported(f.type, 1))
+    if (!supported(f.type, f.minor))
         return f.type == Type::Traffic ? Error::Unsupported : Error::Malformed;
     if (!f.sequence || zero(f.correlation) || f.fields.size() > 64)
         return Error::Malformed;
@@ -468,7 +482,7 @@ Error validate(const Frame &f) {
             body > MaxFrameBytes - HeaderBytes - 8 - field.bytes.size())
             return Error::Capacity;
         body += 8 + field.bytes.size();
-        if (width != Variable && !enumValid(field.tag, number(field)))
+        if (width != Variable && !enumValid(field.tag, number(field), f.minor))
             return Error::Malformed;
         if (width == 16 && field.tag != T::SnapshotId && zero(idValue(f, field.tag)))
             return Error::Malformed;
@@ -500,12 +514,12 @@ Error validate(const Frame &f) {
         auto count = f.type == Type::PendingRecord ? 1 : get(f, T::Count);
         if (f.type == Type::RulesPage) {
             std::vector<RuleRecord> rows;
-            auto e = unpack(b->bytes, count, rows);
+            auto e = unpack(b->bytes, count, rows, f.minor);
             if (e != Error::Ok)
                 return e;
         } else {
             std::vector<PendingRecord> rows;
-            auto e = unpack(b->bytes, count, rows);
+            auto e = unpack(b->bytes, count, rows, f.minor);
             if (e != Error::Ok)
                 return e;
         }
@@ -545,6 +559,11 @@ Error validate(const Frame &f) {
     if (f.type == Type::Attempt || f.type == Type::Authorization) {
         auto p = get(f, T::Presence);
         auto allowed = f.type == Type::Attempt ? 0x83fffull : 0xf3fffull;
+        if (f.minor == 2) allowed |= 1ull << 20;
+        if (p & (1ull << 20)) {
+            auto origin = get(f,T::DirectionOrigin);
+            if ((p & 0x70) != 0x70 || (origin == 3 && (p & 128)) || ((p & 128) && get(f,T::FlowDirection) != (origin == 1 ? 2 : 1))) return Error::Malformed;
+        }
         if ((p & ~allowed) || !get(f, T::EventSeq) || (!(p & (1ull << 19)) && get(f, T::Timestamp)))
             return Error::Malformed;
         if ((p & 8) && !(p & 4))

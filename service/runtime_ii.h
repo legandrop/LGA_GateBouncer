@@ -2,11 +2,12 @@
 #include "../common/pipe_ii_win.h"
 #include "collector_ii.h"
 #include "effects_ii.h"
+#include "journal_iii.h"
 #include "wfp_backend.h"
 namespace gb::decisions {
 class NativeRuntime {
   public:
-    NativeRuntime(Coordinator &coordinator, WfpBackend &backend, SelectorRegistry &registry,
+    NativeRuntime(WfpBackend &backend, SelectorRegistry &registry,
                   std::filesystem::path store, Bytes account, Id epoch, Id boot);
     ~NativeRuntime();
     bool initialize();
@@ -28,11 +29,14 @@ class NativeRuntime {
   private:
     std::vector<ii::RuleRecord> rules() const;
     Frame error(Error error) const;
-    Coordinator &coordinator_;
+    directional::NativeSnapshotFile file_;
+    NativeDirections directions_;
+    directional::SnapshotCoordinator coordinator_;
     WfpBackend &backend_;
+    SelectorRegistry &registry_;
     Id epoch_, boot_;
-    NativeJournal journal_;
-    NativeEffects effects_;
+    directional::SnapshotJournal journal_;
+    directional::SnapshotEffects effects_;
     Engine engine_;
     NativeProfile profile_;
     ObservationRing ring_;

@@ -1,7 +1,7 @@
 #include "session_qt.h"
 namespace gb::controller {
-Session::Session(QObject *parent, std::unique_ptr<ipc::ii::SessionChannel> channel)
-    : QObject(parent), client_(channel ? std::move(channel) : std::make_unique<ipc::ii::Client>()) {
+Session::Session(QObject *parent, std::unique_ptr<ipc::ii::SessionChannel> channel, std::uint16_t minor)
+    : QObject(parent), client_(channel ? std::move(channel) : std::make_unique<ipc::ii::Client>(minor)) {
     qRegisterMetaType<wire::Frame>();
     qRegisterMetaType<wire::Id>();
     worker_ = new QObject;
@@ -37,7 +37,9 @@ bool Session::request(wire::Frame f) {
     ++pending_;
     QMetaObject::invokeMethod(worker_, [this, f = std::move(f)] {
         wire::Frame reply;
-        bool ok = !stopping_ && client_->transact(f, reply);
+        auto request = f;
+        request.minor = client_->hello().minor;
+        bool ok = !stopping_ && (request.minor == 1 || request.minor == 2) && client_->transact(request, reply);
         emit received(ok, std::move(reply), f.correlation);
         if (ok) {
             std::vector<wire::Frame> events;

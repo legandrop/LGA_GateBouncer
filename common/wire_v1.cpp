@@ -47,14 +47,14 @@ bool enumOk(const Field& f) {
 Error header(const Bytes& b, std::size_t& body) {
     if(b.size()<HeaderBytes) return Error::Malformed;
     if(b[0]!='G'||b[1]!='B'||b[2]!='C'||b[3]!='1') return Error::Malformed;
-    if(read(b.data()+4,2)!=1||read(b.data()+6,2)>1) return Error::VersionMismatch;
+    if(read(b.data()+4,2)!=1||read(b.data()+6,2)>2) return Error::VersionMismatch;
     if(read(b.data()+10,2)!=0||read(b.data()+56,8)!=0) return Error::Malformed;
     body=static_cast<std::size_t>(read(b.data()+12,4));
     return body>MaxFrameBytes-HeaderBytes ? Error::Capacity : Error::Ok;
 }
 }
 bool zero(const Id& id) { return std::all_of(id.begin(),id.end(),[](auto c){return c==0;}); }
-bool supported(Type t,std::uint16_t minor) { if(minor==1) return t>=Type::Hello&&t<=Type::ObservationGap&&t!=Type::Traffic; return t==Type::Hello||t==Type::HelloAck||t==Type::GetStatus||
+bool supported(Type t,std::uint16_t minor) { if(minor==1||minor==2) return t>=Type::Hello&&t<=Type::ObservationGap&&t!=Type::Traffic; return t==Type::Hello||t==Type::HelloAck||t==Type::GetStatus||
     t==Type::Status||t==Type::CreateRule||t==Type::RevokeRule||t==Type::MutationAck||t==Type::ProtocolError; }
 Bytes integer(std::uint64_t v,std::size_t n) { Bytes b; if(n<=8) append(b,v,n); return b; }
 std::uint64_t number(const Field& f) { return f.bytes.size()<=8 ? read(f.bytes.data(),f.bytes.size()) : 0; }
@@ -80,7 +80,7 @@ bool validUtf8(const Bytes& b) {
     } return true;
 }
 Error validate(const Frame& f) {
-    if(f.minor==1) return ii::validate(f);
+    if(f.minor==1||f.minor==2) return ii::validate(f);
     if(f.minor!=0) return Error::VersionMismatch;
     auto t=static_cast<unsigned>(f.type);
     if(t<1||t>16) return Error::Malformed;
@@ -124,7 +124,7 @@ Error decode(const Bytes& b,Frame& result) {
     std::size_t body=0;auto e=header(b,body);if(e!=Error::Ok)return e;
     if(b.size()!=HeaderBytes+body)return Error::Malformed;
     Frame f;f.minor=static_cast<std::uint16_t>(read(b.data()+6,2));f.type=static_cast<Type>(read(b.data()+8,2));std::copy_n(b.data()+16,16,f.connection.begin());f.sequence=read(b.data()+32,8);std::copy_n(b.data()+40,16,f.correlation.begin());
-    if(static_cast<unsigned>(f.type)<1||static_cast<unsigned>(f.type)>(f.minor==1?23u:16u))return Error::Malformed;
+    if(static_cast<unsigned>(f.type)<1||static_cast<unsigned>(f.type)>(f.minor>=1?23u:16u))return Error::Malformed;
     // Un tipo reservado no llega al coordinador de política.
     if(!supported(f.type,f.minor)){result=f;return Error::Unsupported;}
     for(std::size_t p=HeaderBytes;p<b.size();) {

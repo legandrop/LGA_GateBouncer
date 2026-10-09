@@ -73,7 +73,7 @@ bool flushCommitted(const std::filesystem::path& path,bool fixture){
 }
 }
 Id randomId(){Id id{};if(BCryptGenRandom(nullptr,id.data(),16,BCRYPT_USE_SYSTEM_PREFERRED_RNG)<0)throw std::runtime_error("No se pudo crear identidad de sesion");return id;}
-Digest sha256(const Bytes& b){Digest d{};if(BCryptHash(BCRYPT_SHA256_ALG_HANDLE,nullptr,0,const_cast<PUCHAR>(b.data()),static_cast<ULONG>(b.size()),d.data(),32)<0)throw std::runtime_error("No se pudo calcular integridad");return d;}
+Digest sha256(const Bytes& b){Digest d{};BCRYPT_ALG_HANDLE algorithm=nullptr;if(b.size()>ULONG_MAX||BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)<0)throw std::runtime_error("No se pudo calcular integridad");auto status=BCryptHash(algorithm,nullptr,0,const_cast<PUCHAR>(b.data()),static_cast<ULONG>(b.size()),d.data(),32);BCryptCloseAlgorithmProvider(algorithm,0);if(status<0)throw std::runtime_error("No se pudo calcular integridad");return d;}
 bool equalRules(const std::vector<Rule>& a,const std::vector<Rule>& b){
     if(a.size()!=b.size())return false;
     for(std::size_t i=0;i<a.size();++i)if(a[i].id!=b[i].id||a[i].selector!=b[i].selector||a[i].decision!=b[i].decision||a[i].appId!=b[i].appId)return false;

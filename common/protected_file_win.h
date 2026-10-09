@@ -42,8 +42,9 @@ class ProtectedDirectory {
     explicit ProtectedDirectory(std::filesystem::path root, bool readableDeployment = false)
         : root_(std::move(root)), readable_(readableDeployment) {}
     bool acquire();
+    bool writerLease(Handle &lease);
     bool read(const wchar_t *leaf, std::size_t cap, wire::Bytes &bytes, bool &exists);
-    bool replace(const wchar_t *leaf, const wire::Bytes &bytes);
+    bool replace(const wchar_t *leaf, const wire::Bytes &bytes, bool stateSnapshot = false);
     const std::filesystem::path &root() const { return root_; }
 
   private:

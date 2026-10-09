@@ -14,6 +14,7 @@ class SessionChannel {
 };
 class Client : public SessionChannel {
   public:
+    explicit Client(std::uint16_t minor = 1) : minor_(minor) {}
     bool open(bool control, const std::filesystem::path &serviceImage);
     bool transact(wire::Frame request, wire::Frame &reply);
     bool events(std::vector<wire::Frame> &batch);
@@ -32,6 +33,7 @@ class Client : public SessionChannel {
     wire::Id connection_{};
     std::uint64_t tx_ = 1, rx_ = 1;
     bool control_ = false;
+    std::uint16_t minor_;
     wire::Frame hello_;
     std::deque<wire::Frame> bufferedEvents_;
 };

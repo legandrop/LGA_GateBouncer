@@ -9,7 +9,8 @@ using namespace wire;
 // Una instancia por conexión autenticada; caller OS fija epoch/profile y los IDs.
 class Pages {
   public:
-    Pages(Id epoch, std::uint64_t profile) : epoch_(epoch), profile_(profile) {}
+    Pages(Id epoch, std::uint64_t profile, std::uint16_t minor = 1)
+        : epoch_(epoch), profile_(profile), minor_(minor) {}
     Error rules(Id snapshot, const std::vector<ii::RuleRecord> &rows, std::uint64_t revision,
                 std::uint64_t now);
     Error pending(Id snapshot, const std::vector<ii::PendingRecord> &rows, std::uint64_t revision,
@@ -30,11 +31,13 @@ class Pages {
     void expire(std::uint64_t now);
     Id epoch_;
     std::uint64_t profile_;
+    std::uint16_t minor_;
     std::map<Id, Snapshot> snapshots_;
 };
 class ObservationRing {
   public:
-    explicit ObservationRing(Id epoch, std::uint64_t profile) : epoch_(epoch), profile_(profile) {}
+    explicit ObservationRing(Id epoch, std::uint64_t profile, std::uint16_t minor = 1)
+        : epoch_(epoch), profile_(profile), minor_(minor) {}
     Error append(const Frame &event);
     Error after(std::uint64_t sequence, std::uint32_t mask, std::vector<Frame> &events,
                 bool &clientGap) const;
@@ -53,6 +56,7 @@ class ObservationRing {
   private:
     Id epoch_;
     std::uint64_t profile_, sequence_ = 0, lostThrough_ = 0;
+    std::uint16_t minor_;
     std::deque<Frame> events_;
 };
 } // namespace gb::decisions

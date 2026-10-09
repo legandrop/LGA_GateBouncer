@@ -1,4 +1,5 @@
 #include "runtime_ii.h"
+#include "runtime_reply_iii.h"
 #include <algorithm>
 #include <thread>
 namespace gb::decisions {
@@ -10,7 +11,8 @@ Frame readOnlyA(Frame f) {
                                       return field.tag == Tag::ProfileGeneration ||
                                              field.tag == Tag::ReviewProfileState ||
                                              field.tag == Tag::CollectorState ||
-                                             field.tag == Tag::SourceCoverage;
+                                             field.tag == Tag::SourceCoverage ||
+                                             field.tag == Tag::DirectionProfile;
                                   }),
                    f.fields.end());
     for (auto &field : f.fields)
@@ -18,38 +20,41 @@ Frame readOnlyA(Frame f) {
             field = value(Tag::Capabilities, ReadStatus);
     return f;
 }
+Frame readOnlyII(Frame f) {
+    f.minor = 1;
+    f.fields.erase(std::remove_if(f.fields.begin(), f.fields.end(), [](const Field &field) {
+        return field.tag == Tag::DirectionProfile || field.tag == Tag::CollectorState ||
+               field.tag == Tag::SourceCoverage;
+    }), f.fields.end());
+    for (auto &field : f.fields)
+        if (field.tag == Tag::Capabilities) field = value(Tag::Capabilities, ReadStatus);
+    return f;
+}
 } // namespace
-NativeRuntime::NativeRuntime(Coordinator &c, WfpBackend &b, SelectorRegistry &r,
+NativeRuntime::NativeRuntime(WfpBackend &b, SelectorRegistry &r,
                              std::filesystem::path store, Bytes account, Id epoch, Id boot)
-    : coordinator_(c), backend_(b), epoch_(epoch), boot_(boot), journal_(std::move(store), epoch),
-      effects_(c, journal_, b), engine_(epoch, boot, journal_, effects_),
-      profile_(std::move(account)), ring_(epoch, 1), collector_(r, engine_, ring_, epoch) {
+    : file_(std::move(store)), directions_(b), coordinator_(file_, directions_, r, epoch),
+      backend_(b), registry_(r), epoch_(epoch), boot_(boot), journal_(coordinator_, r),
+      effects_(coordinator_, directions_), engine_(epoch, boot, journal_, effects_, 2),
+      profile_(std::move(account)), ring_(epoch, 1, 2), collector_(r, engine_, ring_, epoch) {
     backend_.attachCollector(&collector_);
 }
 NativeRuntime::~NativeRuntime() { backend_.attachCollector(nullptr); }
 bool NativeRuntime::initialize() {
-    JournalSnapshot snapshot;
-    bool exists = false;
-    if (!journal_.load(snapshot, exists))
-        return false;
+    if (!coordinator_.load()) return false;
+    directions_.initialLegacy(coordinator_.legacy());
+    // Leer/migrar no aplica baseline ni reproduce comandos. Gate U aún sin prueba OS.
+    if (directions_.ready()) coordinator_.reconcile();
+    auto snapshot = coordinator_.snapshot();
     auto now = GetTickCount64();
-    bool changed = false;
-    for (auto &row : snapshot.entries)
-        if (row.state != State::Applied && effects_.proveApplied(row)) {
-            row.state = State::Applied;
-            row.error = Error::Ok;
-            row.effective = row.desired;
-            row.effectiveKnown = true;
-            row.completedAt = now;
-            changed = true;
-        }
-    if (changed && !journal_.persist(snapshot.entries))
-        return false;
-    if (exists && !engine_.restore(snapshot.entries, now))
-        return false;
-    auto status = coordinator_.status();
-    journal_.observedDesired(status.desired);
-    engine_.initializeRevision(status.desired, effects_.readback(status.desired));
+    std::vector<CommandEntry> commits;
+    for (const auto &entry : snapshot.entries) {
+        Frame f;
+        if (decode(entry.command.payload, f) != Error::Ok) return false;
+        if (f.minor == 2 && f.type == Type::CommitDecision) commits.push_back(entry.command);
+    }
+    if (!commits.empty() && !engine_.restore(commits, now)) return false;
+    engine_.initializeRevision(snapshot.desired, effects_.ready() && effects_.readback(snapshot.desired));
     loaded_ = true;
     tick();
     return true;
@@ -61,45 +66,50 @@ void NativeRuntime::tick() {
         engine_.invalidateProfile(0, GetTickCount64());
         ring_.invalidate(profile_.value().generation);
     }
-    auto s = coordinator_.status();
-    if (!s.effectiveKnown || s.effective != s.desired)
+    if (coordinator_.recovery() || !directions_.ready())
         collector_.unavailable(7);
     collector_.drain(profile_, GetTickCount64());
 }
 Frame NativeRuntime::error(Error e) const {
     Frame f;
-    f.minor = 1;
+    f.minor = 2;
     f.type = Type::ProtocolError;
     f.fields = {value(Tag::ErrorCode, unsigned(e), 2)};
     return f;
 }
 Frame NativeRuntime::status(Type type) const {
-    auto s = coordinator_.status();
-    auto active = loaded_ && !engine_.recoveryRequired() && engine_.profile().state == 1 &&
+    auto s = coordinator_.snapshot();
+    auto known = loaded_ && !coordinator_.recovery() && directions_.ready() &&
+                 coordinator_.currentReadback(s.desired);
+    auto active = known && !engine_.recoveryRequired() && engine_.profile().state == 1 &&
                   profile_.value().state == 1;
     std::uint64_t capabilities =
         ReadStatus | (1ull << 12) | (1ull << 13) | (1ull << 18) | (1ull << 19);
-    if (active && s.effectiveKnown && collector_.state() == 1)
-        capabilities |= PathPermanentRule | BlockRetry | Ipv4Ale | Ipv6Ale | (1ull << 17);
+    if (active && collector_.state() == 1)
+        capabilities |= PathPermanentRule | RuleRevoke | Ipv4Ale | Ipv6Ale |
+                        (1ull << 17) | DirectionalPath;
+    if (active && collector_.state() == 1 && !coordinator_.legacy())
+        capabilities |= BlockRetry;
     if (collector_.state() == 1)
         capabilities |= (1ull << 14) | (1ull << 20) | (1ull << 21);
     Frame f;
-    f.minor = 1;
+    f.minor = 2;
     f.type = type;
     f.fields = {
         value(Tag::ServiceEpoch, epoch_),
         value(Tag::BootId, boot_),
         value(Tag::Capabilities, capabilities),
         value(Tag::DesiredRev, s.desired),
-        value(Tag::EffectiveRev, s.effective),
-        value(Tag::EffectiveKnown, s.effectiveKnown, 1),
+        value(Tag::EffectiveRev, known ? s.desired : 0),
+        value(Tag::EffectiveKnown, known, 1),
         value(Tag::EngineState,
-              unsigned(!loaded_ || engine_.recoveryRequired() ? EngineState::RecoveryRequired
-                                                              : s.state),
+              unsigned(!known || engine_.recoveryRequired() ? EngineState::RecoveryRequired
+                                                           : EngineState::ReadyUnvalidated),
               1),
         value(Tag::BackendMode, 1, 1),
         value(Tag::ProfileGeneration, profile_.value().generation),
         value(Tag::ReviewProfileState, profile_.value().state, 1)};
+    if (capabilities & DirectionalPath) f.fields.push_back(value(Tag::DirectionProfile, 1, 1));
     if (type == Type::Status) {
         f.fields.push_back(value(Tag::GapCount, collector_.gaps()));
         if (capabilities & (1ull << 21)) {
@@ -135,32 +145,33 @@ bool NativeRuntime::peer(HANDLE pipe, bool control, VerifiedControl &out, bool a
         !profile_.accepts(token, control))
         return false;
     out = profile_.authority(token, full);
-    if (control && activate && engine_.profile().state != 1 &&
+    if (control && activate && directions_.ready() && !coordinator_.recovery() && engine_.profile().state != 1 &&
         !engine_.activate(profile_.value(), true, GetTickCount64()))
         return false;
     return true;
 }
 std::vector<ii::RuleRecord> NativeRuntime::rules() const {
     auto snapshot = coordinator_.snapshot();
-    auto current = coordinator_.status();
+    auto known = !coordinator_.recovery() && directions_.ready() && coordinator_.currentReadback(snapshot.desired);
     std::vector<ii::RuleRecord> records;
     for (auto &rule : snapshot.rules) {
         ii::RuleRecord r;
         r.rule = rule.id;
         r.selector = rule.selector;
-        r.revision = r.selectorRevision = 1;
+        r.revision = rule.revision; r.selectorRevision = rule.selectorRevision;
         r.desired = snapshot.desired;
-        r.action = rule.decision;
-        r.direction = 3;
-        r.effective = current.effectiveKnown && current.effective == snapshot.desired ? 1 : 0;
+        r.action = rule.action;
+        r.direction = rule.direction; r.mode = rule.mode;
+        r.effective = known ? 1 : 0;
         records.push_back(std::move(r));
     }
     return records;
 }
 Frame NativeRuntime::dispatch(const Frame &f, const VerifiedControl &peer, Pages &pages) {
     tick();
-    if (f.minor != 1)
+    if (f.minor != 2)
         return error(Error::VersionMismatch);
+    if (wire::validate(f) != Error::Ok) return error(Error::Malformed);
     if (f.type == Type::GetStatus)
         return status(Type::Status);
     if (idValue(f, Tag::ServiceEpoch) != epoch_)
@@ -178,7 +189,7 @@ Frame NativeRuntime::dispatch(const Frame &f, const VerifiedControl &peer, Pages
         if (zero(snapshot)) {
             snapshot = native::randomIdentity();
             e = f.type == Type::ListRules
-                    ? pages.rules(snapshot, rules(), coordinator_.status().desired, now)
+                    ? pages.rules(snapshot, rules(), coordinator_.snapshot().desired, now)
                     : pages.pending(snapshot, engine_.pendingRows(now), ring_.latest(), now);
             for (auto &field : query.fields)
                 if (field.tag == Tag::SnapshotId)
@@ -194,10 +205,10 @@ Frame NativeRuntime::dispatch(const Frame &f, const VerifiedControl &peer, Pages
         if (!record)
             return error(Error::NotFound);
         Bytes bytes;
-        if (ii::pack(std::vector<ii::PendingRecord>{*record}, bytes) != Error::Ok)
+        if (ii::pack(std::vector<ii::PendingRecord>{*record}, bytes, 2) != Error::Ok)
             return error(Error::IdentityUnavailable);
         Frame reply;
-        reply.minor = 1;
+        reply.minor = 2;
         reply.type = Type::PendingRecord;
         reply.fields = {value(Tag::ServiceEpoch, epoch_), {Tag::Records, true, std::move(bytes)}};
         return reply;
@@ -208,7 +219,7 @@ Frame NativeRuntime::dispatch(const Frame &f, const VerifiedControl &peer, Pages
         if (get(f, Tag::AfterEventSeq) > ring_.latest())
             return error(Error::Malformed);
         Frame reply;
-        reply.minor = 1;
+        reply.minor = 2;
         reply.type = Type::SubscriptionAck;
         reply.fields = {value(Tag::ServiceEpoch, epoch_),
                         value(Tag::EventMask, 1, 4),
@@ -221,19 +232,37 @@ Frame NativeRuntime::dispatch(const Frame &f, const VerifiedControl &peer, Pages
         return reply;
     }
     if (f.type == Type::GetCommandStatus) {
-        if (!peer.highAdministrator)
+        if (!peer.highAdministrator || !peer.fullServerToken)
             return error(Error::Unauthorized);
         auto command = idValue(f, Tag::CommandId);
-        auto row = engine_.command(command, peer);
+        auto snapshot = coordinator_.snapshot();
+        auto found = std::find_if(snapshot.entries.begin(), snapshot.entries.end(),
+                                  [&](const auto &e) { return e.command.id == command; });
+        std::optional<CommandEntry> row;
+        if (found != snapshot.entries.end()) {
+            const auto &c = found->command;
+            if (c.principal != peer.account || c.logon != peer.logon || c.accountSid != peer.accountSid ||
+                c.logonSid != peer.logonSid || c.sessionId != peer.sessionId ||
+                c.profileGeneration != peer.profileGeneration) return error(Error::Unauthorized);
+            row = c;
+            auto current = coordinator_.query(command);
+            row->effectiveKnown = current.effectiveKnown;
+            row->effective = current.effective;
+            if (!current.effectiveKnown && (row->state == State::Applied || row->state == State::AppliedUnrecorded)) {
+                row->state = State::RecoveryRequired; row->error = Error::RecoveryRequired;
+            }
+        }
         Frame reply;
-        reply.minor = 1;
+        reply.minor = 2;
         reply.type = Type::CommandStatus;
         reply.fields = {
             value(Tag::ServiceEpoch, epoch_), value(Tag::CommandId, command),
             value(Tag::CommandFound, row ? 1 : 0, 1),
             value(Tag::ErrorCode, unsigned(row ? row->error : Error::CommandUnknown), 2)};
         if (row) {
-            reply.fields.push_back(value(Tag::OriginalCommandType, 9, 2));
+            Frame original;
+            if (decode(row->payload, original) != Error::Ok) return error(Error::RecoveryRequired);
+            reply.fields.push_back(value(Tag::OriginalCommandType, unsigned(original.type), 2));
             reply.fields.push_back(value(Tag::CommandState, unsigned(row->state), 1));
             reply.fields.push_back(value(Tag::DesiredRev, row->desired));
             reply.fields.push_back(value(Tag::EffectiveRev, row->effective));
@@ -241,27 +270,54 @@ Frame NativeRuntime::dispatch(const Frame &f, const VerifiedControl &peer, Pages
         }
         return reply;
     }
+    if (f.type == Type::CreateRule || f.type == Type::RevokeRule) {
+        if (!peer.highAdministrator || !peer.fullServerToken) return error(Error::Unauthorized);
+        auto snapshot = coordinator_.snapshot();
+        auto target = snapshot.rules;
+        auto replay = std::any_of(snapshot.entries.begin(), snapshot.entries.end(),
+                                   [&](const auto &e) { return e.command.id == f.correlation; });
+        if (!replay && (!directions_.ready() || coordinator_.recovery() || engine_.recoveryRequired()))
+            return error(Error::BackendUnavailable);
+        if (!replay && f.type == Type::CreateRule) {
+            auto app = registry_.lookup(idValue(f, Tag::SelectorId));
+            if (!app) return error(Error::IdentityUnavailable);
+            auto action = static_cast<std::uint8_t>(get(f, Tag::Decision));
+            auto direction = static_cast<std::uint8_t>(get(f, Tag::PolicyDirection));
+            target.push_back({f.correlation,idValue(f,Tag::SelectorId),1,1,action,direction,
+                             static_cast<std::uint8_t>(action==1||direction==2?0:direction==1?1:2),*app});
+        } else if (!replay) {
+            auto rule = std::find_if(target.begin(),target.end(),[&](const auto &r){return r.id==idValue(f,Tag::RuleId);});
+            if (rule == target.end()) return error(Error::Stale);
+            target.erase(rule);
+        }
+        CommandEntry command;
+        command.id=f.correlation;command.principal=peer.account;command.logon=peer.logon;
+        command.accountSid=peer.accountSid;command.logonSid=peer.logonSid;command.sessionId=peer.sessionId;
+        command.profileGeneration=peer.profileGeneration;command.commandEpoch=epoch_;command.boot=boot_;
+        if (get(f,Tag::ExpectedDesiredRev)==UINT64_MAX) return error(Error::Capacity);
+        command.desired=get(f,Tag::ExpectedDesiredRev)+1;
+        Frame canonical=f;canonical.connection.fill(1);canonical.sequence=1;
+        std::sort(canonical.fields.begin(),canonical.fields.end(),[](auto&a,auto&b){return a.tag<b.tag;});
+        if (encode(canonical,command.payload)!=Error::Ok) return error(Error::Malformed);
+        auto result=coordinator_.commit(command,target,snapshot.sequence);
+        if (result.durable&&result.effectiveKnown&&result.desired>engine_.desiredRevision())
+            engine_.advanceRevision(result.desired,true,now);
+        return mutationAck(epoch_, result.state, result.error, result.desired, result.effective,
+                           result.effectiveKnown);
+    }
     if (f.type == Type::CommitDecision) {
         if (!peer.highAdministrator)
             return error(Error::Unauthorized);
-        if (collector_.state() != 1)
+        const bool replay = engine_.command(f.correlation, peer).has_value();
+        if (!replay && (collector_.state() != 1 || !directions_.ready() || coordinator_.recovery()))
             return error(Error::BackendUnavailable);
         auto result = engine_.commit(f, peer, now);
         auto pending = engine_.lookup(idValue(f, Tag::RequestId), now);
-        Frame reply;
-        reply.minor = 1;
-        reply.type = Type::MutationAck;
-        reply.fields = {
-            value(Tag::ServiceEpoch, epoch_),
-            value(Tag::DesiredRev, result.desired),
-            value(Tag::EffectiveRev, result.effective),
-            value(Tag::EffectiveKnown, result.effectiveKnown, 1),
-            value(Tag::CommandState, unsigned(result.state), 1),
-            value(Tag::ErrorCode, unsigned(result.error), 2),
-            value(Tag::RequestId, idValue(f, Tag::RequestId)),
-            value(Tag::RequestVersion, pending ? pending->authority : get(f, Tag::RequestVersion)),
-            value(Tag::RequestState, unsigned(pending ? pending->state : ii::RequestState::Stale),
-                  1)};
+        auto reply = mutationAck(epoch_, result.state, result.error, result.desired,
+                                 result.effective, result.effectiveKnown);
+        reply.fields.push_back(value(Tag::RequestId, idValue(f, Tag::RequestId)));
+        reply.fields.push_back(value(Tag::RequestVersion, pending ? pending->authority : get(f, Tag::RequestVersion)));
+        reply.fields.push_back(value(Tag::RequestState, unsigned(pending ? pending->state : ii::RequestState::Stale), 1));
         return reply;
     }
     return error(Error::Unsupported);
@@ -312,7 +368,7 @@ void NativeServer::channel(bool control, HANDLE stop) {
             VerifiedControl peer;
             bool authenticated = false;
             if (ipc::ii::receive(pipe.value, hello, stop) &&
-                (hello.minor == 1 || (!control && hello.minor == 0)) && hello.type == Type::Hello &&
+                (hello.minor == 2 || hello.minor == 1 || (!control && hello.minor == 0)) && hello.type == Type::Hello &&
                 zero(hello.connection) && hello.sequence == 1 &&
                 get(hello, Tag::ClientRole) == (control ? 2 : 1)) {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
@@ -334,11 +390,12 @@ void NativeServer::channel(bool control, HANDLE stop) {
             ack.correlation = hello.correlation;
             if (!hello.minor)
                 ack = readOnlyA(std::move(ack));
+            else if (hello.minor == 1) ack = readOnlyII(std::move(ack));
             if (!ipc::ii::send(pipe.value, ack, stop)) {
                 DisconnectNamedPipe(pipe.value);
                 continue;
             }
-            Pages pages(runtime_.epoch(), profile);
+            Pages pages(runtime_.epoch(), profile, hello.minor);
             std::uint64_t rx = 2, tx = 2, lastActivity = GetTickCount64(), after = 0;
             std::uint32_t mask = 0;
             while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT &&
@@ -407,6 +464,10 @@ void NativeServer::channel(bool control, HANDLE stop) {
                                 value(Tag::ErrorCode, unsigned(Error::Unsupported), 2)};
                         }
                         response = readOnlyA(std::move(response));
+                    } else if (hello.minor == 1) {
+                        response = f.type == Type::GetStatus ? runtime_.status(Type::Status)
+                                                             : runtime_.dispatch(f, peer, pages);
+                        response = readOnlyII(std::move(response));
                     } else
                         response = runtime_.dispatch(f, peer, pages);
                 }

@@ -7,7 +7,7 @@
 #include <set>
 
 namespace Gate {
-// Cliente ordinary 1.1: sólo status, páginas y observaciones. No verbos de mutación.
+// Cliente ordinary minor2: sólo status, páginas y observaciones. No verbos de mutación.
 class DecisionViewClient final : public QObject {
     Q_OBJECT
   public:
@@ -26,6 +26,7 @@ class DecisionViewClient final : public QObject {
     const auto &events() const { return events_; }
     bool historyGap() const { return historyGap_; }
     quint8 collector() const { return collector_; }
+    std::uint16_t protocolMinor() const { return minor_; }
   signals:
     void changed();
 
@@ -48,6 +49,7 @@ class DecisionViewClient final : public QObject {
     bool observationUpdateQueued_ = false;
     quint64 profile_ = 0, lastEvent_ = 0, pageRevision_ = 0;
     quint8 collector_ = 0;
+    std::uint16_t minor_ = 1;
     gb::wire::Id expected_{}, snapshot_{};
     gb::wire::Type expectedType_ = gb::wire::Type::GetStatus;
     quint32 cursor_ = 0;

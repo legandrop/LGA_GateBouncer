@@ -10,7 +10,7 @@ class Session : public QObject {
     Q_OBJECT
   public:
     explicit Session(QObject *parent = nullptr,
-                     std::unique_ptr<ipc::ii::SessionChannel> channel = {});
+                     std::unique_ptr<ipc::ii::SessionChannel> channel = {}, std::uint16_t minor = 1);
     ~Session() override;
     bool open(bool control, std::filesystem::path serviceImage);
     bool request(wire::Frame request);

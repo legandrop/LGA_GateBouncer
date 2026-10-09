@@ -46,9 +46,8 @@ void WINAPI serviceMain(DWORD,wchar_t**){
         PSID sid=nullptr;if(!ConvertStringSidToSidW(viewSid,&sid))throw std::runtime_error("SID de lectura invalido");Bytes account(static_cast<BYTE*>(sid),static_cast<BYTE*>(sid)+GetLengthSid(sid));LocalFree(sid);auto boot=bootIdentity();
         auto root=std::filesystem::path(programData)/L"LGAGateBouncerLab";native::ProtectedDirectory protectedStore(root);if(!protectedStore.acquire())throw std::runtime_error("Store no protegido");
         SelectorRegistry registry;WfpBackend backend(registry);if(!backend.connectGuest())throw std::runtime_error("Backend no conectado");
-        PolicyStore store(root);Coordinator coordinator(store,backend,registry);
-        decisions::NativeRuntime runtime(coordinator,backend,registry,root,std::move(account),randomId(),boot);
-        if(!coordinator.initialize()||!runtime.initialize())throw std::runtime_error("Recuperacion de stores pendiente");
+        decisions::NativeRuntime runtime(backend,registry,root,std::move(account),randomId(),boot);
+        if(!runtime.initialize())throw std::runtime_error("Recuperacion de store pendiente");
         // El perfil único limita revisión; no afirma cobertura completa ni autoriza kernel scopes.
         decisions::NativeServer server(runtime);report(SERVICE_RUNNING);server.run(stopEvent);report(SERVICE_STOPPED);
     }catch(...){report(SERVICE_STOPPED,ERROR_SERVICE_SPECIFIC_ERROR);}

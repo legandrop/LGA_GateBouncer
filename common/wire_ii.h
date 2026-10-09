@@ -10,6 +10,7 @@ struct RuleRecord {
     std::uint64_t created = 0, updated = 0, filterGeneration = 0;
     std::uint8_t action = 1, scope = 1, admin = 1, effective = 0, direction = 3, identity = 1;
     Bytes path, name;
+    std::uint8_t mode = 0;
 };
 struct PendingRecord {
     Id request{}, selector{}, attempt{};
@@ -21,14 +22,15 @@ struct PendingRecord {
     std::uint8_t selectorState = 0, flow = 0, scope = 1, source = 1, identity = 1, direction = 3;
     bool accountMatched = false;
     Bytes path, name;
+    std::uint8_t origin = 0, recommendedMode = 0;
 };
-bool valid(const RuleRecord &record);
-bool valid(const PendingRecord &record);
-bool eligible(const PendingRecord &record);
-Error pack(const std::vector<RuleRecord> &records, Bytes &bytes);
-Error pack(const std::vector<PendingRecord> &records, Bytes &bytes);
-Error unpack(const Bytes &bytes, std::size_t count, std::vector<RuleRecord> &records);
-Error unpack(const Bytes &bytes, std::size_t count, std::vector<PendingRecord> &records);
+bool valid(const RuleRecord &record, std::uint16_t minor = 1);
+bool valid(const PendingRecord &record, std::uint16_t minor = 1);
+bool eligible(const PendingRecord &record, std::uint16_t minor = 1);
+Error pack(const std::vector<RuleRecord> &records, Bytes &bytes, std::uint16_t minor = 1);
+Error pack(const std::vector<PendingRecord> &records, Bytes &bytes, std::uint16_t minor = 1);
+Error unpack(const Bytes &bytes, std::size_t count, std::vector<RuleRecord> &records, std::uint16_t minor = 1);
+Error unpack(const Bytes &bytes, std::size_t count, std::vector<PendingRecord> &records, std::uint16_t minor = 1);
 Error validate(const Frame &frame);
 bool filetimeUtc(std::uint64_t filetime, std::uint64_t &unixNanoseconds);
 } // namespace gb::wire::ii

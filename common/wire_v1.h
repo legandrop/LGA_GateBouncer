@@ -40,9 +40,10 @@ enum class Tag : std::uint16_t { ClientRole=1, ServiceEpoch=2, BootId=3,
     SelectorState=56, CommandFound=58, OriginalCommandType=59, ObservedResult=60,
     PendingSnapshotRevision=61, AttemptLink=62, PolicyDirection=63,
     ObservationRevision=64, ProfileGeneration=65, ReviewProfileState=66,
-    SourceAccountMatched=67 };
+    SourceAccountMatched=67, DirectionOrigin=68, DirectionProfile=69 };
 constexpr std::uint64_t ReadStatus=1ull<<0, PathPermanentRule=1ull<<1,
-    BlockRetry=1ull<<2, RuleRevoke=1ull<<3, Ipv4Ale=1ull<<4, Ipv6Ale=1ull<<5;
+    BlockRetry=1ull<<2, RuleRevoke=1ull<<3, Ipv4Ale=1ull<<4, Ipv6Ale=1ull<<5,
+    DirectionalPath=1ull<<22;
 struct Field { Tag tag; bool required=true; Bytes bytes; };
 struct Frame {
     std::uint16_t minor=0;

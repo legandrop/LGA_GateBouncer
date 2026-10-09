@@ -1059,7 +1059,8 @@ void MainWindow::refreshTable(bool newPage) {
                     const auto name = recordText(r.name, "Selector " + QString::fromStdString(gb::wire::hex(r.selector)));
                     result.push_back({engineRowId("rule", product_.engine().serviceEpoch, r.rule),
                         {{name, "strong", {}}, {r.action == 2 ? "Allow · soft" : "Block", {}, {}},
-                         {"Both · permanent path", {}, {}}, {"Unknown", {}, {}},
+                         {r.direction == 1 ? (r.mode == 1 ? "Outbound unicast · path" : "Outbound · path")
+                                            : r.direction == 2 ? "Inbound · path" : "Both · permanent path", {}, {}}, {"Unknown", {}, {}},
                          {r.effective == 1 ? "Applied revision" : "Effect unknown", {}, {}}, {"Read only", {}, {}}}});
                 }
             const auto &report = view_ == "import" ? product_.draft() : product_.review().report;
@@ -1083,7 +1084,8 @@ void MainWindow::refreshTable(bool newPage) {
             for (const auto &p : product_.records()->pending())
                 result.push_back({engineRowId("pending", product_.engine().serviceEpoch, p.request),
                     {{recordText(p.name, "Unattributed request"), "strong", {}},
-                     {p.flow == 2 ? "Outbound attempt · destination unknown" : "Inbound attempt · destination unknown", {}, {}},
+                     {p.origin == 3 ? "Local listen · remote endpoint unknown"
+                                    : p.flow == 2 ? "Outbound attempt · destination unknown" : "Inbound attempt · destination unknown", {}, {}},
                      {recordUtc(p.lastUtc, p.presence & 8), {}, qulonglong(p.lastUtc)},
                      {"Review in administrator window →", "action", {}}}});
         else if (view_ == "activity" && product_.recordsSelected() && product_.engine().current)
@@ -1771,7 +1773,7 @@ void MainWindow::renderLive() {
         auto *statusOnly = button("Use status-only connection", "select-view-i", "ghost"); p->addWidget(statusOnly, 0, Qt::AlignLeft);
         connect(statusOnly, &QPushButton::clicked, &product_, &ProductController::selectStatusOnly);
         p->addWidget(label(product_.recordsSelected() ? "Selected source: service records · connection failure makes records unavailable" : "Selected source: engine status only", "faint", true));
-        p->addWidget(label("Coverage has not been validated. Both directions / permanent path spans every matching instance and account; outbound attempts never imply an inbound permission. Once, duration and instance scopes are unavailable.", "faint", true)); l->addWidget(panel);
+        p->addWidget(label("Coverage has not been validated. Permanent path rules span every matching instance and account. Outbound Allow is limited to unicast destinations; Both also opens inbound and removes that limit only after explicit review. Once, duration and instance scopes are unavailable.", "faint", true)); l->addWidget(panel);
         auto *reviewPanel = frame("panel"); auto *rp = new QVBoxLayout(reviewPanel); rp->setContentsMargins(16, 16, 16, 16); rp->setSpacing(8);
         rp->addWidget(label("Administrator reviewer", "heading"));
         rp->addWidget(label("Enable the protected reviewer once for this session with an explicit administrator prompt. Each request still requires confirmation in its own window. An ordinary queue entry never chooses Allow or Block.", "muted", true));
@@ -1832,8 +1834,13 @@ void MainWindow::openEngineRequest(const QString &rowId) {
         path->setObjectName("request-readonly-path"); path->setReadOnly(true);
         path->setMinimumHeight(54); path->setMaximumHeight(80);
         path->setWordWrapMode(QTextOption::WrapAnywhere); l->addWidget(path);
-        l->addWidget(label("Attempt direction: " + QString(record.flow == 2 ? "Outbound" : "Inbound") +
-            "\nPermanent policy scope: Both directions · this path · all matching users and instances", "muted", true));
+        l->addWidget(label("Observed origin: " + QString(record.origin == 3 ? "Local listen · remote endpoint unknown"
+            : record.flow == 2 ? "Outbound initiated" : "Inbound initiated") +
+            "\nPermanent path scope: all matching users, sessions and instances" +
+            (product_.records()->protocolMinor() == 2 ? QString("\nRecommended direction: ") +
+                (record.direction == 1 ? "Outbound · Allow is unicast only" : "Inbound") +
+                "\nBoth requires explicit administrator review; no selection grants permission."
+                : "\nPolicy direction: Both"), "muted", true));
         l->addWidget(note("Queueing grants no permission. Confirm only in the administrator reviewer.", true));
         l->addWidget(label("The reviewer fetches the current service request.\nClosing this dialog keeps the request undecided.", "muted", true));
         auto *queue = button("Queue administrator review", "queue-admin-review", "primary"); l->addWidget(queue, 0, Qt::AlignRight);

@@ -16,7 +16,7 @@ Id correlationId() {
 } // namespace
 DecisionViewClient::DecisionViewClient(bool isolatedQa, QObject *parent,
                                        std::unique_ptr<gb::ipc::ii::SessionChannel> channel)
-    : QObject(parent), blocked_(isolatedQa && !channel), session_(this, std::move(channel)) {
+    : QObject(parent), blocked_(isolatedQa && !channel), session_(this, std::move(channel), 2) {
     connect(&session_, &gb::controller::Session::opened, this, &DecisionViewClient::opened);
     connect(&session_, &gb::controller::Session::received, this, &DecisionViewClient::received);
     connect(&session_, &gb::controller::Session::observation, this,
@@ -74,7 +74,7 @@ void DecisionViewClient::fail(const QString &reason) {
     emit changed();
 }
 bool DecisionViewClient::adoptStatus(const Frame &f) {
-    if (f.minor != 1 || validate(f) != Error::Ok ||
+    if ((f.minor != 1 && f.minor != 2) || (connected_ && f.minor != minor_) || validate(f) != Error::Ok ||
         (f.type != Type::Status && f.type != Type::HelloAck))
         return false;
     const auto epoch = idValue(f, Tag::ServiceEpoch), boot = idValue(f, Tag::BootId);
@@ -100,6 +100,7 @@ bool DecisionViewClient::adoptStatus(const Frame &f) {
     status_.state = EngineState(get(f, Tag::EngineState));
     status_.backend = BackendMode(get(f, Tag::BackendMode));
     status_.error.clear();
+    minor_ = f.minor;
     profile_ = profile;
     collector_ = quint8(get(f, Tag::CollectorState));
     return true;
@@ -117,7 +118,7 @@ void DecisionViewClient::opened(bool ok, Frame f) {
 }
 bool DecisionViewClient::send(Type type) {
     Frame f;
-    f.minor = 1;
+    f.minor = minor_;
     f.type = type;
     f.connection = status_.connection;
     f.correlation = correlationId();
@@ -157,7 +158,7 @@ void DecisionViewClient::received(bool ok, Frame f, Id correlation) {
     }
     if (correlation != expected_)
         return;
-    if (f.minor != 1 || validate(f) != Error::Ok || f.correlation != expected_ ||
+    if (f.minor != minor_ || validate(f) != Error::Ok || f.correlation != expected_ ||
         f.connection != status_.connection) {
         fail("View II response binding failed");
         return;
@@ -218,7 +219,7 @@ void DecisionViewClient::page(const Frame &f) {
     }
     if (rules) {
         std::vector<ii::RuleRecord> rows;
-        if (ii::unpack(records->bytes, count, rows) != Error::Ok ||
+        if (ii::unpack(records->bytes, count, rows, minor_) != Error::Ok ||
             rows.size() > 4096 - rulesDraft_.size()) {
             fail("View II rules exceed their bound");
             return;
@@ -232,7 +233,7 @@ void DecisionViewClient::page(const Frame &f) {
         }
     } else {
         std::vector<ii::PendingRecord> rows;
-        if (ii::unpack(records->bytes, count, rows) != Error::Ok ||
+        if (ii::unpack(records->bytes, count, rows, minor_) != Error::Ok ||
             rows.size() > 512 - pendingDraft_.size()) {
             fail("View II pending records exceed their bound");
             return;
@@ -272,7 +273,7 @@ void DecisionViewClient::page(const Frame &f) {
 void DecisionViewClient::observation(Frame f) {
     if (stopping_ || !connected_ || !status_.current || !subscribed_)
         return;
-    if (f.minor != 1 || validate(f) != Error::Ok || f.connection != status_.connection ||
+    if (f.minor != minor_ || validate(f) != Error::Ok || f.connection != status_.connection ||
         idValue(f, Tag::ServiceEpoch) != status_.serviceEpoch ||
         get(f, Tag::ProfileGeneration) != profile_ || get(f, Tag::Source) != 1 ||
         (f.type != Type::Attempt && f.type != Type::ObservationGap) ||

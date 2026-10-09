@@ -40,6 +40,10 @@ class JournalSink {
     virtual ~JournalSink() = default;
     // Debe reemplazar/flush un snapshot completo en almacenamiento protegido.
     virtual bool persist(const std::vector<CommandEntry> &entries) = 0;
+    // Rechazo de dominio antes de crear Prepared; nunca acredita autoridad ni efecto.
+    virtual Error admission(const Frame &) const { return Error::Ok; }
+    virtual bool suspendsMutations() const { return false; }
+    virtual Id pinnedCommand() const { return {}; }
 };
 class EffectBackend {
   public:
@@ -47,6 +51,7 @@ class EffectBackend {
     virtual bool ready() const = 0;
     virtual bool commit(const Frame &command) = 0;
     virtual bool readback(std::uint64_t desiredRevision) = 0;
+    virtual bool currentProof(std::uint64_t revision) { return ready() && readback(revision); }
     virtual bool actualOs() const { return false; }
 };
 struct Result {
@@ -59,7 +64,7 @@ struct Result {
 };
 class Engine {
   public:
-    Engine(Id epoch, Id boot, JournalSink &journal, EffectBackend &backend);
+    Engine(Id epoch, Id boot, JournalSink &journal, EffectBackend &backend, std::uint16_t minor = 1);
     bool activate(Profile profile, bool osEvidenceComplete, std::uint64_t monotonicMs);
     void invalidateProfile(std::uint8_t state, std::uint64_t monotonicMs);
     Error observe(const VerifiedDrop &drop, std::uint64_t monotonicMs);
@@ -68,6 +73,7 @@ class Engine {
                                                    std::uint64_t monotonicMs);
     std::vector<PendingRecord> pendingRows(std::uint64_t monotonicMs);
     bool initializeRevision(std::uint64_t desired, bool currentReadback);
+    bool advanceRevision(std::uint64_t desired, bool currentReadback, std::uint64_t now);
     Result commit(const Frame &command, const VerifiedControl &authority,
                   std::uint64_t monotonicMs);
     std::optional<CommandEntry> command(const Id &id, const VerifiedControl &authority) const;
@@ -76,6 +82,7 @@ class Engine {
     std::uint64_t desiredRevision() const { return desired_; }
     std::uint64_t gaps() const { return gaps_; }
     const Profile &profile() const { return profile_; }
+    std::uint16_t protocolMinor() const { return minor_; }
 
   private:
     struct Pending {
@@ -94,5 +101,6 @@ class Engine {
     std::map<Id, CommandEntry> commands_;
     std::uint64_t desired_ = 0, gaps_ = 0;
     bool recovery_ = false;
+    std::uint16_t minor_ = 1;
 };
 } // namespace gb::decisions

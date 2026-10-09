@@ -1,5 +1,6 @@
 #include "collector_ii.h"
 #include "journal_ii_store.h"
+#include "directional_specs.h"
 #include <algorithm>
 
 namespace gb::decisions {
@@ -24,7 +25,12 @@ bool NativeCollector::publish(std::vector<LedgerFilter> rows, std::uint64_t ft) 
     for (std::size_t i = 0; i < rows.size(); ++i) {
         auto &f = rows[i];
         if (!f.filterId || zero(f.guid) || !f.generation || !f.layerId || f.originalFlow > 2 ||
-            (i && rows[i - 1].filterId == f.filterId))
+            (i && rows[i - 1].filterId == f.filterId) ||
+            (engine_.protocolMinor() == 2 &&
+             (zero(f.layerGuid) || zero(f.rule) || f.origin > 3 || f.direction > 3 ||
+              (f.origin == 1 && f.originalFlow != 2) ||
+              (f.origin == 2 && f.originalFlow != 1) ||
+              (f.origin == 3 && f.originalFlow != 0))))
             return false;
     }
     std::lock_guard<std::mutex> lock(mutex_);
@@ -34,7 +40,9 @@ bool NativeCollector::publish(std::vector<LedgerFilter> rows, std::uint64_t ft) 
         auto &b = ledger_[i];
         identical = a.filterId == b.filterId && a.guid == b.guid && a.generation == b.generation &&
                     a.desired == b.desired && a.layerId == b.layerId &&
-                    a.originalFlow == b.originalFlow && a.drop == b.drop;
+                    a.originalFlow == b.originalFlow && a.drop == b.drop &&
+                    a.layerGuid == b.layerGuid && a.rule == b.rule && a.appId == b.appId &&
+                    a.origin == b.origin && a.direction == b.direction && a.mode == b.mode;
     }
     if (identical && state_ == 1)
         return true;
@@ -109,7 +117,8 @@ void NativeCollector::capture(const FWPM_NET_EVENT1 *e) {
         c.mapped = true;
     }
     // Hecho previo a publicación/otro layer/ID reciclado no se atribuye retroactivamente.
-    if (!c.mapped || !c.filter.originalFlow) {
+    if (!c.mapped || (engine_.protocolMinor() == 2 ? !c.filter.origin : !c.filter.originalFlow) ||
+        (!c.filter.appId.empty() && c.appId != c.filter.appId)) {
         pendingGap_ = 7;
         return;
     }
@@ -132,7 +141,7 @@ bool NativeCollector::gap(std::uint8_t reason, std::uint64_t profile, std::uint8
     if (ring_.latest() == UINT64_MAX)
         return false;
     Frame f;
-    f.minor = 1;
+    f.minor = engine_.protocolMinor();
     f.type = Type::ObservationGap;
     f.correlation = native::randomIdentity();
     f.connection.fill(1);
@@ -221,11 +230,20 @@ void NativeCollector::drain(const NativeProfile &p, std::uint64_t now) {
         record.profileGeneration = p.value().generation;
         record.selectorState = 1;
         record.flow = c.filter.originalFlow;
+        if (engine_.protocolMinor() == 2) {
+            auto suggested = directional::suggested(static_cast<directional::Origin>(c.filter.origin));
+            if (!suggested) { gap(7, p.value().generation, p.value().state); continue; }
+            record.origin = c.filter.origin;
+            record.direction = static_cast<std::uint8_t>(*suggested);
+            record.recommendedMode = record.direction == 1 ? 1 : 0;
+        }
         record.accountMatched = true;
         record.ttl = 600000;
         record.filterId = c.filter.filterId;
         record.filterGeneration = c.filter.generation;
         record.presence = 0xf1 | (known ? 0xc : 0);
+        if (engine_.protocolMinor() == 2)
+            record.presence |= (1u << 9) | (record.flow ? 1u << 8 : 0);
         record.firstUtc = record.lastUtc = utc;
         if (ring_.latest() == UINT64_MAX) {
             unavailable(1);
@@ -243,14 +261,16 @@ void NativeCollector::drain(const NativeProfile &p, std::uint64_t now) {
             continue;
         }
         Frame event;
-        event.minor = 1;
+        event.minor = engine_.protocolMinor();
         event.type = Type::Attempt;
         event.connection.fill(1);
         event.correlation = native::randomIdentity();
         event.fields = {value(Tag::ServiceEpoch, epoch_),
                         value(Tag::EventSeq, record.eventSequence),
                         value(Tag::Timestamp, utc),
-                        value(Tag::Presence, 0xf3 | (known ? 1ull << 19 : 0)),
+                        value(Tag::Presence, 0x73 | (record.flow ? 1ull << 7 : 0) |
+                                             (known ? 1ull << 19 : 0) |
+                                             (event.minor == 2 ? 1ull << 20 : 0)),
                         value(Tag::Source, 1, 1),
                         value(Tag::GapCount, gaps()),
                         value(Tag::SourceCoverage, 1, 1),
@@ -262,8 +282,9 @@ void NativeCollector::drain(const NativeProfile &p, std::uint64_t now) {
                         value(Tag::ObservationRevision, live->observation),
                         value(Tag::NativeFilterId, c.filter.filterId),
                         value(Tag::FilterGuid, c.filter.guid),
-                        value(Tag::FilterGeneration, c.filter.generation),
-                        value(Tag::FlowDirection, c.filter.originalFlow, 1)};
+                        value(Tag::FilterGeneration, c.filter.generation)};
+        if (record.flow) event.fields.push_back(value(Tag::FlowDirection, record.flow, 1));
+        if (event.minor == 2) event.fields.push_back(value(Tag::DirectionOrigin, record.origin, 1));
         if (ring_.append(event) != Error::Ok) {
             unavailable(7);
             return;

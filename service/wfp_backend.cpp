@@ -1,5 +1,6 @@
 #include "wfp_backend.h"
 #include "collector_ii.h"
+#include "directional_specs.h"
 #include <sddl.h>
 #include <shlobj.h>
 #include <algorithm>
@@ -19,7 +20,7 @@ bool localToolPath(const std::wstring& path){
     return false;
 }
 GUID key(const Id& id,unsigned slot){Bytes b(id.begin(),id.end());auto n=integer(slot,4);b.insert(b.end(),n.begin(),n.end());auto d=sha256(b);GUID g{};std::memcpy(&g,d.data(),sizeof(g));return g;}
-struct Spec { GUID id,layer;DWORD flags;std::uint64_t weight;FWP_ACTION_TYPE action;Bytes appId;unsigned rawMode=0;bool raw=false; };
+struct Spec { GUID id,layer;DWORD flags;std::uint64_t weight;FWP_ACTION_TYPE action;Bytes appId;unsigned rawMode=0;bool raw=false;bool unicast=false; };
 std::vector<Spec> specs(const std::vector<Rule>& rules){
     const GUID layers[]={FWPM_LAYER_ALE_AUTH_CONNECT_V4,FWPM_LAYER_ALE_AUTH_CONNECT_V6,
         FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
@@ -40,12 +41,14 @@ std::vector<FWPM_FILTER_CONDITION0> conditions(const Spec& s,FWP_BYTE_BLOB& blob
     if(!s.appId.empty()){blob={static_cast<UINT32>(s.appId.size()),const_cast<UINT8*>(s.appId.data())};FWPM_FILTER_CONDITION0 x{};x.fieldKey=FWPM_CONDITION_ALE_APP_ID;x.matchType=FWP_MATCH_EQUAL;x.conditionValue.type=FWP_BYTE_BLOB_TYPE;x.conditionValue.byteBlob=&blob;c.push_back(x);}
     if(s.raw){FWPM_FILTER_CONDITION0 x{};x.fieldKey=FWPM_CONDITION_FLAGS;x.matchType=FWP_MATCH_FLAGS_ALL_SET;x.conditionValue.type=FWP_UINT32;x.conditionValue.uint32=FWP_CONDITION_FLAG_IS_RAW_ENDPOINT;c.push_back(x);}
     if(s.rawMode){FWPM_FILTER_CONDITION0 x{};x.fieldKey=FWPM_CONDITION_ALE_PROMISCUOUS_MODE;x.matchType=FWP_MATCH_EQUAL;x.conditionValue.type=FWP_UINT32;x.conditionValue.uint32=s.rawMode;c.push_back(x);}
+    if(s.unicast){FWPM_FILTER_CONDITION0 x{};x.fieldKey=FWPM_CONDITION_IP_DESTINATION_ADDRESS_TYPE;x.matchType=FWP_MATCH_EQUAL;x.conditionValue.type=FWP_UINT8;x.conditionValue.uint8=1;c.push_back(x);}
     return c;
 }
 Bytes metadata(std::uint64_t revision){Bytes b={'G','B','F','1'};auto n=integer(revision,8);b.insert(b.end(),n.begin(),n.end());return b;}
 bool conditionSame(const FWPM_FILTER_CONDITION0& a,const FWPM_FILTER_CONDITION0& b){
     if(!same(a.fieldKey,b.fieldKey)||a.matchType!=b.matchType||a.conditionValue.type!=b.conditionValue.type)return false;
     if(a.conditionValue.type==FWP_UINT32)return a.conditionValue.uint32==b.conditionValue.uint32;
+    if(a.conditionValue.type==FWP_UINT8)return a.conditionValue.uint8==b.conditionValue.uint8;
     if(a.conditionValue.type==FWP_BYTE_BLOB_TYPE){auto x=a.conditionValue.byteBlob,y=b.conditionValue.byteBlob;return x&&y&&x->size==y->size&&(x->size==0||std::memcmp(x->data,y->data,x->size)==0);}
     return false;
 }
@@ -125,12 +128,101 @@ bool WfpBackend::matches(const std::vector<Rule>& rules,std::uint64_t revision){
         if(ok&&revision!=UINT64_MAX){FWPM_LAYER0* layer=nullptr;ok=FwpmLayerGetByKey0(engine_,&f->layerKey,&layer)==ERROR_SUCCESS;
             if(ok){std::uint8_t flow=0;if(same(f->layerKey,FWPM_LAYER_ALE_AUTH_CONNECT_V4)||same(f->layerKey,FWPM_LAYER_ALE_AUTH_CONNECT_V6))flow=2;
                 if(same(f->layerKey,FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4)||same(f->layerKey,FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6))flow=1;
-                ledger.push_back({f->filterId,revision+1,revision,decisions::canonicalGuid(f->filterKey),layer->layerId,flow,f->action.type==FWP_ACTION_BLOCK});}
+                decisions::LedgerFilter item;
+                item.filterId=f->filterId;item.generation=revision+1;item.desired=revision;
+                item.guid=decisions::canonicalGuid(f->filterKey);item.layerId=layer->layerId;
+                item.originalFlow=flow;item.drop=f->action.type==FWP_ACTION_BLOCK;
+                item.layerGuid=decisions::canonicalGuid(f->layerKey);item.rule[0]=0xab;item.appId=s.appId;
+                for(const auto& r:rules)for(unsigned slot=0;slot<6;++slot)
+                    if(same(key(r.id,slot),s.id))item.rule=r.id;
+                item.origin=flow==2?1:flow==1?2:
+                    (same(s.layer,FWPM_LAYER_ALE_AUTH_LISTEN_V4)||same(s.layer,FWPM_LAYER_ALE_AUTH_LISTEN_V6))?3:0;
+                item.direction=s.appId.empty()?0:3;item.mode=s.action==FWP_ACTION_PERMIT?2:0;
+                ledger.push_back(std::move(item));}
             if(layer)FwpmFreeMemory0(reinterpret_cast<void**>(&layer));}
         FwpmFreeMemory0(reinterpret_cast<void**>(&f));if(!ok)return false;
     }
     std::lock_guard<std::mutex> lock(callbackMutex_);if(collector_){FILETIME clock{};GetSystemTimeAsFileTime(&clock);auto ft=(std::uint64_t(clock.dwHighDateTime)<<32)|clock.dwLowDateTime;
         if(!subscription_||!collector_->publish(std::move(ledger),ft))collector_->unavailable(7);}
+    return true;
+}
+namespace {
+const GUID& directionalLayer(directional::Layer layer) {
+    static const GUID layers[]={FWPM_LAYER_ALE_AUTH_CONNECT_V4,FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+        FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4,FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+        FWPM_LAYER_ALE_AUTH_LISTEN_V4,FWPM_LAYER_ALE_AUTH_LISTEN_V6,
+        FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V4,FWPM_LAYER_ALE_RESOURCE_ASSIGNMENT_V6};
+    return layers[static_cast<unsigned>(layer)];
+}
+Spec nativeSpec(const directional::FilterSpec& s) {
+    return {key(s.rule,s.slot),directionalLayer(s.layer),
+            DWORD(s.boot?FWPM_FILTER_FLAG_BOOTTIME:FWPM_FILTER_FLAG_PERSISTENT),s.weight,
+            FWP_ACTION_TYPE(s.action==1?FWP_ACTION_BLOCK:FWP_ACTION_PERMIT),s.appId,s.promiscuous,s.rawEndpoint,s.unicast};
+}
+}
+bool WfpBackend::applyDirections(const std::vector<directional::Rule>& rules,std::uint64_t revision) {
+    std::vector<directional::FilterSpec> wanted;
+    if(!available()||!guestActivationAuthorized()||!directional::generate(rules,revision,wanted))return false;
+    for(const auto& r:rules)
+        if(std::find(ownTools_.begin(),ownTools_.end(),r.appId)==ownTools_.end())return false;
+    if(FwpmTransactionBegin0(engine_,0)!=ERROR_SUCCESS)return false;
+    bool ok=objects(engine_);std::vector<GUID> old;
+    if(ok)ok=enumerate(engine_,old);
+    if(ok)for(const auto& id:old)
+        if(FwpmFilterDeleteByKey0(engine_,&id)!=ERROR_SUCCESS){ok=false;break;}
+    if(ok)for(const auto& row:wanted) {
+        auto s=nativeSpec(row);FWP_BYTE_BLOB blob{};auto c=conditions(s,blob);
+        FWPM_FILTER0 f{};f.filterKey=s.id;f.displayData.name=const_cast<wchar_t*>(L"LGA GateBouncer directional policy");
+        f.flags=s.flags;f.providerKey=const_cast<GUID*>(&Provider);
+        f.providerData={static_cast<UINT32>(row.metadata.size()),const_cast<UINT8*>(row.metadata.data())};
+        f.layerKey=s.layer;f.subLayerKey=Sublayer;auto weight=s.weight;
+        f.weight.type=FWP_UINT64;f.weight.uint64=&weight;
+        f.numFilterConditions=static_cast<UINT32>(c.size());f.filterCondition=c.data();f.action.type=s.action;
+        if(FwpmFilterAdd0(engine_,&f,nullptr,nullptr)!=ERROR_SUCCESS){ok=false;break;}
+    }
+    if(!ok){FwpmTransactionAbort0(engine_);return false;}
+    if(FwpmTransactionCommit0(engine_)!=ERROR_SUCCESS){FwpmTransactionAbort0(engine_);return false;}
+    return true;
+}
+bool WfpBackend::matchDirections(const std::vector<directional::Rule>& rules,std::uint64_t revision) {
+    std::vector<directional::FilterSpec> wanted;
+    if(!available()||!objectIdentity(engine_)||!directional::generate(rules,revision,wanted))return false;
+    std::vector<GUID> actual;
+    if(!enumerate(engine_,actual)||actual.size()!=wanted.size())return false;
+    std::vector<decisions::LedgerFilter> ledger;
+    for(const auto& row:wanted) {
+        auto s=nativeSpec(row);FWPM_FILTER0* f=nullptr;
+        if(FwpmFilterGetByKey0(engine_,&s.id,&f)!=ERROR_SUCCESS)return false;
+        FWP_BYTE_BLOB blob{};auto c=conditions(s,blob);
+        bool ok=f->providerKey&&same(*f->providerKey,Provider)&&same(f->subLayerKey,Sublayer)&&
+            same(f->layerKey,s.layer)&&f->flags==s.flags&&f->action.type==s.action&&
+            f->weight.type==FWP_UINT64&&f->weight.uint64&&*f->weight.uint64==s.weight&&
+            f->effectiveWeight.type==FWP_UINT64&&f->effectiveWeight.uint64&&*f->effectiveWeight.uint64==s.weight&&
+            f->numFilterConditions==c.size()&&f->providerData.size==row.metadata.size()&&
+            f->providerData.data&&std::memcmp(f->providerData.data,row.metadata.data(),row.metadata.size())==0;
+        if(ok)for(std::size_t i=0;i<c.size();++i)
+            if(!conditionSame(f->filterCondition[i],c[i])){ok=false;break;}
+        FWPM_LAYER0* layer=nullptr;
+        if(ok)ok=FwpmLayerGetByKey0(engine_,&f->layerKey,&layer)==ERROR_SUCCESS;
+        if(ok) {
+            auto origin=directional::origin(row.layer);
+            decisions::LedgerFilter item;
+            item.filterId=f->filterId;item.generation=revision+1;item.desired=revision;
+            item.guid=decisions::canonicalGuid(f->filterKey);item.layerId=layer->layerId;
+            item.originalFlow=static_cast<std::uint8_t>(directional::originalFlow(origin));
+            item.drop=s.action==FWP_ACTION_BLOCK;item.layerGuid=decisions::canonicalGuid(f->layerKey);
+            item.rule=row.rule;item.appId=row.appId;item.origin=static_cast<std::uint8_t>(origin);
+            item.direction=row.direction;item.mode=row.mode;ledger.push_back(std::move(item));
+        }
+        if(layer)FwpmFreeMemory0(reinterpret_cast<void**>(&layer));
+        FwpmFreeMemory0(reinterpret_cast<void**>(&f));if(!ok)return false;
+    }
+    std::lock_guard<std::mutex> lock(callbackMutex_);
+    if(collector_) {
+        FILETIME clock{};GetSystemTimeAsFileTime(&clock);
+        auto ft=(std::uint64_t(clock.dwHighDateTime)<<32)|clock.dwLowDateTime;
+        if(!subscription_||!collector_->publish(std::move(ledger),ft))collector_->unavailable(7);
+    }
     return true;
 }
 }

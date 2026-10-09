@@ -14,6 +14,9 @@ struct LedgerFilter {
     // CONNECT2 / RECV_ACCEPT1. LISTEN no tiene originalFlow en schema II.
     std::uint8_t originalFlow = 0;
     bool drop = false;
+    Id layerGuid{}, rule{};
+    Bytes appId;
+    std::uint8_t origin = 0, direction = 0, mode = 0;
 };
 Id canonicalGuid(const GUID &guid);
 struct Capture {

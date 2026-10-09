@@ -26,6 +26,7 @@ bool Client::authenticated() {
 }
 bool Client::open(bool control, const std::filesystem::path &image) {
     close();
+    if (minor_ != 1 && minor_ != 2) return false;
     control_ = control;
     image_ = image;
     auto name = control ? L"\\\\.\\pipe\\LGA.GateBouncer.Control.v1"
@@ -38,13 +39,13 @@ bool Client::open(bool control, const std::filesystem::path &image) {
         return false;
     }
     wire::Frame f;
-    f.minor = 1;
+    f.minor = minor_;
     f.type = wire::Type::Hello;
     f.correlation = native::randomIdentity();
     f.fields = {wire::value(wire::Tag::ClientRole, control ? 2 : 1, 1)};
     wire::Frame response;
     if (!send(pipe_.value, f, nullptr) || !receive(pipe_.value, response, nullptr) ||
-        response.minor != 1 || response.type != wire::Type::HelloAck || response.sequence != 1 ||
+        response.minor != minor_ || response.type != wire::Type::HelloAck || response.sequence != 1 ||
         response.correlation != f.correlation || wire::zero(response.connection) ||
         !authenticated()) {
         close();
@@ -60,7 +61,7 @@ bool Client::transact(wire::Frame f, wire::Frame &out) {
         close();
         return false;
     }
-    f.minor = 1;
+    f.minor = minor_;
     f.connection = connection_;
     f.sequence = tx_++;
     if (wire::zero(f.correlation))
@@ -71,7 +72,7 @@ bool Client::transact(wire::Frame f, wire::Frame &out) {
     }
     for (unsigned n = 0; n <= 512; ++n) {
         wire::Frame reply;
-        if (!receive(pipe_.value, reply, nullptr) || reply.minor != 1 ||
+        if (!receive(pipe_.value, reply, nullptr) || reply.minor != minor_ ||
             reply.connection != connection_ || reply.sequence != rx_++ ||
             (reply.type != wire::Type::ProtocolError &&
              wire::idValue(reply, wire::Tag::ServiceEpoch) !=
@@ -123,7 +124,7 @@ bool Client::events(std::vector<wire::Frame> &out) {
             return false;
         }
         wire::Frame f;
-        if (!receive(pipe_.value, f, nullptr) || f.minor != 1 || f.connection != connection_ ||
+        if (!receive(pipe_.value, f, nullptr) || f.minor != minor_ || f.connection != connection_ ||
             f.sequence != rx_++ ||
             (f.type != wire::Type::Attempt && f.type != wire::Type::ObservationGap &&
              f.type != wire::Type::Authorization)) {

@@ -11,16 +11,17 @@
 #include <QMouseEvent>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QStandardItemModel>
 #include <QVBoxLayout>
 
 namespace gb::controller {
 using namespace wire;
 ReviewWindow::ReviewWindow(std::filesystem::path root, QWidget *parent,
                            std::unique_ptr<ipc::ii::SessionChannel> channel)
-    : QWidget(parent), root_(std::move(root)), session_(this, std::move(channel)) {
+    : QWidget(parent), root_(std::move(root)), session_(this, std::move(channel), 2) {
     setWindowTitle("GateBouncer — Review decisions");
-    setMinimumSize(640, 520);
-    resize(780, 600);
+    setMinimumSize(680, 640);
+    resize(820, 760);
     setStyleSheet(
         "QWidget{background:#17171b;color:#e8e8ec;font-size:13px} QLabel{background:transparent} "
         "QPushButton,QComboBox{background:#29292e;padding:9px;border:1px solid "
@@ -34,9 +35,11 @@ ReviewWindow::ReviewWindow(std::filesystem::path root, QWidget *parent,
     state_->setWordWrap(true);
     layout->addWidget(state_);
     auto notice = new QLabel(
-        "Permanent path rules affect all users and instances. Engine coverage is unvalidated.",
+        "Permanent path rules affect all users, sessions and instances.\n"
+        "Engine coverage is unvalidated.",
         this);
     notice->setWordWrap(true);
+    notice->setMinimumHeight(notice->sizeHint().height());
     layout->addWidget(notice);
     queued_ = new QLabel("No queued references", this);
     layout->addWidget(queued_);
@@ -75,6 +78,14 @@ ReviewWindow::ReviewWindow(std::filesystem::path root, QWidget *parent,
     reviewButton_->setAutoRepeat(false);
     reviewButton_->installEventFilter(this);
     layout->addWidget(reviewButton_);
+    direction_ = new QComboBox(this);
+    direction_->setObjectName("reviewPolicyDirection");
+    direction_->addItem("Choose a policy direction", 0);
+    direction_->addItem("Outbound — Allow is limited to unicast destinations", 1);
+    direction_->addItem("Inbound — incoming connections and local listening", 2);
+    direction_->addItem("Both — Allow also includes non-unicast outbound destinations", 3);
+    direction_->setEnabled(false);
+    layout->addWidget(direction_);
     both_ = new QCheckBox(
         "Apply to both inbound and outbound, all users and instances of this path", this);
     both_->setEnabled(false);
@@ -106,6 +117,14 @@ ReviewWindow::ReviewWindow(std::filesystem::path root, QWidget *parent,
     connect(action_, &QComboBox::currentIndexChanged, this, &ReviewWindow::choice);
     connect(remember_, &QCheckBox::toggled, this, &ReviewWindow::choice);
     connect(both_, &QCheckBox::toggled, this, &ReviewWindow::choice);
+    connect(direction_, &QComboBox::currentIndexChanged, this, [this] {
+        QSignalBlocker block(both_);
+        both_->setChecked(false);
+        both_->setText(direction_->currentData().toInt() == 3
+            ? "Apply both directions to all users, sessions and instances\nAllow also removes the outbound unicast limit"
+            : "Apply to all users, sessions and instances\nof this permanent path");
+        choice();
+    });
     connect(&session_, &Session::opened, this, [this](bool ok, Frame f) {
         if (ok) {
             status(f);
@@ -166,22 +185,28 @@ void ReviewWindow::invalidate(const QString &reason) {
     action_->setEnabled(false);
     remember_->setEnabled(false);
     both_->setEnabled(false);
+    direction_->setEnabled(false);
 }
 void ReviewWindow::status(const Frame &f) {
     auto epoch = idValue(f, Tag::ServiceEpoch), boot = idValue(f, Tag::BootId);
     auto profile = get(f, Tag::ProfileGeneration);
-    bool ok = get(f, Tag::ReviewProfileState) == 1 &&
+    bool protocol = (f.minor == 1 || f.minor == 2) && wire::validate(f) == Error::Ok;
+    bool directional = f.minor == 1 || ((get(f, Tag::Capabilities) & DirectionalPath) && get(f, Tag::DirectionProfile) == 1);
+    bool ok = protocol && directional && get(f, Tag::ReviewProfileState) == 1 &&
               get(f, Tag::EngineState) == unsigned(EngineState::ReadyUnvalidated) &&
               (get(f, Tag::Capabilities) & (1ull << 17));
-    if (epoch != epoch_ || boot != boot_ || profile != profile_ || !ok) {
-        review_.session(epoch, boot, profile, ok);
+    if (epoch != epoch_ || boot != boot_ || profile != profile_ || minor_ != f.minor || !ok) {
+        review_.session(epoch, boot, profile, ok, f.minor);
         fence();
         identity_->setText("No active confirmation");
     }
     epoch_ = epoch;
     boot_ = boot;
     profile_ = profile;
-    authenticated_ = get(f, Tag::ReviewProfileState) == 1;
+    minor_ = f.minor;
+    blockRetry_ = (get(f, Tag::Capabilities) & BlockRetry) != 0;
+    direction_->setVisible(minor_ == 2);
+    authenticated_ = protocol && get(f, Tag::ReviewProfileState) == 1;
     state_->setText(!session_.actualOsAuthenticated()
                         ? "Offline fixture — no protection or real decisions"
                     : ok ? "Authenticated review session — engine coverage unvalidated"
@@ -239,6 +264,7 @@ bool ReviewWindow::eventFilter(QObject *object, QEvent *event) {
             both_->setEnabled(true);
             action_->setEnabled(true);
             remember_->setEnabled(true);
+            direction_->setEnabled(minor_ == 2);
         }
         return false;
     }
@@ -336,12 +362,13 @@ void ReviewWindow::choice() {
     if (!review_.active())
         return;
     auto action = std::uint8_t(action_->currentIndex());
-    if (action == 2 && !remember_->isChecked()) {
+    if ((action == 2 || (minor_ == 2 && !blockRetry_)) && !remember_->isChecked()) {
         QSignalBlocker block(remember_);
         remember_->setChecked(true);
     }
     if (review_.chooseLocal(review_.generation(), action, remember_->isChecked(),
-                            both_->isChecked()))
+                            both_->isChecked(), minor_ == 2 ? std::uint8_t(direction_->currentData().toUInt()) : 3,
+                            minor_ == 2 && direction_->currentData().toUInt() == 3 && both_->isChecked()))
         fence();
     else {
         review_.discardChoice();
@@ -359,8 +386,8 @@ void ReviewWindow::reply(bool ok, const Frame &f, Id correlation) {
             profile_ == wait->reference.profile) {
             auto blob = wire::find(f, Tag::Records);
             std::vector<ii::PendingRecord> records;
-            if (blob && ii::unpack(blob->bytes, 1, records) == Error::Ok &&
-                records[0].request == wait->reference.request && ii::eligible(records[0])) {
+            if (blob && f.minor == minor_ && ii::unpack(blob->bytes, 1, records, minor_) == Error::Ok &&
+                records[0].request == wait->reference.request && ii::eligible(records[0], minor_)) {
                 std::lock_guard<std::mutex> lock(wait->mutex);
                 if (!wait->cancelled)
                     error = review_.enqueue(wait->reference.epoch, wait->reference.request,
@@ -395,7 +422,7 @@ void ReviewWindow::reply(bool ok, const Frame &f, Id correlation) {
         std::vector<ii::PendingRecord> rows;
         auto blob = wire::find(f, Tag::Records);
         if (!blob ||
-            ii::unpack(blob->bytes, std::uint16_t(get(f, Tag::Count)), rows) != Error::Ok) {
+            f.minor != minor_ || ii::unpack(blob->bytes, std::uint16_t(get(f, Tag::Count)), rows, minor_) != Error::Ok) {
             invalidate("Invalid service record");
             return;
         }
@@ -426,7 +453,7 @@ void ReviewWindow::reply(bool ok, const Frame &f, Id correlation) {
     if (f.type == Type::PendingRecord) {
         std::vector<ii::PendingRecord> rows;
         auto blob = wire::find(f, Tag::Records);
-        if (!blob || ii::unpack(blob->bytes, 1, rows) != Error::Ok) {
+        if (!blob || f.minor != minor_ || ii::unpack(blob->bytes, 1, rows, minor_) != Error::Ok) {
             invalidate("Invalid trusted record");
             return;
         }
@@ -437,15 +464,27 @@ void ReviewWindow::reply(bool ok, const Frame &f, Id correlation) {
                 state_->setText("This request cannot be reviewed.");
                 return;
             }
+            QString origin = row.origin == 3 ? "Observed local listen operation; remote endpoint unknown"
+                : row.flow == 2 ? "Observed attempt: outbound initiated" : "Observed attempt: inbound initiated";
             identity_->setText(QString::fromUtf8(reinterpret_cast<const char *>(row.path.data()),
                                                  qsizetype(row.path.size())) +
-                               "\nPermanent path · Both directions · All users and instances\n" +
-                               (row.flow == 2 ? "Observed attempt: outbound initiated"
-                                              : "Observed attempt: inbound initiated"));
-            QSignalBlocker a(action_), b(both_), c(remember_);
+                               "\nPermanent path · All users, sessions and instances\n" + origin +
+                               (minor_ == 2 && !blockRetry_ ? "\nBlocking only this retry is unavailable on the legacy store" : "") +
+                               (minor_ == 2 ? (row.direction == 1 ? "\nRecommended: Outbound; Allow is unicast only"
+                                                                : "\nRecommended: Inbound")
+                                            : "\nPolicy scope: Both directions"));
+            QSignalBlocker a(action_), b(both_), c(remember_), d(direction_);
             action_->setCurrentIndex(0);
             both_->setChecked(false);
             remember_->setChecked(false);
+            direction_->setCurrentIndex(0);
+            direction_->setEnabled(false);
+            if (auto model = qobject_cast<QStandardItemModel *>(direction_->model())) {
+                model->item(1)->setEnabled(row.direction == 1);
+                model->item(2)->setEnabled(row.direction == 2);
+            }
+            both_->setText(minor_ == 2 ? "Apply to all users, sessions and instances\nof this permanent path"
+                                      : "Apply to both inbound and outbound, all users and instances of this path");
             both_->setEnabled(false);
             action_->setEnabled(false);
             remember_->setEnabled(false);

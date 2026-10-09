@@ -27,7 +27,7 @@ Error Pages::rules(Id id, const std::vector<ii::RuleRecord> &rows, std::uint64_t
     std::vector<Bytes> records;
     for (const auto &r : rows) {
         Bytes b;
-        auto e = ii::pack(std::vector<ii::RuleRecord>{r}, b);
+        auto e = ii::pack(std::vector<ii::RuleRecord>{r}, b, minor_);
         if (e != Error::Ok)
             return e;
         records.push_back(std::move(b));
@@ -43,7 +43,7 @@ Error Pages::pending(Id id, const std::vector<ii::PendingRecord> &rows, std::uin
         if (r.state != ii::RequestState::Pending || r.profileGeneration != profile_)
             return Error::Stale;
         Bytes b;
-        auto e = ii::pack(std::vector<ii::PendingRecord>{r}, b);
+        auto e = ii::pack(std::vector<ii::PendingRecord>{r}, b, minor_);
         if (e != Error::Ok)
             return e;
         records.push_back(std::move(b));
@@ -51,7 +51,7 @@ Error Pages::pending(Id id, const std::vector<ii::PendingRecord> &rows, std::uin
     return insert(id, false, revision, now, std::move(records));
 }
 Error Pages::page(const Frame &f, std::uint64_t profile, std::uint64_t now, Frame &out) {
-    if (f.minor != 1 || wire::validate(f) != Error::Ok ||
+    if (f.minor != minor_ || wire::validate(f) != Error::Ok ||
         (f.type != Type::ListRules && f.type != Type::ListPending))
         return Error::Malformed;
     if (profile != profile_ || idValue(f, Tag::ServiceEpoch) != epoch_)
@@ -74,7 +74,7 @@ Error Pages::page(const Frame &f, std::uint64_t profile, std::uint64_t now, Fram
         ++count;
     }
     Frame r;
-    r.minor = 1;
+    r.minor = minor_;
     r.type = s.rules ? Type::RulesPage : Type::PendingPage;
     r.connection = f.connection;
     r.correlation = f.correlation;
@@ -98,7 +98,7 @@ Error Pages::page(const Frame &f, std::uint64_t profile, std::uint64_t now, Fram
     return Error::Ok;
 }
 Error ObservationRing::append(const Frame &event) {
-    if (event.minor != 1 || wire::validate(event) != Error::Ok ||
+    if (event.minor != minor_ || wire::validate(event) != Error::Ok ||
         (event.type != Type::Attempt && event.type != Type::Authorization &&
          event.type != Type::ObservationGap))
         return Error::Malformed;

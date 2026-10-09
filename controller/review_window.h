@@ -54,9 +54,12 @@ class ReviewWindow : public QWidget, public QAbstractNativeEventFilter {
     QPushButton *reviewButton_ = nullptr, *confirm_ = nullptr, *connect_ = nullptr;
     QCheckBox *both_ = nullptr, *remember_ = nullptr;
     QComboBox *action_ = nullptr;
+    QComboBox *direction_ = nullptr;
     QTimer timer_;
     wire::Id epoch_{}, boot_{}, selectCorrelation_{}, command_{}, listSnapshot_{};
     std::uint64_t profile_ = 0;
+    std::uint16_t minor_ = 1;
+    bool blockRetry_ = false;
     DWORD cutoff_ = 0;
     bool barrier_ = true, armed_ = false, closing_ = false, authenticated_ = false,
          loading_ = false;

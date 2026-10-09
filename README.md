@@ -6,6 +6,8 @@ Live mode lists running processes with the available local metadata and lets you
 
 Settings lets you explicitly select authenticated engine status or the separate decision-record source. The latter displays bounded pending and rule snapshots, with observed attempts and coverage gaps when that source is available. Attempts, authorization and traffic are distinct; a missing source or an empty list does not prove that no connections occurred. The ordinary desktop window cannot allow or block a service request. It can queue a request reference for a separately enabled administrator reviewer. Queueing or requesting that reviewer to start does not confirm a policy change or protection.
 
+Direction-aware service records distinguish outbound attempts, inbound attempts and local listen observations. Permanent path review offers Outbound, Inbound and an explicit Both selection. Outbound Allow is limited to unicast destinations; Both broadens the rule to inbound access as well. Queuing a request and changing a selection grant no permission. The direction-aware backend remains disabled pending operating-system coverage validation.
+
 The six views — Processes, Pending, Activity, Rules, Import and Settings — also offer a separate Simulation mode. Its synthetic fixtures, sample decisions and reversible cleanup stay in session memory. Closing the application discards these demo changes.
 
 The NVIDIA explanation workflow in this desktop build uses local sample responses. No API key can be entered, no credentials are read or saved, and no external request is made. An explanation never decides whether to allow an application or verifies its safety.

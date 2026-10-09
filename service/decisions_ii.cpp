@@ -22,9 +22,9 @@ bool next(std::uint64_t &counter) {
     return true;
 }
 } // namespace
-Engine::Engine(Id epoch, Id boot, JournalSink &journal, EffectBackend &backend)
-    : epoch_(epoch), boot_(boot), journal_(journal), backend_(backend) {
-    if (zero(epoch) || zero(boot))
+Engine::Engine(Id epoch, Id boot, JournalSink &journal, EffectBackend &backend, std::uint16_t minor)
+    : epoch_(epoch), boot_(boot), journal_(journal), backend_(backend), minor_(minor) {
+    if (zero(epoch) || zero(boot) || (minor != 1 && minor != 2))
         recovery_ = true;
 }
 bool Engine::activate(Profile p, bool evidence, std::uint64_t now) {
@@ -76,7 +76,7 @@ Error Engine::observe(const VerifiedDrop &d, std::uint64_t now) {
     expire(now);
     const auto &r = d.record;
     if (recovery_ || profile_.state != 1 || !d.ownLedger || !d.appIdPresent || !d.userIdPresent ||
-        !d.accountMatches || r.profileGeneration != profile_.generation || !ii::eligible(r)) {
+        !d.accountMatches || r.profileGeneration != profile_.generation || !ii::eligible(r, minor_)) {
         if (!next(gaps_))
             recovery_ = true;
         return Error::IdentityUnavailable;
@@ -86,7 +86,7 @@ Error Engine::observe(const VerifiedDrop &d, std::uint64_t now) {
         auto &p = pair.second;
         auto &old = p.record;
         if (old.state != ii::RequestState::Pending || old.selector != r.selector ||
-            old.flow != r.flow)
+            old.flow != r.flow || (minor_ == 2 && old.origin != r.origin))
             continue;
         if (old.selectorRevision != r.selectorRevision ||
             old.profileGeneration != r.profileGeneration || old.desired != r.desired) {
@@ -160,9 +160,18 @@ bool Engine::initializeRevision(std::uint64_t desired, bool readback) {
     recovery_ = false;
     return true;
 }
+bool Engine::advanceRevision(std::uint64_t desired, bool readback, std::uint64_t now) {
+    if (!readback || desired <= desired_) { recovery_ = true; return false; }
+    for (auto &pair : pending_) stale(pair.second, now);
+    desired_ = desired;
+    return !recovery_;
+}
 Result Engine::result(const CommandEntry &e, bool replay) const {
     // Los resultados históricos no aseguran efecto después de recuperación/restart.
-    bool unknown = recovery_ && !(e.state == State::AppliedUnrecorded && e.commandEpoch == epoch_);
+    const bool uncertainProof = e.state == State::AppliedUnrecorded &&
+                                e.commandEpoch == epoch_ && e.effectiveKnown &&
+                                backend_.currentProof(e.effective);
+    bool unknown = recovery_ && !uncertainProof;
     return {backend_.actualOs() && !unknown && e.effectiveKnown,
             e.error,
             e.state,
@@ -181,7 +190,7 @@ Result Engine::commit(const Frame &f, const VerifiedControl &a, std::uint64_t no
         fail.error = Error::Unauthorized;
         return fail;
     }
-    if (f.minor != 1 || f.type != Type::CommitDecision || wire::validate(f) != Error::Ok) {
+    if (f.minor != minor_ || f.type != Type::CommitDecision || wire::validate(f) != Error::Ok) {
         fail.error = Error::Malformed;
         return fail;
     }
@@ -212,23 +221,29 @@ Result Engine::commit(const Frame &f, const VerifiedControl &a, std::uint64_t no
         return fail;
     }
     auto row = lookup(idValue(f, Tag::RequestId), now);
-    if (!row || !ii::eligible(*row) || row->authority != get(f, Tag::RequestVersion) ||
+    if (!row || !ii::eligible(*row, minor_) || row->authority != get(f, Tag::RequestVersion) ||
         row->selector != idValue(f, Tag::SelectorId) ||
         row->selectorRevision != get(f, Tag::SelectorRevision) ||
         row->desired != get(f, Tag::ExpectedDesiredRev) || row->desired != desired_) {
         fail.error = Error::Stale;
         return fail;
     }
+    if(minor_ == 2 && get(f,Tag::PolicyDirection) != row->direction && get(f,Tag::PolicyDirection) != 3) {
+        fail.error=Error::Conflict;return fail;
+    }
     if (!backend_.ready()) {
         fail.error = Error::BackendUnavailable;
         return fail;
     }
+    fail.error = journal_.admission(f);
+    if (fail.error != Error::Ok)
+        return fail;
     auto before = commands_;
     if (commands_.size() >= 4096) {
         auto oldest = commands_.end();
         for (auto it = commands_.begin(); it != commands_.end(); ++it) {
             auto &c = it->second;
-            if ((c.state == State::Applied || c.state == State::Failed) && now >= c.completedAt &&
+            if (c.id != journal_.pinnedCommand() && (c.state == State::Applied || c.state == State::Failed) && now >= c.completedAt &&
                 now - c.completedAt >= RetainMs &&
                 (oldest == commands_.end() || c.completedAt < oldest->second.completedAt))
                 oldest = it;
@@ -261,6 +276,7 @@ Result Engine::commit(const Frame &f, const VerifiedControl &a, std::uint64_t no
     commands_[entry.id] = entry;
     if (!persist()) {
         commands_ = std::move(before);
+        if(journal_.suspendsMutations()) recovery_=true;
         fail.error = Error::StoreFailure;
         return fail;
     }

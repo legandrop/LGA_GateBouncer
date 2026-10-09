@@ -193,6 +193,27 @@ bool ProtectedDirectory::leafName(const wchar_t *leaf) const {
             return false;
     return std::wstring(leaf).find(L"..") == std::wstring::npos;
 }
+bool ProtectedDirectory::writerLease(Handle &lease) {
+    if (lease || readable_ || !acquire())
+        return false;
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)", SDDL_REVISION_1, &sd, nullptr))
+        return false;
+    SECURITY_ATTRIBUTES sa{sizeof(sa), sd, FALSE};
+    Handle candidate(CreateFileW((root_ / L"state-writer.lock").c_str(),
+                                 GENERIC_READ | GENERIC_WRITE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+                                 0, &sa, OPEN_ALWAYS, FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+    LocalFree(sd);
+    LARGE_INTEGER size{};
+    DWORD flags = 0;
+    if (!candidate || !protectedObject(candidate.value, false, false) ||
+        !GetFileSizeEx(candidate.value, &size) || size.QuadPart != 0 ||
+        !GetHandleInformation(candidate.value, &flags) || (flags & HANDLE_FLAG_INHERIT))
+        return false;
+    lease = std::move(candidate);
+    return true;
+}
 bool ProtectedDirectory::read(const wchar_t *leaf, std::size_t cap, wire::Bytes &out,
                               bool &exists) {
     exists = false;
@@ -217,8 +238,10 @@ bool ProtectedDirectory::read(const wchar_t *leaf, std::size_t cap, wire::Bytes 
     out = std::move(b);
     return true;
 }
-bool ProtectedDirectory::replace(const wchar_t *leaf, const wire::Bytes &b) {
+bool ProtectedDirectory::replace(const wchar_t *leaf, const wire::Bytes &b, bool stateSnapshot) {
     if (!leafName(leaf) || b.size() > ULONG_MAX || !acquire())
+        return false;
+    if (stateSnapshot && std::wstring(leaf) != L"policy.bin")
         return false;
     auto final = root_ / leaf, backup = root_ / (std::wstring(leaf) + L".previous");
     for (auto &path : {final, backup}) {
@@ -232,7 +255,8 @@ bool ProtectedDirectory::replace(const wchar_t *leaf, const wire::Bytes &b) {
             return false;
     }
     auto text = wire::hex(randomIdentity());
-    auto temp = root_ / (L"journal-prepared-" + std::wstring(text.begin(), text.end()) + L".bin");
+    auto temp = root_ / ((stateSnapshot ? L"state-prepared-" : L"journal-prepared-") +
+                        std::wstring(text.begin(), text.end()) + L".bin");
     PSECURITY_DESCRIPTOR sd = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             L"O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)", SDDL_REVISION_1, &sd, nullptr))
