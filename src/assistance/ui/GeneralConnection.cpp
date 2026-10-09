@@ -1,4 +1,5 @@
 #include "GeneralConnection.h"
+#include "ObservationSelection.h"
 #include "../broker/BrokerLauncher.h"
 #include "../../mainwindow.h"
 #include <QCoreApplication>
@@ -12,6 +13,8 @@ struct GeneralConnection::SettingsView {
     QPointer<MainWindow> window;
     std::weak_ptr<General::FrameChannel> channel;
     bool retired=false;
+    std::optional<ObservationSelection> selected,attempted;
+    std::uint64_t attemptedConfiguration=0;
     bool current(const Broker::Id& captured,std::uint64_t revision) const {
         const auto live=channel.lock();
         return !retired&&window&&Broker::nonzero(nonce)&&nonce==captured&&generation==revision&&
@@ -20,6 +23,8 @@ struct GeneralConnection::SettingsView {
 };
 GeneralConnection::GeneralConnection(MainWindow& window):QObject(&window),window_(&window){
     connect(&window,&MainWindow::assistanceConnectRequested,this,&GeneralConnection::connectBroker);
+    connect(window.product()->ordinary(),&OrdinaryDecisionClient::changed,this,&GeneralConnection::synchronizePending);
+    connect(window.product(),&ProductController::invalidated,this,&GeneralConnection::synchronizePending);
 }
 GeneralConnection::~GeneralConnection(){
     close();
@@ -56,10 +61,18 @@ void GeneralConnection::connectBroker(){
         auto channel=std::make_shared<General::PipeFrameChannel>(std::move(result->session));view->channel=channel;
         settings_=view;const auto nonce=view->nonce;
         const std::weak_ptr<SettingsView> weak=view;
-        auto session=std::make_unique<GeneralSession>(std::move(channel),GeneralSession::Current{},[weak,nonce,serial]{
+        auto session=std::make_unique<GeneralSession>(std::move(channel),[weak,nonce,serial](const General::FullBinding& binding){
+            const auto owner=weak.lock();if(!owner||!owner->selected||!owner->current(nonce,serial))return false;
+            const auto captured=*owner->selected;
+            const auto actual=currentObservation(owner->window->product()->ordinary());
+            if(!actual||!(*actual==captured)||!captured.matches(binding))return false;
+            const auto after=currentObservation(owner->window->product()->ordinary());
+            return owner->selected&&*owner->selected==captured&&after&&*after==captured&&owner->current(nonce,serial);
+        },[weak,nonce,serial]{
             const auto owner=weak.lock();return owner&&owner->current(nonce,serial);
         },Broker::generalSearchConfiguration());
         window_->setAssistance(std::move(session));
+        connect(window_->assistance(),&GeneralSession::changed,this,&GeneralConnection::synchronizePending);
         // La configuración no depende de que exista un registro pendiente canónico.
         QPointer<GeneralSession> observed=window_->assistance();auto* initial=new QTimer(this);initial->setInterval(50);
         connect(initial,&QTimer::timeout,this,[this,initial,observed,weak,nonce,serial,attempts=0]() mutable {
@@ -71,5 +84,23 @@ void GeneralConnection::connectBroker(){
             if(owner->current(nonce,serial)&&!observed->busy())observed->refresh();
         });initial->start();
     });worker_->start();
+}
+void GeneralConnection::synchronizePending(){
+    const auto owner=settings_;if(closed_||!owner||owner->retired||!window_)return;
+    QPointer<GeneralSession> session=window_->assistance();if(!session)return;
+    const auto selected=window_->product()->simulation()?std::nullopt:currentObservation(window_->product()->ordinary());
+    if(!selected){
+        if(owner->selected){owner->selected.reset();session->cancel();}
+        return;
+    }
+    if(owner->selected&&!(*owner->selected==*selected)){
+        owner->selected.reset();session->cancel();if(!session)return;
+    }
+    if(session->busy()||!session->available()||!session->configuration())return;
+    const auto revision=session->configuration()->local.revision;
+    // Un error o Cancel no reintenta la misma selección/configuración automáticamente.
+    if(owner->attempted&&*owner->attempted==*selected&&owner->attemptedConfiguration==revision)return;
+    owner->selected=selected;owner->attempted=selected;owner->attemptedConfiguration=revision;
+    session->selectPending(selected->record.observed,selected->service);
 }
 }

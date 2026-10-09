@@ -19,6 +19,7 @@ class QLineEdit;
 class QPushButton;
 
 namespace Gate {
+namespace Assistance::Ui { class ExplanationWidget; }
 class RowsModel;
 class MainWindow final : public QMainWindow {
     Q_OBJECT
@@ -121,6 +122,7 @@ class MainWindow final : public QMainWindow {
     QPointer<QLabel> count_;
     QPointer<QLabel> emptyState_;
     QPointer<QFrame> detail_, notice_, modalOverlay_, message_;
+    QPointer<Assistance::Ui::ExplanationWidget> ordinaryExplanation_;
     QPointer<QWidget> modalPanel_;
     QPointer<QWidget> previousFocus_;
     ModalOwner modalOwner_ = ModalOwner::General;

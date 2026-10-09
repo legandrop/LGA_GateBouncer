@@ -17,6 +17,7 @@ class PendingPresentationContext final {
 public:
     const PendingServiceContext& service() const {return service_;}
     const Id128& request() const {return request_;}
+    // En observaciones IV, este slot es captureBinding readonly, nunca selector del writer.
     const Id128& selector() const {return selector_;}
     std::uint64_t requestRevision() const {return requestRevision_;}
     std::uint64_t selectorRevision() const {return selectorRevision_;}

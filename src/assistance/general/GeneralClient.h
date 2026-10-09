@@ -22,6 +22,7 @@ public:
         std::function<bool()> currentContext,ControlCompletion);
     bool storeCredential(Configuration::ConfigurationIntent,Broker::SensitiveBytes,ControlCompletion);
     void cancel();
+    bool settled() const;
     void close();
 private:
     struct Data;

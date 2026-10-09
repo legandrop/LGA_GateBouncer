@@ -163,7 +163,7 @@ bool GeneralSession::selectPending(const G::Id128& request,G::PendingServiceCont
             const auto predicate=self->pendingCurrent_;const bool valid=predicate&&predicate(*binding);
             if(!self||!self->current(stamp))return;
             if(!valid){self->failed("The pending request changed. Your request remains undecided.");return;}
-            self->pendingPresentation_=pending;self->pendingBinding_=binding;self->busy_=false;emit self->changed();
+            self->pendingPresentation_=pending;self->pendingBinding_=binding;self->busy_=false;self->state_=G::State::Insufficient;emit self->changed();
         });
     if(!sent)failed("The current request could not be read. Your request remains undecided.");else emit changed();
     return sent;
@@ -179,13 +179,41 @@ bool GeneralSession::publicReviewCurrent() const {
     return self&&valid&&self->current(stamp)&&self->review_&&self->review_->binding==review.binding&&
         self->review_->fields==review.fields&&self->review_->pendingBytes==review.pendingBytes;
 }
+bool GeneralSession::clearPublicReview(){
+    if(busy_||closed_||generation_==UINT64_MAX||state_==G::State::Uncertain||!client_||
+        !client_->settled()||!channel_||!view_||!presentation_||!pendingPresentation_){
+        review_.reset();cancel();return false;
+    }
+    QPointer<GeneralSession> self(this);const auto before=generation_,expected=before+1;
+    const auto client=client_.get();const auto channel=channel_;const auto connection=channel->connection();
+    const auto config=*view_;const auto presentation=*presentation_;const auto pending=*pendingPresentation_;
+    const auto bytes=G::pendingPresentationBytes(pending);
+    const auto presentationBytes=G::presentationBytes(presentation,config,connection);
+    const auto binding=pendingBinding();
+    auto unchanged=[self,client,channel,connection,config,presentationBytes](quint64 stamp){
+        return self&&self->generation_==stamp&&!self->busy_&&!self->closed_&&self->client_.get()==client&&
+            client->settled()&&self->channel_==channel&&channel->connection()==connection&&channel->peerCurrent()&&self&&
+            self->view_&&G::sameConfigurationView(*self->view_,config)&&self->presentation_&&presentationBytes&&
+            G::presentationBytes(*self->presentation_,*self->view_,connection)==presentationBytes;
+    };
+    if(!self||!binding||!bytes||!unchanged(before)||!pendingPresentation_||
+        G::pendingPresentationBytes(*pendingPresentation_)!=bytes)return false;
+    cancel();if(!self||!unchanged(expected))return false;
+    review_.reset();const auto predicate=pendingCurrent_;const bool valid=predicate&&predicate(*binding);
+    if(!self||!valid||!unchanged(expected))return false;
+    // Sólo presentación ya entregada, sin operación ni cancelación en wire.
+    pendingPresentation_=pending;pendingBinding_=binding;state_=G::State::Insufficient;emit changed();
+    return self&&unchanged(expected)&&self->pendingBinding_==binding&&self->pendingPresentation_&&
+        G::pendingPresentationBytes(*self->pendingPresentation_)==bytes;
+}
 bool GeneralSession::reviewPublicFields(G::PublicFields fields){
     if(busy_||!pendingPresentation_||!G::validPublicFields(fields))return false;
     QPointer<GeneralSession> self(this);const auto before=generation_;
     const auto binding=pendingBinding();if(!self||!binding||before!=generation_||!pendingPresentation_)return false;
-    const auto bytes=G::pendingPresentationBytes(*pendingPresentation_);if(!bytes)return false;
-    cancel();if(!self||closed_)return false;
-    const auto stamp=generation_;
+    const auto bytes=G::pendingPresentationBytes(*pendingPresentation_);if(!bytes||before==UINT64_MAX)return false;
+    const auto stamp=before+1;
+    if(!clearPublicReview()||!self||generation_!=stamp||!pendingBinding_||*pendingBinding_!=*binding||
+        !pendingPresentation_||G::pendingPresentationBytes(*pendingPresentation_)!=bytes)return false;
     review_=PublicReview{*binding,std::move(fields),*bytes,channel_->connection()};
     const bool valid=publicReviewCurrent();if(!self||stamp!=generation_)return false;
     if(!valid){review_.reset();return false;}
@@ -248,7 +276,7 @@ bool GeneralSession::explainApproved(){
 bool GeneralSession::explain(G::FullBinding binding,G::PublicFields fields){return approvePublic(std::move(binding),std::move(fields));}
 void GeneralSession::cancel(){
     if(generation_==UINT64_MAX){close();return;}
-    ++generation_;busy_=false;approving_=false;result_.reset();public_.reset();pendingBinding_.reset();pendingPresentation_.reset();state_=G::State::Cancelled;
+    ++generation_;busy_=false;approving_=false;result_.reset();public_.reset();review_.reset();pendingBinding_.reset();pendingPresentation_.reset();state_=G::State::Cancelled;
     if(client_)client_->cancel();
 }
 void GeneralSession::invalidate(){review_.reset();cancel();view_.reset();presentation_.reset();modelBody_.clear();webBody_.clear();emit changed();}

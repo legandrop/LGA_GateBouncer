@@ -1,7 +1,7 @@
 #include "GeneralBrokerHost.h"
 #include "../general/PendingPresentationContext.h"
 #include "client_ii_win.h"
-#include "wire_iv.h"
+#include "../general/ObservationReader.h"
 #include "../../localfacts/WinFile.h"
 #include <QPointer>
 #include <QThread>
@@ -20,21 +20,14 @@ QString text(const gb::wire::Bytes& bytes){return QString::fromUtf8(
     reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size()));}
 std::string requestName(const Id128& id){return QUuid::fromRfc4122(QByteArray(
     reinterpret_cast<const char*>(id.data()),16)).toString().toStdString();}
-bool sameRecord(const gb::wire::ii::PendingRecord& a,const gb::wire::ii::PendingRecord& b,std::uint16_t minor){
-    if(!a.ttl||!b.ttl)return false;
-    auto observed=a,captured=b;
-    // Remaining TTL desciende en lookup; no es una revisión de identidad.
-    observed.ttl=captured.ttl=1;
-    gb::wire::Bytes left,right;
-    return gb::wire::ii::pack({observed},left,minor)==gb::wire::Error::Ok&&
-        gb::wire::ii::pack({captured},right,minor)==gb::wire::Error::Ok&&left==right;
-}
+
 }
 struct GeneralBrokerHost::OwnedFacts {
     PendingServiceContext service;
     gb::wire::Id sourceConnection{};
     std::shared_ptr<const gb::ipc::ii::ReadPeerLease> sourcePeer;
-    gb::wire::ii::PendingRecord record;
+    gb::wire::iv::ObservedRecord record;
+    std::uint64_t profile=0,desired=0;
     Id128 token{};
     std::uint64_t generation=0;
     L::detail::OpenFile pin;
@@ -63,23 +56,24 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
         PendingServiceContext context;
         gb::wire::Id connection{};
         std::shared_ptr<const gb::ipc::ii::ReadPeerLease> peer;
-        gb::wire::ii::PendingRecord record;
+        gb::wire::iv::ObservedRecord record;
+        std::uint64_t profile=0,desired=0;
     };
     // Adquiere observaciones actuales del MISMO canal, nunca del cache de la GUI.
     std::optional<ReadSource> readSource(const Id128& request) const;
     bool sourceCurrent(const OwnedFacts& owner) const {
         if(closed||!owner.sourcePeer||owner.sourcePeer->checkLive()!=gb::ipc::ii::ReadPeerState::Current||!owner.fileCurrent())return false;
-        const auto observation=readSource(owner.record.request);
-        return !closed&&observation&&observation->context==owner.service&&observation->peer&&
+        const auto observation=readSource(owner.record.observed);
+        return !closed&&observation&&observation->context==owner.service&&observation->peer==owner.sourcePeer&&
             observation->peer->checkLive()==gb::ipc::ii::ReadPeerState::Current&&
             owner.sourcePeer&&owner.sourcePeer->checkLive()==gb::ipc::ii::ReadPeerState::Current&&
-            observation->connection==owner.sourceConnection&&sameRecord(observation->record,owner.record,3)&&owner.fileCurrent();
+            observation->connection==owner.sourceConnection&&observation->profile==owner.profile&&observation->desired==owner.desired&&ObservationReader::sameRecord(observation->record,owner.record)&&owner.fileCurrent();
     }
     bool current(const FullBinding& binding) const {
         const auto owner=selected;
-        if(!owner||!factory||binding.requestId!=requestName(owner->record.request)||
-            binding.applicationToken!=owner->record.selector||binding.snapshotRevision!=owner->record.authority||
-            binding.serviceEpoch!=owner->service.engineBindingGeneration||binding.generation!=owner->record.profileGeneration||
+        if(!owner||!factory||binding.requestId!=requestName(owner->record.observed)||
+            binding.applicationToken!=owner->record.binding||binding.snapshotRevision!=owner->record.revision||
+            binding.serviceEpoch!=owner->service.engineBindingGeneration||binding.generation!=owner->profile||
             binding.localSnapshotToken!=owner->token||binding.localSnapshotGeneration!=owner->generation||!sourceCurrent(*owner))return false;
         const auto view=factory->status();const auto& config=view.local;const auto& epochs=config.epochs;
         const bool matching=config.search&&binding.sessionEpoch==epochs.session&&binding.retrievalEpoch==epochs.retrieval&&
@@ -98,13 +92,13 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
         if(closed||worker||!host){completion({});return;}
         const auto observation=readSource(request);
         if(!observation||!observation->peer||observation->peer->checkLive()!=gb::ipc::ii::ReadPeerState::Current||
-            !observation->record.authority||!observation->record.selectorRevision||!observation->record.profileGeneration||
+            !observation->record.revision||!observation->profile||
             !observation->context.engineBindingGeneration){completion({});return;}
-        auto owner=std::make_shared<OwnedFacts>();owner->service=observation->context;owner->record=observation->record;owner->generation=serial;
+        auto owner=std::make_shared<OwnedFacts>();owner->service=observation->context;owner->record=observation->record;owner->profile=observation->profile;owner->desired=observation->desired;owner->generation=serial;
         owner->sourceConnection=observation->connection;owner->sourcePeer=observation->peer;
         if(!Broker::randomId(owner->token)){completion({});return;}
         cancellation=std::make_shared<L::Cancellation>();const auto cancelled=cancellation;
-        const auto path=text(owner->record.path).toStdWString();const auto before=serial;
+        const auto path=text(owner->record.display.path).toStdWString();const auto before=serial;
         const auto self=shared_from_this();
         worker=QThread::create([owner,path,cancelled]{
             DWORD error=0;L::Request request{path,owner->generation,{}};
@@ -121,8 +115,8 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
             Q_UNUSED(thread);self->worker=nullptr;self->cancellation.reset();
             if(self->closed||self->serial!=before||cancelled->requested||!self->sourceCurrent(*owner)){completion({});return;}
             self->selected=owner;
-            PendingPresentationContext view(owner->service,owner->record.request,owner->record.selector,
-                owner->record.authority,owner->record.selectorRevision,owner->record.profileGeneration,owner->token,owner->generation);
+            PendingPresentationContext view(owner->service,owner->record.observed,owner->record.binding,
+                owner->record.revision,owner->record.revision,owner->profile,owner->token,owner->generation);
             const std::weak_ptr<Data> weak=self;
             auto owned=std::shared_ptr<const OwnedPendingPresentation>(new OwnedPendingPresentation(
                 std::move(view),self->connection,owner,[weak,owner]{const auto state=weak.lock();
@@ -139,65 +133,22 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
     }
 };
 std::optional<GeneralBrokerHost::Data::ReadSource> GeneralBrokerHost::Data::readSource(const Id128& request) const {
-    using namespace gb::wire;
-    if(closed||zero(request))return {};
+    if(closed||gb::wire::zero(request))return {};
     if(!source){
         source=std::make_unique<gb::ipc::ii::Client>(3);
         const auto image=QDir(QCoreApplication::applicationDirPath()).filePath("GateBouncerService.exe");
         if(!source->open(false,std::filesystem::path(image.toStdWString()))){source.reset();return {};}
     }
-    const auto peer=source->readonlyPeer();
-    auto rejected=[this]()->std::optional<ReadSource>{source->close();source.reset();return {};};
-    if(!peer||peer->checkLive()!=gb::ipc::ii::ReadPeerState::Current)return rejected();
-    const auto connection=peer->connection();QElapsedTimer age;age.start();
-    auto transact=[&](Frame query,Frame& reply,Type expected){
-        query.minor=3;query.connection=connection;
-        return !closed&&age.elapsed()<5000&&peer->checkLive()==gb::ipc::ii::ReadPeerState::Current&&
-            source->transact(std::move(query),reply)&&age.elapsed()<5000&&reply.type==expected&&
-            reply.minor==3&&reply.connection==connection&&validate(reply)==gb::wire::Error::Ok&&
-            peer->checkLive()==gb::ipc::ii::ReadPeerState::Current;
-    };
-    Frame before,query;query.type=Type::GetStatus;
-    gb::wire::iv::ServiceContext first{},last{};
-    if(!transact(query,before,Type::Status)||gb::wire::iv::decodeServiceContext(before,first)!=gb::wire::Error::Ok||
-        !first.engineBindingGeneration)return rejected();
-    ReadSource observed;observed.context={first.serviceEpoch,first.boot,first.engineContext,first.engineBindingGeneration};
-    observed.connection=connection;observed.peer=peer;
-    Id snapshot{};std::uint32_t cursor=0;std::uint64_t revision=0;unsigned total=0;
-    std::set<Id> ids;bool found=false;
-    for(unsigned page=0;page<16;++page){
-        Frame rows;query.type=Type::ListPending;
-        query.fields={value(Tag::ServiceEpoch,first.serviceEpoch),value(Tag::SnapshotId,snapshot),
-            value(Tag::Cursor,cursor,4),value(Tag::Limit,32,2)};
-        // Runtime Status-only rechaza ListPending; no se sintetiza un registro.
-        if(!transact(query,rows,Type::PendingPage)||idValue(rows,Tag::ServiceEpoch)!=first.serviceEpoch||
-            get(rows,Tag::Cursor)!=cursor||(!zero(snapshot)&&idValue(rows,Tag::SnapshotId)!=snapshot)||
-            (cursor&&get(rows,Tag::PendingSnapshotRevision)!=revision))return rejected();
-        const auto field=find(rows,Tag::Records);std::vector<gb::wire::ii::PendingRecord> records;
-        if(!field||gb::wire::ii::unpack(field->bytes,get(rows,Tag::Count),records,3)!=gb::wire::Error::Ok||
-            records.size()>512-total)return rejected();
-        total+=unsigned(records.size());
-        for(const auto& record:records){
-            if(!ids.insert(record.request).second||record.state!=gb::wire::ii::RequestState::Pending||
-                record.profileGeneration!=get(before,Tag::ProfileGeneration))return rejected();
-            if(record.request==request){observed.record=record;found=true;}
-        }
-        snapshot=idValue(rows,Tag::SnapshotId);revision=get(rows,Tag::PendingSnapshotRevision);
-        const auto next=get(rows,Tag::NextCursor);
-        if(next==0xffffffffu)break;
-        if(!records.size()||next!=cursor+records.size()||page==15)return rejected();
-        cursor=std::uint32_t(next);
+    std::optional<ObservationRead> expected;
+    const auto owner=selected;
+    if(owner&&owner->record.observed==request){
+        expected=ObservationRead{owner->service,owner->sourceConnection,owner->sourcePeer,
+            owner->record,owner->profile,owner->desired};
     }
-    Frame after;query.type=Type::GetStatus;query.fields.clear();
-    if(!found||!transact(query,after,Type::Status)||gb::wire::iv::decodeServiceContext(after,last)!=gb::wire::Error::Ok||
-        first.serviceEpoch!=last.serviceEpoch||first.boot!=last.boot||first.engineContext!=last.engineContext||
-        first.engineBindingGeneration!=last.engineBindingGeneration||
-        get(before,Tag::ProfileGeneration)!=get(after,Tag::ProfileGeneration)||
-        get(before,Tag::DesiredRev)!=get(after,Tag::DesiredRev))return rejected();
-    const auto live=source->readonlyPeer();
-    if(!live||live->connection()!=connection||live->checkLive()!=gb::ipc::ii::ReadPeerState::Current||
-        peer->checkLive()!=gb::ipc::ii::ReadPeerState::Current)return rejected();
-    return observed;
+    const auto observed=ObservationReader::read(*source,request,expected?&*expected:nullptr);
+    if(closed||!observed){source->close();source.reset();return {};}
+    return ReadSource{observed->service,observed->connection,observed->peer,observed->record,
+        observed->profile,observed->desired};
 }
 GeneralBrokerHost::GeneralBrokerHost(QObject* parent):QObject(parent),data_(std::make_shared<Data>()){
     data_->host=this;

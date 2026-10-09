@@ -8,6 +8,7 @@ class ExplanationWidget final : public QFrame {
 public:
     using Binding=std::function<std::optional<General::FullBinding>()>;
     ExplanationWidget(GeneralSession*,Binding,const QString& suggestedProduct,QWidget* parent=nullptr);
+    void setSession(GeneralSession*);
 private:
     void refresh();
     QPointer<GeneralSession> session_;

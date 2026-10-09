@@ -17,6 +17,7 @@ signals:
     void failed(const QString&);
 private:
     void connectBroker();
+    void synchronizePending();
     struct LaunchResult;
     struct SettingsView;
     QPointer<MainWindow> window_;

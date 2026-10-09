@@ -38,6 +38,7 @@ qt_add_library(gatebouncer_general_live STATIC
     general/GeneralDisclosures.cpp general/GeneralDisclosures.h
     general/PresentationContext.cpp general/PresentationContext.h
     general/PendingPresentationContext.cpp general/PendingPresentationContext.h
+    general/ObservationReader.cpp general/ObservationReader.h
     general/QtSearchAdapter.cpp general/QtSearchAdapter.h
     general/GeneralWire.cpp general/GeneralWire.h
     general/InferenceEncoding.cpp general/InferenceEncoding.h
@@ -69,6 +70,7 @@ qt_add_library(gatebouncer_assistance_ui STATIC
     ui/SettingsWidget.cpp ui/SettingsWidget.h
     ui/ExplanationWidget.cpp ui/ExplanationWidget.h
     ui/GeneralConnection.cpp ui/GeneralConnection.h
+    ui/ObservationSelection.h
 )
 target_link_libraries(gatebouncer_assistance_ui PUBLIC gatebouncer_general_live Qt6::Widgets PRIVATE gatebouncer_service_view_ui)
 target_include_directories(gatebouncer_assistance_ui PUBLIC .. .)

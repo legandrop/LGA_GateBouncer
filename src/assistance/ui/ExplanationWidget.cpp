@@ -7,14 +7,14 @@
 namespace Gate::Assistance::Ui {
 namespace G=General;
 ExplanationWidget::ExplanationWidget(GeneralSession* session,Binding binding,const QString& suggested,QWidget* parent)
-    :QFrame(parent),session_(session),binding_(std::move(binding)){
+    :QFrame(parent),binding_(std::move(binding)){
     setObjectName("general-explanation");setProperty("role","panel");auto* layout=new QVBoxLayout(this);layout->setContentsMargins(12,12,12,12);layout->setSpacing(8);
-    auto* notice=new QLabel("Only the public product name and optional public publisher below are approved for this query. Paths, file hashes and local signature details are not sent. An explanation never decides your pending request.",this);
+    auto* notice=new QLabel("Public application information is unavailable. You can review public information for this request manually. Paths, file hashes and local signature details are not sent. An explanation never decides Allow or Block.",this);
     notice->setTextFormat(Qt::PlainText);notice->setWordWrap(true);notice->setProperty("role","faint");layout->addWidget(notice);
-    product_=new QLineEdit(suggested,this);product_->setObjectName("public-product");product_->setMaxLength(96);layout->addWidget(product_);
+    product_=new QLineEdit(suggested,this);product_->setObjectName("public-product");product_->setMaxLength(96);product_->setPlaceholderText("Public product name");layout->addWidget(product_);
     publisher_=new QLineEdit(this);publisher_->setObjectName("public-publisher");publisher_->setMaxLength(96);publisher_->setPlaceholderText("Public publisher · optional");layout->addWidget(publisher_);
-    approve_=new QPushButton("Approve this public query",this);approve_->setObjectName("approve-public-query");layout->addWidget(approve_,0,Qt::AlignLeft);
-    start_=new QPushButton("Explain approved query",this);start_->setObjectName("explain-approved-query");layout->addWidget(start_,0,Qt::AlignLeft);
+    approve_=new QPushButton("Review public information",this);approve_->setObjectName("approve-public-query");layout->addWidget(approve_,0,Qt::AlignLeft);
+    start_=new QPushButton("Explain reviewed information",this);start_->setObjectName("explain-approved-query");layout->addWidget(start_,0,Qt::AlignLeft);
     progress_=new QProgressBar(this);progress_->setObjectName("explanation-progress");progress_->setRange(0,0);progress_->setTextVisible(false);layout->addWidget(progress_);
     state_=new QLabel(this);state_->setObjectName("explanation-state");state_->setTextFormat(Qt::PlainText);state_->setWordWrap(true);layout->addWidget(state_);
     cancel_=new QPushButton("Cancel explanation",this);cancel_->setObjectName("cancel-general-explanation");layout->addWidget(cancel_,0,Qt::AlignLeft);
@@ -26,23 +26,28 @@ ExplanationWidget::ExplanationWidget(GeneralSession* session,Binding binding,con
         G::PublicFields fields;fields.product=product_->text().trimmed().toUtf8().toStdString();
         const auto publisher=publisher_->text().trimmed();if(!publisher.isEmpty())fields.publisher=publisher.toUtf8().toStdString();
         fields.query=fields.product+(fields.publisher?" "+*fields.publisher:"");
-        session_->approvePublic(*binding,std::move(fields));
+        session_->reviewPublicFields(std::move(fields));
     });
-    connect(start_,&QPushButton::clicked,this,[this]{if(session_)session_->explainApproved();});
+    connect(start_,&QPushButton::clicked,this,[this]{if(session_)session_->explainReviewed();});
     connect(cancel_,&QPushButton::clicked,this,[this]{if(session_){session_->cancel();refresh();}});
-    auto edited=[this]{if(session_){session_->cancel();refresh();}};
+    auto edited=[this]{if(session_){session_->clearPublicReview();refresh();}};
     connect(product_,&QLineEdit::textEdited,this,edited);connect(publisher_,&QLineEdit::textEdited,this,edited);
+    setSession(session);
+}
+void ExplanationWidget::setSession(GeneralSession* session){
+    if(session_)disconnect(session_,nullptr,this,nullptr);
+    session_=session;product_->clear();publisher_->clear();
     if(session_)connect(session_,&GeneralSession::changed,this,&ExplanationWidget::refresh);
     refresh();
 }
 void ExplanationWidget::refresh(){
     const bool busy=session_&&session_->busy(),available=session_&&session_->available();
     const auto binding=binding_?binding_():std::nullopt;
-    approve_->setEnabled(available&&!busy&&binding.has_value());start_->setEnabled(available&&!busy&&binding.has_value()&&session_->publicApproved());cancel_->setEnabled(busy);
+    approve_->setEnabled(available&&!busy&&binding.has_value());start_->setEnabled(available&&!busy&&binding.has_value()&&session_->publicReviewCurrent());cancel_->setEnabled(busy);
     product_->setEnabled(!busy);publisher_->setEnabled(!busy);progress_->setVisible(busy);
-    state_->setText(!session_?"Assistance unavailable":busy?session_->publicApprovalPending()?"Confirming your public query…":session_->state()==G::State::Explaining?"Explaining the approved public evidence…":"Searching for the approved public query…":
+    state_->setText(!session_?"Assistance unavailable":busy?session_->publicApprovalPending()?"Registering reviewed public information…":session_->state()==G::State::Explaining?"Explaining public evidence…":session_->state()==G::State::Searching?"Searching for reviewed public information…":"Reading the current request or assistance configuration…":
         session_->state()==G::State::Cancelled?"Explanation cancelled · request remains undecided":
-        session_->publicApproved()?"Public query approved · start the explanation when ready":"Request remains undecided");
+        session_->publicReviewCurrent()?"Public information reviewed for this request · identity unverified":"Automatic explanation unavailable · public application information is not verified");
     QString text;const auto result=session_?session_->result():std::nullopt;
     if(result){const auto view=G::makeView(*result);text=QString::fromUtf8(view.purpose)+"\n"+QString::fromUtf8(view.networkReason)+"\n"+
         QString::fromUtf8(view.uncertainty)+"\n"+QString::fromUtf8(view.identityNotice);

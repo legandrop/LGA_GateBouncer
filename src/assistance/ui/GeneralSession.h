@@ -23,6 +23,7 @@ public:
     bool selectPending(const General::Id128&,General::PendingServiceContext);
     std::optional<General::FullBinding> pendingBinding() const;
     bool reviewPublicFields(General::PublicFields);
+    bool clearPublicReview();
     bool publicReviewCurrent() const;
     bool explainReviewed();
     bool explain(General::FullBinding,General::PublicFields);

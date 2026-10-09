@@ -104,6 +104,11 @@ struct GeneralClient::Data : std::enable_shared_from_this<Data> {
         p->terminal=true;if(type==2)greeted=true;auto callback=std::move(p->control);if(callback)callback(std::move(f));
     }
 };
+bool GeneralClient::settled() const {
+    const auto d=data_;
+    return !d->closed&&d->greeted&&!d->pending&&std::all_of(d->ledger.begin(),d->ledger.end(),
+        [](const auto& entry){return entry.second->terminal||entry.second->retired;});
+}
 GeneralClient::GeneralClient(std::shared_ptr<FrameChannel> channel,GeneralCoordinator::Current current,QObject* parent):QObject(parent),data_(std::make_shared<Data>()){
     const auto d=data_;d->channel=std::move(channel);d->current=std::move(current);
     if(!d->channel||d->channel->version()!=Broker::WireVersion::General3||!d->current){d->closed=true;return;}

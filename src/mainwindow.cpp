@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "assistance/ui/SettingsWidget.h"
+#include "assistance/ui/ExplanationWidget.h"
 #include <QAbstractTableModel>
 #include <QApplication>
 #include <QButtonGroup>
@@ -550,6 +551,7 @@ void MainWindow::enableNativeAssistance(){
 void MainWindow::setAssistance(std::unique_ptr<Assistance::Ui::GeneralSession> session) {
     if(assistance_)assistance_->close();
     assistance_=std::move(session);
+    if(ordinaryExplanation_)ordinaryExplanation_->setSession(assistance_.get());
     buildPage();
 }
 void MainWindow::startLifecycle(std::unique_ptr<Lifecycle::TraySurface> tray, bool minimized,
@@ -1414,6 +1416,13 @@ void MainWindow::renderOrdinaryNotice() {
     if (client->state() == OrdinaryDecisionClient::State::Preparing) body->addWidget(new Spinner, 0, Qt::AlignLeft);
     definition(body, "Requested destination", "Unknown · not included in this observation");
     definition(body, "Original attempt", "Blocked attempt observed · no held connection");
+    ordinaryExplanation_=new Assistance::Ui::ExplanationWidget(assistance_.get(),[this,selection]{
+        const auto* current=product_.ordinary();
+        QPointer<Assistance::Ui::GeneralSession> explanation=assistance_.get();
+        if(!explanation||!current->visible()||!current->current()||current->selection()!=selection)return std::optional<Assistance::General::FullBinding>{};
+        return explanation->pendingBinding();
+    },QString{},content);
+    body->addWidget(ordinaryExplanation_);
     definition(body, "Application", recordText(display.name, "Unknown"));
     definition(body, "Account", recordText(display.principal, "Unknown"));
     definition(body, "Package", package == 1 ? "Unrestricted · any package" : recordText(display.package, "Unknown"));
