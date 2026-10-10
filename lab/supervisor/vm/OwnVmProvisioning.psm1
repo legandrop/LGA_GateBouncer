@@ -71,7 +71,11 @@ function Get-VmOwnView($owner) {
         VmRemovalObserved=$owner.Removed;SwitchRemovalObserved=$false;
         BootObserved=[bool](-not $script:VmBoundary.Busy -and -not $owner.Revoked -and $owner.GuestObservation -and
             $owner.GuestObservation.Confirmed -and $owner.GuestObservation.Observed -le $owner.Observed -and
-            $owner.Observed-$owner.GuestObservation.Observed -lt 5000);EnrollmentObserved=$false;
+            $owner.Observed-$owner.GuestObservation.Observed -lt 5000);
+        EnrollmentObserved=[bool](-not $script:VmBoundary.Busy -and -not $owner.Revoked -and $owner.GuestEnrollment -and
+            $owner.GuestEnrollment.Confirmed -and -not $owner.GuestEnrollment.Revoked -and
+            $owner.GuestEnrollment.Generation -eq $owner.Generation -and $owner.GuestObservation -and
+            $owner.GuestObservation.Confirmed -and $owner.Observed-$owner.GuestObservation.Observed -lt 5000);
         StartSubmitted=[bool]($owner.Storage -and $owner.Storage.StartSubmitted)}
 }
 function Set-VmOwnRevoked($owner,[string]$cause) {
@@ -202,7 +206,7 @@ function Open-GbOwnVmProvisioning {
         Path=(Join-Path $script:VmRoot $suffix);Created=$now;Observed=$now;Deadline=$now+10000;
         Generation=[long]0;Revoked=$false;State='Reserving';Cause='';Pending=$false;
         Resources=[Collections.Generic.List[object]]::new();Removed=$false;RemoveSubmitted=$false;AdapterId='';Storage=$null;
-        GuestPackage=$null;GuestCredential=$null;GuestObservation=$null}
+        GuestPackage=$null;GuestCredential=$null;GuestObservation=$null;GuestEnrollment=$null}
     $script:VmOwners[$id]=$owner
     try {
         & $script:VmPlatform
@@ -303,6 +307,10 @@ function Close-GbOwnVmProvisioning {
     $owner=Get-VmOwnRecord $OwnerId
     Set-VmOwnRevoked $owner 'Cancelled'
     if ($script:VmBoundary.Busy) { return Get-VmOwnView $owner }
+    if ($owner.GuestEnrollment) {
+        try { Close-VmGuestEnrollmentOwn $owner }
+        catch { $owner.Cause=$_.Exception.Message; $owner.Pending=$true; return Get-VmOwnView $owner }
+    }
     if ($owner.GuestObservation) {
         try { Close-VmGuestObservationOwn $owner }
         catch { $owner.Cause=$_.Exception.Message; $owner.Pending=$true; return Get-VmOwnView $owner }
@@ -339,4 +347,5 @@ function Close-GbOwnVmProvisioning {
 }
 . (Join-Path $PSScriptRoot 'OwnVmBootAdapters.ps1')
 . (Join-Path $PSScriptRoot 'OwnVmGuestObservation.ps1')
-Export-ModuleMember -Function Open-GbOwnVmProvisioning,Get-GbOwnVmProvisioningState,Revoke-GbOwnVmProvisioning,Close-GbOwnVmProvisioning,Prepare-GbOwnVmBoot,Start-GbOwnVmBoot
+. (Join-Path $PSScriptRoot 'OwnVmGuestEnrollment.ps1')
+Export-ModuleMember -Function Open-GbOwnVmProvisioning,Get-GbOwnVmProvisioningState,Revoke-GbOwnVmProvisioning,Close-GbOwnVmProvisioning,Prepare-GbOwnVmBoot,Start-GbOwnVmBoot,Initialize-GbOwnVmGuestEnrollment,Open-GbOwnVmCapture

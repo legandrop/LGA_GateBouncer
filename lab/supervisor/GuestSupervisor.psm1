@@ -54,6 +54,14 @@ function Test-GbCurrent($owner,[long]$generation,[bool]$cleanup = $false) {
     if (-not $owner.Session) { throw 'SessionMissing' }
     $instance = & $script:GbInspect $owner.Session $owner.VmId
     if ($instance -ne $owner.Instance) { Set-GbInvalid $owner 'InstanceChanged'; throw 'InstanceChanged' }
+    if ($owner.Enrollment) { Confirm-GbEnrollmentOwn $owner $cleanup }
+}
+function Confirm-GbEnrollmentOwn($owner,[bool]$cleanup=$false) {
+    $e=$owner.Enrollment
+    if (-not $e -or -not $e.Issuer -or -not [object]::ReferenceEquals($e.Supervisor,$owner) -or
+        -not [object]::ReferenceEquals($e.Channel.Session,$owner.Session) -or $e.Owner.VmId -ne $owner.VmId -or
+        $e.Channel.Instance -ne $owner.Instance) { throw 'EnrollmentRequired' }
+    & $e.Issuer { param($bound,$closing) Confirm-VmGuestEnrollmentOwn $bound $closing } $e $cleanup
 }
 function Confirm-GbBootstrap($owner,[long]$generation) {
     $inventory = & $script:GbInventory $owner.VmId
@@ -87,6 +95,7 @@ function Close-GbOwnResource($owner) {
     if ($owner.Gate) { $owner.CleanupPending = $true; return }
     foreach ($entry in $owner.Resources) {
         if (-not $entry.Pending) { continue }
+        if ($owner.Enrollment) { $entry.Pending=$false; $entry.Session=$null; continue }
         $owner.Busy = $true
         try {
             & $script:GbRemove $entry.Session
@@ -99,8 +108,10 @@ function Close-GbOwnResource($owner) {
     if (-not $owner.CleanupPending) {
         try {
             if ($owner.CapturePackage) {
-                foreach ($stream in $owner.CapturePackage.Streams) { $stream.Dispose() }
-                foreach ($parent in $owner.CapturePackage.Parents) { $parent.Dispose() }
+                if (-not $owner.Enrollment) {
+                    foreach ($stream in $owner.CapturePackage.Streams) { $stream.Dispose() }
+                    foreach ($parent in $owner.CapturePackage.Parents) { $parent.Dispose() }
+                }
                 $owner.CapturePackage.Streams.Clear(); $owner.CapturePackage=$null
             }
             $owner.CaptureCancel.Dispose()
@@ -124,7 +135,7 @@ function Open-GbWindowsSupervisor {
         Created = $now; Observed = $now; Deadline = $now + 10000; Generation = [long]0;
         Revoked = $false; Busy = $true; CleanupPending = $false; StartSubmitted = $false;
         StopObserved = $false; FileFinal = $false; CapturePackage=$null;
-        CaptureLocal=$CaptureLocal;CapturePeer=$CapturePeer;CaptureCancel=[Threading.CancellationTokenSource]::new();Conversion=$null }
+        CaptureLocal=$CaptureLocal;CapturePeer=$CapturePeer;CaptureCancel=[Threading.CancellationTokenSource]::new();Conversion=$null;Enrollment=$null }
     $script:GbOwners[$owner.Id] = $owner
     try {
         $owner.Inventory = & $script:GbInventory $VmId
@@ -164,8 +175,10 @@ function Invoke-GbLabCommand {
     try {
         $cleanup = $Operation -in @('StopCapture','CleanupCapture')
         Test-GbCurrent $owner $Generation $cleanup
+        if ($Operation -ne 'WindowsStatus') { Confirm-GbEnrollmentOwn $owner $cleanup }
         if (-not $cleanup) { Confirm-GbBootstrap $owner $Generation }
         if ($Operation -eq 'WindowsStatus') { return Get-GbView $owner }
+        # La entrada legacy puede observar Windows; nunca autoriza captura por igualdad de datos.
         $composition = $script:GbComposition
         if (-not $composition) { throw 'GuestComponentsNotBound' }
         # Referencia privada admitida por composicion, nunca receipt/DTO del consumidor.
@@ -202,6 +215,48 @@ function Invoke-GbLabCommand {
         if ($_.Exception.Message -ne 'GuestComponentsNotBound') { Set-GbInvalid $owner 'CommandUnconfirmed' }
         throw
     } finally { $owner.Busy = $false }
+}
+function Open-GbOwnEnrollmentSupervisor($enrollment,[string]$local,[string]$peer) {
+    if (-not $enrollment -or -not $enrollment.Issuer -or $enrollment.Supervisor) { throw 'EnrollmentBindingInvalid' }
+    & $enrollment.Issuer { param($bound) Confirm-VmGuestEnrollmentOwn $bound } $enrollment
+    $source=$enrollment.Owner; $channel=$enrollment.Channel; $sample=$enrollment.AuthenticatedObservation
+    if ($channel.Session -isnot [System.Management.Automation.Runspaces.PSSession] -or
+        -not [object]::ReferenceEquals($source.GuestEnrollment,$enrollment)) { throw 'EnrollmentBindingInvalid' }
+    if (@($script:GbOwners.Values | Where-Object { $_.VmId -eq $source.VmId -and $_.State -ne 'Closed' }).Count) { throw 'VmOwnershipPending' }
+    $now=& $script:GbClock
+    $owner=@{Id=[guid]::NewGuid();VmId=$source.VmId;LabId=$source.Id;Instance=$channel.Instance;Session=$channel.Session;
+        Resources=[Collections.Generic.List[object]]::new();Inventory=$null;Nic=$null;Gate=$null;Run=[guid]::Empty;
+        Boot=$sample.Boot;Nonce='';Plan=@{Hash=$enrollment.Package.Hashes[2];Mac=$sample.Mac;Sid=$sample.Sid};
+        State='CreatingWindows';Cause='';Created=$now;Observed=$now;Deadline=$now+10000;Generation=[long]0;
+        Revoked=$false;Busy=$true;CleanupPending=$true;StartSubmitted=$false;StopObserved=$false;FileFinal=$false;
+        CapturePackage=$null;CaptureLocal=$local;CapturePeer=$peer;CaptureCancel=[Threading.CancellationTokenSource]::new();
+        Conversion=$null;Enrollment=$enrollment}
+    # Ambas reservas preceden cualquier callback; el módulo no exporta este constructor.
+    $script:GbOwners[$owner.Id]=$owner; $enrollment.Supervisor=$owner
+    $owner.Resources.Add(@{Session=$channel.Session;Pending=$true})
+    try {
+        Confirm-GbEnrollmentOwn $owner
+        $owner.Inventory=& $script:GbInventory $owner.VmId
+        Confirm-GbBootstrap $owner $owner.Generation
+        $owner.Deadline=$now+60000; $owner.State='WindowsEnrolled'; $owner.Cause='BrokerNoJobNotObserved'
+    } catch { Set-GbInvalid $owner 'EnrollmentBindingUnconfirmed'; throw }
+    finally { $owner.Busy=$false }
+    Get-GbView $owner
+}
+function Close-GbOwnEnrollmentSupervisor($enrollment) {
+    $owner=$enrollment.Supervisor
+    if (-not $owner -or -not [object]::ReferenceEquals((Get-GbOwner $owner.Id),$owner) -or
+        -not [object]::ReferenceEquals($owner.Enrollment,$enrollment)) { throw 'EnrollmentBindingInvalid' }
+    $null=Revoke-GbLabSupervisor $owner.Id
+    if ($owner.Busy) { throw 'PipelineBusy' }
+    if ($owner.Gate) {
+        if ($owner.StartSubmitted -and (-not $owner.StopObserved -or -not $owner.FileFinal)) {
+            $null=Invoke-GbLabCommand $owner.Id $owner.Generation $owner.Run 'StopCapture'
+        }
+        $null=Invoke-GbLabCommand $owner.Id $owner.Generation $owner.Run 'CleanupCapture'
+    }
+    Close-GbOwnResource $owner
+    Get-GbView $owner
 }
 function Revoke-GbLabSupervisor {
     [CmdletBinding()] param([Parameter(Mandatory)][guid]$OwnerId)

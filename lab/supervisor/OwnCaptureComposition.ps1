@@ -28,6 +28,31 @@ public static class GbSupervisorCustody {
 function Open-GbCapturePackageOwn($owner) {
     Initialize-GbSupervisorCustodyOwn
     if ($owner.CapturePackage) { return $owner.CapturePackage }
+    if ($owner.Enrollment) {
+        Confirm-GbEnrollmentOwn $owner
+        $source=$owner.Enrollment.Package
+        $package=@{Owner=$owner;Generation=$owner.Generation;Streams=[Collections.Generic.List[object]]::new();
+            Hashes=@{};Module=$null;Complete=$false;Parents=[Collections.Generic.List[object]]::new();
+            ParentPaths=[Collections.Generic.List[string]]::new();Paths=[Collections.Generic.List[string]]::new();
+            Identities=[Collections.Generic.List[object]]::new();BorrowedEnrollment=$owner.Enrollment}
+        $owner.CapturePackage=$package
+        $names=@('ModuleHash','LauncherHash','ConverterHash')
+        for ($i=0;$i -lt 3;$i++) {
+            $entry=$source.Entries[$i+3]
+            # Misma hoja host que escribió y fijó el paquete guest; no reabrir por DTO/hash.
+            $package.Streams.Add($entry.Stream); $package.Paths.Add($entry.Path)
+            $package.Identities.Add([GbSupervisorCustody]::Inspect($entry.Stream.SafeFileHandle,$entry.Path,$false))
+            $package.Hashes[$names[$i]]=$entry.Hash
+        }
+        $path=$package.Paths[0]
+        $modules=@(Get-Module | Where-Object Path -CEQ $path)
+        if ($modules.Count -eq 0) { $modules=@(Import-Module -Name $path -PassThru -ErrorAction Stop) }
+        if ($modules.Count -ne 1) { throw 'CaptureModuleCardinality' }
+        $package.Module=$modules[0]
+        Confirm-GbEnrollmentOwn $owner
+        $package.Complete=$true
+        return $package
+    }
     $package=@{Owner=$owner;Generation=$owner.Generation;Streams=[Collections.Generic.List[object]]::new();
         Hashes=@{};Module=$null;Complete=$false;Parents=[Collections.Generic.List[object]]::new();
         ParentPaths=[Collections.Generic.List[string]]::new();Paths=[Collections.Generic.List[string]]::new();Identities=[Collections.Generic.List[object]]::new()}
@@ -71,6 +96,10 @@ function Confirm-GbCapturePackageOwn($owner) {
     $package=$owner.CapturePackage
     if (-not $package -or -not $package.Complete -or -not [object]::ReferenceEquals($package.Owner,$owner) -or
         $package.Generation -ne $owner.Generation -or $package.Streams.Count -ne 3 -or -not $package.Module) { throw 'CapturePackageRevoked' }
+    if ($owner.Enrollment) {
+        if (-not [object]::ReferenceEquals($package.BorrowedEnrollment,$owner.Enrollment)) { throw 'CapturePackageRevoked' }
+        Confirm-GbEnrollmentOwn $owner
+    }
     for ($i=0;$i -lt $package.Streams.Count;$i++) {
         if (-not $package.Streams[$i].CanRead -or -not [GbSupervisorCustody]::Same($package.Identities[$i],
             [GbSupervisorCustody]::Inspect($package.Streams[$i].SafeFileHandle,$package.Paths[$i],$false))) { throw 'CapturePackageLost' }
@@ -96,6 +125,7 @@ $script:GbComposition=@{
     Current={
         param($owner,$run,$generation)
         Test-GbCurrent $owner $generation
+        Confirm-GbEnrollmentOwn $owner
         if (-not [object]::ReferenceEquals((Get-GbOwner $owner.Id),$owner) -or $run -eq [guid]::Empty) { throw 'CaptureOwnerUnknown' }
         if ($owner.Gate) {
             $null=Confirm-GbCapturePackageOwn $owner
@@ -131,6 +161,7 @@ $script:GbComposition=@{
         $owners=@($script:GbOwners.Values | Where-Object { [object]::ReferenceEquals($_.Gate,$gate) })
         if ($owners.Count -ne 1) { throw 'CaptureGateUnknown' }
         $owner=$owners[0]
+        Confirm-GbEnrollmentOwn $owner ($step -in @('Stop','Cleanup','Cancel'))
         $package=$owner.CapturePackage
         if (-not $package -or -not [object]::ReferenceEquals($package.Owner,$owner) -or -not $package.Module) { throw 'CapturePackageUnknown' }
         Test-GbCurrent $owner $owner.Generation ($step -in @('Stop','Cleanup','Cancel'))

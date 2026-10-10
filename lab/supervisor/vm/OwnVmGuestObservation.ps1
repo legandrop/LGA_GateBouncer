@@ -47,7 +47,9 @@ public static class GbGuestReadCustody {
             $global:GbGuestOwnObservation=@{Owner=$ownerId;Streams=[Collections.Generic.List[object]]::new();
                 Parents=[Collections.Generic.List[object]]::new();ParentPaths=[Collections.Generic.List[string]]::new();
                 Identities=[Collections.Generic.List[object]]::new();Complete=$false}
-            foreach ($path in @('C:\GateBouncerLab\bin\guest_broker.exe','C:\GateBouncerLab\supervisor\GuestCommands.ps1')) {
+            foreach ($path in @('C:\GateBouncerLab\bin\guest_broker.exe','C:\GateBouncerLab\bin\desktop_worker.exe',
+                'C:\GateBouncerLab\supervisor\GuestCommands.ps1','C:\GateBouncerLab\bin\capture_netevent.psm1',
+                'C:\GateBouncerLab\bin\guest_conversion.dll','C:\GateBouncerLab\bin\conversion_worker.exe')) {
                 $stream=[IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
                 $global:GbGuestOwnObservation.Streams.Add($stream)
                 $global:GbGuestOwnObservation.Identities.Add([GbGuestReadCustody]::Inspect($stream.SafeFileHandle,$path,$false))
@@ -65,7 +67,7 @@ public static class GbGuestReadCustody {
             $global:GbGuestOwnObservation.Complete=$true
         }
         $item=$global:GbGuestOwnObservation
-        if ($item.Owner -cne $ownerId -or -not $item.Complete -or $item.Streams.Count -ne 2) { throw 'GuestCustodyUnknown' }
+        if ($item.Owner -cne $ownerId -or -not $item.Complete -or $item.Streams.Count -ne 6) { throw 'GuestCustodyUnknown' }
         $hashes=[Collections.Generic.List[string]]::new()
         for ($i=0;$i -lt $item.Parents.Count;$i++) { $null=[GbGuestReadCustody]::Inspect($item.Parents[$i],$item.ParentPaths[$i],$true) }
         for ($i=0;$i -lt $item.Streams.Count;$i++) {
@@ -85,7 +87,8 @@ public static class GbGuestReadCustody {
         })
         if ($nics.Count -gt 16) { throw 'GuestTopologyBudget' }
         [pscustomobject]@{Owner=$ownerId;Challenge=$challenge;Boot=[long]$boot.LastBootUpTime.ToUniversalTime().Ticks;
-            Sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;Hashes=$hashes.ToArray();Nics=$nics}
+            Sid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;Hashes=$hashes.ToArray();Nics=$nics;
+            Files=@($item.Identities | ForEach-Object { [pscustomobject]@{Volume=[uint32]$_.Volume;IdHi=[uint32]$_.IdHi;IdLo=[uint32]$_.IdLo} })}
     } -ArgumentList $operation,$ownerId,$challenge -ErrorAction Stop
 }
 function Confirm-VmGuestSessionOwn($owner) {
@@ -99,22 +102,25 @@ function Confirm-VmGuestSessionOwn($owner) {
 function Invoke-VmGuestObservationOwn($owner) {
     if (-not [object]::ReferenceEquals((Get-VmOwnRecord $owner.Id),$owner)) { throw 'GuestOwnerUnknown' }
     if ($script:VmBoundary.Busy) { throw 'ProvisioningBusy' }
-    # Paquete y credencial solo pueden venir del productor propio futuro; no existen setters/export.
+    # Sólo el productor propio puede dar la sesión y paquete vivos; sin setters de DTO.
     if (-not $owner.GuestPackage -or -not [object]::ReferenceEquals($owner.GuestPackage.Owner,$owner) -or
-        $owner.GuestPackage.Generation -ne $owner.Generation -or $owner.GuestPackage.Hashes.Count -ne 2 -or
-        $owner.Kind -cne 'Windows') { throw 'GuestPackageNotBound' }
+        $owner.GuestPackage.Generation -ne $owner.Generation -or $owner.GuestPackage.Hashes.Count -ne 6 -or
+        $owner.Kind -cne 'Windows' -or -not $owner.GuestEnrollment -or $owner.GuestEnrollment.Revoked -or
+        -not [object]::ReferenceEquals($owner.GuestEnrollment.Owner,$owner) -or
+        -not [object]::ReferenceEquals($owner.GuestEnrollment.Package,$owner.GuestPackage) -or
+        $owner.GuestEnrollment.Generation -ne $owner.Generation) { throw 'GuestPackageNotBound' }
     $script:VmBoundary.Busy=$true
     try {
         Enter-VmOwnFrame $owner $false; Test-VmOwnFrame; Confirm-VmStoragePeers $owner
         if (-not $owner.GuestObservation) {
-            if ($owner.GuestCredential -isnot [pscredential]) { throw 'GuestCredentialNotBound' }
+            $enrollment=$owner.GuestEnrollment
+            Confirm-VmEnrollmentChannelOwn $owner $enrollment.Channel
             $guest=@{Owner=$owner;Generation=$owner.Generation;Session=$null;Instance=[guid]::Empty;
                 Resources=[Collections.Generic.List[object]]::new();Boot=[long]0;Nic=$null;Confirmed=$false;Package=$owner.GuestPackage;
                 ObserveSubmitted=$false;Observed=[long]0}
             $owner.GuestObservation=$guest
-            & $script:VmGuestCreate $owner.VmId $owner.GuestCredential | ForEach-Object {
-                $guest.Resources.Add($_); $guest.Session=$_
-            }
+            # La hoja comparte el canal exacto autenticado por la credencial propia, sin abrir otro.
+            $guest.Session=$enrollment.Channel.Session; $guest.Resources.Add($guest.Session)
             Test-VmOwnFrame
             if ($guest.Resources.Count -ne 1 -or $guest.Session -isnot [System.Management.Automation.Runspaces.PSSession]) { throw 'GuestSessionCardinality' }
             $guest.Instance=[guid]$guest.Session.InstanceId
@@ -133,16 +139,24 @@ function Invoke-VmGuestObservationOwn($owner) {
         $reply=$reply[0]
         if ($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
             $reply.Boot -isnot [long] -or $reply.Boot -le 0 -or ($guest.Boot -and $guest.Boot -ne $reply.Boot) -or
-            $reply.Sid -cne $guest.Package.Sid -or @($reply.Hashes).Count -ne 2) { throw 'GuestBootPinChanged' }
-        for ($i=0;$i -lt 2;$i++) {
+            $reply.Sid -cne $guest.Package.Sid -or @($reply.Hashes).Count -ne 6 -or @($reply.Files).Count -ne 6) { throw 'GuestBootPinChanged' }
+        for ($i=0;$i -lt 6;$i++) {
             if ($guest.Package.Hashes[$i] -cnotmatch '^[0-9A-F]{64}$' -or $reply.Hashes[$i] -cne $guest.Package.Hashes[$i]) { throw 'GuestImagePinChanged' }
+            $file=$guest.Package.GuestIdentities[$i]
+            if ($file.Volume -ne $reply.Files[$i].Volume -or $file.IdHi -ne $reply.Files[$i].IdHi -or
+                $file.IdLo -ne $reply.Files[$i].IdLo) { throw 'GuestFilePinChanged' }
         }
+        $enrollment=$owner.GuestEnrollment
+        if ($reply.Boot -ne $enrollment.AuthenticatedObservation.Boot -or
+            $reply.Boot -ne $enrollment.BootstrapObservation.Boot) { throw 'GuestBootPinChanged' }
         $adapters=@(Read-VmOwnPort $script:VmAdapters @($owner.Resources[0].Ref))
         if ($adapters.Count -ne 1) { throw 'GuestTopologyChanged' }
         $mac=([string]$adapters[0].MacAddress -replace '[-:]','').ToUpperInvariant()
         $nics=@($reply.Nics | Where-Object { $_.Mac -ceq $mac })
         if (@($reply.Nics).Count -gt 16 -or $nics.Count -ne 1 -or [guid]$nics[0].Guid -eq [guid]::Empty -or [int]$nics[0].Index -le 0) { throw 'GuestTopologyChanged' }
         if ($guest.Nic -and ($guest.Nic.Guid -ne $nics[0].Guid -or $guest.Nic.Index -ne $nics[0].Index)) { throw 'GuestTopologyChanged' }
+        if ($nics[0].Guid -ne $enrollment.AuthenticatedObservation.Nic.Guid -or
+            $nics[0].Index -ne $enrollment.AuthenticatedObservation.Nic.Index) { throw 'GuestTopologyChanged' }
         Confirm-VmStoragePeers $owner; Test-VmOwnFrame
         $guest.Boot=[long]$reply.Boot; $guest.Nic=$nics[0]; $guest.Confirmed=$true
         $owner.Observed=Read-VmOwnClock
@@ -180,7 +194,8 @@ function Close-VmGuestObservationOwn($owner) {
     Confirm-VmGuestSessionOwn $owner
     if ($reply.Count -ne 1 -or $reply[0].Closed -isnot [bool] -or -not $reply[0].Closed -or
         $reply[0].Owner -cne $owner.Id.ToString('N') -or $reply[0].Challenge -cne $challenge) { throw 'GuestCloseUnconfirmed' }
-    & $script:VmGuestRemove $guest.Session
+    # El canal pertenece al enrollment; éste lo cierra después de captura/cuenta/streams.
+    if (-not $owner.GuestEnrollment) { & $script:VmGuestRemove $guest.Session }
     $guest.Session=$null; $guest.Resources.Clear(); $owner.GuestObservation=$null
     } finally { $script:VmBoundary.Busy=$false }
 }
