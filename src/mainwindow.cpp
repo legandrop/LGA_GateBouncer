@@ -1537,7 +1537,7 @@ void MainWindow::refreshTable(bool newPage) {
             ? view_ == "pending" ? product_.ordinary()->current() ? "No requests awaiting a decision" : "Requests unavailable · refresh to check the connection"
                 : view_ == "activity" ? "Network activity collector unavailable"
                 : view_ == "rules" ? QString(query_.isEmpty() ? "No rules or saved review candidates" : "No matching rules or saved review candidates\nChange or clear the search.")
-                    + (!product_.ordinary()->rulesCurrent() && !(product_.recordsSelected() && product_.records()->recordsCurrent())
+                    + (!product_.ordinary()->rulesCurrent() && !(!product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent())
                         ? "\nLive rule catalog unavailable" : "")
                 : view_ == "import" ? "Choose a migration file for structural analysis"
                 : "No matching observed processes"
