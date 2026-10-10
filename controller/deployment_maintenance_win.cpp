@@ -473,6 +473,7 @@ class GuestMaintenance {
     bool haveReplacement_ = false;
     DriverRetirement retirement_{};
     bool cleanupReceipt_ = false, userGone_ = false;
+    bool reinstall_ = false, restoring_ = false;
     HKEY key_ = nullptr;
     SC_HANDLE manager_ = nullptr, service_ = nullptr;
     std::filesystem::path active_, store_, original_;
@@ -495,7 +496,9 @@ class GuestMaintenance {
                 remainingString(key_,L"OrdinaryImage",(active_/L"GateBouncer.exe").native()) &&
                 remainingString(key_,L"StoreRoot",store_.native()) && remainingString(key_,L"ViewSid",view_) &&
                 remainingDword(key_,L"ProvisionPrincipal",provision_) && remainingDword(key_,L"MaintenanceVersion",1) &&
-                remainingDword(key_,L"MaintenanceState",3);
+                (restoring_ && haveReplacement_ && replacementPlan_.phase == 1 ?
+                    remainingDword(key_,L"MaintenanceState",3) || remainingDword(key_,L"MaintenanceState",2) :
+                    remainingDword(key_,L"MaintenanceState",3));
         }
         bool present = false; DWORD state = 0, initial = 0;
         std::wstring root, ordinary, store, view;
@@ -573,18 +576,33 @@ class GuestMaintenance {
         if (RegOpenKeyExW(lease_.gate(),deploymentConfiguration(mode_),0,KEY_QUERY_VALUE | READ_CONTROL |
                 (finalization && mode_ == DeploymentMode::Laboratory ? 0 : KEY_SET_VALUE),&key_) != ERROR_SUCCESS ||
             !native::protectedRegistry(key_)) return false;
-        cleanupReceipt_ = uninstallOnly && mode_ == DeploymentMode::Product && readRetirement(key_,retirement_) &&
+        const bool terminal = mode_ == DeploymentMode::Product && readRetirement(key_,retirement_) &&
             retirement_.state == 3 && retirement_.userRemoval == 1;
+        ReplacementPlan terminalPlan{}; DWORD terminalSize = 0;
+        const auto terminalPlanQuery = RegQueryValueExW(key_,L"DriverReplacement",nullptr,nullptr,nullptr,&terminalSize);
+        const bool terminalPlanPresent = terminalPlanQuery == ERROR_SUCCESS && readReplacement(key_,terminalPlan) &&
+            terminalPlan.oldRoot == std::wstring(retirement_.package);
+        bool markerPresent = false; DWORD terminalMarker = 0;
+        const bool knownMarker = maintenanceState(key_,markerPresent,terminalMarker);
+        reinstall_ = terminal && ((updateOnly && (terminalPlanQuery == ERROR_FILE_NOT_FOUND || terminalPlanPresent)) ||
+            (finalization && terminalPlanPresent && terminalPlan.phase == 3 && knownMarker && markerPresent && terminalMarker == 0));
+        restoring_ = reinstall_ && updateOnly && (!terminalPlanPresent || terminalPlan.phase == 1) &&
+            ((!knownMarker && remainingDword(key_,L"MaintenanceVersion",1) &&
+              (remainingDword(key_,L"MaintenanceState",3) || (terminalPlanPresent && remainingDword(key_,L"MaintenanceState",2)))) ||
+             (knownMarker && (!markerPresent || terminalMarker == 3 || (terminalPlanPresent && terminalMarker == 2))));
+        cleanupReceipt_ = terminal && (uninstallOnly || restoring_);
         if (cleanupReceipt_) {
             if (root.native() != retirement_.package || !lease_.ownsConfiguration(key_) ||
-                !remainingDword(key_,L"MaintenanceVersion",1) || !remainingDword(key_,L"MaintenanceState",3)) return false;
+                !remainingDword(key_,L"MaintenanceVersion",1) ||
+                !(remainingDword(key_,L"MaintenanceState",3) || (restoring_ && terminalPlanPresent && remainingDword(key_,L"MaintenanceState",2)))) return false;
             hadMarker_ = true; marker_ = 3;
         } else if (!maintenanceState(key_,hadMarker_,marker_) || (mode_ == DeploymentMode::Product && !hadMarker_)) return false;
         if (finalization && (!hadMarker_ || !lease_.ownsConfiguration(key_))) return false;
         ReplacementPlan pendingPlan{};
         const bool stagedBeforeIntent = mode_ == DeploymentMode::Product && updateOnly && marker_ == 0 &&
             readReplacement(key_,pendingPlan) && pendingPlan.phase == 1;
-        if (mode_ == DeploymentMode::Product && updateOnly && (marker_ == 2 || stagedBeforeIntent)) {
+        if (mode_ == DeploymentMode::Product && updateOnly && (marker_ == 2 || stagedBeforeIntent ||
+                (reinstall_ && terminalPlanPresent))) {
             if (!readReplacement(key_,replacementPlan_) || !native::fixedPath(replacementPlan_.oldRoot) ||
                 !native::fixedPath(replacementPlan_.newRoot) || (root.native() != replacementPlan_.oldRoot && root.native() != replacementPlan_.newRoot) ||
                 !deployment_detail::disjoint(replacementPlan_.oldRoot,replacementPlan_.newRoot)) return false;
@@ -602,15 +620,26 @@ class GuestMaintenance {
             auto &newPackage = replacementPlan_.phase == 3 ? *package_ : *other;
             if (!packageIdentity(oldPackage,replacementPlan_.oldIdentity,replacementPlan_.oldInventory,false) ||
                 !packageIdentity(newPackage,replacementPlan_.newIdentity,replacementPlan_.newInventory,false)) return false;
+            if (reinstall_ && !packageIdentity(oldPackage,retirement_.packageIdentity,retirement_.inventory,false)) return false;
             if (replacementPlan_.phase == 3) previous_ = std::move(other); else replacement_ = std::move(other);
         }
+        if (reinstall_ && finalization) {
+            if (root.native() != terminalPlan.newRoot ||
+                !packageIdentity(*package_,terminalPlan.newIdentity,terminalPlan.newInventory,false)) return false;
+            auto original = std::make_shared<Deployment>(retirement_.package,mode_);
+            if (!original->verify(original->root()/L"GateBouncerService.exe",DeploymentRole::Service) ||
+                !packageIdentity(*original,retirement_.packageIdentity,retirement_.inventory,false) ||
+                !packageIdentity(*original,terminalPlan.oldIdentity,terminalPlan.oldInventory,false)) return false;
+            previous_ = std::move(original);
+        }
+        if (reinstall_) { policyRemoval_ = true; driverGone_ = true; }
         // Sólo desmontaje del tuple Product íntegro retenido antes de instalar el driver.
         pendingRemoval_ = uninstallOnly && mode_ == DeploymentMode::Product && hadMarker_ && marker_ == 1;
         DriverRetirement receipt{};
         DWORD receiptBytes = 0;
         const auto receiptQuery = RegQueryValueExW(key_,L"DriverRetirement",nullptr,nullptr,nullptr,&receiptBytes);
         resumingDriver_ = mode_ == DeploymentMode::Product && hadMarker_ &&
-            ((uninstallOnly && marker_ == 3) || (updateOnly && marker_ == 2)) &&
+            ((uninstallOnly && marker_ == 3) || (updateOnly && (marker_ == 2 || restoring_))) &&
             (readRetirement(key_,receipt) || receiptQuery == ERROR_FILE_NOT_FOUND);
         if (marker_ != 0 && !pendingRemoval_ && !resumingDriver_) return false;
         std::wstring store;
@@ -618,21 +647,24 @@ class GuestMaintenance {
         else if (!readString(key_,L"StoreRoot",store) || !readString(key_,L"ViewSid",view_) ||
             !readDword(key_,L"ProvisionPrincipal",provision_) || provision_ > 1 ||
             (pendingRemoval_ && provision_ != 1)) return false;
+        if (reinstall_ && (store != retirement_.store || view_ != retirement_.view || provision_ > retirement_.provision)) return false;
         store_ = store;
         native::ProtectedDirectory directory(store_);
         if (!deployment_detail::disjoint(root,store_) || !deployment_detail::disjoint(store_,lease_.image().parent_path()) || !directory.acquire()) return false;
-        if (finalization || pendingRemoval_ || resumingDriver_) {
+        if (finalization || pendingRemoval_ || resumingDriver_ || reinstall_) {
             retainedStore_ = std::make_unique<native::ProtectedDirectory>(store_);
             if (!retainedStore_->acquire()) return false;
         }
         PSID sid = nullptr; if (!ConvertStringSidToSidW(view_.c_str(),&sid)) return false;
         const auto valid = IsValidSid(sid) && native::sidString(wire::Bytes(static_cast<BYTE *>(sid),
             static_cast<BYTE *>(sid)+GetLengthSid(sid))) == view_; LocalFree(sid); if (!valid) return false;
-        manager_ = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
+        manager_ = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT | (restoring_ ? SC_MANAGER_CREATE_SERVICE : 0));
         if (!manager_) return false;
         service_ = OpenServiceW(manager_,deploymentService(mode_),SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS |
-            SERVICE_CHANGE_CONFIG | READ_CONTROL | (finalization ? 0 : SERVICE_STOP | DELETE));
+            SERVICE_CHANGE_CONFIG | READ_CONTROL | (finalization ? 0 : SERVICE_STOP | DELETE) |
+            (restoring_ ? WRITE_DAC | WRITE_OWNER : 0));
         if (!service_ && cleanupReceipt_ && GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) userGone_ = true;
+        if (restoring_) { closed_ = true; start_ = SERVICE_DISABLED; return tuple() && package_->current(); }
         if (pendingRemoval_ || resumingDriver_) {
             // Un tuple deshabilitado completo exige STOPPED/PID0; el intent anterior a Disable
             // sólo puede detener el mismo servicio original, nunca habilitarlo.
@@ -643,10 +675,10 @@ class GuestMaintenance {
                 // Crash entre marker durable y Disable: sólo el mismo tuple original del intent.
                 start_ = SERVICE_AUTO_START; closed_ = false;
             }
-        } else if (finalization) {
+        } else if (finalization || (reinstall_ && haveReplacement_ && replacementPlan_.phase == 3 && marker_ == 0)) {
             closed_ = true;
             // Sólo esta operación explícita admite Disabled; Auto requiere el mismo readback íntegro.
-            start_ = serviceConfigurationPhase(service_,root/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode_) ?
+            start_ = serviceConfigurationPhase(service_,active_/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode_) ?
                 SERVICE_DISABLED : SERVICE_AUTO_START;
         }
         return current(); // Legado sin marker sólo después del tuple/ACL/SCM/paquete completos.
@@ -698,11 +730,135 @@ class GuestMaintenance {
     bool loadPolicy() {
         if (!closed_ || !current() || policy_) return false;
         policy_.reset(new decisions::MaintenanceRuntime(store_,provision_ == 1,&retained,this,mode_));
-        return (policyRemoval_ && marker_ == 3 && driverGone_ ? policy_->prepareAfterRemoval() : policy_->prepare()) && policy_->current();
+        // El tuple completo y el driver nuevo son el testigo después de consumir los receipts.
+        // La lectura sólo acepta inventario exacto o ausencia total; no recrea filtros ni admite protección.
+        const bool completedInstallation = mode_ == DeploymentMode::Product && finalizing_ && marker_ == 0 &&
+            package_->driverInstalledCurrent();
+        return ((policyRemoval_ && driverGone_ && (marker_ == 3 || reinstall_)) || completedInstallation ?
+            policy_->prepareAfterRemoval() : policy_->prepare()) && policy_->current();
+    }
+    bool policyInventory() {
+        return policy_ && policy_->current() && (policy_->resumeRemoval_ && policy_->removedInventory_ ?
+            policy_->absent(false) : policy_->inspect(false));
+    }
+    bool restorationService(SC_HANDLE created = nullptr) {
+        if (!restoring_ || !cleanupReceipt_ || !haveReplacement_ || replacementPlan_.phase != 1 ||
+            !tuple() || !package_->current() || !replacement_ || !replacement_->current() || !service_) return false;
+        DWORD needed = 0, done = 0;
+        QueryServiceConfigW(service_,nullptr,0,&needed);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(QUERY_SERVICE_CONFIGW) || needed > 65536) return false;
+        wire::Bytes bytes(needed);
+        if (!QueryServiceConfigW(service_,reinterpret_cast<QUERY_SERVICE_CONFIGW *>(bytes.data()),needed,&done)) return false;
+        const auto row = reinterpret_cast<QUERY_SERVICE_CONFIGW *>(bytes.data());
+        const auto text = [&](const wchar_t *value,const std::wstring &expected) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(bytes.data()), at = reinterpret_cast<std::uintptr_t>(value);
+            if (!value || at < begin || at-begin >= bytes.size() || at % alignof(wchar_t)) return false;
+            const auto cap = (bytes.size()-(at-begin))/sizeof(wchar_t);
+            std::size_t length = 0; while (length < cap && value[length]) ++length;
+            return length < cap && std::wstring(value,length) == expected;
+        };
+        SERVICE_STATUS_PROCESS state{}; SERVICE_SID_INFO sid{};
+        if (row->dwServiceType != SERVICE_WIN32_OWN_PROCESS || row->dwStartType != SERVICE_DISABLED ||
+            row->dwErrorControl != SERVICE_ERROR_NORMAL || !text(row->lpBinaryPathName,deploymentCommand(active_/L"GateBouncerService.exe",mode_)) ||
+            !text(row->lpServiceStartName,L"LocalSystem") || !text(row->lpDependencies,L"") || !text(row->lpLoadOrderGroup,L"") ||
+            !text(row->lpDisplayName,L"LGA GateBouncer") || !status(service_,state) || state.dwCurrentState != SERVICE_STOPPED || state.dwProcessId ||
+            !QueryServiceConfig2W(service_,SERVICE_CONFIG_SERVICE_SID_INFO,reinterpret_cast<BYTE *>(&sid),sizeof(sid),&done) ||
+            (sid.dwServiceSidType != SERVICE_SID_TYPE_NONE && sid.dwServiceSidType != SERVICE_SID_TYPE_UNRESTRICTED)) return false;
+        if (created && created == service_) return tuple() && package_->current() && replacement_->current();
+        needed = 0;
+        QueryServiceObjectSecurity(service_,OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,nullptr,0,&needed);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || !needed || needed > 65536) return false;
+        bytes.resize(needed);
+        if (!QueryServiceObjectSecurity(service_,OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,bytes.data(),needed,&done)) return false;
+        if (serviceDescriptor(bytes.data())) return tuple() && package_->current() && replacement_->current();
+        // Sólo la forma inicial documentada de CreateService, ligada al plan/receipt original.
+        // No se admite aquí operación, StartService, parser ni tráfico.
+        PSID owner = nullptr; PACL acl = nullptr; BOOL present = FALSE, defaulted = FALSE;
+        BYTE sy[SECURITY_MAX_SID_SIZE]{}, ba[SECURITY_MAX_SID_SIZE]{}, au[SECURITY_MAX_SID_SIZE]{}, iu[SECURITY_MAX_SID_SIZE]{};
+        DWORD sn = sizeof(sy), bn = sizeof(ba), an = sizeof(au), in = sizeof(iu);
+        native::Handle token; HANDLE raw = nullptr; native::TokenEvidence actor;
+        if (!GetSecurityDescriptorOwner(bytes.data(),&owner,&defaulted) || !owner || !IsValidSid(owner) ||
+            !GetSecurityDescriptorDacl(bytes.data(),&present,&acl,&defaulted) || !present || !acl || !IsValidAcl(acl) ||
+            !CreateWellKnownSid(WinLocalSystemSid,nullptr,sy,&sn) || !CreateWellKnownSid(WinBuiltinAdministratorsSid,nullptr,ba,&bn) ||
+            !CreateWellKnownSid(WinAuthenticatedUserSid,nullptr,au,&an) || !CreateWellKnownSid(WinInteractiveSid,nullptr,iu,&in) ||
+            !OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw)) return false;
+        token.reset(raw);
+        if (!native::tokenEvidence(token.value,actor) || !actor.administrator || !actor.elevated ||
+            (!EqualSid(owner,sy) && !EqualSid(owner,ba) && !EqualSid(owner,actor.account.data()))) return false;
+        constexpr DWORD readable = READ_CONTROL | SERVICE_ENUMERATE_DEPENDENTS | SERVICE_INTERROGATE |
+            SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_USER_DEFINED_CONTROL;
+        GENERIC_MAPPING mapping{STANDARD_RIGHTS_READ | SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_INTERROGATE | SERVICE_ENUMERATE_DEPENDENTS,
+            STANDARD_RIGHTS_WRITE | SERVICE_CHANGE_CONFIG,STANDARD_RIGHTS_EXECUTE | SERVICE_START | SERVICE_STOP | SERVICE_PAUSE_CONTINUE | SERVICE_USER_DEFINED_CONTROL,SERVICE_ALL_ACCESS};
+        bool administrator = false, system = false;
+        for (DWORD i = 0; i < acl->AceCount; ++i) {
+            void *entry = nullptr; if (!GetAce(acl,i,&entry)) return false;
+            const auto header = static_cast<ACE_HEADER *>(entry);
+            if (header->AceType != ACCESS_ALLOWED_ACE_TYPE || header->AceFlags) return false;
+            const auto ace = static_cast<ACCESS_ALLOWED_ACE *>(entry); DWORD mask = ace->Mask;
+            if (!IsValidSid(&ace->SidStart) || (mask & MAXIMUM_ALLOWED)) return false;
+            MapGenericMask(&mask,&mapping);
+            if (EqualSid(&ace->SidStart,ba)) { if (mask != SERVICE_ALL_ACCESS) return false; administrator = true; }
+            else if (EqualSid(&ace->SidStart,sy)) {
+                if (mask != SERVICE_ALL_ACCESS && mask != (readable | SERVICE_START | SERVICE_STOP | SERVICE_PAUSE_CONTINUE)) return false;
+                system = true;
+            } else if ((EqualSid(&ace->SidStart,au) || EqualSid(&ace->SidStart,iu)) && mask == readable) {}
+            else return false;
+        }
+        return administrator && system && tuple() && package_->current() && replacement_->current();
+    }
+    bool restoreTerminal(const std::filesystem::path &source,const std::filesystem::path &replacement) {
+        if (!restoring_ || !cleanupReceipt_ || !closed_ || active_.native() != retirement_.package || !tuple() ||
+            !packageIdentity(*package_,retirement_.packageIdentity,retirement_.inventory,false)) return false;
+        bool reboot = false;
+        if (!package_->retiredProductDriverCurrent(lease_,key_,reboot) || reboot) return false;
+        if (!haveReplacement_) {
+            // El servicio antiguo está ausente; ningún SCM por nombre se adopta sin plan previo.
+            if (!userGone_ || service_ || !current() || replacement.native().size() >= MAX_PATH || active_.native().size() >= MAX_PATH ||
+                !deployment_detail::stagePackage(source,replacement,replacement_,mode_) || !current()) return false;
+            std::copy(active_.native().begin(),active_.native().end(),replacementPlan_.oldRoot);
+            std::copy(replacement.native().begin(),replacement.native().end(),replacementPlan_.newRoot);
+            if (!packageIdentity(*package_,replacementPlan_.oldIdentity,replacementPlan_.oldInventory,true) ||
+                !packageIdentity(*replacement_,replacementPlan_.newIdentity,replacementPlan_.newInventory,true) ||
+                !writeReplacement(key_,replacementPlan_,lease_)) return false;
+            haveReplacement_ = true;
+        }
+        if (replacementPlan_.phase != 1 || replacement.native() != replacementPlan_.newRoot ||
+            !replacement_ || !replacement_->current() || !tuple()) return false;
+        SC_HANDLE created = nullptr;
+        if (!service_) {
+            if (!userGone_ || !current()) return false;
+            const auto command = deploymentCommand(active_/L"GateBouncerService.exe",mode_);
+            service_ = CreateServiceW(manager_,deploymentService(mode_),L"LGA GateBouncer",
+                SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG | SERVICE_STOP | DELETE |
+                    READ_CONTROL | WRITE_DAC | WRITE_OWNER,
+                SERVICE_WIN32_OWN_PROCESS,SERVICE_DISABLED,SERVICE_ERROR_NORMAL,command.c_str(),nullptr,nullptr,nullptr,L"LocalSystem",nullptr);
+            if (!service_) return false;
+            created = service_; // Handle original devuelto por CreateService en esta llamada, no reapertura.
+        }
+        if (!restorationService(created)) return false;
+        PSECURITY_DESCRIPTOR descriptor = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;BU)",
+            SDDL_REVISION_1,&descriptor,nullptr)) return false;
+        const bool secured = SetServiceObjectSecurity(service_,OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,descriptor) != FALSE;
+        LocalFree(descriptor);
+        SERVICE_SID_INFO sid{SERVICE_SID_TYPE_UNRESTRICTED};
+        if (!secured || !restorationService() || !ChangeServiceConfig2W(service_,SERVICE_CONFIG_SERVICE_SID_INFO,&sid) ||
+            !serviceConfigurationPhase(service_,active_/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode_) || !tuple()) return false;
+        userGone_ = false;
+        if (!current() || !deployment_detail::setString(key_,L"PackageRoot",active_.native()) || !current() ||
+            !deployment_detail::setString(key_,L"OrdinaryImage",(active_/L"GateBouncer.exe").native()) || !current() ||
+            !deployment_detail::setString(key_,L"StoreRoot",store_.native()) || !current() ||
+            !deployment_detail::setString(key_,L"ViewSid",view_) || !current() ||
+            !deployment_detail::setDword(key_,L"ProvisionPrincipal",provision_) || !current() ||
+            !deployment_detail::setDword(key_,L"MaintenanceVersion",1) || !current() ||
+            !deployment_detail::setDword(key_,L"MaintenanceState",2) || !current() || RegFlushKey(key_) != ERROR_SUCCESS) return false;
+        marker_ = 2; cleanupReceipt_ = false; restoring_ = false; resumingDriver_ = true;
+        return current(); // Receipt original sigue durable durante todas las fases posteriores.
     }
     bool completeReceipts() {
         if (mode_ != DeploymentMode::Product || marker_ != 0 || !current() || !package_->driverInstalledCurrent() ||
-            !policy_ || !policy_->current() || !policy_->inspect(false)) return false;
+            !policy_ || !policyInventory()) return false;
         DWORD size = 0;
         const auto retirementQuery = RegQueryValueExW(key_,L"DriverRetirement",nullptr,nullptr,nullptr,&size);
         const auto replacementQuery = RegQueryValueExW(key_,L"DriverReplacement",nullptr,nullptr,nullptr,&size);
@@ -715,7 +871,14 @@ class GuestMaintenance {
         }
         if (retirementQuery == ERROR_SUCCESS) {
             DriverRetirement receipt{};
-            if (!readRetirement(key_,receipt) || receipt.state != 3 || receipt.userRemoval) return false;
+            if (!readRetirement(key_,receipt) || receipt.state != 3) return false;
+            if (receipt.userRemoval) {
+                ReplacementPlan plan{};
+                if (replacementQuery != ERROR_SUCCESS || !readReplacement(key_,plan) || plan.phase != 3 ||
+                    plan.oldRoot != std::wstring(receipt.package) ||
+                    std::memcmp(plan.oldIdentity,receipt.packageIdentity,sizeof(plan.oldIdentity)) ||
+                    plan.oldInventory != receipt.inventory) return false;
+            }
             Deployment original(receipt.package,DeploymentMode::Product);
             if (!original.verify(original.root()/L"GateBouncerService.exe",DeploymentRole::Service) ||
                 !packageIdentity(original,receipt.packageIdentity,receipt.inventory,false)) return false;
@@ -799,14 +962,14 @@ class GuestMaintenance {
             result_.phase = MaintenancePhase::Store;
             if (!loadPolicy()) return recovery(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
             result_.phase = MaintenancePhase::Inventory;
-            if (!current() || !policy_->current() || !policy_->inspect(false) || !current()) return recovery();
+            if (!current() || !policyInventory() || !current()) return recovery();
             result_.phase = MaintenancePhase::Service;
             if (start_ == SERVICE_DISABLED) {
                 if (!ChangeServiceConfigW(service_,SERVICE_NO_CHANGE,SERVICE_AUTO_START,SERVICE_NO_CHANGE,
                     nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr)) return recovery(GetLastError());
                 start_ = SERVICE_AUTO_START;
             }
-            if (!current() || !policy_->current() || !policy_->inspect(false) ||
+            if (!current() || !policyInventory() ||
                 !current() || !policy_->current()) return recovery();
             if (mode_ == DeploymentMode::Product && !completeReceipts()) return recovery();
             result_.phase = MaintenancePhase::Complete;
@@ -820,6 +983,7 @@ class GuestMaintenance {
                 !deployment_detail::disjoint(root,replacement) || !deployment_detail::disjoint(store_,replacement)) return fail();
             if (mode_ == DeploymentMode::Product) {
                 result_.phase = MaintenancePhase::Package;
+                if (restoring_ && !restoreTerminal(source,replacement)) return fail(GetLastError());
                 if (haveReplacement_) {
                     if (replacement.native() != replacementPlan_.newRoot || !deployment_detail::disjoint(store_,replacement)) return fail();
                 } else {
@@ -882,7 +1046,7 @@ class GuestMaintenance {
                     replacementPlan_.restart = 0;
                     if (!writeReplacement(key_,replacementPlan_,lease_)) return fail();
                 }
-                if (!package_->driverInstalledCurrent() || !current() || !policy_->current() || !policy_->inspect(false) ||
+                if (!package_->driverInstalledCurrent() || !current() || !policyInventory() ||
                     !deployment_detail::mark(key_,0,marker_,lease_)) return fail();
                 marker_ = 0;
                 if (!current() || !ChangeServiceConfigW(service_,SERVICE_NO_CHANGE,SERVICE_AUTO_START,SERVICE_NO_CHANGE,
