@@ -50,6 +50,11 @@ MaintenanceRuntime::~MaintenanceRuntime() {
     if (fault_) fault_->retire();
     if (write_) FwpmEngineClose0(write_);
 }
+bool MaintenanceRuntime::prepareAfterRemoval() {
+    // Sólo GuestMaintenance puede seleccionar esta lectura, después de marker3 y driverGone originales.
+    if (store_ || resumeRemoval_) return false;
+    resumeRemoval_ = true; return prepare();
+}
 bool MaintenanceRuntime::current() const {
     if (!check_ || !context_ || !check_(context_) || !store_ || store_->uncertain()) return false;
     if (missing()) return allowMissing_ && const_cast<directional::NativeSnapshotFile &>(file_).cleanForInitial(store_.get());
@@ -77,6 +82,10 @@ bool MaintenanceRuntime::prepare() {
         if (error_ != ERROR_SUCCESS || !write_ || write_ == INVALID_HANDLE_VALUE) { write_ = nullptr; return false; }
         sdk_ = allnative::systemSdk();
         if (missing()) return absent(false);
+        // El snapshot original se conserva al retirar. Ausencia TOTAL readonly también
+        // cubre crash después del commit WFP y antes del receipt/limpieza del registro.
+        if (resumeRemoval_ && absent(false)) { removedInventory_ = true; return current(); }
+        if (cleanupUnknown_) return false;
         observation_ = EngineResource::acquire(1,&fault_);
         if (!observation_ || !sdk_.allocate) return false;
         LUID index{}; if (!sdk_.allocate(&index)) return false;
@@ -161,6 +170,7 @@ bool MaintenanceRuntime::absent(bool insideWrite) {
 bool MaintenanceRuntime::remove() {
     if (attempted_ || !current() || !write_) return false;
     attempted_ = true;
+    if (removedInventory_) return resumeRemoval_ && absent(false);
     if (missing()) return absent(false);
     bool transaction = false;
     try {

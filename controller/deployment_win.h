@@ -53,6 +53,9 @@ class Deployment {
     bool installProductDriver(const deployment_detail::AdministrativeLease &, HKEY originalConfiguration);
     bool admitProductDriver();
     bool driverInstalledCurrent() noexcept;
+    bool retireProductDriver(deployment_detail::AdministrativeLease &,HKEY,bool &reboot);
+    bool retiredProductDriverCurrent(deployment_detail::AdministrativeLease &,HKEY,bool &reboot);
+    bool clearProductDriverRetirement(const deployment_detail::AdministrativeLease &,HKEY);
     DeploymentMode mode() const { return mode_; }
     bool prepareEnvironment();
     const std::filesystem::path &root() const { return root_; }
@@ -62,7 +65,21 @@ class Deployment {
     bool enumerate(const std::filesystem::path &relative, unsigned depth,
                    std::vector<std::wstring> &files, bool retain = true);
     struct Registration;
-    struct DriverRegistration;
+    struct DriverRegistration {
+        struct Pin { native::Handle handle; std::filesystem::path path; BY_HANDLE_FILE_INFORMATION identity{}; bool directory = false; };
+        SC_HANDLE service = nullptr;
+        std::filesystem::path image;
+        std::vector<Pin> pins;
+        DWORD state = SERVICE_STOPPED;
+        bool allowRemoval = false;
+        ~DriverRegistration();
+        static bool config(SC_HANDLE,std::filesystem::path &,DWORD &);
+        static bool inspect(Pin &,bool initial);
+        bool hold(const std::filesystem::path &,bool directory,wire::Bytes * = nullptr);
+        bool current();
+        bool acquire(Deployment &,bool removal = false);
+        bool start(Deployment &,HANDLE originalActor);
+    };
     struct ServiceRuntime;
     struct FilePin { std::filesystem::path path; BY_HANDLE_FILE_INFORMATION identity{};
                      std::size_t handle = 0; };

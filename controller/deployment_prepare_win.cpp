@@ -317,9 +317,10 @@ bool Deployment::installProductDriver(const deployment_detail::AdministrativeLea
         bool present = false; DWORD state = 0, initial = 0, size = sizeof(initial);
         wchar_t root[32768]{}, ordinary[32768]{}; DWORD rootSize = sizeof(root), ordinarySize = sizeof(ordinary);
         return mode_ == DeploymentMode::Product && role_ == DeploymentRole::Service && current() &&
-            lease.ownsConfiguration(configuration) && maintenanceState(configuration,present,state) && present && state == 1 &&
+            lease.ownsConfiguration(configuration) && maintenanceState(configuration,present,state) && present &&
+            (state == 1 || (state == 2 && deployment_detail::replacementCurrent(*this,configuration))) &&
             RegGetValueW(configuration,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&initial,&size) == ERROR_SUCCESS &&
-            size == sizeof(initial) && initial == 1 &&
+            size == sizeof(initial) && (state == 1 ? initial == 1 : initial <= 1) &&
             RegGetValueW(configuration,nullptr,L"PackageRoot",RRF_RT_REG_SZ,nullptr,root,&rootSize) == ERROR_SUCCESS &&
             rootSize == (root_.native().size()+1)*sizeof(wchar_t) && root_.native() == root &&
             RegGetValueW(configuration,nullptr,L"OrdinaryImage",RRF_RT_REG_SZ,nullptr,ordinary,&ordinarySize) == ERROR_SUCCESS &&

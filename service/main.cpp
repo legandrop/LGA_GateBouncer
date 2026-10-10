@@ -100,6 +100,14 @@ int wmain(int argc,wchar_t** argv){
             std::cout << "Mantenimiento resultado=" << static_cast<unsigned>(result.outcome) <<
                 " fase=" << static_cast<unsigned>(result.phase) << " error=" << result.error <<
                 " recuperacion_confirmada=" << result.recoveryRecorded << '\n';
+            if (result.outcome == controller::MaintenanceOutcome::RebootRequired) {
+                std::cout << "A Windows restart is required. Protection is not admitted. Restart Windows yourself, then repeat the same maintenance command to continue.\n";
+                return ERROR_SUCCESS_REBOOT_REQUIRED;
+            }
+            if (argc == 5 && result.outcome == controller::MaintenanceOutcome::Recovery &&
+                result.phase >= controller::MaintenancePhase::Switch) {
+                std::wcout << L"Keep both package directories. If the active package has already switched, use --finalize-deployment with the replacement directory: " << argv[4] << L'\n';
+            }
             return result.outcome == controller::MaintenanceOutcome::UpdatedPrepared ||
                 result.outcome == controller::MaintenanceOutcome::UninstalledRetained ||
                 result.outcome == controller::MaintenanceOutcome::PreparedFinalized ? 0 : 2;

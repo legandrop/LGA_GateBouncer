@@ -345,14 +345,8 @@ struct Deployment::Registration {
             serviceConfiguration(service, root / L"GateBouncerService.exe", GetCurrentProcessId(),mode);
     }
 };
-struct Deployment::DriverRegistration {
-    struct Pin { native::Handle handle; std::filesystem::path path; BY_HANDLE_FILE_INFORMATION identity{}; bool directory = false; };
-    SC_HANDLE service = nullptr;
-    std::filesystem::path image;
-    std::vector<Pin> pins;
-    DWORD state = SERVICE_STOPPED;
-    ~DriverRegistration() { if (service) CloseServiceHandle(service); }
-    static bool config(SC_HANDLE service,std::filesystem::path &image,DWORD &state) {
+Deployment::DriverRegistration::~DriverRegistration() { if (service) CloseServiceHandle(service); }
+bool Deployment::DriverRegistration::config(SC_HANDLE service,std::filesystem::path &image,DWORD &state) {
         DWORD needed = 0, done = 0;
         QueryServiceConfigW(service,nullptr,0,&needed);
         if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(QUERY_SERVICE_CONFIGW) || needed > 65536) return false;
@@ -391,8 +385,8 @@ struct Deployment::DriverRegistration {
         bytes.resize(needed);
         if (!QueryServiceObjectSecurity(service,information,bytes.data(),needed,&done) || !serviceDescriptor(bytes.data())) return false;
         image = candidate; state = status.dwCurrentState; return true;
-    }
-    static bool inspect(Pin &pin,bool initial) {
+}
+bool Deployment::DriverRegistration::inspect(Pin &pin,bool initial) {
         BY_HANDLE_FILE_INFORMATION now{}; wchar_t final[32768]{};
         // DriverStore es custodia Windows: propietario/ACL SY, BA o TrustedInstaller originales.
         // El límite TCB sólo cubre filesystem/instalación; no concede tráfico a esos actores.
@@ -431,12 +425,13 @@ struct Deployment::DriverRegistration {
               CompareFileTime(&now.ftLastWriteTime,&pin.identity.ftLastWriteTime)))))) return false;
         if (initial) pin.identity = now;
         return true;
-    }
-    bool hold(const std::filesystem::path &path,bool directory,wire::Bytes *bytes = nullptr) {
+}
+bool Deployment::DriverRegistration::hold(const std::filesystem::path &path,bool directory,wire::Bytes *bytes) {
         if (!native::fixedPath(path) || pins.size() >= 64) return false;
         Pin pin; pin.path = path; pin.directory = directory;
         pin.handle.reset(CreateFileW(path.c_str(),READ_CONTROL | FILE_READ_ATTRIBUTES | (directory ? 0 : GENERIC_READ),
-            FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT | (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0),nullptr));
+            FILE_SHARE_READ | (allowRemoval ? FILE_SHARE_DELETE : 0),nullptr,OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT | (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0),nullptr));
         if (!pin.handle || !inspect(pin,true)) return false;
         if (bytes) {
             LARGE_INTEGER size{}; DWORD done = 0;
@@ -445,8 +440,8 @@ struct Deployment::DriverRegistration {
             if (!ReadFile(pin.handle.value,bytes->data(),DWORD(bytes->size()),&done,nullptr) || done != bytes->size() || !inspect(pin,false)) return false;
         }
         pins.push_back(std::move(pin)); return true;
-    }
-    bool current() {
+}
+bool Deployment::DriverRegistration::current() {
         std::filesystem::path actual; DWORD observed = 0;
         if (!config(service,actual,observed) || actual != image) return false;
         if (observed != state) {
@@ -456,8 +451,9 @@ struct Deployment::DriverRegistration {
         }
         for (auto &pin : pins) if (!inspect(pin,false)) return false;
         return !pins.empty();
-    }
-    bool acquire(Deployment &owner) {
+}
+bool Deployment::DriverRegistration::acquire(Deployment &owner,bool removal) {
+        allowRemoval = removal;
         if (!primitivePlatform() || !owner.current()) return false;
         SC_HANDLE manager = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
         if (!manager) return false;
@@ -504,8 +500,8 @@ struct Deployment::DriverRegistration {
         const bool unloaded = api.close();
         // No se adopta otro namespace ni un path/hash suministrado: proviene del SCM original.
         return located && unloaded && current() && owner.current();
-    }
-    bool start(Deployment &owner,HANDLE originalActor) {
+}
+bool Deployment::DriverRegistration::start(Deployment &owner,HANDLE originalActor) {
         const auto admitted = [&]() {
             native::Handle repeated; HANDLE raw = nullptr;
             HANDLE impersonation = nullptr;
@@ -535,8 +531,7 @@ struct Deployment::DriverRegistration {
             Sleep(25);
         } while (GetTickCount64() < deadline);
         SetLastError(ERROR_TIMEOUT); return false;
-    }
-};
+}
 struct Deployment::ServiceRuntime {
     struct Module { HMODULE value = nullptr; std::filesystem::path path; bool pinned = false; };
     std::vector<Module> modules;

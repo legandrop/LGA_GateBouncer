@@ -5,6 +5,7 @@
 #include <shlobj.h>
 #include <algorithm>
 #include <set>
+#include <cstring>
 namespace gb {
 bool guestActivationAuthorized(){
     // Marcador administrativo del harness invitado. No se escribe desde el producto.
@@ -59,10 +60,100 @@ bool status(SC_HANDLE service,SERVICE_STATUS_PROCESS &out) {
     return QueryServiceStatusEx(service,SC_STATUS_PROCESS_INFO,reinterpret_cast<BYTE *>(&out),sizeof(out),&count) &&
         count == sizeof(out) && out.dwServiceType == SERVICE_WIN32_OWN_PROCESS;
 }
+struct DriverRetirement {
+    DWORD version = 1, state = 1, restart = 0;
+    wire::Id boot{};
+    wchar_t inf[MAX_PATH]{}, published[MAX_PATH]{};
+    // FileIDs de los outputs Windows originales: directorio, SYS/INF/CAT y OEM INF.
+    DWORD identities[5][3]{};
+    DWORD provision = 0, userRemoval = 0;
+    wchar_t package[MAX_PATH]{}, store[MAX_PATH]{}, view[184]{};
+    DWORD packageIdentity[3]{};
+    wire::Digest inventory{};
+};
+static_assert(sizeof(DriverRetirement) == 2588);
+bool readRetirement(HKEY key,DriverRetirement &out) {
+    DWORD size = sizeof(out);
+    return RegGetValueW(key,nullptr,L"DriverRetirement",RRF_RT_REG_BINARY,nullptr,&out,&size) == ERROR_SUCCESS &&
+        size == sizeof(out) && out.version == 1 && out.state >= 1 && out.state <= 3 && out.restart <= 1 && out.provision <= 1 && out.userRemoval <= 1 &&
+        wcsnlen(out.inf,MAX_PATH) < MAX_PATH && wcsnlen(out.published,MAX_PATH) < MAX_PATH &&
+        wcsnlen(out.package,MAX_PATH) < MAX_PATH && wcsnlen(out.store,MAX_PATH) < MAX_PATH && wcsnlen(out.view,184) < 184 &&
+        out.package[0] && out.store[0] && out.view[0] && out.inf[0] && out.published[0] &&
+        std::any_of(out.boot.begin(),out.boot.end(),[](auto v) { return v != 0; });
+}
+bool sameIdentity(const BY_HANDLE_FILE_INFORMATION &id,const DWORD (&record)[3]) {
+    return id.dwVolumeSerialNumber == record[0] && id.nFileIndexHigh == record[1] && id.nFileIndexLow == record[2];
+}
+void recordIdentity(const BY_HANDLE_FILE_INFORMATION &id,DWORD (&record)[3]) {
+    record[0] = id.dwVolumeSerialNumber; record[1] = id.nFileIndexHigh; record[2] = id.nFileIndexLow;
+}
+bool remainingString(HKEY key,const wchar_t *name,const std::wstring &expected) {
+    DWORD size = 0; const auto query = RegQueryValueExW(key,name,nullptr,nullptr,nullptr,&size);
+    std::wstring text; return query == ERROR_FILE_NOT_FOUND || (query == ERROR_SUCCESS && readString(key,name,text) && text == expected);
+}
+bool remainingDword(HKEY key,const wchar_t *name,DWORD expected) {
+    DWORD size = 0, number = 0; const auto query = RegQueryValueExW(key,name,nullptr,nullptr,nullptr,&size);
+    return query == ERROR_FILE_NOT_FOUND || (query == ERROR_SUCCESS && readDword(key,name,number) && number == expected);
+}
+bool writeRetirement(HKEY key,const DriverRetirement &value,const deployment_detail::AdministrativeLease &lease) {
+    DriverRetirement repeated{};
+    return lease.ownsConfiguration(key) && RegSetValueExW(key,L"DriverRetirement",0,REG_BINARY,
+        reinterpret_cast<const BYTE *>(&value),sizeof(value)) == ERROR_SUCCESS && RegFlushKey(key) == ERROR_SUCCESS &&
+        readRetirement(key,repeated) && std::memcmp(&value,&repeated,sizeof(value)) == 0 && lease.ownsConfiguration(key);
+}
+struct ReplacementPlan {
+    DWORD version = 1, phase = 1, restart = 0;
+    wire::Id installBoot{};
+    wchar_t oldRoot[MAX_PATH]{}, newRoot[MAX_PATH]{};
+    DWORD oldIdentity[3]{}, newIdentity[3]{};
+    wire::Digest oldInventory{}, newInventory{};
+};
+bool readReplacement(HKEY key,ReplacementPlan &plan) {
+    DWORD size = sizeof(plan);
+    return RegGetValueW(key,nullptr,L"DriverReplacement",RRF_RT_REG_BINARY,nullptr,&plan,&size) == ERROR_SUCCESS &&
+        size == sizeof(plan) && plan.version == 1 && plan.phase >= 1 && plan.phase <= 3 && plan.restart <= 1 && plan.oldRoot[0] && plan.newRoot[0] &&
+        wcsnlen(plan.oldRoot,MAX_PATH) < MAX_PATH && wcsnlen(plan.newRoot,MAX_PATH) < MAX_PATH &&
+        (plan.phase == 3 ? std::any_of(plan.installBoot.begin(),plan.installBoot.end(),[](auto v) { return v != 0; }) : plan.restart == 0);
+}
+bool packageIdentity(Deployment &package,DWORD (&identity)[3],wire::Digest &inventory,bool original) {
+    if (!package.current()) return false;
+    native::Handle root(CreateFileW(package.root().c_str(),FILE_READ_ATTRIBUTES | READ_CONTROL,FILE_SHARE_READ,
+        nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,nullptr));
+    BY_HANDLE_FILE_INFORMATION id{};
+    native::Handle file(CreateFileW((package.root()/L"deployment.gbd").c_str(),GENERIC_READ | READ_CONTROL,FILE_SHARE_READ,
+        nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+    LARGE_INTEGER size{}; DWORD count = 0;
+    if (!root || !file || !native::protectedObject(root.value,true,true,true) || !GetFileInformationByHandle(root.value,&id) ||
+        !package.matchesCreatedFile(package.root()/L"deployment.gbd",file.value) || !GetFileSizeEx(file.value,&size) || size.QuadPart <= 0 || size.QuadPart > 65536) return false;
+    wire::Bytes bytes(static_cast<std::size_t>(size.QuadPart));
+    if (!ReadFile(file.value,bytes.data(),DWORD(bytes.size()),&count,nullptr) || count != bytes.size() || !package.current()) return false;
+    const auto digest = native::digest(bytes);
+    if (!original) return sameIdentity(id,identity) && digest == inventory;
+    recordIdentity(id,identity); inventory = digest; return true;
+}
+bool writeReplacement(HKEY key,const ReplacementPlan &plan,const deployment_detail::AdministrativeLease &lease) {
+    ReplacementPlan repeated{};
+    return lease.ownsConfiguration(key) && RegSetValueExW(key,L"DriverReplacement",0,REG_BINARY,
+        reinterpret_cast<const BYTE *>(&plan),sizeof(plan)) == ERROR_SUCCESS && RegFlushKey(key) == ERROR_SUCCESS &&
+        readReplacement(key,repeated) && std::memcmp(&plan,&repeated,sizeof(plan)) == 0 && lease.ownsConfiguration(key);
+}
+struct DriverMaintenanceModule {
+    HMODULE value;
+    explicit DriverMaintenanceModule(const wchar_t *name) : value(LoadLibraryExW(name,nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32)) {}
+    ~DriverMaintenanceModule() { if (value) FreeLibrary(value); }
+    DriverMaintenanceModule(const DriverMaintenanceModule &) = delete;
+    DriverMaintenanceModule &operator=(const DriverMaintenanceModule &) = delete;
+};
 }
 namespace deployment_detail {
+bool replacementCurrent(Deployment &package,HKEY key) {
+    ReplacementPlan plan{}; DriverRetirement receipt{};
+    return native::protectedRegistry(key) && readRetirement(key,receipt) && receipt.state == 3 && readReplacement(key,plan) && plan.phase >= 2 &&
+        package.root().native() == plan.newRoot && packageIdentity(package,plan.newIdentity,plan.newInventory,false);
+}
 AdministrativeLease::~AdministrativeLease() {
     if (owns_) ReleaseMutex(mutex_.value);
+    if (boot_) RegCloseKey(boot_);
     if (gate_) RegCloseKey(gate_);
     if (parent_) RegCloseKey(parent_);
 }
@@ -133,6 +224,16 @@ bool AdministrativeLease::current() const {
     const bool sameGate = opened == ERROR_SUCCESS && compareObjectHandles(gate_,repeated);
     if (repeated) RegCloseKey(repeated);
     if (!sameGate) return false;
+    if (boot_) {
+        HKEY repeatedBoot = nullptr; wire::Id id{}; DWORD size = sizeof(id), symbolic = 0;
+        const bool original = native::protectedRegistry(boot_) &&
+            RegQueryValueExW(boot_,L"SymbolicLinkValue",nullptr,nullptr,nullptr,&symbolic) == ERROR_FILE_NOT_FOUND &&
+            RegOpenKeyExW(gate_,L"BootSession",REG_OPTION_OPEN_LINK,KEY_QUERY_VALUE | READ_CONTROL,&repeatedBoot) == ERROR_SUCCESS &&
+            compareObjectHandles(boot_,repeatedBoot) &&
+            RegGetValueW(boot_,nullptr,L"Id",RRF_RT_REG_BINARY,nullptr,id.data(),&size) == ERROR_SUCCESS && size == sizeof(id) && id == bootId_;
+        if (repeatedBoot) RegCloseKey(repeatedBoot);
+        if (!original) return false;
+    }
     if (mode_ == DeploymentMode::Product) {
         HKEY repeatedParent = nullptr; DWORD bytes = 0;
         const bool original = parent_ && native::protectedRegistry(parent_) &&
@@ -163,11 +264,205 @@ bool AdministrativeLease::ownsConfiguration(HKEY key) const {
     if (gate) RegCloseKey(gate);
     return ok && current(); // El handle retenido debe seguir siendo el mismo objeto bajo el mismo gate.
 }
+bool AdministrativeLease::bootIdentity(wire::Id &out) {
+    if (mode_ != DeploymentMode::Product || !current()) return false;
+    if (!boot_) {
+        auto error = RegOpenKeyExW(gate_,L"BootSession",REG_OPTION_OPEN_LINK,KEY_QUERY_VALUE | READ_CONTROL,&boot_);
+        if (error == ERROR_FILE_NOT_FOUND) {
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)",SDDL_REVISION_1,&sd)) return false;
+            SECURITY_ATTRIBUTES attributes{sizeof(attributes),sd,FALSE}; DWORD disposition = 0;
+            error = RegCreateKeyExW(gate_,L"BootSession",0,nullptr,REG_OPTION_VOLATILE,
+                KEY_QUERY_VALUE | KEY_SET_VALUE | READ_CONTROL,&attributes,&boot_,&disposition);
+            LocalFree(sd);
+            if (error != ERROR_SUCCESS || disposition != REG_CREATED_NEW_KEY || !native::protectedRegistry(boot_)) return false;
+            bootId_ = native::randomIdentity();
+            if (!std::any_of(bootId_.begin(),bootId_.end(),[](auto v) { return v != 0; }) ||
+                RegSetValueExW(boot_,L"Id",0,REG_BINARY,bootId_.data(),DWORD(bootId_.size())) != ERROR_SUCCESS) return false;
+        } else if (error != ERROR_SUCCESS) return false;
+        DWORD size = sizeof(bootId_);
+        if (!native::protectedRegistry(boot_) || RegGetValueW(boot_,nullptr,L"Id",RRF_RT_REG_BINARY,nullptr,
+            bootId_.data(),&size) != ERROR_SUCCESS || size != sizeof(bootId_) ||
+            !std::any_of(bootId_.begin(),bootId_.end(),[](auto v) { return v != 0; })) return false;
+    }
+    if (!current()) return false;
+    out = bootId_; return true;
+}
+}
+bool Deployment::retiredProductDriverCurrent(deployment_detail::AdministrativeLease &lease,HKEY key,bool &reboot) {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_); reboot = false;
+    bool present = false; DWORD marker = 0; DriverRetirement receipt{}; wire::Id boot{};
+    std::wstring root;
+    const auto ownRoot = [&]() {
+        if (!readString(key,L"PackageRoot",root)) return receipt.state == 3 && receipt.userRemoval == 1 &&
+            root_.native() == receipt.package && remainingString(key,L"PackageRoot",root_.native()) &&
+            packageIdentity(*this,receipt.packageIdentity,receipt.inventory,false);
+        if (root == root_.native()) return true;
+        ReplacementPlan plan{};
+        return marker == 2 && readReplacement(key,plan) && plan.phase == 2 && root_.native() == plan.oldRoot &&
+            root == plan.newRoot && packageIdentity(*this,plan.oldIdentity,plan.oldInventory,false);
+    };
+    if (mode_ != DeploymentMode::Product || role_ != DeploymentRole::Service || driver_ || !current() ||
+        !lease.ownsConfiguration(key) || !readRetirement(key,receipt) ||
+        root_.native() != receipt.package || !packageIdentity(*this,receipt.packageIdentity,receipt.inventory,false) ||
+        (!(maintenanceState(key,present,marker) && present && (marker == 2 || marker == 3)) &&
+            !(receipt.state == 3 && receipt.userRemoval == 1 && remainingDword(key,L"MaintenanceVersion",1) && remainingDword(key,L"MaintenanceState",3))) ||
+        !ownRoot() ||
+        !lease.bootIdentity(boot)) return false;
+    // Sólo ausencia completa tras el receipt de la operación original; ACCESS_DENIED no es ausencia.
+    wchar_t windows[MAX_PATH]{}; const auto count = GetWindowsDirectoryW(windows,MAX_PATH);
+    if (!count || count >= MAX_PATH) return false;
+    const std::filesystem::path inf(receipt.inf), published(receipt.published);
+    const std::filesystem::path systemRoot(std::wstring(windows,count));
+    const auto repository = systemRoot/L"System32"/L"DriverStore"/L"FileRepository";
+    const auto name = published.filename().native();
+    if (!native::fixedPath(inf) || !native::fixedPath(published) ||
+        inf.filename() != L"GateBouncerClassifier.inf" || _wcsicmp(inf.parent_path().parent_path().c_str(),repository.c_str()) ||
+        _wcsicmp(published.parent_path().c_str(),(systemRoot/L"INF").c_str()) || name.size() < 8 ||
+        _wcsnicmp(name.c_str(),L"oem",3) || _wcsicmp(name.c_str()+name.size()-4,L".inf") ||
+        !std::all_of(name.begin()+3,name.end()-4,[](wchar_t c) { return c >= L'0' && c <= L'9'; })) return false;
+    if (receipt.restart && boot == receipt.boot) { reboot = true; return lease.ownsConfiguration(key) && current(); }
+    DriverRegistration custody;
+    // Retener todos los ancestros originales protegidos antes de consultar hojas ausentes.
+    for (const auto &parent : {repository,published.parent_path()}) {
+        std::vector<std::filesystem::path> ancestors;
+        for (auto p = parent; !p.empty(); p = p.parent_path()) { ancestors.push_back(p); if (p == p.parent_path()) break; }
+        for (auto p = ancestors.rbegin(); p != ancestors.rend(); ++p) if (!custody.hold(*p,true)) return false;
+    }
+    const auto pinsCurrent = [&]() { for (auto &p : custody.pins) if (!DriverRegistration::inspect(p,false)) return false; return true; };
+    const auto absent = [&](const std::filesystem::path &path) {
+        if (!pinsCurrent() || !lease.ownsConfiguration(key) || !current()) return false;
+        native::Handle probe(CreateFileW(path.c_str(),FILE_READ_ATTRIBUTES | READ_CONTROL,FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,nullptr));
+        const auto error = probe ? ERROR_ALREADY_EXISTS : GetLastError();
+        return !probe && (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) && pinsCurrent();
+    };
+    SC_HANDLE manager = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
+    if (!manager) return false;
+    SC_HANDLE kernel = OpenServiceW(manager,L"LGAGateBouncerClassifier",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL);
+    const auto error = kernel ? ERROR_SERVICE_EXISTS : GetLastError();
+    if (kernel) CloseServiceHandle(kernel); CloseServiceHandle(manager);
+    if (error != ERROR_SERVICE_DOES_NOT_EXIST) return false;
+    const auto directoryIndex = custody.pins.size();
+    if (custody.hold(inf.parent_path(),true)) {
+        if (!sameIdentity(custody.pins[directoryIndex].identity,receipt.identities[0])) return false;
+        for (const auto &leaf : {L"GateBouncerClassifier.sys",L"GateBouncerClassifier.inf",L"GateBouncerClassifier.cat"})
+            if (!absent(inf.parent_path()/leaf)) return false;
+    } else {
+        const auto directoryError = GetLastError();
+        if (directoryError != ERROR_FILE_NOT_FOUND && directoryError != ERROR_PATH_NOT_FOUND) return false;
+        if (!absent(inf.parent_path())) return false;
+    }
+    if (!absent(published) ||
+        !pinsCurrent() || !lease.ownsConfiguration(key) || !current()) return false;
+    if (receipt.state != 3) { receipt.state = 3; if (!writeRetirement(key,receipt,lease)) return false; }
+    return current() && lease.ownsConfiguration(key); // No afirma FileID de imagen cargada ni CI.
+}
+bool Deployment::retireProductDriver(deployment_detail::AdministrativeLease &lease,HKEY key,bool &reboot) {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_); reboot = false;
+    bool present = false; DWORD marker = 0; std::wstring root;
+    const auto ownRoot = [&]() {
+        if (!readString(key,L"PackageRoot",root)) return false;
+        if (root == root_.native()) return true;
+        ReplacementPlan plan{};
+        return marker == 2 && readReplacement(key,plan) && plan.phase == 2 && root_.native() == plan.oldRoot &&
+            root == plan.newRoot && packageIdentity(*this,plan.oldIdentity,plan.oldInventory,false);
+    };
+    const auto admitted = [&]() { return mode_ == DeploymentMode::Product && role_ == DeploymentRole::Service && !driver_ &&
+        current() && lease.ownsConfiguration(key) && maintenanceState(key,present,marker) && present && (marker == 2 || marker == 3) &&
+        ownRoot(); };
+    if (!admitted()) return false;
+    DriverRetirement receipt{}; DWORD bytes = 0;
+    const auto prior = RegQueryValueExW(key,L"DriverRetirement",nullptr,nullptr,nullptr,&bytes);
+    if (prior == ERROR_SUCCESS) {
+        if (!readRetirement(key,receipt)) return false;
+        if (receipt.state >= 2) return retiredProductDriverCurrent(lease,key,reboot);
+    } else if (prior != ERROR_FILE_NOT_FOUND) return false;
+    DriverRegistration original;
+    if (!original.acquire(*this,true) || !admitted()) return false;
+    const auto count = original.pins.size(); if (count < 4) return false;
+    const auto infPath = original.pins[count-2].path;
+    DriverMaintenanceModule setup(L"setupapi.dll"), api(L"newdev.dll");
+    using Published = BOOL (WINAPI *)(PCWSTR,PWSTR,DWORD,PDWORD);
+    using Uninstall = BOOL (WINAPI *)(HWND,LPCWSTR,DWORD,PBOOL);
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4191)
+#endif
+    const auto publishedName = setup.value ? reinterpret_cast<Published>(GetProcAddress(setup.value,"SetupGetInfPublishedNameW")) : nullptr;
+    const auto uninstall = api.value ? reinterpret_cast<Uninstall>(GetProcAddress(api.value,"DiUninstallDriverW")) : nullptr;
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    DriverRetirement expected{}; DWORD required = 0;
+    if (!publishedName || !uninstall || infPath.native().size() >= MAX_PATH ||
+        !publishedName(infPath.c_str(),expected.published,MAX_PATH,&required) || required <= 1 || required > MAX_PATH ||
+        expected.published[required-1] || wcsnlen(expected.published,MAX_PATH)+1 != required) return false;
+    std::copy(infPath.native().begin(),infPath.native().end(),expected.inf);
+    wchar_t windows[MAX_PATH]{}; const auto windowCount = GetWindowsDirectoryW(windows,MAX_PATH);
+    const std::filesystem::path published(expected.published), infParent = std::filesystem::path(windows)/L"INF";
+    const auto name = published.filename().native();
+    if (!windowCount || windowCount >= MAX_PATH || !native::fixedPath(published) ||
+        _wcsicmp(published.parent_path().c_str(),infParent.c_str()) || name.size() < 8 || _wcsnicmp(name.c_str(),L"oem",3) ||
+        _wcsicmp(name.c_str()+name.size()-4,L".inf") ||
+        !std::all_of(name.begin()+3,name.end()-4,[](wchar_t c) { return c >= L'0' && c <= L'9'; }) ||
+        !original.hold(infParent,true)) return false;
+    wire::Bytes publishedBytes;
+    if (!original.hold(published,false,&publishedBytes) || native::digest(publishedBytes) != inventory_.at(L"driver\\GateBouncerClassifier.inf") ||
+        !original.current() || !admitted() || !lease.bootIdentity(expected.boot)) return false;
+    std::wstring store, view; DWORD provision = 0;
+    if (!readString(key,L"StoreRoot",store) || !readString(key,L"ViewSid",view) || !readDword(key,L"ProvisionPrincipal",provision) ||
+        provision > 1 || root_.native().size() >= MAX_PATH || store.size() >= MAX_PATH || view.size() >= 184 ||
+        !packageIdentity(*this,expected.packageIdentity,expected.inventory,true)) return false;
+    expected.provision = provision;
+    std::copy(root_.native().begin(),root_.native().end(),expected.package);
+    std::copy(store.begin(),store.end(),expected.store); std::copy(view.begin(),view.end(),expected.view);
+    recordIdentity(original.pins[count-4].identity,expected.identities[0]);
+    for (unsigned i = 0; i < 3; ++i) recordIdentity(original.pins[count-3+i].identity,expected.identities[i+1]);
+    recordIdentity(original.pins.back().identity,expected.identities[4]);
+    if (prior == ERROR_SUCCESS) {
+        // Un intent sin resultado sólo puede retomarse con los mismos outputs originales aún presentes.
+        expected.boot = receipt.boot;
+        if (std::memcmp(&expected,&receipt,sizeof(receipt))) return false;
+    } else if (!writeRetirement(key,expected,lease)) return false;
+    if (!original.current() || !admitted()) return false;
+    BOOL needReboot = FALSE;
+    const auto wasRunning = original.state != SERVICE_STOPPED;
+    // Reopen bajo custodia de los handles/ACL originales. SY/BA/TI son TCB sólo filesystem/instalación.
+    const bool removed = uninstall(nullptr,infPath.c_str(),0,&needReboot) != FALSE;
+    const auto error = GetLastError();
+    // Retener identidad y bytes originales aun si Windows desvinculó los nombres durante su operación.
+    bool originals = true;
+    for (auto &pin : original.pins) {
+        BY_HANDLE_FILE_INFORMATION now{};
+        originals = originals && GetFileInformationByHandle(pin.handle.value,&now) &&
+            now.dwVolumeSerialNumber == pin.identity.dwVolumeSerialNumber && now.nFileIndexHigh == pin.identity.nFileIndexHigh &&
+            now.nFileIndexLow == pin.identity.nFileIndexLow && native::protectedObject(pin.handle.value,true,pin.directory,true) &&
+            (pin.directory || (now.nFileSizeHigh == pin.identity.nFileSizeHigh && now.nFileSizeLow == pin.identity.nFileSizeLow &&
+                CompareFileTime(&now.ftLastWriteTime,&pin.identity.ftLastWriteTime) == 0));
+    }
+    if (!removed || !originals || !admitted()) { SetLastError(!removed && error ? error : ERROR_INVALID_STATE); return false; }
+    expected.state = 2; expected.restart = needReboot || wasRunning;
+    if (!writeRetirement(key,expected,lease)) return false;
+    // Cerrar el handle kernel propio: DeleteService diferido no se confirma manteniéndolo abierto.
+    CloseServiceHandle(original.service); original.service = nullptr;
+    reboot = expected.restart != 0;
+    if (reboot) return admitted();
+    return retiredProductDriverCurrent(lease,key,reboot);
+}
+bool Deployment::clearProductDriverRetirement(const deployment_detail::AdministrativeLease &lease,HKEY key) {
+    DriverRetirement receipt{};
+    return current() && lease.ownsConfiguration(key) && readRetirement(key,receipt) && receipt.state == 3 &&
+        RegDeleteValueW(key,L"DriverRetirement") == ERROR_SUCCESS && RegFlushKey(key) == ERROR_SUCCESS && lease.ownsConfiguration(key);
 }
 class GuestMaintenance {
     const DeploymentMode mode_;
     deployment_detail::AdministrativeLease lease_;
-    std::shared_ptr<Deployment> package_, replacement_;
+    std::shared_ptr<Deployment> package_, replacement_, previous_;
+    ReplacementPlan replacementPlan_{};
+    bool haveReplacement_ = false;
+    DriverRetirement retirement_{};
+    bool cleanupReceipt_ = false, userGone_ = false;
     HKEY key_ = nullptr;
     SC_HANDLE manager_ = nullptr, service_ = nullptr;
     std::filesystem::path active_, store_, original_;
@@ -175,27 +470,56 @@ class GuestMaintenance {
     std::wstring recoveryRoot_, recoveryOrdinary_;
     DWORD provision_ = 0, marker_ = 0, start_ = SERVICE_AUTO_START;
     bool hadMarker_ = false, mutated_ = false, closed_ = false;
-    bool finalizing_ = false, pendingRemoval_ = false;
+    bool finalizing_ = false, pendingRemoval_ = false, resumingDriver_ = false, driverGone_ = false, policyRemoval_ = false;
     std::unique_ptr<native::ProtectedDirectory> retainedStore_;
     native::ProcessEvidence process_;
     std::unique_ptr<decisions::MaintenanceRuntime> policy_;
     MaintenanceResult result_;
     bool tuple() const {
+        if (cleanupReceipt_) {
+            DriverRetirement original{};
+            return marker_ == 3 && retirement_.state == 3 && retirement_.userRemoval == 1 &&
+                lease_.ownsConfiguration(key_) && readRetirement(key_,original) && std::memcmp(&original,&retirement_,sizeof(original)) == 0 &&
+                retainedStore_ && retainedStore_->acquire() &&
+                remainingString(key_,L"PackageRoot",active_.native()) &&
+                remainingString(key_,L"OrdinaryImage",(active_/L"GateBouncer.exe").native()) &&
+                remainingString(key_,L"StoreRoot",store_.native()) && remainingString(key_,L"ViewSid",view_) &&
+                remainingDword(key_,L"ProvisionPrincipal",provision_) && remainingDword(key_,L"MaintenanceVersion",1) &&
+                remainingDword(key_,L"MaintenanceState",3);
+        }
         bool present = false; DWORD state = 0, initial = 0;
         std::wstring root, ordinary, store, view;
         return key_ && native::protectedRegistry(key_) && lease_.current() &&
             (!(finalizing_ || mode_ == DeploymentMode::Product) || lease_.ownsConfiguration(key_)) &&
-            (!(finalizing_ || pendingRemoval_) || (retainedStore_ && retainedStore_->acquire())) &&
+            (!(finalizing_ || pendingRemoval_ || resumingDriver_) || (retainedStore_ && retainedStore_->acquire())) &&
             maintenanceState(key_,present,state) && present == hadMarker_ && state == marker_ &&
-            readString(key_,L"PackageRoot",root) && root == active_.native() &&
-            readString(key_,L"OrdinaryImage",ordinary) && ordinary == (active_/L"GateBouncer.exe").native() &&
+            readString(key_,L"PackageRoot",root) &&
+            (haveReplacement_ && marker_ == 2 && replacementPlan_.phase == 2 ?
+                root == replacementPlan_.oldRoot || root == replacementPlan_.newRoot : root == active_.native()) &&
+            readString(key_,L"OrdinaryImage",ordinary) &&
+            (haveReplacement_ && marker_ == 2 && replacementPlan_.phase == 2 ?
+                ordinary == (std::filesystem::path(replacementPlan_.oldRoot)/L"GateBouncer.exe").native() ||
+                ordinary == (std::filesystem::path(replacementPlan_.newRoot)/L"GateBouncer.exe").native() : ordinary == (active_/L"GateBouncer.exe").native()) &&
             readString(key_,L"StoreRoot",store) && store == store_.native() &&
             readString(key_,L"ViewSid",view) && view == view_ &&
             readDword(key_,L"ProvisionPrincipal",initial) && initial == provision_;
     }
     bool current() const {
         if (!tuple() || !package_ || !package_->current() || (replacement_ && !replacement_->current()) ||
-            !service_ || !serviceConfigurationPhase(service_,active_/L"GateBouncerService.exe",start_,0,mode_)) return false;
+            (previous_ && !previous_->current())) return false;
+        if (userGone_) {
+            if (!cleanupReceipt_ || !closed_ || service_ || !manager_) return false;
+            SC_HANDLE probe = OpenServiceW(manager_,deploymentService(mode_),SERVICE_QUERY_STATUS);
+            const auto error = probe ? ERROR_SERVICE_EXISTS : GetLastError();
+            if (probe) CloseServiceHandle(probe);
+            return error == ERROR_SERVICE_DOES_NOT_EXIST && tuple();
+        }
+        if (!service_) return false;
+        const bool serviceExact = haveReplacement_ && marker_ == 2 && replacementPlan_.phase == 2 ?
+            serviceConfigurationPhase(service_,std::filesystem::path(replacementPlan_.oldRoot)/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode_) ||
+            serviceConfigurationPhase(service_,std::filesystem::path(replacementPlan_.newRoot)/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode_) :
+            serviceConfigurationPhase(service_,active_/L"GateBouncerService.exe",start_,0,mode_);
+        if (!serviceExact) return false;
         SERVICE_STATUS_PROCESS info{};
         if (!status(service_,info)) return false;
         if (closed_) return info.dwCurrentState == SERVICE_STOPPED && !info.dwProcessId &&
@@ -219,36 +543,75 @@ class GuestMaintenance {
     }
     MaintenanceResult fail(DWORD error = ERROR_INVALID_STATE,bool pending = false) {
         result_.error = error == ERROR_SUCCESS ? ERROR_INVALID_STATE : error;
-        result_.outcome = pending ? MaintenanceOutcome::Pending : mutated_ ? MaintenanceOutcome::Recovery : MaintenanceOutcome::Rejected;
-        if (mutated_ && recoveryCurrent()) {
+        result_.outcome = pending ? MaintenanceOutcome::Pending :
+            (mutated_ || resumingDriver_ || cleanupReceipt_ || (haveReplacement_ && marker_ == 2)) ?
+                MaintenanceOutcome::Recovery : MaintenanceOutcome::Rejected;
+        // Los receipts Product de retiro conservan marker2/3; nunca convertirlos en marker4 genérico.
+        if (mutated_ && !resumingDriver_ && !driverGone_ &&
+            !(mode_ == DeploymentMode::Product && (haveReplacement_ || marker_ == 2 || marker_ == 3)) && recoveryCurrent()) {
             result_.recoveryRecorded = deployment_detail::mark(key_,4,marker_,lease_);
             if (result_.recoveryRecorded) { marker_ = 4; hadMarker_ = true; }
         }
         return result_;
     }
-    bool admit(const std::filesystem::path &root,bool finalization = false,bool uninstallOnly = false) {
+    bool admit(const std::filesystem::path &root,bool finalization = false,bool uninstallOnly = false,bool updateOnly = false) {
         if (finalization && uninstallOnly) return false;
         finalizing_ = finalization;
         if (!lease_.acquire() || !native::fixedPath(root) || !deployment_detail::disjoint(root,lease_.image().parent_path())) return false;
         active_ = original_ = root; recoveryRoot_ = root.native();
-        recoveryOrdinary_ = (root/L"GateBouncer.exe").native(); package_ = std::make_shared<Deployment>(root,mode_);
-        if (!package_->verify(root/L"GateBouncerService.exe",DeploymentRole::Service) || !package_->current() ||
-            RegOpenKeyExW(lease_.gate(),deploymentConfiguration(mode_),0,KEY_QUERY_VALUE | READ_CONTROL |
-                (finalization ? 0 : KEY_SET_VALUE),&key_) != ERROR_SUCCESS ||
-            !native::protectedRegistry(key_) || !maintenanceState(key_,hadMarker_,marker_) ||
-            (mode_ == DeploymentMode::Product && !hadMarker_) ||
-            (finalization && (!hadMarker_ || !lease_.ownsConfiguration(key_)))) return false;
+        recoveryOrdinary_ = (root/L"GateBouncer.exe").native();
+        if (RegOpenKeyExW(lease_.gate(),deploymentConfiguration(mode_),0,KEY_QUERY_VALUE | READ_CONTROL |
+                (finalization && mode_ == DeploymentMode::Laboratory ? 0 : KEY_SET_VALUE),&key_) != ERROR_SUCCESS ||
+            !native::protectedRegistry(key_)) return false;
+        cleanupReceipt_ = uninstallOnly && mode_ == DeploymentMode::Product && readRetirement(key_,retirement_) &&
+            retirement_.state == 3 && retirement_.userRemoval == 1;
+        if (cleanupReceipt_) {
+            if (root.native() != retirement_.package || !lease_.ownsConfiguration(key_) ||
+                !remainingDword(key_,L"MaintenanceVersion",1) || !remainingDword(key_,L"MaintenanceState",3)) return false;
+            hadMarker_ = true; marker_ = 3;
+        } else if (!maintenanceState(key_,hadMarker_,marker_) || (mode_ == DeploymentMode::Product && !hadMarker_)) return false;
+        if (finalization && (!hadMarker_ || !lease_.ownsConfiguration(key_))) return false;
+        ReplacementPlan pendingPlan{};
+        const bool stagedBeforeIntent = mode_ == DeploymentMode::Product && updateOnly && marker_ == 0 &&
+            readReplacement(key_,pendingPlan) && pendingPlan.phase == 1;
+        if (mode_ == DeploymentMode::Product && updateOnly && (marker_ == 2 || stagedBeforeIntent)) {
+            if (!readReplacement(key_,replacementPlan_) || !native::fixedPath(replacementPlan_.oldRoot) ||
+                !native::fixedPath(replacementPlan_.newRoot) || (root.native() != replacementPlan_.oldRoot && root.native() != replacementPlan_.newRoot) ||
+                !deployment_detail::disjoint(replacementPlan_.oldRoot,replacementPlan_.newRoot)) return false;
+            haveReplacement_ = true;
+            active_ = replacementPlan_.phase == 3 ? replacementPlan_.newRoot : replacementPlan_.oldRoot;
+            original_ = replacementPlan_.oldRoot;
+        }
+        package_ = std::make_shared<Deployment>(active_,mode_);
+        if (!package_->verify(active_/L"GateBouncerService.exe",DeploymentRole::Service) || !package_->current()) return false;
+        if (cleanupReceipt_ && !packageIdentity(*package_,retirement_.packageIdentity,retirement_.inventory,false)) return false;
+        if (haveReplacement_) {
+            auto other = std::make_shared<Deployment>(replacementPlan_.phase == 3 ? replacementPlan_.oldRoot : replacementPlan_.newRoot,mode_);
+            if (!other->verify(other->root()/L"GateBouncerService.exe",DeploymentRole::Service)) return false;
+            auto &oldPackage = replacementPlan_.phase == 3 ? *other : *package_;
+            auto &newPackage = replacementPlan_.phase == 3 ? *package_ : *other;
+            if (!packageIdentity(oldPackage,replacementPlan_.oldIdentity,replacementPlan_.oldInventory,false) ||
+                !packageIdentity(newPackage,replacementPlan_.newIdentity,replacementPlan_.newInventory,false)) return false;
+            if (replacementPlan_.phase == 3) previous_ = std::move(other); else replacement_ = std::move(other);
+        }
         // Sólo desmontaje del tuple Product íntegro retenido antes de instalar el driver.
         pendingRemoval_ = uninstallOnly && mode_ == DeploymentMode::Product && hadMarker_ && marker_ == 1;
-        if (marker_ != 0 && !pendingRemoval_) return false;
+        DriverRetirement receipt{};
+        DWORD receiptBytes = 0;
+        const auto receiptQuery = RegQueryValueExW(key_,L"DriverRetirement",nullptr,nullptr,nullptr,&receiptBytes);
+        resumingDriver_ = mode_ == DeploymentMode::Product && hadMarker_ &&
+            ((uninstallOnly && marker_ == 3) || (updateOnly && marker_ == 2)) &&
+            (readRetirement(key_,receipt) || receiptQuery == ERROR_FILE_NOT_FOUND);
+        if (marker_ != 0 && !pendingRemoval_ && !resumingDriver_) return false;
         std::wstring store;
-        if (!readString(key_,L"StoreRoot",store) || !readString(key_,L"ViewSid",view_) ||
+        if (cleanupReceipt_) { store = retirement_.store; view_ = retirement_.view; provision_ = retirement_.provision; }
+        else if (!readString(key_,L"StoreRoot",store) || !readString(key_,L"ViewSid",view_) ||
             !readDword(key_,L"ProvisionPrincipal",provision_) || provision_ > 1 ||
             (pendingRemoval_ && provision_ != 1)) return false;
         store_ = store;
         native::ProtectedDirectory directory(store_);
         if (!deployment_detail::disjoint(root,store_) || !deployment_detail::disjoint(store_,lease_.image().parent_path()) || !directory.acquire()) return false;
-        if (finalization || pendingRemoval_) {
+        if (finalization || pendingRemoval_ || resumingDriver_) {
             retainedStore_ = std::make_unique<native::ProtectedDirectory>(store_);
             if (!retainedStore_->acquire()) return false;
         }
@@ -259,10 +622,17 @@ class GuestMaintenance {
         if (!manager_) return false;
         service_ = OpenServiceW(manager_,deploymentService(mode_),SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS |
             SERVICE_CHANGE_CONFIG | READ_CONTROL | (finalization ? 0 : SERVICE_STOP | DELETE));
-        if (pendingRemoval_) {
-            // No admite Running/AutoStart ni otro marcador; current exige STOPPED y PID0.
+        if (!service_ && cleanupReceipt_ && GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) userGone_ = true;
+        if (pendingRemoval_ || resumingDriver_) {
+            // Un tuple deshabilitado completo exige STOPPED/PID0; el intent anterior a Disable
+            // sólo puede detener el mismo servicio original, nunca habilitarlo.
             closed_ = true;
             start_ = SERVICE_DISABLED;
+            if (resumingDriver_ && (!haveReplacement_ || replacementPlan_.phase == 1) &&
+                serviceConfigurationPhase(service_,active_/L"GateBouncerService.exe",SERVICE_AUTO_START,0,mode_)) {
+                // Crash entre marker durable y Disable: sólo el mismo tuple original del intent.
+                start_ = SERVICE_AUTO_START; closed_ = false;
+            }
         } else if (finalization) {
             closed_ = true;
             // Sólo esta operación explícita admite Disabled; Auto requiere el mismo readback íntegro.
@@ -318,7 +688,48 @@ class GuestMaintenance {
     bool loadPolicy() {
         if (!closed_ || !current() || policy_) return false;
         policy_.reset(new decisions::MaintenanceRuntime(store_,provision_ == 1,&retained,this,mode_));
-        return policy_->prepare() && policy_->current();
+        return (policyRemoval_ && marker_ == 3 && driverGone_ ? policy_->prepareAfterRemoval() : policy_->prepare()) && policy_->current();
+    }
+    bool completeReceipts() {
+        if (mode_ != DeploymentMode::Product || marker_ != 0 || !current() || !package_->driverInstalledCurrent() ||
+            !policy_ || !policy_->current() || !policy_->inspect(false)) return false;
+        DWORD size = 0;
+        const auto retirementQuery = RegQueryValueExW(key_,L"DriverRetirement",nullptr,nullptr,nullptr,&size);
+        const auto replacementQuery = RegQueryValueExW(key_,L"DriverReplacement",nullptr,nullptr,nullptr,&size);
+        if ((retirementQuery != ERROR_SUCCESS && retirementQuery != ERROR_FILE_NOT_FOUND) ||
+            (replacementQuery != ERROR_SUCCESS && replacementQuery != ERROR_FILE_NOT_FOUND)) return false;
+        if (replacementQuery == ERROR_SUCCESS) {
+            ReplacementPlan plan{};
+            if (!readReplacement(key_,plan) || plan.phase != 3 || active_.native() != plan.newRoot ||
+                !packageIdentity(*package_,plan.newIdentity,plan.newInventory,false)) return false;
+        }
+        if (retirementQuery == ERROR_SUCCESS) {
+            DriverRetirement receipt{};
+            if (!readRetirement(key_,receipt) || receipt.state != 3 || receipt.userRemoval) return false;
+            Deployment original(receipt.package,DeploymentMode::Product);
+            if (!original.verify(original.root()/L"GateBouncerService.exe",DeploymentRole::Service) ||
+                !packageIdentity(original,receipt.packageIdentity,receipt.inventory,false)) return false;
+        }
+        // Marker0 + AUTO + driver/policy originales ya confirmados: limpiar sólo los receipts propios.
+        for (const auto &entry : {std::make_pair(L"DriverRetirement",retirementQuery),std::make_pair(L"DriverReplacement",replacementQuery)}) {
+            if (entry.second == ERROR_FILE_NOT_FOUND) continue;
+            if (!current() || !lease_.ownsConfiguration(key_) || RegDeleteValueW(key_,entry.first) != ERROR_SUCCESS ||
+                RegQueryValueExW(key_,entry.first,nullptr,nullptr,nullptr,&size) != ERROR_FILE_NOT_FOUND) return false;
+        }
+        return RegFlushKey(key_) == ERROR_SUCCESS && current();
+    }
+    MaintenanceResult rebootRequired() {
+        result_.phase = MaintenancePhase::Service; result_.outcome = MaintenanceOutcome::RebootRequired;
+        result_.error = ERROR_SUCCESS_REBOOT_REQUIRED; result_.recoveryRecorded = true; return result_;
+    }
+    bool retireDriver(bool &reboot) {
+        if (!closed_ || !current() || mode_ != DeploymentMode::Product || (marker_ != 2 && marker_ != 3)) return false;
+        // A partir del intent durable, todos los fallos preservan marker2/3 y su tuple.
+        resumingDriver_ = true;
+        if (!retainedStore_) { retainedStore_ = std::make_unique<native::ProtectedDirectory>(store_); if (!retainedStore_->acquire()) return false; }
+        if (!(cleanupReceipt_ ? package_->retiredProductDriverCurrent(lease_,key_,reboot) : package_->retireProductDriver(lease_,key_,reboot)) || !current()) return false;
+        driverGone_ = !reboot;
+        return true;
     }
     bool removeConfiguration() {
         if (!tuple() || !key_ || !closed_) return false;
@@ -330,11 +741,14 @@ class GuestMaintenance {
             const auto *name = names[i]; std::wstring text; DWORD number = 0;
             const bool exact = i < 4 ? readString(key_,name,text) && text == texts[i] :
                 readDword(key_,name,number) && number == numbers[i-4];
-            if (!exact || !native::protectedRegistry(key_) || !lease_.current() || !package_->current() ||
+            DWORD size = 0;
+            const bool alreadyAbsent = cleanupReceipt_ && RegQueryValueExW(key_,name,nullptr,nullptr,nullptr,&size) == ERROR_FILE_NOT_FOUND;
+            if ((!exact && !alreadyAbsent) || !native::protectedRegistry(key_) || !lease_.current() || !package_->current() ||
                 (mode_ == DeploymentMode::Product && !lease_.ownsConfiguration(key_)) ||
-                RegDeleteValueW(key_,name) != ERROR_SUCCESS) return false;
+                (!alreadyAbsent && RegDeleteValueW(key_,name) != ERROR_SUCCESS)) return false;
             DWORD bytes = 0; if (RegQueryValueExW(key_,name,nullptr,nullptr,nullptr,&bytes) != ERROR_FILE_NOT_FOUND) return false;
         }
+        if (cleanupReceipt_ && !package_->clearProductDriverRetirement(lease_,key_)) return false;
         if (RegFlushKey(key_) != ERROR_SUCCESS) return false;
         DWORD subkeys = 0, values = 0;
         if (RegQueryInfoKeyW(key_,nullptr,nullptr,nullptr,&subkeys,nullptr,nullptr,&values,nullptr,nullptr,nullptr,nullptr) != ERROR_SUCCESS) return false;
@@ -379,6 +793,7 @@ class GuestMaintenance {
             }
             if (!current() || !policy_->current() || !policy_->inspect(false) ||
                 !current() || !policy_->current()) return recovery();
+            if (mode_ == DeploymentMode::Product && !completeReceipts()) return recovery();
             result_.phase = MaintenancePhase::Complete;
             result_.outcome = MaintenanceOutcome::PreparedFinalized;
             result_.error = ERROR_SUCCESS; return result_;
@@ -386,15 +801,81 @@ class GuestMaintenance {
     }
     MaintenanceResult update(const std::filesystem::path &root,const std::filesystem::path &source,const std::filesystem::path &replacement) {
         try {
-            if (!admit(root) || lease_.image() != source/L"GateBouncerService.exe" ||
+            if (!admit(root,false,false,true) || lease_.image() != source/L"GateBouncerService.exe" ||
                 !deployment_detail::disjoint(root,replacement) || !deployment_detail::disjoint(store_,replacement)) return fail();
             if (mode_ == DeploymentMode::Product) {
-                // DriverUnload no existe: reemplazar una imagen cargada requiere otro recorrido/reboot.
-                // No cambiar registro/archivos bajo la imagen física actual ni fingir una actualización.
                 result_.phase = MaintenancePhase::Package;
-                result_.outcome = MaintenanceOutcome::Pending;
-                result_.error = ERROR_NOT_SUPPORTED;
-                return result_;
+                if (haveReplacement_) {
+                    if (replacement.native() != replacementPlan_.newRoot || !deployment_detail::disjoint(store_,replacement)) return fail();
+                } else {
+                    DWORD bytes = 0;
+                    if (replacement.native().size() >= MAX_PATH || active_.native().size() >= MAX_PATH ||
+                        RegQueryValueExW(key_,L"DriverReplacement",nullptr,nullptr,nullptr,&bytes) != ERROR_FILE_NOT_FOUND ||
+                        RegQueryValueExW(key_,L"DriverRetirement",nullptr,nullptr,nullptr,&bytes) != ERROR_FILE_NOT_FOUND ||
+                        !deployment_detail::stagePackage(source,replacement,replacement_,mode_) || !current()) return fail();
+                    std::copy(active_.native().begin(),active_.native().end(),replacementPlan_.oldRoot);
+                    std::copy(replacement.native().begin(),replacement.native().end(),replacementPlan_.newRoot);
+                    if (!packageIdentity(*package_,replacementPlan_.oldIdentity,replacementPlan_.oldInventory,true) ||
+                        !packageIdentity(*replacement_,replacementPlan_.newIdentity,replacementPlan_.newInventory,true) ||
+                        !writeReplacement(key_,replacementPlan_,lease_)) return fail();
+                    haveReplacement_ = true;
+                }
+                if (replacementPlan_.phase < 3) {
+                    result_.phase = MaintenancePhase::Marker;
+                    if ((!resumingDriver_ || !closed_) && !begin(2)) return fail(GetLastError());
+                    result_.phase = MaintenancePhase::Stop; if (!closed_ && !stop()) return fail(GetLastError());
+                    result_.phase = MaintenancePhase::Store; if (!loadPolicy()) return fail(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
+                    bool reboot = false;
+                    result_.phase = MaintenancePhase::Service;
+                    if (!retireDriver(reboot)) return fail(GetLastError());
+                    if (reboot) return rebootRequired();
+                    // Journal de los outputs NT-relative propios antes de cualquier switch mutable.
+                    replacementPlan_.phase = 2;
+                    if (!writeReplacement(key_,replacementPlan_,lease_) || !current() || !policy_->current()) return fail();
+                    result_.phase = MaintenancePhase::Switch;
+                    const auto command = deploymentCommand(replacement/L"GateBouncerService.exe",mode_);
+                    if (!ChangeServiceConfigW(service_,SERVICE_NO_CHANGE,SERVICE_DISABLED,SERVICE_NO_CHANGE,command.c_str(),
+                        nullptr,nullptr,nullptr,nullptr,nullptr,nullptr) || !current() ||
+                        !deployment_detail::setString(key_,L"PackageRoot",replacement.native()) || !current() ||
+                        !deployment_detail::setString(key_,L"OrdinaryImage",(replacement/L"GateBouncer.exe").native()) || !current() ||
+                        RegFlushKey(key_) != ERROR_SUCCESS) return fail(GetLastError());
+                    if (!policy_->missing() && provision_ != 0) {
+                        if (!deployment_detail::setDword(key_,L"ProvisionPrincipal",0)) return fail(GetLastError());
+                        provision_ = 0;
+                        if (RegFlushKey(key_) != ERROR_SUCCESS || !current() || !policy_->current()) return fail();
+                    }
+                    previous_ = std::move(package_); package_ = std::move(replacement_); active_ = replacement;
+                    replacementPlan_.phase = 3; replacementPlan_.restart = 1;
+                    if (!lease_.bootIdentity(replacementPlan_.installBoot) || !writeReplacement(key_,replacementPlan_,lease_) || !current()) return fail();
+                } else {
+                    result_.phase = MaintenancePhase::Store;
+                    if (!loadPolicy()) return fail(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
+                }
+                result_.phase = MaintenancePhase::Service;
+                if (!package_->admitProductDriver()) {
+                    // No se adopta ningún driver por nombre: install exige namespace ausente y el plan original.
+                    if (!package_->installProductDriver(lease_,key_)) {
+                        if (GetLastError() == ERROR_SUCCESS_REBOOT_REQUIRED) return rebootRequired();
+                        return fail(GetLastError());
+                    }
+                    replacementPlan_.restart = 0;
+                    if (!writeReplacement(key_,replacementPlan_,lease_)) return fail();
+                } else if (replacementPlan_.restart) {
+                    wire::Id boot{};
+                    if (!lease_.bootIdentity(boot)) return fail();
+                    if (boot == replacementPlan_.installBoot) return rebootRequired();
+                    replacementPlan_.restart = 0;
+                    if (!writeReplacement(key_,replacementPlan_,lease_)) return fail();
+                }
+                if (!package_->driverInstalledCurrent() || !current() || !policy_->current() || !policy_->inspect(false) ||
+                    !deployment_detail::mark(key_,0,marker_,lease_)) return fail();
+                marker_ = 0;
+                if (!current() || !ChangeServiceConfigW(service_,SERVICE_NO_CHANGE,SERVICE_AUTO_START,SERVICE_NO_CHANGE,
+                    nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr)) return fail(GetLastError());
+                start_ = SERVICE_AUTO_START;
+                if (!current() || !policy_->current() || !completeReceipts()) return fail();
+                result_.phase = MaintenancePhase::Complete; result_.outcome = MaintenanceOutcome::UpdatedPrepared;
+                result_.error = ERROR_SUCCESS; return result_;
             }
             result_.phase = MaintenancePhase::Package;
             if (!deployment_detail::stagePackage(source,replacement,replacement_,mode_) || !current()) return fail();
@@ -432,7 +913,7 @@ class GuestMaintenance {
     MaintenanceResult uninstall(const std::filesystem::path &root) {
         try {
             if (!admit(root,false,true)) return fail();
-            if (mode_ == DeploymentMode::Product) {
+            if (mode_ == DeploymentMode::Product && pendingRemoval_) {
                 SC_HANDLE kernel = OpenServiceW(manager_,L"LGAGateBouncerClassifier",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL);
                 const auto error = kernel ? ERROR_SERVICE_EXISTS : GetLastError();
                 const auto absent = !kernel && error == ERROR_SERVICE_DOES_NOT_EXIST;
@@ -451,17 +932,32 @@ class GuestMaintenance {
                 result_.phase = MaintenancePhase::Store;
                 if (!loadPolicy() || !policy_->missing()) return fail(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
             }
-            result_.phase = MaintenancePhase::Marker; if (!begin(3)) return fail(GetLastError());
-            result_.phase = MaintenancePhase::Stop; if (!stop()) return fail(GetLastError());
+            result_.phase = MaintenancePhase::Marker; if ((!resumingDriver_ || !closed_) && !begin(3)) return fail(GetLastError());
+            result_.phase = MaintenancePhase::Stop; if (!closed_ && !stop()) return fail(GetLastError());
+            if (mode_ == DeploymentMode::Product && !pendingRemoval_) {
+                bool reboot = false;
+                if (!retireDriver(reboot)) return fail(GetLastError());
+                if (reboot) return rebootRequired();
+                // Receipt driverGone durable: después de un crash sólo PRESENT exacto
+                // o catálogo completamente AUSENTE readonly, nunca inventario parcial.
+                policyRemoval_ = true;
+            }
             result_.phase = MaintenancePhase::Store;
             if ((!policy_ && !loadPolicy()) || !policy_ || !policy_->current())
                 return fail(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
             result_.phase = MaintenancePhase::Filters;
             if (!policy_->remove()) return fail(policy_->error_);
             result_.phase = MaintenancePhase::Service;
-            if (!current() || !policy_->current() || !DeleteService(service_)) return fail(GetLastError());
+            if (!current() || !policy_->current()) return fail();
+            if (driverGone_ && !cleanupReceipt_) {
+                if (!readRetirement(key_,retirement_) || retirement_.state != 3) return fail();
+                retirement_.userRemoval = 1;
+                if (!writeRetirement(key_,retirement_,lease_)) return fail();
+                cleanupReceipt_ = true;
+            }
+            if (!userGone_ && (!current() || !DeleteService(service_))) return fail(GetLastError());
             // Este owner nunca adquirió Deployment::Registration. Cerrar TODO SC_HANDLE propio al servicio.
-            CloseServiceHandle(service_); service_ = nullptr;
+            if (service_) CloseServiceHandle(service_); service_ = nullptr;
             const auto deadline = GetTickCount64()+2000; DWORD error = ERROR_SERVICE_MARKED_FOR_DELETE;
             do {
                 if (!tuple() || !package_->current()) return fail();
@@ -473,6 +969,7 @@ class GuestMaintenance {
                 Sleep(25);
             } while (GetTickCount64() < deadline);
             if (error != ERROR_SERVICE_DOES_NOT_EXIST) return fail(error,true);
+            userGone_ = true;
             result_.phase = MaintenancePhase::Configuration;
             if (!removeConfiguration()) return fail(GetLastError());
             result_.phase = MaintenancePhase::Complete; result_.outcome = MaintenanceOutcome::UninstalledRetained;

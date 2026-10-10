@@ -2,7 +2,7 @@
 #include "deployment_prepare_win.h"
 #include "../common/token_ii_win.h"
 namespace gb::controller {
-enum class MaintenanceOutcome { Rejected, Recovery, Pending, UpdatedPrepared, UninstalledRetained, PreparedFinalized };
+enum class MaintenanceOutcome { Rejected, Recovery, Pending, UpdatedPrepared, UninstalledRetained, PreparedFinalized, RebootRequired };
 enum class MaintenancePhase { Admission, Package, Marker, Stop, Store, Inventory, Switch, Filters, Service, Configuration, Complete };
 struct MaintenanceResult {
     MaintenanceOutcome outcome = MaintenanceOutcome::Rejected;
@@ -28,6 +28,7 @@ bool setDword(HKEY, const wchar_t *, DWORD);
 class AdministrativeLease;
 bool mark(HKEY, DWORD state, DWORD expectedState, const AdministrativeLease &);
 bool disjoint(const std::filesystem::path &, const std::filesystem::path &);
+bool replacementCurrent(Deployment &, HKEY);
 // Sólo operaciones administrativas; no es prueba de invitado o contención.
 class AdministrativeLease {
   public:
@@ -36,6 +37,7 @@ class AdministrativeLease {
     bool acquire(bool fresh = false);
     bool current() const;
     bool ownsConfiguration(HKEY) const;
+    bool bootIdentity(wire::Id &);
     HKEY gate() const { return gate_; }
     const std::filesystem::path &image() const { return image_; }
   private:
@@ -43,6 +45,8 @@ class AdministrativeLease {
     native::Handle mutex_, token_;
     HKEY gate_ = nullptr;
     HKEY parent_ = nullptr;
+    HKEY boot_ = nullptr;
+    wire::Id bootId_{};
     native::TokenEvidence actor_;
     std::filesystem::path image_;
     std::vector<native::Handle> source_;

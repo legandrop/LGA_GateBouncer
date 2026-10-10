@@ -12,6 +12,7 @@ class MaintenanceRuntime final {
     explicit MaintenanceRuntime(std::filesystem::path store, bool allowMissing, Current, void *,
                                 controller::DeploymentMode);
     bool prepare();
+    bool prepareAfterRemoval();
     bool current() const;
     bool inspect(bool insideWrite);
     bool absent(bool insideWrite);
@@ -19,7 +20,7 @@ class MaintenanceRuntime final {
     bool remove();
     bool missing() const { return read_.kind == principal::StoredImage::Missing; }
     DWORD error_ = ERROR_INVALID_STATE;
-    bool attempted_ = false, committed_ = false, cleanupUnknown_ = false;
+    bool attempted_ = false, committed_ = false, cleanupUnknown_ = false, resumeRemoval_ = false, removedInventory_ = false;
     Current check_; void *context_;
     bool allowMissing_;
     const controller::DeploymentMode mode_;
