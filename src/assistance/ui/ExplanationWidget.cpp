@@ -110,12 +110,12 @@ void ExplanationWidget::refresh(){
     if(session_&&!session_->problem().isEmpty())text=session_->problem();
     text_->setText(text);
     networkDetails_->setText(network);
-    localSummary_->setText(local?"Local file: "+signatureText(local->signature)+" · safety unproven":"Local file check: Unknown · no current retained snapshot");
+    localSummary_->setText(local?"File at observed path: "+signatureText(local->signature)+" · safety unproven":"File at observed path: Unknown · no current retained snapshot");
     QString localText="Local signature, certificate publisher and file metadata: Unknown.";
     if(local)localText=signatureText(local->signature)+"\nCertificate publisher (local): "+
         (local->publisher.empty()?QString("Unknown"):QString::fromUtf8(local->publisher))+"\nFile size: "+QString::number(local->size)+
         " bytes\nFile modified: "+utc(local->modifiedAtMs)+"\nLocally checked: "+utc(local->checkedAtMs);
-    localDetails_->setText(localText+"\nSource: the retained local file and offline Authenticode policy. No current revocation or catalog verification. A signed file may still be harmful; an unsigned file is not necessarily harmful. These facts do not establish legitimacy or decide permissions.");
+    localDetails_->setText(localText+"\nSource: the retained local file opened at the observed path and offline Authenticode policy. The image loaded by the process is not verified. No current revocation or catalog verification. A signed file may still be harmful; an unsigned file is not necessarily harmful. These facts do not establish legitimacy or decide permissions.");
     delete citations_->layout();qDeleteAll(citations_->findChildren<QLabel*>(QString{},Qt::FindDirectChildrenOnly));
     auto* sources=new QVBoxLayout(citations_);sources->setContentsMargins(0,0,0,0);
     if(result)for(const auto& citation:result->citations){
