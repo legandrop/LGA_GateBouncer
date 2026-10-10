@@ -21,13 +21,14 @@ if not "%~1"=="" if not "%~1"=="--no-run" (
 )
 set "PATH=%MINGW_ROOT%\bin;%NINJA_ROOT%;%QT_ROOT%\bin;%PATH%"
 if not defined GATEBOUNCER_BUILD_DIR set "GATEBOUNCER_BUILD_DIR=%~dp0build"
+if not defined GATEBOUNCER_BUILD_JOBS set "GATEBOUNCER_BUILD_JOBS=1"
 if defined GATEBOUNCER_OBSERVER_SOURCE (
   call "%QT_ROOT%\bin\qt-cmake.bat" -S "%~dp0." -B "%GATEBOUNCER_BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGATEBOUNCER_OBSERVER_SOURCE="%GATEBOUNCER_OBSERVER_SOURCE%"
 ) else (
   call "%QT_ROOT%\bin\qt-cmake.bat" -S "%~dp0." -B "%GATEBOUNCER_BUILD_DIR%" -G Ninja -DCMAKE_BUILD_TYPE=Release -DGATEBOUNCER_OBSERVER_SOURCE=
 )
 if errorlevel 1 exit /b 1
-cmake --build "%GATEBOUNCER_BUILD_DIR%" --parallel 4
+cmake --build "%GATEBOUNCER_BUILD_DIR%" --parallel "%GATEBOUNCER_BUILD_JOBS%"
 if errorlevel 1 exit /b 1
 echo Compilacion lista. El script no inicia la aplicacion.
 exit /b 0
