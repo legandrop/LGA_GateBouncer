@@ -825,7 +825,7 @@ void MainWindow::buildPage() {
         const QMap<QString, QStringList> liveHeadings{
             {"processes", {"Processes", "Observed local processes · policy and network history are unknown."}},
             {"pending", {"Pending requests", "Review an application's request and choose how long your decision applies."}},
-            {"activity", {"Activity", "Retained attempts, causal applied decisions and history gaps · traffic unknown."}},
+            {"activity", {"Activity", "Connection requests, decisions and available history."}},
             {"rules", {"Rules", "Service policy records and inactive local review candidates."}},
             {"import", {"Import from NetLimiter", "Structural analysis only · compatibility not validated."}},
             {"settings", {"Settings", "Engine status and assistance configuration with separate consents."}}};
@@ -1192,23 +1192,25 @@ void MainWindow::refreshTable(bool newPage) {
                 const auto &n = *e.native;
                 const QString at = e.observedAtUtc.isValid()
                     ? QLocale().toString(e.observedAtUtc.toLocalTime(), QLocale::ShortFormat)
-                    : "Observed time unknown";
+                    : "Event time unknown";
                 const QString received = QLocale().toString(e.receivedAtUtc.toLocalTime(), QLocale::ShortFormat);
                 const QString kind = e.kind == Data::ActivityKind::Authorization
-                    ? (e.action == Data::Action::Allow ? "Applied Allow decision" : "Applied Block decision")
-                    : e.kind == Data::ActivityKind::Traffic ? "OS layer activity observed" : "Attempt observed";
+                    ? (n.scope == 2
+                        ? (e.action == Data::Action::Allow ? "Allow rule saved" : "Block rule saved")
+                        : (e.action == Data::Action::Allow ? "Access allowed" : "Access blocked"))
+                    : e.kind == Data::ActivityKind::Traffic ? "Traffic observed" : "Connection request";
                 const QString reason = e.kind == Data::ActivityKind::Traffic
                     ? QString("%1 bytes · %2 network buffers observed\n%3")
                         .arg(e.bytes ? QString::number(*e.bytes) : "Unknown", QString::number(n.packetCount),
-                            n.externalPartial ? "Causal evidence unavailable · partial evidence" : "Delivery and physical packet count unproven")
-                    : n.externalPartial ? "Causal evidence unavailable · partial evidence"
+                            n.externalPartial ? "Related request unavailable · history incomplete" : "Delivery and physical packet count unproven")
+                    : n.externalPartial ? "Related request unavailable · history incomplete"
                     : e.kind == Data::ActivityKind::Authorization
-                        ? (n.routeMask == 7 ? "Causal applied decision · traffic recorded separately" : "Causal applied decision · traffic unknown")
-                    : n.source == 2 ? "Retained classifier cause · traffic unknown" : "Copied SDK drop · subset only";
-                const QString image = n.process ? n.process->image.section('\\',-1) + " · source image\n" : QString{};
+                        ? (n.routeMask == 7 ? "Decision recorded · traffic recorded separately" : "Decision recorded · traffic unknown")
+                    : n.source == 2 ? "Request recorded · traffic unknown" : "Blocked request reported · limited history";
+                const QString image = n.process ? n.process->image.section('\\',-1) + "\nRecorded application" : "Application unknown";
                 result.push_back({"history:" + Data::nativeEventKey(e),
                     {{at + "\nReceived " + received, {}, qulonglong(e.sequence.toULongLong())},
-                     {image + "Observed " + n.observed.left(12) + "\nBinding " + n.captureBinding.left(12), {}, {}},
+                     {image, {}, {}},
                      {kind, n.externalPartial ? "warning" : "", {}},
                      {(e.kind == Data::ActivityKind::Traffic ?
                         (n.packetDirection == 1 ? "Outbound packet activity" : "Inbound packet activity") :
@@ -1224,8 +1226,8 @@ void MainWindow::refreshTable(bool newPage) {
                                                       : "Omitted record count unknown";
                     result.push_back({"history-gap:" + coverage.sourceId + ':' + coverage.sourceEpoch + ':' + QString::number(index++),
                         {{"Gap received\n" + QLocale().toString(gap.atUtc.toLocalTime(), QLocale::ShortFormat), {}, qulonglong(gap.resync)},
-                         {"Source " + coverage.native->sourceEpoch.left(12), {}, {}},
-                         {"Observation gap", "warning", {}}, {"Unknown", {}, {}},
+                         {"Application unknown", {}, {}},
+                         {"History incomplete", "warning", {}}, {"Unknown", {}, {}},
                          {gap.reason + "\n" + loss, {}, {}}}});
                 }
             }
@@ -2035,9 +2037,9 @@ void MainWindow::renderLive() {
         }
         pageLayout_->addWidget(label(nativeSources
             ? QString("Coverage: %1 · %2 historical sources · %3 recorded gaps. Archived records do not report current permissions.")
-                .arg(liveSources ? "Partial retained-cause subset" : "Unavailable; archived evidence retained").arg(nativeSources).arg(gaps)
-            : "Coverage: Unavailable · a service heartbeat does not report traffic.", "faint", true));
-        pageLayout_->addWidget(label("History starts at subscription and retains 4,096 detail events. Attempt, applied decision and traffic are separate facts. Authorization time can be unknown; traffic and process attribution remain unknown until their original sources are available. Silence does not establish inactivity.", "faint", true));
+                .arg(liveSources ? "Partial available history" : "Monitoring unavailable; saved history retained").arg(nativeSources).arg(gaps)
+            : "Monitoring unavailable · a service heartbeat does not report traffic.", "faint", true));
+        pageLayout_->addWidget(label("History starts when monitoring connects and retains 4,096 detail events. Connection requests, decisions and traffic are recorded separately. Decision time can be unknown; traffic and application identity remain unknown until their original sources are available. No recorded events does not mean an application was inactive.", "faint", true));
         if (!product_.historyError().isEmpty()) pageLayout_->addWidget(note(product_.historyError()));
     } else if (view_ == "rules") {
         pageLayout_->addWidget(label("Engine rules: " + (product_.recordsSelected() && product_.records()->recordsCurrent()
