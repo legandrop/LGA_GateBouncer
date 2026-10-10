@@ -38,6 +38,7 @@ struct GeneralFactory::Data : std::enable_shared_from_this<Data> {
     std::unique_ptr<GeneralServer> server;
     std::optional<WebSearchDisclosure> web;
     PendingResolver pendingResolver;
+    std::shared_ptr<const OwnedPendingPresentation> ownedPending;
     std::uint64_t pendingGeneration=0;
     bool pendingInFlight=false;
     Web::ProviderConfig provider;
@@ -99,8 +100,21 @@ struct GeneralFactory::Data : std::enable_shared_from_this<Data> {
             std::move(ref),modelDescriptor(model,canonical),std::move(expectedWeb));
     }
     void retirePending(){
+        ownedPending.reset();
         if(pendingGeneration!=UINT64_MAX)++pendingGeneration;
         if(pendingResolver.retire)pendingResolver.retire();
+    }
+    bool publicCurrent(const FullBinding& binding,const PublicFields& fields){
+        if(!fields.destination)return true;
+        const auto original=ownedPending;const auto generation=pendingGeneration;
+        const auto active=[&]{return !closed&&ownedPending==original&&pendingGeneration==generation;};
+        if(!original||!original->lifetime_||!original->current_||!original->view_.destination()||
+            !(*original->view_.destination()==*fields.destination)||!validDestination(*fields.destination,true)||!peer()||!active())return false;
+        if(!original->current_()||!active())return false;
+        const auto canonical=status();const auto notice=presentation(canonical);if(!active()||!notice)return false;
+        const auto expected=pendingFullBinding(original->view_,*notice,canonical,original->connection_);
+        if(!expected||*expected!=binding||!active())return false;
+        const bool current=original->current_();return current&&active()&&peer()&&active()&&sameConfigurationView(canonical,status())&&active();
     }
     void pendingControl(Broker::Frame request,GeneralServer::PendingCompletion completion){
         auto stale=[completion]{Broker::Frame f;f.message=Broker::Message::ErrorReply;
@@ -144,6 +158,7 @@ struct GeneralFactory::Data : std::enable_shared_from_this<Data> {
             if(!pending||!config||!current()){if(!d->closed&&d->pendingGeneration==generation)d->retirePending();stale();return;}
             Broker::Frame reply;reply.message=Broker::Message::ConfigurationStatusReply;
             reply.fields[70]=*config;reply.fields[76]=notice;reply.fields[77]=*pending;
+            d->ownedPending=owner;
             completion(std::move(reply),std::move(current));
         };
         // La entrega conserva el dispatcher; un worker nunca toca el estado Qt directamente.
@@ -237,6 +252,7 @@ GeneralFactory::GeneralFactory(std::shared_ptr<FrameChannel> channel,std::shared
     d->server->setPendingControl([weak](Broker::Frame frame,GeneralServer::PendingCompletion completion){
         if(const auto owner=weak.lock())owner->pendingControl(std::move(frame),std::move(completion));
     },[weak]{if(const auto owner=weak.lock())owner->retirePending();});
+    d->server->setPublicControl([weak](const FullBinding& b,const PublicFields& p){const auto owner=weak.lock();return owner&&owner->publicCurrent(b,p);});
 }
 std::unique_ptr<GeneralFactory> GeneralFactory::forCurrentUser(std::unique_ptr<Broker::PipeSession> session,
     GeneralCoordinator::Current current,const Web::ProviderConfig& provider) {

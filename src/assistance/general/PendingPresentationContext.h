@@ -24,17 +24,19 @@ public:
     std::uint64_t profileGeneration() const {return profileGeneration_;}
     const Id128& snapshotToken() const {return snapshotToken_;}
     std::uint64_t snapshotGeneration() const {return snapshotGeneration_;}
+    const std::optional<Destination>& destination() const {return destination_;}
 private:
     friend class GeneralBrokerHost;
     friend std::optional<PendingPresentationContext> pendingPresentationContext(const QByteArray&);
     PendingPresentationContext(PendingServiceContext service,Id128 request,Id128 selector,
         std::uint64_t requestRevision,std::uint64_t selectorRevision,std::uint64_t profileGeneration,
-        Id128 token,std::uint64_t generation):service_(service),request_(request),selector_(selector),
+        Id128 token,std::uint64_t generation,std::optional<Destination> destination={}):service_(service),request_(request),selector_(selector),
         snapshotToken_(token),requestRevision_(requestRevision),selectorRevision_(selectorRevision),
-        profileGeneration_(profileGeneration),snapshotGeneration_(generation){}
+        profileGeneration_(profileGeneration),snapshotGeneration_(generation),destination_(std::move(destination)){}
     PendingServiceContext service_;
     Id128 request_,selector_,snapshotToken_;
     std::uint64_t requestRevision_,selectorRevision_,profileGeneration_,snapshotGeneration_;
+    std::optional<Destination> destination_;
 };
 std::optional<Id128> pendingQuery(const QByteArray&);
 std::optional<QByteArray> pendingQueryBytes(const Id128&);

@@ -33,20 +33,29 @@ std::optional<FullBinding> readBinding(const QByteArray& bytes,bool pending){
     return r.end()&&validBinding(b,pending)?std::optional<FullBinding>(std::move(b)):std::nullopt;
 }
 std::optional<PublicFields> readPublic(const QByteArray& bytes){
-    auto j=Retrieval::strictJson(bytes,512);if(!j||!j->exact({"product","publisher","query"}))return {};
+    auto j=Retrieval::strictJson(bytes,1024);if(!j||!j->exact({"product","publisher","query","destination"}))return {};
     const auto product=j->get("product")->text(),query=j->get("query")->text();if(!product||!query)return {};
     PublicFields p{product->toUtf8().toStdString(),{},query->toUtf8().toStdString()};const auto* publisher=j->get("publisher");
     if(publisher->kind!=Retrieval::Json::Kind::Null){auto text=publisher->text();if(!text)return {};p.publisher=text->toUtf8().toStdString();}
+    const auto* d=j->get("destination");
+    if(d->kind!=Retrieval::Json::Kind::Null){
+        if(!d->exact({"address","port","protocol","observed_at_ms"}))return {};
+        const auto address=d->get("address")->text();const auto port=d->get("port")->integer(),protocol=d->get("protocol")->integer(),at=d->get("observed_at_ms")->integer();
+        if(!address||!port||*port>65535||!protocol||*protocol>255||!at)return {};
+        p.destination=Destination{address->toStdString(),std::uint16_t(*port),std::uint8_t(*protocol),*at};
+    }
     return GeneralPayloadBuilder::publicJson(p)?std::optional<PublicFields>(std::move(p)):std::nullopt;
 }
 std::optional<std::vector<Citation>> readCitations(const QByteArray& bytes){
     auto j=Retrieval::strictJson(bytes,4096);if(!j||j->kind!=Retrieval::Json::Kind::Array||j->array.size()>3)return {};
     std::vector<Citation> out;
     for(const auto& value:j->array){
-        if(!value.exact({"id","url","title","snippet","origin","retrieved_at_ms","shortened"}))return {};
+        if(!value.exact({"id","url","title","snippet","origin","retrieved_at_ms","shortened","kind","subject"}))return {};
         const auto id=value.get("id")->integer(),at=value.get("retrieved_at_ms")->integer();const auto shortened=value.get("shortened")->boolean();
         if(!id||*id!=out.size()+1||!at||!*at||!shortened)return {};
         Citation c;c.id=std::uint8_t(*id);c.retrievedAtMs=*at;c.shortened=*shortened;
+        const auto kind=value.get("kind")->integer();const auto subject=value.get("subject")->text();if(!kind||*kind>2||!subject)return {};
+        c.kind=std::uint8_t(*kind);c.subject=subject->toStdString();
         std::string* destinations[]={&c.url,&c.title,&c.snippet,&c.origin};const char* keys[]={"url","title","snippet","origin"};
         for(int n=0;n<4;++n){const auto text=value.get(keys[n])->text();if(!text)return {};*destinations[n]=text->toUtf8().toStdString();}
         out.push_back(std::move(c));

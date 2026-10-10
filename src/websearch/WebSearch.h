@@ -1,4 +1,5 @@
 #pragma once
+#include "DestinationEvidence.h"
 
 #include <QByteArray>
 #include <QDateTime>
@@ -9,6 +10,7 @@
 #include <QUrl>
 #include <QVector>
 #include <memory>
+#include <functional>
 
 namespace gatebouncer::websearch {
 enum class Provider { MwmblV2, SearXng };
@@ -23,6 +25,7 @@ struct SearchInput {
     QString requestId;
     quint64 generation = 0;
     QString publicQuery;
+    std::optional<Destination> destination;
 };
 struct Citation {
     QString title;
@@ -30,6 +33,8 @@ struct Citation {
     QUrl url;
     QString origin;
     QDateTime retrievalUtc;
+    quint8 kind=0; // 0 snippet, 1 registro RDAP, 2 documentación oficial con IP literal.
+    QString subject;
 };
 struct SearchResult {
     SearchInput input;
@@ -39,7 +44,8 @@ struct SearchResult {
     Status status = Status::Unavailable;
     QVector<Citation> citations;
 };
-struct HttpRequest { ProviderConfig config; QString query; };
+struct HttpRequest { ProviderConfig config; QString query; Resource resource=Resource::Search;
+    QUrl evidenceUrl;std::optional<Destination> destination; };
 struct HttpResponse {
     bool transportOk = false;
     int statusCode = 0;
@@ -85,13 +91,18 @@ public:
     QString disclosure() const;
     bool grantConsent(const QByteArray &binding);
     void revokeConsent();
-    bool begin(const SearchInput &input);
+    bool begin(const SearchInput &input,std::function<bool()> current={});
     void cancel();
 signals:
     void finished(const gatebouncer::websearch::SearchResult &result);
 private:
     void tick();
     void complete(Status status);
+    bool startResource(Resource,const QUrl&);
+    void nextResource();
+    void finishEvidence();
+    bool sourceCurrent();
+    std::function<bool()> current_;
     std::shared_ptr<Transport> transport_;
     std::shared_ptr<Exchange> exchange_;
     ProviderConfig config_;
@@ -106,6 +117,14 @@ private:
     QString lastQuery_;
     qint64 lastQueryAt_ = -600000;
     qint64 deadline_ = 0;
+    bool working_=false;
+    bool reusedDestinationCache_=false;
+    Resource resource_=Resource::Search;
+    QUrl resourceUrl_;
+    QByteArray bootstrap4_,bootstrap6_;
+    qint64 bootstrap4At_=0,bootstrap6At_=0;
+    struct DestinationCache { QString key;QVector<Citation> evidence;qint64 at=0; };
+    QVector<DestinationCache> destinationCache_;
 };
 }
 Q_DECLARE_METATYPE(gatebouncer::websearch::SearchResult)

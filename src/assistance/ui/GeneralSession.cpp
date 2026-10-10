@@ -170,6 +170,11 @@ bool GeneralSession::selectPending(const G::Id128& request,G::PendingServiceCont
     if(!sent)failed("The current request could not be read. Your request remains undecided.");else emit changed();
     return sent;
 }
+std::optional<G::Destination> GeneralSession::observedDestination() const {
+    const auto stamp=generation_;QPointer<const GeneralSession> self(this);
+    const auto binding=pendingBinding();
+    return self&&binding&&self->generation_==stamp&&self->pendingPresentation_?self->pendingPresentation_->destination():std::nullopt;
+}
 bool GeneralSession::publicReviewCurrent() const {
     if(!review_||!view_||!presentation_||!pendingCurrent_||!available())return false;
     const auto review=*review_;const auto stamp=generation_;const auto predicate=pendingCurrent_;
@@ -228,6 +233,11 @@ bool GeneralSession::reviewPublicFields(G::PublicFields fields){
     if(busy_||!pendingPresentation_||!G::validPublicFields(fields))return false;
     QPointer<GeneralSession> self(this);const auto before=generation_;
     const auto binding=pendingBinding();if(!self||!binding||before!=generation_||!pendingPresentation_)return false;
+    const auto original=pendingPresentation_->destination();
+    if(fields.destination&&(!original||!(*fields.destination==*original)))return false;
+    if(original&&G::validDestination(*original,true))fields.destination=original;
+    else fields.destination.reset();
+    if(!G::validPublicFields(fields))return false;
     const auto bytes=G::pendingPresentationBytes(*pendingPresentation_);if(!bytes||before==UINT64_MAX)return false;
     const auto stamp=before+1;
     if(!clearPublicReview()||!self||generation_!=stamp||!pendingBinding_||*pendingBinding_!=*binding||
@@ -263,7 +273,8 @@ bool GeneralSession::registerPublic(G::FullBinding binding,G::PublicFields field
     if(busy_||!view_||!available())return false;
     const auto predicate=pendingCurrent_;const auto before=generation_;QPointer<GeneralSession> guarded(this);
     const bool valid=predicate(binding);if(!guarded||!valid||!guarded->current(before))return false;
-    cancel();pendingBinding_=binding;busy_=true;approving_=true;problem_.clear();state_=G::State::Searching;const auto stamp=generation_;QPointer<GeneralSession> self(this);
+    const auto projection=pendingBinding_&&*pendingBinding_==binding?pendingPresentation_:std::nullopt;
+    cancel();pendingBinding_=binding;pendingPresentation_=projection;busy_=true;approving_=true;problem_.clear();state_=G::State::Searching;const auto stamp=generation_;QPointer<GeneralSession> self(this);
     const bool sent=client_->approve(binding,fields,[self,stamp,startAfterRegistration](std::optional<G::ApprovedPublicContext> approval,G::Failure failure){
         if(!self||!self->current(stamp))return;
         if(!approval||failure!=G::Failure::None){self->state_=G::State::Failed;self->failed("The public query is no longer approved for this request.");return;}

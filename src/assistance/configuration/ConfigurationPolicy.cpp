@@ -29,17 +29,17 @@ ActivationCause availability(const AuthorityImage &a,std::uint64_t) {
     return ActivationCause::Ready;
 }
 const std::string &trialModelNoticeBody() {
-    static const std::string notice="For internal testing and evaluation only. Your API key does not verify production rights or remaining trial credits. Public application information, including the executable name, and approved search evidence are sent to NVIDIA. Do not include personal, confidential or sensitive information. NVIDIA may collect requests and responses to operate and improve its services and AI models, and log use for security, fraud and abuse monitoring with third-party providers. Trial time and credit limits apply; production use requires a separate service subscription. Explanations can be wrong and never decide Allow or Block or establish that a file is safe. Review the NVIDIA API Trial Terms of Service before use: https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf";
+    static const std::string notice="For internal testing and evaluation only. Your API key does not verify production rights or remaining trial credits. Public application information, including the executable name, and approved search evidence are sent to NVIDIA. Approved public destination IP, port and protocol and retrieved registration or official endpoint evidence may also be sent. Internal and reserved addresses are excluded. Registration does not prove the final service, telemetry or safety; blocking impact may be unknown. Do not include personal, confidential or sensitive information. NVIDIA may collect requests and responses to operate and improve its services and AI models, and log use for security, fraud and abuse monitoring with third-party providers. Trial time and credit limits apply; production use requires a separate service subscription. Explanations can be wrong and never decide Allow or Block or establish that a file is safe. Review the NVIDIA API Trial Terms of Service before use: https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf";
     return notice;
 }
 ProviderRecord nvidiaTrial() {
     ProviderRecord p;
-    const std::string destination="https://integrate.api.nvidia.com:443/v1/chat/completions|POST|TLS|no-redirect|"+p.model+"|InternalEvaluation|GB_GENERAL_SNIPPETS_ULTRA_1|1";
+    const std::string destination="https://integrate.api.nvidia.com:443/v1/chat/completions|POST|TLS|no-redirect|"+p.model+"|InternalEvaluation|GB_GENERAL_SNIPPETS_ULTRA_1|2";
     p.destination=digest("GB_DESTINATION_MODEL_MODE_1",reinterpret_cast<const unsigned char *>(destination.data()),destination.size());
     const std::string trial="https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf|1.2|1.4|internal-testing-evaluation-only|production-subscription-pending";
     p.evidenceRevision=digest("GB_PROVIDER_EVIDENCE_REVISION_1",reinterpret_cast<const unsigned char *>(trial.data()),trial.size());
     const auto &notice=trialModelNoticeBody();
-    p.notice.granted=true;p.notice.noticeRevision=2;p.notice.profileRef=p.profile;p.notice.destinationPolicyBinding=p.destination;
+    p.notice.granted=true;p.notice.noticeRevision=3;p.notice.profileRef=p.profile;p.notice.destinationPolicyBinding=p.destination;
     p.notice.noticeDigest=digest("GB_MODEL_NOTICE_1",reinterpret_cast<const unsigned char *>(notice.data()),notice.size());return p;
 }
 static void number(std::vector<unsigned char> &v,std::uint64_t n,unsigned width) {for(unsigned i=0;i<width;++i)v.push_back(static_cast<unsigned char>(n>>(8*i)));}

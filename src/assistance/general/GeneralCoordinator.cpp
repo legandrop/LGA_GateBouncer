@@ -88,7 +88,7 @@ bool GeneralCoordinator::beginAt(std::shared_ptr<const ApprovalRecord> approval,
     auto job=std::make_shared<Impl::Job>();job->approval=std::move(approval);job->completion=std::move(completion);job->progress=std::move(progress);job->deadline=absoluteDeadline;s->active=job;
     if(!s->progress(job,State::Searching))return true;
     job->searching=true;
-    const bool started=s->search->begin(job->approval->binding(),job->approval->fields(),[s,job](SearchReply r){s->searched(job,std::move(r));});
+    const bool started=s->search->beginCurrent(job->approval->binding(),job->approval->fields(),[s,job](SearchReply r){s->searched(job,std::move(r));},[s,job]{return s->fresh(job);});
     if(!s->same(job))return true;
     if(!started){job->searching=false;s->finish(job,State::Failed,Failure::SearchRejected);}else s->fresh(job);return true;
 }

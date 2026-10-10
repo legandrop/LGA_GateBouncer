@@ -8,6 +8,7 @@
 #include <QStringDecoder>
 #include <QThread>
 #include <QUuid>
+#include <QPointer>
 #include <cmath>
 
 namespace gatebouncer::websearch {
@@ -85,13 +86,16 @@ QByteArray configurationBinding(const ProviderConfig &config)
     if (!validConfiguration(config)) return {};
     const QByteArray material = QByteArray::number(int(config.provider)) + '\n'
         + config.endpoint.toEncoded() + '\n' + config.revision.toUtf8() + '\n'
-        + QByteArrayLiteral("web-disclosure-v2");
+        + QByteArrayLiteral("web-disclosure-v3|IANA-RDAP5|Adobe-fixed|destination-profile2");
     return QCryptographicHash::hash(material, QCryptographicHash::Sha256).toHex();
 }
 QString disclosure(const ProviderConfig &config)
 {
     if (config.provider == Provider::MwmblV2)
         return QStringLiteral("Automatic explanations send the executable name observed for each current request to Mwmbl. "
+            "An approved public destination IP is looked up through IANA and one of the five regional Internet registries. Internal or reserved addresses are never sent. "
+            "Adobe endpoint evidence uses its fixed official network documentation; the destination itself is never contacted. "
+            "The approved IP, port, protocol and retrieved registration or official evidence may be sent to NVIDIA under the separate model notice. Registration is not proof of a service or telemetry. "
             "The name can reveal which app you use; it does not verify the file's identity. Publisher is included only if you review it manually. "
             "Names and public search snippets are used for NVIDIA explanations under the separate model notice. Paths, file hashes, file contents and local signature details are not sent. "
             "Standard searches may be shared with external sources and TypeSafe AI; "
@@ -99,7 +103,10 @@ QString disclosure(const ProviderConfig &config)
             "Coverage is limited. Results do not certify the safety of this executable. "
             "You can revoke this consent. Mwmbl terms and privacy policy apply.");
     return QStringLiteral("Automatic explanations send the executable name observed for each current request to your configured "
-        "SearXNG server. The name can reveal which app you use; it does not verify the file's identity. Publisher is included only if you review it manually. "
+        "SearXNG server. Approved public destination IPs are looked up through IANA and one of the five regional Internet registries. Internal or reserved addresses are never sent. "
+        "Adobe endpoint evidence uses its fixed official network documentation; the destination itself is never contacted. "
+        "Approved IP, port, protocol and retrieved evidence may be sent to NVIDIA under the separate model notice. Registration is not proof of a service or telemetry. "
+        "The name can reveal which app you use; it does not verify the file's identity. Publisher is included only if you review it manually. "
         "Names and public search snippets are used for NVIDIA explanations under the separate model notice. Paths, file hashes, file contents and local signature details are not sent. "
         "Searches use the configured "
         "SearXNG server and its search engines. The server operator can observe queries; "
@@ -192,7 +199,7 @@ bool SearchClient::configure(const ProviderConfig &config)
 {
     if (QThread::currentThread() != thread() || !validConfiguration(config)) return false;
     const auto next = websearch::configurationBinding(config);
-    if (next != binding_) { revokeConsent(); binding_ = next; }
+    if (next != binding_) { revokeConsent(); binding_ = next;destinationCache_.clear();bootstrap4_.clear();bootstrap6_.clear(); }
     config_ = config;
     return true;
 }
@@ -206,50 +213,156 @@ bool SearchClient::grantConsent(const QByteArray &binding)
     return true;
 }
 void SearchClient::revokeConsent() { consent_.clear(); cancel(); }
-bool SearchClient::begin(const SearchInput &input)
+bool SearchClient::begin(const SearchInput &input,std::function<bool()> current)
 {
-    if (QThread::currentThread() != thread() || exchange_ || !transport_ || binding_.isEmpty()
+    if (QThread::currentThread() != thread() || working_ || !transport_ || binding_.isEmpty()
         || consent_ != binding_ || !validPublicQuery(input.publicQuery)
-        || !plain(input.requestId, 128) || input.requestId.isEmpty()) return false;
+        || !plain(input.requestId, 128) || input.requestId.isEmpty()
+        || (input.destination&&(!current||!publicDestination(*input.destination)))) return false;
     const auto now = clock_->milliseconds();
+    if(input.destination){const auto key=input.destination->address+'\n'+input.publicQuery;
+        for(const auto& cached:destinationCache_)if(cached.key==key&&now>=cached.at&&now-cached.at<600000){
+            active_={input,instance_,binding_,config_.provider,Status::Unavailable,cached.evidence};
+            current_=std::move(current);working_=true;reusedDestinationCache_=true;
+            finishEvidence();return true;
+        }
+    }
     while (!budget_.isEmpty() && now - budget_.first() >= 3600000) budget_.removeFirst();
     if (now - lastStart_ < 10000 || budget_.size() >= 30
         || (input.publicQuery == lastQuery_ && now - lastQueryAt_ < 600000)) return false;
     active_ = {input, instance_, binding_, config_.provider, Status::Unavailable, {}};
+    current_=std::move(current);
+    working_=true;reusedDestinationCache_=false;resource_=Resource::Search;resourceUrl_={};
+    QPointer<SearchClient> self(this);if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return true;}if(!self)return true;
     lastStart_ = now;
     budget_.append(now);
     lastQuery_ = input.publicQuery;
     lastQueryAt_ = now;
-    exchange_ = transport_->start({config_, input.publicQuery});
+    const auto transport=transport_;auto operation=transport->start({config_, input.publicQuery,Resource::Search,{},{}});
+    if(!self){if(operation)operation->cancel();return true;}
+    if(!sourceCurrent()){if(operation)operation->cancel();if(self&&working_)complete(Status::Cancelled);return true;}if(!self){if(operation)operation->cancel();return true;}
+    exchange_=std::move(operation);
     if (!exchange_) {
-        const auto result = active_;
+        working_=false;current_={};const auto result = active_;
         QMetaObject::invokeMethod(this, [this, result] { emit finished(result); }, Qt::QueuedConnection);
         return true;
     }
-    deadline_ = now + 15000;
+    deadline_ = now + (input.destination?40000:15000);
     timer_.start();
     return true;
 }
 void SearchClient::complete(Status status)
 {
     timer_.stop();
-    const auto operation = std::move(exchange_);
-    if (operation) operation->cancel();
+    working_=false;
+    current_={};
     auto result = active_;
     result.status = status;
     result.citations.clear();
+    const auto operation = std::move(exchange_);
     QMetaObject::invokeMethod(this, [this, result] { emit finished(result); }, Qt::QueuedConnection);
+    if (operation) operation->cancel();
 }
-void SearchClient::cancel() { if (exchange_) complete(Status::Cancelled); }
+void SearchClient::cancel() { if (working_) complete(Status::Cancelled); }
+bool SearchClient::sourceCurrent(){
+    const auto proof=current_;const auto input=active_.input;const auto binding=binding_;QPointer<SearchClient> self(this);
+    const bool valid=proof?proof():!input.destination;
+    return self&&valid&&working_&&binding_==binding&&consent_==binding&&active_.input.requestId==input.requestId&&
+        active_.input.generation==input.generation&&active_.input.publicQuery==input.publicQuery&&active_.input.destination==input.destination;
+}
+bool SearchClient::startResource(Resource kind,const QUrl& url) {
+    if(!working_||exchange_||consent_!=binding_||!validResource(kind,url,active_.input.destination))return false;
+    QPointer<SearchClient> self(this);if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return false;}if(!self)return false;
+    const auto now=clock_->milliseconds();
+    if(now<lastStart_||now>=deadline_)return false;
+    while(!budget_.isEmpty()&&now-budget_.first()>=3600000)budget_.removeFirst();
+    if(now-lastStart_<10000)return false;
+    // Cada GET consume el mismo presupuesto y cooldown que la búsqueda; sin cupo nuevo.
+    if(budget_.size()>=30){finishEvidence();return false;}
+    lastStart_=now;budget_.append(now);resource_=kind;resourceUrl_=url;
+    const auto transport=transport_;auto operation=transport->start({config_,active_.input.publicQuery,kind,url,active_.input.destination});
+    if(!self){if(operation)operation->cancel();return false;}
+    if(!sourceCurrent()){if(operation)operation->cancel();if(self&&working_)complete(Status::Cancelled);return false;}if(!self){if(operation)operation->cancel();return false;}
+    exchange_=std::move(operation);
+    if(!exchange_)finishEvidence();
+    return bool(exchange_);
+}
+void SearchClient::finishEvidence() {
+    if(!working_)return;
+    QPointer<SearchClient> self(this);if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return;}if(!self)return;
+    timer_.stop();working_=false;current_={};
+    auto result=active_;result.status=result.citations.isEmpty()?Status::NoEvidence:Status::Evidence;
+    if(result.citations.size()>3)result.citations.resize(3);
+    if(result.input.destination&&!reusedDestinationCache_){QVector<Citation> evidence;
+        for(const auto& c:result.citations)if(c.kind)evidence.push_back(c);
+        if(!evidence.isEmpty()){const auto key=result.input.destination->address+'\n'+result.input.publicQuery;
+            for(qsizetype n=destinationCache_.size();n>0;--n)if(destinationCache_[n-1].key==key)destinationCache_.removeAt(n-1);
+            if(destinationCache_.size()>=32)destinationCache_.removeFirst();
+            destinationCache_.push_back({key,std::move(evidence),clock_->milliseconds()});}}
+    QMetaObject::invokeMethod(this,[this,result]{emit finished(result);},Qt::QueuedConnection);
+}
+void SearchClient::nextResource() {
+    if(!working_||exchange_)return;
+    if(consent_!=binding_){complete(Status::Cancelled);return;}
+    const auto now=clock_->milliseconds();
+    if(now<lastStart_||now>=deadline_){finishEvidence();return;}
+    if(!active_.input.destination){finishEvidence();return;}
+    const auto& destination=*active_.input.destination;
+    const auto key=destination.address+'\n'+active_.input.publicQuery;
+    if(resource_==Resource::Search){
+        for(const auto& cached:destinationCache_)if(cached.key==key&&now>=cached.at&&now-cached.at<600000){
+            for(qsizetype n=cached.evidence.size();n>0;--n)active_.citations.prepend(cached.evidence[n-1]);
+            reusedDestinationCache_=true;
+            finishEvidence();return;}
+        const bool ipv6=destination.address.contains(':');const auto& data=ipv6?bootstrap6_:bootstrap4_;
+        const auto at=ipv6?bootstrap6At_:bootstrap4At_;
+        if(!data.isEmpty()&&now>=at&&now-at<86400000){const auto url=registryUrl(data,destination);
+            if(url){startResource(Resource::Registry,*url);return;}}
+        startResource(ipv6?Resource::Bootstrap6:Resource::Bootstrap4,bootstrapUrl(destination));return;
+    }
+    if(resource_==Resource::Bootstrap4||resource_==Resource::Bootstrap6){
+        const auto& data=destination.address.contains(':')?bootstrap6_:bootstrap4_;
+        const auto url=registryUrl(data,destination);if(!url){finishEvidence();return;}
+        startResource(Resource::Registry,*url);return;
+    }
+    if(resource_==Resource::Registry){
+        bool adobe=active_.input.publicQuery.contains("adobe",Qt::CaseInsensitive);
+        for(const auto& c:active_.citations)adobe|=c.kind==1&&c.snippet.contains("adobe",Qt::CaseInsensitive);
+        if(adobe){startResource(Resource::AdobeEndpoints,adobeEndpointsUrl());return;}
+    }
+    finishEvidence();
+}
 void SearchClient::tick()
 {
-    if (!exchange_) return;
+    if(!working_)return;
+    QPointer<SearchClient> self(this);if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return;}if(!self)return;
+    if(!exchange_){nextResource();return;}
     if (clock_->milliseconds() >= deadline_) { complete(Status::Unavailable); return; }
     HttpResponse response;
-    if (!exchange_->poll(response)) return;
-    timer_.stop();
+    const auto operation=exchange_;if(!operation->poll(response))return;
+    if(!self)return;if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return;}if(!self)return;
     exchange_.reset();
-    const auto result = parseResponse(response, active_, QDateTime::currentDateTimeUtc());
-    emit finished(result);
+    const auto checked=QDateTime::currentDateTimeUtc();
+    if(resource_==Resource::Search){
+        const auto result=parseResponse(response,active_,checked);
+        active_.citations=result.citations;
+        if(!active_.input.destination){timer_.stop();working_=false;current_={};emit finished(result);return;}
+    }else if(resource_==Resource::Bootstrap4||resource_==Resource::Bootstrap6){
+        const auto type=response.contentType.toLower().split(';').front().trimmed();
+        if(response.transportOk&&response.statusCode==200&&type=="application/json"&&
+            (response.contentEncoding.isEmpty()||response.contentEncoding.toLower().trimmed()=="identity")&&
+            registryUrl(response.body,*active_.input.destination)){
+            auto& data=resource_==Resource::Bootstrap6?bootstrap6_:bootstrap4_;
+            auto& at=resource_==Resource::Bootstrap6?bootstrap6At_:bootstrap4At_;
+            data=response.body;at=clock_->milliseconds();
+        }else{finishEvidence();return;}
+    }else{
+        const auto evidence=resource_==Resource::Registry
+            ?registrationEvidence(response,*active_.input.destination,resourceUrl_,quint64(checked.toMSecsSinceEpoch()))
+            :officialDestinationEvidence(response,*active_.input.destination,quint64(checked.toMSecsSinceEpoch()));
+        if(evidence){if(evidence->kind==1)active_.citations.prepend(*evidence);
+            else active_.citations.insert(std::min<qsizetype>(1,active_.citations.size()),*evidence);}
+    }
+    nextResource();
 }
 }

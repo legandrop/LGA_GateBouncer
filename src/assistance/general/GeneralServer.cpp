@@ -5,6 +5,7 @@ namespace Gate::Assistance::General {
 struct GeneralServer::Data : std::enable_shared_from_this<Data> {
     std::shared_ptr<FrameChannel> channel;std::shared_ptr<GeneralRuntime> runtime;Control control;
     PendingControl pendingControl;std::function<void()> retire;Id128 pendingStatus{};std::uint64_t pendingGeneration=0;
+    std::function<bool(const FullBinding&,const PublicFields&)> publicControl;
     std::map<Id128,unsigned> correlations;Id128 approval{},active{};std::uint64_t sent=0,received=0;bool greeted=false,closed=false;
     void close(){if(closed)return;closed=true;pendingStatus={};if(retire)retire();active={};approval={};runtime->drain();channel->stop();}
     void send(Broker::Frame f){if(closed||sent==UINT64_MAX){close();return;}f.connection=channel->connection();f.sequence=++sent;
@@ -22,7 +23,10 @@ struct GeneralServer::Data : std::enable_shared_from_this<Data> {
             if(found){approval={};runtime->withdraw();}if(closed)return;
             Broker::Frame ack;ack.message=Broker::Message::CancelAck;ack.correlation=id;ack.fields[21]=Broker::integer(found?3:6,1);send(std::move(ack));return;}
         if(type==23){
-            const auto b=frameBinding(f,true);const auto p=framePublicFields(f);auto record=runtime->approve(*b,*p,channel->connection(),id);if(closed)return;
+            const auto b=frameBinding(f,true);const auto p=framePublicFields(f);
+            const bool allowed=p->destination?(publicControl&&publicControl(*b,*p)):true;if(closed)return;
+            auto record=allowed?runtime->approve(*b,*p,channel->connection(),id):std::shared_ptr<const ApprovalRecord>{};if(closed)return;
+            if(record&&p->destination&&(!publicControl||!publicControl(*b,*p))){runtime->withdraw();record.reset();}if(closed)return;
             Broker::Frame ack;ack.message=Broker::Message::PublicApprovalAck;ack.correlation=id;setPublicFields(ack,*p);
             if(record){approval=id;setFrameBinding(ack,record->binding());ack.fields[65]=Broker::integer(0,2);}else{setFrameBinding(ack,*b);ack.fields[65]=Broker::integer(unsigned(Failure::Stale),2);}
             send(std::move(ack));return;
@@ -68,4 +72,5 @@ void GeneralServer::close(){const auto d=data_;d->close();}
 void GeneralServer::setPendingControl(PendingControl control,std::function<void()> retire){
     const auto d=data_;if(d->closed)return;d->pendingControl=std::move(control);d->retire=std::move(retire);
 }
+void GeneralServer::setPublicControl(std::function<bool(const FullBinding&,const PublicFields&)> control){const auto d=data_;if(!d->closed)d->publicControl=std::move(control);}
 }

@@ -27,15 +27,24 @@ struct FullBinding {
     Provider provider=Provider::MwmblV2;
     std::string providerInstance;
     Digest256 providerConfiguration{},publicApprovalDigest{};
-    std::uint32_t profileRevision=1;
+    std::uint32_t profileRevision=2;
     bool operator==(const FullBinding&) const;
     bool operator!=(const FullBinding& b) const { return !(*this==b); }
     Digest256 canonicalDigest() const;
 };
+struct Destination {
+    std::string address;
+    std::uint16_t port=0;
+    std::uint8_t protocol=0;
+    std::uint64_t observedAtMs=0;
+    bool operator==(const Destination&) const;
+};
+bool validDestination(const Destination&,bool external=false);
 struct PublicFields {
     std::string product;
     std::optional<std::string> publisher;
     std::string query;
+    std::optional<Destination> destination;
     bool operator==(const PublicFields&) const;
 };
 struct Citation {
@@ -43,8 +52,11 @@ struct Citation {
     std::string url,title,snippet,origin;
     std::uint64_t retrievedAtMs=0;
     bool shortened=false;
+    std::uint8_t kind=0;
+    std::string subject;
 };
-struct Inference { std::string purpose,networkReason,caution; bool possible=false; std::vector<std::uint8_t> sourceIds; };
+struct Inference { std::string purpose,networkReason,caution; bool possible=false; std::vector<std::uint8_t> sourceIds;
+    std::string service,impact,advice; };
 struct Result {
     FullBinding binding;
     State state=State::Insufficient;
@@ -54,10 +66,11 @@ struct Result {
     std::optional<Inference> inference;
 };
 struct View {
-    std::string purpose,networkReason,uncertainty,identityNotice,providerNotice;
+    std::string purpose="Unknown",networkReason="Unknown",uncertainty,identityNotice,providerNotice;
     bool identityUnverified=true;
     std::vector<Citation> citations;
     std::vector<std::uint8_t> sourceIds;
+    std::string networkOperator="Unknown",service="Unknown",impact="Unknown",advice="Unknown";
 };
 bool validBinding(const FullBinding&,bool approvalPending=false);
 bool validPublicFields(const PublicFields&);
@@ -92,6 +105,9 @@ public:
     using Completion=std::function<void(SearchReply)>;
     virtual ~SearchPort()=default;
     virtual bool begin(const FullBinding&,const PublicFields&,Completion)=0;
+    virtual bool beginCurrent(const FullBinding& b,const PublicFields& p,Completion completion,std::function<bool()> current){
+        if(p.destination||!current||!current())return false;return begin(b,p,std::move(completion));
+    }
     virtual void cancel()=0;
 };
 class SealedGeneralPayload;

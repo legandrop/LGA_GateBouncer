@@ -130,7 +130,9 @@ class NativeTransport final : public Transport {
 public:
     std::shared_ptr<Exchange> start(const HttpRequest &input) override
     {
-        if (!validConfiguration(input.config) || !validPublicQuery(input.query))
+        if (!validConfiguration(input.config) || !validPublicQuery(input.query)||
+            (input.resource!=Resource::Search&&!validResource(input.resource,input.evidenceUrl,input.destination))||
+            (input.resource==Resource::Search&&(!input.evidenceUrl.isEmpty()||input.destination)))
             return std::make_shared<ImmediateFailure>();
         // La fábrica productiva funciona fuera de QA; el arnés nunca genera red real.
         if (qEnvironmentVariableIsSet("LGA_HEADLESS_DESKTOP")
@@ -145,15 +147,16 @@ public:
         if (!state->session) return std::make_shared<ImmediateFailure>();
         if (!WinHttpSetTimeouts(state->session, 5000, 5000, 5000, 5000))
             return std::make_shared<ImmediateFailure>();
-        const auto host = input.config.endpoint.host().toStdWString();
+        const auto endpoint=input.resource==Resource::Search?input.config.endpoint:input.evidenceUrl;
+        const auto host = endpoint.host().toStdWString();
         state->connection = WinHttpConnect(state->session, host.c_str(),
-            INTERNET_PORT(input.config.endpoint.port(443)), 0);
+            INTERNET_PORT(endpoint.port(443)), 0);
         if (!state->connection) return std::make_shared<ImmediateFailure>();
-        const bool post = input.config.provider == Provider::SearXng;
-        QString path = input.config.endpoint.path(QUrl::FullyEncoded);
+        const bool post = input.resource==Resource::Search&&input.config.provider == Provider::SearXng;
+        QString path = endpoint.path(QUrl::FullyEncoded);
         const auto encoded = QUrl::toPercentEncoding(input.query);
         if (post) state->body = "q=" + encoded + "&format=json&categories=general&pageno=1&language=en&safesearch=1";
-        else path += QStringLiteral("?q=") + QString::fromLatin1(encoded);
+        else if(input.resource==Resource::Search)path += QStringLiteral("?q=") + QString::fromLatin1(encoded);
         const auto widePath = path.toStdWString();
         state->request = WinHttpOpenRequest(state->connection, post ? L"POST" : L"GET",
             widePath.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
@@ -188,7 +191,9 @@ public:
         }
         const wchar_t *headers = post
             ? L"Accept: application/json\r\nAccept-Encoding: identity\r\nContent-Type: application/x-www-form-urlencoded\r\n"
-            : L"Accept: application/json\r\nAccept-Encoding: identity\r\n";
+            : input.resource==Resource::AdobeEndpoints?L"Accept: text/html\r\nAccept-Encoding: identity\r\n"
+            : input.resource==Resource::Search?L"Accept: application/json\r\nAccept-Encoding: identity\r\n"
+            : L"Accept: application/rdap+json, application/json\r\nAccept-Encoding: identity\r\n";
         std::lock_guard<std::recursive_mutex> lock(state->mutex);
         if (!WinHttpSendRequest(req, headers, DWORD(-1), post ? state->body.data() : nullptr,
             DWORD(state->body.size()), DWORD(state->body.size()), opaque)) state->finish(false);

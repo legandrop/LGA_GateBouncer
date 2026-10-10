@@ -35,7 +35,14 @@ bool FullBinding::operator==(const FullBinding& b) const {
         b.entitlementPolicyEpoch,b.localSnapshotToken,b.localSnapshotGeneration,b.provider,b.providerInstance,
         b.providerConfiguration,b.publicApprovalDigest,b.profileRevision);
 }
-bool PublicFields::operator==(const PublicFields& b) const { return std::tie(product,publisher,query)==std::tie(b.product,b.publisher,b.query); }
+bool Destination::operator==(const Destination& d) const {return std::tie(address,port,protocol,observedAtMs)==std::tie(d.address,d.port,d.protocol,d.observedAtMs);}
+bool validDestination(const Destination& d,bool external) {
+    namespace Web=gatebouncer::websearch;
+    const auto canonical=Web::canonicalAddress(QString::fromUtf8(d.address));
+    return d.address.size()<=45&&canonical&&canonical->toStdString()==d.address&&(d.protocol==6||d.protocol==17)&&d.observedAtMs&&d.observedAtMs<=std::uint64_t(INT64_MAX)&&
+        (!external||Web::publicDestination({*canonical,d.port,d.protocol,d.observedAtMs}));
+}
+bool PublicFields::operator==(const PublicFields& b) const { return std::tie(product,publisher,query,destination)==std::tie(b.product,b.publisher,b.query,b.destination); }
 bool safeText(std::string_view s,std::size_t cap,bool empty) {
     if(s.size()>cap||(!empty&&s.empty())||s.find('\0')!=s.npos)return false;
     QStringDecoder decoder(QStringDecoder::Utf8);const QString t=decoder(QByteArrayView(s.data(),qsizetype(s.size())));
@@ -48,13 +55,13 @@ bool validBinding(const FullBinding& b,bool pending) {
         b.credentialEpoch,b.modelConsentEpoch,b.webConsentEpoch,b.generation,b.entitlementPolicyEpoch,b.localSnapshotGeneration};
     return safeText(b.requestId,128)&&nonzero(b.applicationToken)&&nonzero(b.localSnapshotToken)&&
         std::all_of(std::begin(epochs),std::end(epochs),[](auto n){return n!=0;})&&uuid(b.providerInstance)&&
-        nonzero(b.providerConfiguration)&&b.profileRevision==1&&(b.provider==Provider::MwmblV2||b.provider==Provider::SearXng)&&
+        nonzero(b.providerConfiguration)&&b.profileRevision==2&&(b.provider==Provider::MwmblV2||b.provider==Provider::SearXng)&&
         (pending?(b.approvalEpoch==0&&!nonzero(b.publicApprovalDigest)):(b.approvalEpoch!=0&&nonzero(b.publicApprovalDigest)));
 }
 bool validPublicFields(const PublicFields& p) {
     auto name=[](const std::string& s){return safeText(s,96)&&!QString::fromUtf8(s).front().isSpace()&&!QString::fromUtf8(s).back().isSpace();};
     return name(p.product)&&(!p.publisher||name(*p.publisher))&&p.query==p.product+(p.publisher?" "+*p.publisher:"")&&
-        gatebouncer::websearch::validPublicQuery(QString::fromUtf8(p.query));
+        gatebouncer::websearch::validPublicQuery(QString::fromUtf8(p.query))&&(!p.destination||validDestination(*p.destination,true));
 }
 std::string canonicalBinding(const FullBinding& b) {
     std::string out;out.reserve(367);text(out,b.requestId);bytes(out,b.applicationToken.data(),16);
@@ -67,7 +74,9 @@ Digest256 FullBinding::canonicalDigest() const { return digest("GB_GENERAL_BINDI
 Digest256 approvalDigest(const PublicFields& p,std::uint64_t epoch) {
     if(!validPublicFields(p)||!epoch)return {};
     std::string out;out.reserve(400);text(out,p.product);number(out,p.publisher?1:0,1);if(p.publisher)text(out,*p.publisher);text(out,p.query);number(out,epoch,8);
-    return digest("GB_GENERAL_PUBLIC_APPROVAL_1",out);
+    number(out,p.destination?1:0,1);if(p.destination){text(out,p.destination->address);number(out,p.destination->port,2);
+        number(out,p.destination->protocol,1);number(out,p.destination->observedAtMs,8);}
+    return digest("GB_GENERAL_PUBLIC_APPROVAL_2",out);
 }
 ApprovalRecord::ApprovalRecord(FullBinding b,PublicFields p,Id128 connection,Id128 correlation,std::weak_ptr<const void> owner,std::function<bool()> current):
     binding_(std::move(b)),fields_(std::move(p)),connection_(connection),correlation_(correlation),owner_(std::move(owner)),current_(std::move(current)){}
@@ -82,9 +91,11 @@ View makeView(const Result& r) {
     else if(r.state!=State::Evidence)v.providerNotice+=" No current grounded explanation is available.";
     const bool citationsValid=GeneralPayloadBuilder::citationsJson(r.citations).has_value();
     if(citationsValid)v.citations=r.citations;
+    if(citationsValid)for(const auto& c:r.citations)if(c.kind==1)v.networkOperator="Registration record: "+c.snippet;
     if(r.state==State::Evidence&&r.failure==Failure::None&&r.observedHttpStatus==200&&validBinding(r.binding)&&
         !r.citations.empty()&&citationsValid&&r.inference&&Detail::inferenceJson(*r.inference,r.citations)){
         v.purpose=r.inference->purpose;v.networkReason=r.inference->networkReason;v.uncertainty+=" "+r.inference->caution;v.sourceIds=r.inference->sourceIds;
+        v.service=r.inference->service;v.impact=r.inference->impact;v.advice=r.inference->advice;
     }
     return v;
 }

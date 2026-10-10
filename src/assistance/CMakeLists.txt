@@ -56,10 +56,11 @@ qt_add_library(gatebouncer_general_live STATIC
     retrieval/SourceNormalizer.cpp retrieval/SourceNormalizer.h
     retrieval/StrictJson.cpp retrieval/StrictJson.h
     ../websearch/WebSearch.cpp ../websearch/WebSearch.h ../websearch/WinHttpTransport.cpp
+    ../websearch/DestinationEvidence.cpp ../websearch/DestinationEvidence.h
 )
 # La composición comparte Store, Authority y Vault; no objetos de ABI anteriores.
 target_link_libraries(gatebouncer_general_live PUBLIC gatebouncer_assistance Qt6::Core PRIVATE
-    gatebouncer_native_ii gatebouncer_localfacts gatebouncer_wire winhttp bcrypt crypt32 advapi32 shell32 ole32)
+    gatebouncer_native_ii gatebouncer_localfacts gatebouncer_wire winhttp ws2_32 bcrypt crypt32 advapi32 shell32 ole32)
 target_include_directories(gatebouncer_general_live PUBLIC .. .)
 target_compile_features(gatebouncer_general_live PUBLIC cxx_std_17)
 target_compile_definitions(gatebouncer_general_live PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
