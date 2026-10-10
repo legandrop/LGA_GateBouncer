@@ -117,6 +117,7 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
             records_.rejectHistory(historyError_); return;
         }
         historyChanged();
+        if (event.kind == Data::ActivityKind::Attempt && event.native) ordinary_.observationChanged();
         if (event.kind == Data::ActivityKind::Attempt && event.native && event.native->process) {
             const auto context = records_.currentNativeContext(false);
             if (context && source_.setNativeContext(context->binding,context->peer,context->connection) && source_.queueNativeAttempt(event))

@@ -37,6 +37,8 @@ class OrdinaryDecisionClient final : public QObject {
     const auto &rules() const { return rules_; }
     std::optional<QByteArray> selectedRuleBackup(const std::vector<gb::wire::Id> &, quint64 selection) const;
     void startAutomatic();
+    // Sólo una señal de lectura; no aporta identidad ni autoridad a la revisión.
+    void observationChanged();
     bool select(const gb::wire::Id &observed);
     bool direction(int direction);
     bool scope(int scope);
@@ -83,11 +85,16 @@ class OrdinaryDecisionClient final : public QObject {
     void outcome(const gb::wire::Frame &);
     void fail(const QString &, bool uncertain = false);
     void showNext();
+    void automaticRead();
     gb::controller::OrdinarySession session_;
     State state_ = State::Closed;
     bool stopping_ = false, connected_ = false, current_ = false, visible_ = false;
     bool finalStatus_ = false, checkOnly_ = false;
     bool readingRules_ = false, rulesCurrent_ = false;
+    bool backgroundRead_ = false;
+    bool checkingObservation_ = false;
+    bool checkingObservationAfter_ = false;
+    int quietPollMs_ = 2000;
     quint64 generation_ = 1, desired_ = 0, profile_ = 0, bindingGeneration_ = 0, pageRevision_ = 0;
     quint64 observedGeneration_ = 0;
     int direction_ = 1;

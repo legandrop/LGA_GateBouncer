@@ -58,6 +58,7 @@ class MainWindow final : public QMainWindow {
     void buildShell();
     void buildPage();
     void refresh();
+    void updatePageState();
     void refreshTable(bool newPage = false);
     void renderProcesses();
     void renderPending();
@@ -129,6 +130,8 @@ class MainWindow final : public QMainWindow {
     QPointer<QLabel> count_;
     QPointer<QLabel> emptyState_;
     QPointer<QFrame> detail_, notice_, modalOverlay_, message_;
+    QByteArray ordinaryNoticeKey_;
+    QByteArray tableSourceKey_;
     QPointer<Assistance::Ui::ExplanationWidget> ordinaryExplanation_;
     QPointer<QWidget> modalPanel_;
     QPointer<QWidget> previousFocus_;

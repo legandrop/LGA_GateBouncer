@@ -10,6 +10,8 @@
 #include <QComboBox>
 #include <QEvent>
 #include <QDateTime>
+#include <QDataStream>
+#include <QIODevice>
 #include <QFileDialog>
 #include <QFontMetrics>
 #include <QFrame>
@@ -181,9 +183,19 @@ QComboBox *combo(const QStringList &values, const QString &name) {
 }
 void dispose(QWidget *widget) {
     if (widget) {
+        widget->setProperty("retired",true);
         widget->hide();
         widget->deleteLater();
     }
+}
+template<class T> T *pageControl(QWidget *page,const char *name) {
+    for (auto *control : page->findChildren<T *>(name)) {
+        bool retired = false;
+        for (auto *p = static_cast<QWidget *>(control); p && p != page; p = p->parentWidget())
+            if (p->property("retired").toBool()) { retired = true; break; }
+        if (!retired) return control;
+    }
+    return nullptr;
 }
 QIcon navigationIcon(int index) {
     QPixmap image(17, 17);
@@ -299,6 +311,7 @@ void definition(QVBoxLayout *layout, const QString &name, const QString &value) 
     key->setFixedWidth(95);
     key->setStyleSheet("font-size: 11px; color: #8f8f8f;");
     auto *v = label(value, "strong", true);
+    v->setProperty("definition-name",name);
     v->setStyleSheet("font-size: 11px; color: #ccc;");
     l->addWidget(key, 0, Qt::AlignTop);
     l->addWidget(v, 1);
@@ -468,16 +481,52 @@ class RowsModel final : public QAbstractTableModel {
                                                                         : QVariant{};
     }
     void replace(QVector<Row> rows) {
-        beginResetModel();
-        rows_ = std::move(rows);
-        endResetModel();
-        sort(sortColumn_, sortOrder_);
+        QHash<QString, int> incoming;
+        for (int i = 0; i < rows.size(); ++i) incoming.insert(rows[i].id, i);
+        // Las identidades supervivientes conservan selección e índices persistentes.
+        bool changed = false;
+        for (int end = rows_.size() - 1; end >= 0;) {
+            if (incoming.contains(rows_[end].id)) { --end; continue; }
+            int start = end;
+            while (start && !incoming.contains(rows_[start - 1].id)) --start;
+            beginRemoveRows({}, start, end); rows_.remove(start, end - start + 1); endRemoveRows();
+            changed = true; end = start - 1;
+        }
+        QSet<QString> retained;
+        for (int i = 0; i < rows_.size(); ++i) {
+            retained.insert(rows_[i].id);
+            const auto &next = rows[incoming.value(rows_[i].id)];
+            bool equal = rows_[i].cells.size() == next.cells.size();
+            for (int c = 0; equal && c < next.cells.size(); ++c)
+                equal = rows_[i].cells[c].text == next.cells[c].text &&
+                    rows_[i].cells[c].kind == next.cells[c].kind && rows_[i].cells[c].sort == next.cells[c].sort;
+            if (!equal) {
+                rows_[i] = next; changed = true;
+                emit dataChanged(index(i, 0), index(i, headers_.size() - 1));
+            }
+        }
+        QVector<Row> added;
+        for (auto &r : rows) if (!retained.contains(r.id)) added.push_back(std::move(r));
+        if (!added.isEmpty()) {
+            const int first = rows_.size(); beginInsertRows({}, first, first + added.size() - 1);
+            rows_ += added; endInsertRows(); changed = true;
+        }
+        if (changed) sort(sortColumn_, sortOrder_);
     }
     void sort(int column, Qt::SortOrder order) override {
         if (column < 0 || column >= headers_.size())
             return;
         sortColumn_ = column;
         sortOrder_ = order;
+        const auto less = [&](const Row &a, const Row &b) {
+            const auto &ac = a.cells[column]; const auto &bc = b.cells[column];
+            int cmp = ac.sort.isValid() && bc.sort.isValid() && ac.sort.metaType().id() != QMetaType::QString
+                ? (ac.sort.toLongLong() < bc.sort.toLongLong() ? -1 : ac.sort.toLongLong() > bc.sort.toLongLong() ? 1 : 0)
+                : QString::compare(ac.text, bc.text, Qt::CaseInsensitive);
+            if (!cmp) cmp = QString::compare(a.id, b.id, Qt::CaseSensitive);
+            return order == Qt::AscendingOrder ? cmp < 0 : cmp > 0;
+        };
+        if (std::is_sorted(rows_.begin(), rows_.end(), less)) return;
         emit layoutAboutToBeChanged({}, QAbstractItemModel::VerticalSortHint);
         const auto persistent = persistentIndexList();
         QStringList identities;
@@ -792,37 +841,8 @@ void MainWindow::buildPage() {
     rows_.clear();
     count_.clear();
     emptyState_.clear();
-    for (auto it = navigation_.begin(); it != navigation_.end(); ++it)
-        it.value()->setChecked(it.key() == view_);
-    pendingCount_->setText(product_.simulation() ? QString::number(model_.state().pending.size())
-        : product_.ordinary()->current() ? QString::number(product_.ordinary()->observations().size())
-        : product_.recordsSelected() && product_.records()->recordsCurrent()
-            ? QString::number(product_.records()->pending().size()) : "—");
-    pendingCount_->setVisible(!product_.simulation() || !model_.state().pending.isEmpty());
-    sideStatus_->setText(model_.available()
-                             ? (model_.service() == Service::UiClosed
-                                    ? "UI closed · simulated scenario\nThis preview stays open"
-                                    : "Synthetic model available\nNo protection is active")
-                             : "Simulated service unavailable\nPolicy changes disabled");
-    status_->setText(model_.available() ? "Synthetic data only\nNo network filtering"
-                                        : "Simulated service unavailable\nPolicy changes disabled");
-    auto *banner = root_->findChild<QLabel *>("simulation-banner");
-    if (banner) banner->setText(product_.simulation() ? "Simulation · no network filtering"
-        : product_.engine().current ? product_.engineSummary() : "Live processes · firewall engine not connected");
-    footer_->setText(product_.simulation()
-        ? "Synthetic fixtures · session memory only                 Sample clock: 2026-10-08 10:42:40 UTC−03"
-        : "Live process catalog · files not inspected · network collector unavailable");
+    updatePageState();
     if (!product_.simulation()) {
-        sideStatus_->setText(product_.engineSummary() + "\nCoverage not validated");
-        status_->setText("Read only · no administrator control\nNetwork collector unavailable");
-        if (product_.recordsSelected() && product_.records()->recordsCurrent()) {
-            status_->setText("Read only · decisions require administrator review\nCoverage not validated");
-            footer_->setText("Read-only snapshots · attempts and applied decisions remain separate from traffic");
-        }
-        if (product_.ordinary()->current()) {
-            status_->setText("Request review available\nCoverage not validated");
-            footer_->setText("Pending requests · review each connection or save a rule for this application and account");
-        }
         const QMap<QString, QStringList> liveHeadings{
             {"processes", {"Processes", "Observed local processes · policy and network history are unknown."}},
             {"pending", {"Pending requests", "Review an application's request and choose how long your decision applies."}},
@@ -831,7 +851,7 @@ void MainWindow::buildPage() {
             {"import", {"Import from NetLimiter", "Structural analysis only · compatibility not validated."}},
             {"settings", {"Settings", "Engine status and assistance configuration with separate consents."}}};
         title_->setText(liveHeadings[view_][0]); subtitle_->setText(liveHeadings[view_][1]);
-        renderLive(); refreshing_ = false; refreshTable(true); restoreFocus(); positionOverlays(); return;
+        renderLive(); updatePageState(); refreshing_ = false; refreshTable(true); restoreFocus(); positionOverlays(); return;
     }
     const QMap<QString, QStringList> headings{
         {"processes",
@@ -870,15 +890,101 @@ void MainWindow::buildPage() {
     renderNotice();
     positionOverlays();
 }
-void MainWindow::refresh() {
-    if (detail_) {
-        dispose(detail_);
-        detail_.clear();
+void MainWindow::updatePageState() {
+    for (auto it = navigation_.begin(); it != navigation_.end(); ++it)
+        it.value()->setChecked(it.key() == view_);
+    pendingCount_->setText(product_.simulation() ? QString::number(model_.state().pending.size())
+        : product_.ordinary()->current() ? QString::number(product_.ordinary()->observations().size())
+        : product_.recordsSelected() && product_.records()->recordsCurrent()
+            ? QString::number(product_.records()->pending().size()) : "—");
+    pendingCount_->setVisible(!product_.simulation() || !model_.state().pending.isEmpty());
+    sideStatus_->setText(model_.available()
+                             ? (model_.service() == Service::UiClosed
+                                    ? "UI closed · simulated scenario\nThis preview stays open"
+                                    : "Synthetic model available\nNo protection is active")
+                             : "Simulated service unavailable\nPolicy changes disabled");
+    status_->setText(model_.available() ? "Synthetic data only\nNo network filtering"
+                                        : "Simulated service unavailable\nPolicy changes disabled");
+    auto *banner = root_->findChild<QLabel *>("simulation-banner");
+    if (banner) banner->setText(product_.simulation() ? "Simulation · no network filtering"
+        : product_.engine().current ? product_.engineSummary() : "Live processes · firewall engine not connected");
+    footer_->setText(product_.simulation()
+        ? "Synthetic fixtures · session memory only                 Sample clock: 2026-10-08 10:42:40 UTC−03"
+        : "Live process catalog · files not inspected · network collector unavailable");
+    if (!product_.simulation()) {
+        sideStatus_->setText(product_.engineSummary() + "\nCoverage not validated");
+        status_->setText("Read only · no administrator control\nNetwork collector unavailable");
+        if (product_.recordsSelected() && product_.records()->recordsCurrent()) {
+            status_->setText("Read only · decisions require administrator review\nCoverage not validated");
+            footer_->setText("Read-only snapshots · attempts and applied decisions remain separate from traffic");
+        }
+        if (product_.ordinary()->current()) {
+            status_->setText("Request review available\nCoverage not validated");
+            footer_->setText("Pending requests · review each connection or save a rule for this application and account");
+        }
+        const auto *client = product_.ordinary();
+        const bool ordinaryIdle = client->idle() && client->state() != OrdinaryDecisionClient::State::Uncertain;
+        const auto enable = [this](const char *name, bool enabled) {
+            if (auto *b = pageControl<QPushButton>(page_,name)) b->setEnabled(enabled);
+        };
+        enable("refresh-ordinary",ordinaryIdle);
+        enable("refresh-principal-rules",ordinaryIdle && !client->visible());
+        for (const char *name : {"cleanup-live-rules","edit-file-rule","backup-file-rules"}) enable(name,client->rulesCurrent());
+        enable("connect-history",product_.records()->idle() && !product_.records()->refreshing());
+        enable("cancel-analysis",product_.importBusy());
+        enable("save-candidates",!product_.importBusy() && !product_.reviewBusy() && product_.reviewWritable() && product_.draft().accepted);
+        enable("prepare-source-files",product_.importedView(false).current && product_.importedView(false).qname.has_value());
+        for (const char *name : {"ordinary-recover-page","rule-recover"})
+            if (auto *b = pageControl<QPushButton>(page_,name)) {
+                b->setVisible(client->state() == OrdinaryDecisionClient::State::Uncertain); b->setEnabled(client->idle());
+            }
+        if (auto *text = pageControl<QLabel>(page_,"ordinary-page-message")) text->setText(client->message());
+        const auto text = [this](const char *name,const QString &value) {
+            if (auto *w = pageControl<QLabel>(page_,name)) { if (w->text() != value) w->setText(value); w->setVisible(!value.isEmpty()); }
+        };
+        text("catalog-error",product_.catalog().error); text("history-error",product_.historyError());
+        text("review-error",product_.reviewError()); text("engine-summary",product_.engineSummary());
+        text("engine-revision",product_.revisionSummary()); text("engine-error",product_.engine().error);
+        text("engine-connection",client->current() ? "Request review connected" : product_.engine().current
+            ? "View connected · reading service status" : "No current service snapshot");
+        if (auto *panel = pageControl<QFrame>(page_,"pending-context-note")) {
+            const auto labels = panel->findChildren<QLabel *>();
+            if (labels.size() == 2) labels.last()->setText(client->current()
+                ? "Review each request to choose Allow or Block and how long it applies. Always rules cover future connections for this application and account. Protection coverage has not been validated."
+                : product_.recordsSelected() && product_.records()->recordsCurrent()
+                    ? "View request snapshot · read only. These requests use the separate administrator reviewer; coverage remains unvalidated."
+                    : "No current request list. Refresh requests to check the connection; a running process is not an access request.");
+        }
+        text("import-count",QString::number(product_.draft().candidates.size()) + " inactive rows · compatibility: not validated");
+        text("engine-rule-count","Engine rules: " + (product_.recordsSelected() && product_.records()->recordsCurrent()
+            ? QString::number(product_.records()->rules().size()) + " read only" : "Unavailable") +
+            " · local candidates: " + QString::number(product_.review().report.candidates.size()) + " inactive");
+        if (pageControl<QLabel>(page_,"history-coverage")) {
+            int sources = 0, live = 0, gaps = 0;
+            for (const auto &c : product_.history().coverage) if (c.native) {
+                ++sources; gaps += c.gaps.size(); live += c.status != Data::CoverageStatus::Unavailable;
+            }
+            text("history-coverage",sources ? QString("Coverage: %1 · %2 historical sources · %3 recorded gaps. Archived records do not report current permissions.")
+                .arg(live ? "Partial available history" : "Monitoring unavailable; saved history retained").arg(sources).arg(gaps)
+                : "Monitoring unavailable · a service heartbeat does not report traffic.");
+        }
+        if (auto *text = pageControl<QLabel>(page_,"principal-page-count")) text->setText("Rules for your account: " +
+            (client->rulesCurrent() ? QString::number(client->rules().size()) : "Unavailable") + " · no recorded activity does not mean inactive");
+        if (auto *text = pageControl<QLabel>(page_,"import-page-state")) {
+            QStringList messages;
+            if (product_.importBusy()) messages << "Analyzing the chosen file in the background · preview preserved";
+            if (product_.reviewBusy()) messages << "Loading or saving inactive review in the background";
+            if (!product_.importError().isEmpty()) messages << "Preview preserved · " + product_.importError();
+            if (!product_.reviewError().isEmpty()) messages << product_.reviewError();
+            text->setText(messages.join('\n')); text->setVisible(!messages.isEmpty());
+        }
     }
-    buildPage();
-    if (!selected_.isEmpty() && view_ == "processes" &&
-        (product_.simulation() ? model_.process(selected_) != nullptr : product_.process(selected_) != nullptr))
-        openDetail(selected_);
+}
+void MainWindow::refresh() {
+    updatePageState();
+    refreshTable();
+    if (detail_ && !selected_.isEmpty()) openDetail(selected_);
+    renderNotice();
     closeStaleModal();
 }
 QTableView *MainWindow::makeTable(const QStringList &headers, const QVector<int> &widths,
@@ -1124,6 +1230,15 @@ void MainWindow::renderImport() {
 void MainWindow::refreshTable(bool newPage) {
     if (!rows_ || !table_)
         return;
+    // El preview grande no se recorre por avisos del motor o del writer sin cambios de fuente.
+    if (!product_.simulation() && view_ == "import") {
+        const auto &source = product_.importedView(true);
+        QByteArray key; QDataStream stamp(&key,QIODevice::WriteOnly);
+        stamp << product_.draft().digest << qint64(product_.draft().candidates.size()) << product_.draft().accepted
+              << source.digest << source.revision << source.job << source.current << source.busy << source.facts.error;
+        if (!newPage && key == tableSourceKey_) return;
+        tableSourceKey_ = key;
+    } else tableSourceKey_.clear();
     if (!newPage) saveViewState();
     const auto saved = viewStates_.value(stateKey());
     const auto current = table_->currentIndex().isValid() ? table_->currentIndex().data(IdRole).toString() : saved.selectedId;
@@ -1331,10 +1446,10 @@ void MainWindow::refreshTable(bool newPage) {
                                {r.status, r.status, {}},
                                {r.note, {}, {}}}});
     rows_->replace(result);
-    if (table_->isSortingEnabled()) table_->sortByColumn(saved.sortColumn, saved.order);
-    bool restored = false;
+    if (newPage && table_->isSortingEnabled()) table_->sortByColumn(saved.sortColumn, saved.order);
+    bool restored = table_->currentIndex().isValid() && table_->currentIndex().data(IdRole).toString() == current;
     for (int i = 0; i < rows_->rowCount(); ++i)
-        if (rows_->index(i, 0).data(IdRole).toString() == current) {
+        if (!restored && rows_->index(i, 0).data(IdRole).toString() == current) {
             table_->setCurrentIndex(rows_->index(i, qMin(saved.currentColumn, rows_->columnCount() - 1)));
             restored = true;
             break;
@@ -1385,11 +1500,31 @@ void MainWindow::openDetail(const QString &id) {
     const auto *p = model_.process(id);
     if (!p || view_ != "processes")
         return;
+    QByteArray key; QDataStream stamp(&key, QIODevice::WriteOnly);
+    stamp << id << p->name << p->path << p->publisher << p->signature << int(p->policy)
+          << p->scope << p->duration << p->attempt << p->authorized << p->traffic
+          << p->destination << p->protocol << model_.available();
+    if (detail_ && detail_->property("detail-key").toByteArray() == key) return;
+    if (detail_ && detail_->property("detail-id").toString() == id) {
+        const QMap<QString,QString> values{{"Publisher",p->publisher},{"Signature",p->signature + " · sample"},
+            {"Policy",policyText(p->policy)},{"Application identity",p->scope},{"Duration",p->duration},
+            {"Last attempt",timestamp(p->attempt)},{"Authorized",timestamp(p->authorized)},
+            {"Observed traffic",timestamp(p->traffic)}};
+        for (auto *text : detail_->findChildren<QLabel *>()) {
+            const auto name = text->property("definition-name").toString();
+            if (values.contains(name) && text->text() != values[name]) text->setText(values[name]);
+            if (text->property("role").toString() == "heading" && text->text() != p->name) text->setText(p->name);
+        }
+        if (auto *edit = detail_->findChild<QPushButton *>("detail-edit")) edit->setEnabled(model_.available());
+        detail_->setProperty("detail-key",key); return;
+    }
     selected_ = id;
     if (detail_)
         dispose(detail_);
     detail_ = new QFrame(page_);
     detail_->setObjectName("detail");
+    detail_->setProperty("detail-key", key);
+    detail_->setProperty("detail-id",id);
     auto *l = new QVBoxLayout(detail_);
     l->setContentsMargins(15, 15, 15, 13);
     l->setSpacing(10);
@@ -1456,6 +1591,21 @@ void MainWindow::openRequest(const QString &id) {
 void MainWindow::renderOrdinaryNotice() {
     if (product_.simulation()) return;
     auto *client = product_.ordinary();
+    QByteArray key; QDataStream stamp(&key, QIODevice::WriteOnly);
+    gb::wire::Bytes encoded;
+    if (client->observed()) gb::wire::iv::pack(std::vector<gb::wire::iv::ObservedRecord>{*client->observed()}, encoded);
+    stamp << QByteArray(reinterpret_cast<const char *>(encoded.data()), encoded.size());
+    encoded.clear();
+    if (client->draft()) gb::wire::iv::pack(std::vector<gb::wire::iv::FutureDraftRecord>{*client->draft()}, encoded);
+    stamp << QByteArray(reinterpret_cast<const char *>(encoded.data()), encoded.size())
+          << client->selection() << int(client->state()) << client->message() << client->visible()
+          << client->ready() << client->selectedDirection() << client->selectedScope()
+          << product_.importedActivation().busy << product_.importedActivation().ready;
+    if (notice_ && key == ordinaryNoticeKey_) {
+        if (auto *check = notice_->findChild<QPushButton *>("ordinary-recover")) check->setEnabled(client->idle());
+        return;
+    }
+    ordinaryNoticeKey_ = key;
     const QString focused = notice_ && notice_->isAncestorOf(QApplication::focusWidget())
         ? QApplication::focusWidget()->objectName() : QString{};
     if (notice_) { dispose(notice_); notice_.clear(); }
@@ -1578,8 +1728,9 @@ void MainWindow::renderOrdinaryNotice() {
         const bool enabled = checked && selection == client->selection() && client->ready();
         block->setEnabled(enabled); allow->setEnabled(enabled);
     });
-    for (auto *b : {block, allow}) connect(b, &QPushButton::clicked, this, [client, selection, consent, allowAction = b == allow] {
-        client->decide(allowAction, consent->isChecked(), selection);
+    for (auto *b : {block, allow}) connect(b, &QPushButton::clicked, this, [client, selection, consent, status, allowAction = b == allow] {
+        if (!client->decide(allowAction, consent->isChecked(), selection) && selection == client->selection() && client->ready())
+            status->setText("Review is being checked. Choose again when it finishes.");
     });
     if (client->state() == OrdinaryDecisionClient::State::Uncertain) {
         auto *check = button("Check same command", "ordinary-recover"); check->setEnabled(client->idle());
@@ -1593,6 +1744,12 @@ void MainWindow::renderNotice() {
     if (!product_.simulation()) { renderOrdinaryNotice(); return; }
     const auto id = explanation_.visibleId();
     const auto *p = model_.process(id);
+    QByteArray key; QDataStream stamp(&key,QIODevice::WriteOnly);
+    const auto reviewKey = model_.review(id);
+    stamp << id << model_.epoch() << model_.available() << model_.isPending(id) << explanation_.generation()
+          << int(explanation_.status()) << explanation_.text() << explanation_.problem() << explanation_.disclosure()
+          << explanation_.configured() << explanation_.consent() << reviewKey.scope << reviewKey.duration << reviewKey.expanded;
+    if (notice_ && notice_->property("simulation-notice-key").toByteArray() == key) return;
     const QString focused = notice_ && notice_->isAncestorOf(QApplication::focusWidget())
                                 ? QApplication::focusWidget()->objectName()
                                 : QString{};
@@ -1609,6 +1766,7 @@ void MainWindow::renderNotice() {
     notice_ = new QFrame(root_);
     notice_->setObjectName("access-notice");
     notice_->setAccessibleName("Access request · simulation");
+    notice_->setProperty("simulation-notice-key",key);
     auto *l = new QVBoxLayout(notice_);
     l->setContentsMargins(15, 12, 15, 12);
     l->setSpacing(9);
@@ -2004,6 +2162,7 @@ void MainWindow::modeSelector(QVBoxLayout *layout) {
     layout->addWidget(panel);
 }
 void MainWindow::renderLive() {
+    const auto named = [](QLabel *text, const char *name) { text->setObjectName(name); return text; };
     if (view_ != "settings") pageLayout_->addWidget(note("Process and activity records are read only. Review pending access requests to choose Allow or Block. Protection coverage has not been validated.", true));
     if (view_ == "processes") {
         auto *bar = line(pageLayout_); auto *search = new QLineEdit(query_);
@@ -2014,24 +2173,25 @@ void MainWindow::renderLive() {
         makeTable({"Process", "Policy", "Last request", "Last allowed request", "Last traffic", "State"}, {27, 13, 16, 18, 14, 12});
         pageLayout_->addWidget(label("Dates require a live original source and a retained local process instance. Traffic records bytes and network buffers observed by the OS; it does not confirm delivery. Unknown does not mean inactive.", "faint", true));
         count_ = label({}, "faint"); pageLayout_->addWidget(count_);
-        if (!product_.catalog().error.isEmpty()) pageLayout_->addWidget(label(product_.catalog().error, "warning", true));
+        pageLayout_->addWidget(named(label(product_.catalog().error, "warning", true),"catalog-error"));
     } else if (view_ == "pending") {
         auto *bar = line(pageLayout_);
         auto *refresh = button("Refresh requests", "refresh-ordinary"); bar->addWidget(refresh);
         refresh->setEnabled(product_.ordinary()->idle() && product_.ordinary()->state() != OrdinaryDecisionClient::State::Uncertain);
         connect(refresh, &QPushButton::clicked, product_.ordinary(), &OrdinaryDecisionClient::refresh);
-        if (product_.ordinary()->state() == OrdinaryDecisionClient::State::Uncertain) {
+        {
             auto *recover = button("Check same command", "ordinary-recover-page");
-            recover->setEnabled(product_.ordinary()->idle()); bar->addWidget(recover);
+            recover->setEnabled(product_.ordinary()->idle()); recover->setVisible(product_.ordinary()->state() == OrdinaryDecisionClient::State::Uncertain); bar->addWidget(recover);
             connect(recover, &QPushButton::clicked, product_.ordinary(), &OrdinaryDecisionClient::recover);
         }
         bar->addStretch();
-        pageLayout_->addWidget(label(product_.ordinary()->message(), "muted", true));
-        pageLayout_->addWidget(note(product_.ordinary()->current()
+        pageLayout_->addWidget(named(label(product_.ordinary()->message(), "muted", true),"ordinary-page-message"));
+        auto *contextNote = note(product_.ordinary()->current()
             ? "Review each request to choose Allow or Block and how long it applies. Always rules cover future connections for this application and account. Protection coverage has not been validated."
             : product_.recordsSelected() && product_.records()->recordsCurrent()
                 ? "View request snapshot · read only. These requests use the separate administrator reviewer; coverage remains unvalidated."
-                : "No current request list. Refresh requests to check the connection; a running process is not an access request."));
+                : "No current request list. Refresh requests to check the connection; a running process is not an access request.");
+        contextNote->setObjectName("pending-context-note"); pageLayout_->addWidget(contextNote);
         makeTable({"Application", "Destination", "Last request", "Decision"}, {32, 31, 14, 23}, 57);
     } else if (view_ == "activity") {
         auto *bar = line(pageLayout_);
@@ -2046,12 +2206,12 @@ void MainWindow::renderLive() {
             ++nativeSources; gaps += coverage.gaps.size();
             if (coverage.status != Data::CoverageStatus::Unavailable) ++liveSources;
         }
-        pageLayout_->addWidget(label(nativeSources
+        pageLayout_->addWidget(named(label(nativeSources
             ? QString("Coverage: %1 · %2 historical sources · %3 recorded gaps. Archived records do not report current permissions.")
                 .arg(liveSources ? "Partial available history" : "Monitoring unavailable; saved history retained").arg(nativeSources).arg(gaps)
-            : "Monitoring unavailable · a service heartbeat does not report traffic.", "faint", true));
+            : "Monitoring unavailable · a service heartbeat does not report traffic.", "faint", true),"history-coverage"));
         pageLayout_->addWidget(label("History starts when monitoring connects and retains 4,096 detail events. Connection requests, decisions and traffic are recorded separately. Decision time can be unknown; traffic and application identity remain unknown until their original sources are available. No recorded events does not mean an application was inactive.", "faint", true));
-        if (!product_.historyError().isEmpty()) pageLayout_->addWidget(note(product_.historyError()));
+        pageLayout_->addWidget(named(label(product_.historyError(),"warning",true),"history-error"));
     } else if (view_ == "rules") {
         auto *bar = line(pageLayout_);
         auto *refresh = button("Refresh my rules","refresh-principal-rules");
@@ -2071,20 +2231,20 @@ void MainWindow::renderLive() {
         backup->setEnabled(product_.ordinary()->rulesCurrent()); connect(backup,&QPushButton::clicked,this,&MainWindow::backupSelectedFileRules);
         auto *restore = button("Open inactive backup…","open-rule-backup","ghost"); files->addWidget(restore); files->addStretch();
         connect(restore,&QPushButton::clicked,this,&MainWindow::openRuleBackup);
-        if (product_.ordinary()->state() == OrdinaryDecisionClient::State::Uncertain) {
+        {
             auto *recover = button("Check same command","rule-recover","ghost");
-            recover->setEnabled(product_.ordinary()->idle()); bar->addWidget(recover);
+            recover->setEnabled(product_.ordinary()->idle()); recover->setVisible(product_.ordinary()->state() == OrdinaryDecisionClient::State::Uncertain); bar->addWidget(recover);
             connect(recover,&QPushButton::clicked,product_.ordinary(),&OrdinaryDecisionClient::recover);
         }
         bar->addStretch();
-        pageLayout_->addWidget(label(product_.ordinary()->message(),"muted",true));
-        pageLayout_->addWidget(label("Rules for your account: " + (product_.ordinary()->rulesCurrent()
+        pageLayout_->addWidget(named(label(product_.ordinary()->message(),"muted",true),"ordinary-page-message"));
+        pageLayout_->addWidget(named(label("Rules for your account: " + (product_.ordinary()->rulesCurrent()
             ? QString::number(product_.ordinary()->rules().size()) : "Unavailable") +
-            " · no recorded activity does not mean inactive", "faint",true));
-        pageLayout_->addWidget(label("Engine rules: " + (product_.recordsSelected() && product_.records()->recordsCurrent()
+            " · no recorded activity does not mean inactive", "faint",true),"principal-page-count"));
+        pageLayout_->addWidget(named(label("Engine rules: " + (product_.recordsSelected() && product_.records()->recordsCurrent()
             ? QString::number(product_.records()->rules().size()) + " read only" : "Unavailable") +
-            " · local candidates: " + QString::number(product_.review().report.candidates.size()) + " inactive", "muted", true));
-        if (!product_.reviewError().isEmpty()) pageLayout_->addWidget(note(product_.reviewError()));
+            " · local candidates: " + QString::number(product_.review().report.candidates.size()) + " inactive", "muted", true),"engine-rule-count"));
+        pageLayout_->addWidget(named(label(product_.reviewError(),"warning",true),"review-error"));
         makeTable({"Source target", "State", "Direction", "Last request", "Mapping", "Candidate"}, {24, 15, 20, 20, 12, 9});
         table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
         auto *review = button("Review selected candidate", "review-candidate"); pageLayout_->addWidget(review, 0, Qt::AlignRight);
@@ -2107,10 +2267,7 @@ void MainWindow::renderLive() {
             dialog->setAttribute(Qt::WA_DeleteOnClose); dialog->setFileMode(QFileDialog::ExistingFile);
             connect(dialog, &QFileDialog::fileSelected, &product_, &ProductController::analyzeChosenFile); dialog->open();
         });
-        if (product_.importBusy()) pageLayout_->addWidget(label("Analyzing the chosen file in the background · preview preserved", "muted", true));
-        if (product_.reviewBusy()) pageLayout_->addWidget(label("Loading or saving inactive review in the background · previous file preserved until commit", "muted", true));
-        if (!product_.importError().isEmpty()) pageLayout_->addWidget(note("Preview preserved · " + product_.importError()));
-        if (!product_.reviewError().isEmpty()) pageLayout_->addWidget(note(product_.reviewError()));
+        pageLayout_->addWidget(named(label({},"warning",true),"import-page-state"));
         makeTable({"Source target", "Original policy", "Mapping", "Review reason"}, {27, 17, 18, 38}, 38);
         table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
         auto *selectedFiles = button("Review selected saved rules…","prepare-source-files","ghost");
@@ -2118,7 +2275,7 @@ void MainWindow::renderLive() {
         pageLayout_->addWidget(selectedFiles,0,Qt::AlignLeft);
         connect(selectedFiles,&QPushButton::clicked,this,&MainWindow::prepareSelectedSourceFiles);
         auto *foot = line(pageLayout_);
-        foot->addWidget(label(QString::number(product_.draft().candidates.size()) + " inactive rows · compatibility: not validated", "faint"), 1);
+        foot->addWidget(named(label(QString::number(product_.draft().candidates.size()) + " inactive rows · compatibility: not validated", "faint"),"import-count"), 1);
         auto *save = button("Save all inactive candidates", "save-candidates", "primary");
         save->setEnabled(!product_.importBusy() && !product_.reviewBusy() && product_.reviewWritable() && product_.draft().accepted); foot->addWidget(save);
         connect(save, &QPushButton::clicked, this, [this] { if (product_.saveCandidates()) message("Saving inactive candidates in the background…"); });
@@ -2127,8 +2284,8 @@ void MainWindow::renderLive() {
         modeSelector(l);
         auto *panel = frame("panel"); auto *p = new QVBoxLayout(panel); p->setContentsMargins(16, 16, 16, 16); p->setSpacing(8);
         p->addWidget(label("Network engine", "heading"));
-        p->addWidget(label(product_.ordinary()->current() ? "Request review connected"
-            : product_.engine().current ? "View connected · reading service status" : "No current service snapshot", "warning", true));
+        p->addWidget(named(label(product_.ordinary()->current() ? "Request review connected"
+            : product_.engine().current ? "View connected · reading service status" : "No current service snapshot", "warning", true),"engine-connection"));
         p->addWidget(label("Network protection has not been validated. Access requests can be reviewed here without administrator confirmation. Read-only View requests require the separate administrator reviewer.", "faint", true));
         auto *refresh = button("Refresh connection", "refresh-engine"); p->addWidget(refresh, 0, Qt::AlignLeft);
         connect(refresh, &QPushButton::clicked, &product_, &ProductController::refreshEngine);
@@ -2139,9 +2296,9 @@ void MainWindow::renderLive() {
         auto *advanced = new QWidget(panel);auto *advancedLayout = new QVBoxLayout(advanced);
         advancedLayout->setContentsMargins(0, 0, 0, 0);advanced->hide();p->addWidget(advanced);
         connect(advancedToggle, &QPushButton::toggled, advanced, &QWidget::setVisible);
-        advancedLayout->addWidget(label(product_.engineSummary(), "muted", true));
-        advancedLayout->addWidget(label(product_.revisionSummary(), "muted", true));
-        if (!product_.engine().error.isEmpty()) advancedLayout->addWidget(label(product_.engine().error, "muted", true));
+        advancedLayout->addWidget(named(label(product_.engineSummary(), "muted", true),"engine-summary"));
+        advancedLayout->addWidget(named(label(product_.revisionSummary(), "muted", true),"engine-revision"));
+        advancedLayout->addWidget(named(label(product_.engine().error, "muted", true),"engine-error"));
         auto *statusOnly = button("Use status-only connection", "select-view-i", "ghost"); advancedLayout->addWidget(statusOnly, 0, Qt::AlignLeft);
         connect(statusOnly, &QPushButton::clicked, &product_, &ProductController::selectStatusOnly);
         advancedLayout->addWidget(label(product_.recordsSelected() ? "Selected source: service records · connection failure makes records unavailable" : "Selected source: engine status only", "faint", true));
@@ -2227,8 +2384,36 @@ void MainWindow::openEngineRequest(const QString &rowId) {
 }
 void MainWindow::renderLiveDetail(const QString &id) {
     const auto *p = product_.process(id); if (!p || view_ != "processes") return;
+    QByteArray key; QDataStream stamp(&key, QIODevice::WriteOnly);
+    stamp << id << p->name << p->imagePath << p->lastAttemptUtc << p->lastAuthorizedUtc << p->lastTrafficUtc
+          << bool(p->sourceImage);
+    if (p->sourceImage) stamp << p->sourceImage->volumeSerial << p->sourceImage->indexHigh << p->sourceImage->indexLow;
+    if (detail_ && detail_->property("detail-key").toByteArray() == key) return;
+    if (detail_ && detail_->property("detail-id").toString() == id) {
+        const auto at = [](const QDateTime &time) { return time.isValid() ? time.toUTC().toString(Qt::ISODateWithMs) : QString("Unknown"); };
+        const QMap<QString,QString> values{{"Last request",at(p->lastAttemptUtc)},
+            {"Last allowed",at(p->lastAuthorizedUtc)},{"Last traffic",at(p->lastTrafficUtc)},
+            {"Image custody",p->sourceImage ? "Source-retained original image + local live process snapshot" : "Snapshot only · original image unknown"},
+            {"Original NTFS file ID",p->sourceImage ? QString("%1:%2%3").arg(p->sourceImage->volumeSerial,8,16,QChar('0'))
+                .arg(p->sourceImage->indexHigh,8,16,QChar('0')).arg(p->sourceImage->indexLow,8,16,QChar('0')) : "Unknown"}};
+        for (auto *text : detail_->findChildren<QLabel *>()) {
+            const auto name = text->property("definition-name").toString();
+            if (values.contains(name) && text->text() != values[name]) text->setText(values[name]);
+            if (text->property("role").toString() == "heading") {
+                const auto title = p->name.isEmpty() ? QString("Unattributed process") : p->name;
+                if (text->text() != title) text->setText(title);
+            }
+        }
+        if (auto *path = detail_->findChild<QPlainTextEdit *>("observed-process-path")) {
+            const auto text = p->imagePath.isEmpty() ? QString("Path unknown") : p->imagePath;
+            if (path->toPlainText() != text) path->setPlainText(text);
+        }
+        detail_->setProperty("detail-key",key); return;
+    }
     selected_ = id; if (detail_) dispose(detail_);
     detail_ = new QFrame(page_); detail_->setObjectName("detail"); auto *l = new QVBoxLayout(detail_);
+    detail_->setProperty("detail-key", key);
+    detail_->setProperty("detail-id",id);
     l->setContentsMargins(15, 15, 15, 13); l->setSpacing(10);
     auto *head = line(l); head->addWidget(label(p->name.isEmpty() ? "Unattributed process" : p->name, "heading"), 1); auto *close = button("×", "close-detail", "ghost"); head->addWidget(close);
     connect(close, &QPushButton::clicked, this, [this] { selected_.clear(); dispose(detail_); detail_.clear(); });
@@ -2245,7 +2430,7 @@ void MainWindow::renderLiveDetail(const QString &id) {
     if (p->sourceImage) {
         const auto &f = *p->sourceImage;
         definition(body, "Original NTFS file ID", QString("%1:%2%3").arg(f.volumeSerial,8,16,QChar('0')).arg(f.indexHigh,8,16,QChar('0')).arg(f.indexLow,8,16,QChar('0')));
-    }
+    } else definition(body,"Original NTFS file ID","Unknown");
     definition(body, "Policy", "Unknown");
     const auto observed = [](const QDateTime &at) { return at.isValid() ? at.toUTC().toString(Qt::ISODateWithMs) : QString("Unknown"); };
     definition(body, "Last request", observed(p->lastAttemptUtc)); definition(body, "Last allowed", observed(p->lastAuthorizedUtc)); definition(body, "Last traffic", observed(p->lastTrafficUtc));

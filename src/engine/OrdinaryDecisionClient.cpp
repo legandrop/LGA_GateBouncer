@@ -39,18 +39,35 @@ OrdinaryDecisionClient::OrdinaryDecisionClient(bool isolatedQa, QObject *parent,
             message_ = "Review expired. Reopen the request before deciding."; emit changed(); }
     });
     // QA depende de un canal inyectado; sin canal nunca conecta con el equipo.
-    poll_.setInterval(12000);
+    poll_.setSingleShot(true);
+    poll_.setInterval(2000);
     connect(&poll_, &QTimer::timeout, this, [this] {
-        if (!session_.idle()) return;
-        if (visible_ && state_ == State::Ready) { checkOnly_ = true; send(Type::GetStatus); }
-        else if (!visible_ && state_ != State::Sending && state_ != State::Uncertain) {
-            if (readingRules_) refreshRules(); else refresh();
-        }
+        automaticRead();
+        if (automatic_ && !stopping_) poll_.start(session_.idle() ? quietPollMs_ : 500);
     });
+}
+void OrdinaryDecisionClient::observationChanged() {
+    if (!automatic_ || stopping_) return;
+    quietPollMs_ = 2000;
+    // Una ráfaga conserva una sola lectura pendiente; no pospone la primera señal.
+    if (!poll_.isActive() || poll_.remainingTime() > 150) poll_.start(150);
+}
+void OrdinaryDecisionClient::automaticRead() {
+    if (stopping_ || fileOwner_ || !session_.idle() || backgroundRead_ || checkOnly_ || checkingObservation_ ||
+        checkingObservationAfter_ || state_ == State::Loading || state_ == State::Preparing ||
+        state_ == State::Sending || state_ == State::Uncertain) return;
+    if (visible_) {
+        if (state_ == State::Ready) { checkOnly_ = true; send(Type::GetStatus); }
+        return;
+    }
+    if (!connected_ || (!current_ && !rulesCurrent_)) { refresh(); return; }
+    // Una lectura observacional no retira la selección ni el snapshot anterior.
+    backgroundRead_ = true; readingRules_ = false; finalStatus_ = false; checkOnly_ = false;
+    pageRows_.clear(); ids_.clear(); send(Type::GetStatus);
 }
 void OrdinaryDecisionClient::startAutomatic() {
     if (stopping_) return;
-    automatic_ = true; poll_.start();
+    automatic_ = true; quietPollMs_ = 2000; poll_.start(quietPollMs_);
     if (!visible_ && state_ != State::Sending && state_ != State::Uncertain) refresh();
 }
 void OrdinaryDecisionClient::showNext() {
@@ -63,6 +80,7 @@ void OrdinaryDecisionClient::showNext() {
 }
 bool OrdinaryDecisionClient::refresh() {
     if (stopping_ || fileOwner_ || !session_.idle() || state_ == State::Sending || state_ == State::Uncertain) return false;
+    backgroundRead_ = false;
     closeNotice(); current_ = false; rulesCurrent_ = false; readingRules_ = false;
     revocation_.reset(); rows_.clear(); pageRows_.clear(); ids_.clear();
     state_ = State::Loading; message_ = "Reading pending requests…"; finalStatus_ = false; checkOnly_ = false;
@@ -76,6 +94,7 @@ bool OrdinaryDecisionClient::refresh() {
 }
 bool OrdinaryDecisionClient::refreshRules() {
     if (stopping_ || visible_ || !session_.idle() || state_ == State::Sending || state_ == State::Uncertain) return false;
+    backgroundRead_ = false;
     closeNotice(); current_ = false; rulesCurrent_ = false; readingRules_ = true;
     revocation_.reset(); rulePageRows_.clear(); rulePageBytes_ = 0; ids_.clear();
     state_ = State::Loading; message_ = "Reading rules for your account…";
@@ -257,6 +276,7 @@ void OrdinaryDecisionClient::prepare() {
     send(Type::PrepareFuturePolicy, std::move(fields));
 }
 void OrdinaryDecisionClient::closeNotice() {
+    backgroundRead_ = false; checkingObservation_ = false; checkingObservationAfter_ = false; checkOnly_ = false;
     visible_ = false; draftExpiry_.stop();
     if (state_ != State::Sending && state_ != State::Uncertain) {
         ++generation_; draft_.reset(); fileDraft_.reset(); fileOwner_.reset(); expectedFileTarget_.clear(); editing_.reset(); observed_.reset(); submitted_.reset(); state_ = State::Closed;
@@ -378,16 +398,38 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         }
         if (checkOnly_) {
             checkOnly_ = false;
-            if (f.type != Type::Status || !status(f, true)) fail("Service context changed. Reopen the review before deciding.");
+            if (f.type != Type::Status || !status(f, true)) { fail("Service context changed. Reopen the review before deciding."); return; }
+            if (!checkingObservationAfter_ && observed_ && state_ == State::Ready) {
+                checkingObservation_ = true;
+                send(Type::GetObservedRecord,{value(Tag::ObservedId,observed_->observed),
+                    value(Tag::ObservedRevision,observed_->revision),value(Tag::SourceEpoch,observed_->source)});
+                return;
+            }
+            checkingObservationAfter_ = false;
+            quietPollMs_ = std::min(8000,quietPollMs_ * 2);
+            if (automatic_ && !stopping_) poll_.start(quietPollMs_);
             return;
         }
-        if (f.type != Type::Status || !status(f, finalStatus_)) { fail("Service context changed. Refresh before deciding."); return; }
+        if (f.type != Type::Status || !status(f, finalStatus_ || backgroundRead_)) { fail("Service context changed. Refresh before deciding."); return; }
         if (finalStatus_ && readingRules_) {
             if (pageAge_.elapsed() >= 5000) { fail("Rule review snapshot expired."); return; }
             rules_ = std::move(rulePageRows_); rulesCurrent_ = true; current_ = false; state_ = State::Closed;
-            message_ = "Rules for your account ready to review · protection coverage unvalidated"; emit changed(); return;
+            message_ = "Rules for your account ready to review · protection coverage unvalidated"; emit changed();
+            if (automatic_ && !stopping_) poll_.start(quietPollMs_); return;
         }
-        if (finalStatus_) { rows_ = std::move(pageRows_); current_ = true; state_ = State::Closed;
+        if (finalStatus_) {
+            // El codec admite 32 por página; el snapshot completo admite 64.
+            const bool unchanged = backgroundRead_ && rows_.size() == pageRows_.size() &&
+                std::equal(rows_.begin(),rows_.end(),pageRows_.begin(),[](const auto &a,const auto &b) {
+                    Bytes before, after;
+                    return iv::pack(std::vector<iv::ObservedRecord>{a},before) == Error::Ok &&
+                        iv::pack(std::vector<iv::ObservedRecord>{b},after) == Error::Ok && before == after;
+                });
+            backgroundRead_ = false;
+            quietPollMs_ = unchanged ? std::min(8000,quietPollMs_ * 2) : 2000;
+            if (automatic_ && !stopping_) poll_.start(quietPollMs_);
+            if (unchanged && current_) { showNext(); return; }
+            rows_ = std::move(pageRows_); current_ = true; state_ = State::Closed;
             for (auto it = shown_.begin(); it != shown_.end();) {
                 if (!ids_.count(it->first)) it = shown_.erase(it); else ++it;
             }
@@ -448,6 +490,17 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         if (f.type != Type::ObservedRecord || iv::unpack(find(f, Tag::Records)->bytes, 1, rows) != Error::Ok ||
             rows[0].observed != observed_->observed || rows[0].revision != observed_->revision || rows[0].source != source_ ||
             rows[0].binding != observed_->binding || rows[0].state != 1) { fail("This request is no longer current."); return; }
+        if (checkingObservation_) {
+            checkingObservation_ = false;
+            Bytes before, after;
+            if (iv::pack(std::vector<iv::ObservedRecord>{*observed_},before) != Error::Ok ||
+                iv::pack(rows,after) != Error::Ok || before != after ||
+                (scope_ >= 3 && get(f,Tag::PolicyDirection) != unsigned(direction_))) {
+                fail("This request changed. Reopen the review before deciding."); return;
+            }
+            checkingObservationAfter_ = true; checkOnly_ = true; send(Type::GetStatus);
+            return;
+        }
         if (scope_ >= 3) {
             const auto direction = get(f, Tag::PolicyDirection);
             if (rows[0].temporal != 2 || direction < 1 || direction > 2) {
@@ -524,6 +577,11 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
     fail("Unexpected ordinary response.", mutation);
 }
 void OrdinaryDecisionClient::fail(const QString &message, bool uncertain) {
+    backgroundRead_ = false;
+    checkingObservation_ = false;
+    checkingObservationAfter_ = false;
+    quietPollMs_ = std::min(8000,quietPollMs_ * 2);
+    if (automatic_ && !stopping_) poll_.start(quietPollMs_);
     draftExpiry_.stop(); draft_.reset(); current_ = false; rulesCurrent_ = false;
     state_ = uncertain ? State::Uncertain : State::Failed; message_ = message; emit changed();
 }
