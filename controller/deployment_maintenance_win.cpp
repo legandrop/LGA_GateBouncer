@@ -176,7 +176,8 @@ class GuestMaintenance {
         bool present = false; DWORD state = 0, initial = 0;
         std::wstring root, ordinary, store, view;
         return key_ && native::protectedRegistry(key_) && lease_.current() &&
-            (!finalizing_ || (lease_.ownsConfiguration(key_) && retainedStore_ && retainedStore_->acquire())) &&
+            (!(finalizing_ || mode_ == DeploymentMode::Product) || lease_.ownsConfiguration(key_)) &&
+            (!finalizing_ || (retainedStore_ && retainedStore_->acquire())) &&
             maintenanceState(key_,present,state) && present == hadMarker_ && state == marker_ &&
             readString(key_,L"PackageRoot",root) && root == active_.native() &&
             readString(key_,L"OrdinaryImage",ordinary) && ordinary == (active_/L"GateBouncer.exe").native() &&
