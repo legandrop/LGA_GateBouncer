@@ -28,7 +28,6 @@ qt_add_library(gatebouncer_general_live STATIC
     configuration/ConfigurationPolicy.cpp configuration/ConfigurationPolicy.h
     configuration/WindowsConfigurationStore.cpp configuration/WindowsConfigurationStore.h
     configuration/ProviderEntitlementVerifier.cpp configuration/ProviderEntitlementVerifier.h
-    configuration/ProviderEntitlementInternal.h
     general/GeneralContracts.cpp general/GeneralContracts.h
     general/GeneralPayload.cpp general/GeneralPayload.h
     general/GeneralCoordinator.cpp general/GeneralCoordinator.h

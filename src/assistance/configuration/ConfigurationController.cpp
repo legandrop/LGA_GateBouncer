@@ -43,7 +43,7 @@ std::unique_ptr<ConfigurationController> ConfigurationController::forCurrentUser
 ConfigurationSnapshot ConfigurationController::snapshot() const {std::lock_guard<std::mutex> lock(authority_->mutex);return authority_->snapshot;}
 std::optional<ConfigurationIntent> ConfigurationController::intent(ConfigurationVerb verb,std::uint64_t revision) {
     auto a=authority_;std::lock_guard<std::mutex> lock(a->mutex);
-    if(!a->alive||!a->ordinary||!a->ordinary()||nonzero(a->pendingTicket)||revision!=a->snapshot.revision||std::uint8_t(verb)<1||std::uint8_t(verb)>6)return {};
+    if(!a->alive||!a->ordinary||!a->ordinary()||nonzero(a->pendingTicket)||revision!=a->snapshot.revision||std::uint8_t(verb)<1||std::uint8_t(verb)>7)return {};
     if(!Broker::randomId(a->capability))return {};
     a->capabilityVerb=verb;a->capabilityExpiry=GetTickCount64()+5000;
     return ConfigurationIntent{a->capability,a->snapshot.revision,verb};
@@ -70,6 +70,8 @@ std::unique_ptr<MutationTicket> ConfigurationController::begin(ConfigurationInte
     auto candidate=a->snapshot;failure=ConfigFailure::Malformed;
     if(m.verb==ConfigurationVerb::Consent&&(!validReceipt(m.receipt,true)||(m.target!=ConsentTarget::Model&&m.target!=ConsentTarget::Web)||(m.receipt.granted&&!sameNotice(m.receipt,m.target==ConsentTarget::Model?a->provider.notice:a->searchNotice))))return {};
     if(m.verb==ConfigurationVerb::Mode&&(m.mode!=ModeChoice::Manual&&m.mode!=ModeChoice::Automatic))return {};
+    if(m.verb==ConfigurationVerb::ServiceUse&&std::uint8_t(m.serviceUse)>2)return {};
+    if(m.verb==ConfigurationVerb::Consent&&m.target==ConsentTarget::Model&&m.receipt.granted&&candidate.serviceUse!=ServiceUse::InternalEvaluation)return {};
     if(m.verb==ConfigurationVerb::Profile&&(m.profileRef!=a->provider.profile||m.profileRevision!=a->provider.profileRevision)){failure=ConfigFailure::UnsupportedProfile;return {};}
     if(m.verb==ConfigurationVerb::Search&&(!m.search||!validSearch(*m.search,true)||!a->currentSearch||!sameSearch(*m.search,*a->currentSearch)))return {};
     auto d=std::make_unique<Detail::MutationData>();d->precedent=a->observedRecord;d->precedentRevision=a->committedRevision;d->failureLatchedAtBegin=a->failureLatched;if(!Broker::randomId(d->ticket)){failure=ConfigFailure::Unreadable;return {};}
@@ -91,10 +93,14 @@ std::unique_ptr<MutationTicket> ConfigurationController::begin(ConfigurationInte
         auto receipt=m.receipt;receipt.epoch=epoch;if(!receipt.granted){receipt={};receipt.epoch=epoch;}
         (m.target==ConsentTarget::Model?candidate.modelConsent:candidate.webConsent)=std::move(receipt);
     }else if(m.verb==ConfigurationVerb::Mode)candidate.mode=m.mode;
+    else if(m.verb==ConfigurationVerb::ServiceUse){
+        candidate.serviceUse=m.serviceUse;++candidate.epochs.entitlement;++candidate.epochs.consent;
+        ++candidate.epochs.modelConsent;++candidate.epochs.webConsent;Detail::revokeReceipts(candidate);
+    }
     else if(m.verb==ConfigurationVerb::Profile){candidate.selectedProfileRef=m.profileRef;++candidate.epochs.entitlement;++candidate.epochs.consent;++candidate.epochs.modelConsent;candidate.modelConsent={};candidate.modelConsent.epoch=candidate.epochs.modelConsent;}
     else if(m.verb==ConfigurationVerb::Search){candidate.search=a->currentSearch;candidate.epochs.providerPolicy=a->currentSearch->providerPolicyEpoch;++candidate.epochs.consent;++candidate.epochs.webConsent;candidate.webConsent={};candidate.webConsent.epoch=candidate.epochs.webConsent;}
     if(candidate.search)candidate.search->webConsentEpoch=candidate.epochs.webConsent;
-    if(candidate.mode==ModeChoice::Unchosen&&candidate.credential==CredentialState::Stored&&candidate.modelConsent.granted&&candidate.webConsent.granted)candidate.mode=ModeChoice::Automatic;
+    if(candidate.mode==ModeChoice::Unchosen&&candidate.serviceUse==ServiceUse::InternalEvaluation&&candidate.credential==CredentialState::Stored&&candidate.modelConsent.granted&&candidate.webConsent.granted)candidate.mode=ModeChoice::Automatic;
     if(!validSnapshot(candidate)){a->failureLatched=true;a->snapshot.storage=StorageState::IoUncertain;Detail::revokeReceipts(a->snapshot);return {};}
     a->snapshot.epochs=candidate.epochs;a->snapshot.storage=StorageState::IoUncertain;Detail::revokeReceipts(a->snapshot);a->pendingTicket=d->ticket;
     d->authority=a;d->candidate=std::move(candidate);d->committedRevision=a->committedRevision+1;d->verb=m.verb;d->secret=std::move(secret);failure=ConfigFailure::None;

@@ -20,6 +20,7 @@ public:
     bool forget();
     bool consent(Configuration::ConsentTarget,bool);
     bool mode(Configuration::ModeChoice);
+    bool serviceUse(Configuration::ServiceUse);
     bool selectSearch();
     bool selectPending(const General::Id128&,General::PendingServiceContext);
     std::optional<General::FullBinding> pendingBinding() const;

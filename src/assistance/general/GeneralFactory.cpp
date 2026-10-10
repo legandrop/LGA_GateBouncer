@@ -16,8 +16,7 @@ bool sameDisclosure(const C::ModelDisclosure& a,const C::ModelDisclosure& b) {
 std::optional<C::ConsentReceipt> modelDescriptor(const C::ModelDisclosure& model,const ConfigurationView& canonical) {
     const auto &receipt=model.descriptor;
     const bool available=model.cause==C::DisclosureCause::Available&&
-        (model.source==C::DisclosureSource::ReviewedCatalog||
-         (model.source==C::DisclosureSource::TrialRestricted&&model.evidence==C::EvidenceState::Restricted));
+        model.source==C::DisclosureSource::TrialRestricted&&model.evidence==C::EvidenceState::Restricted;
     if(!available||model.evidence!=canonical.activation.entitlementState||model.viewRevision!=canonical.local.revision||
         model.body.empty()||model.body.size()>2048||receipt.granted||receipt.epoch||!receipt.noticeRevision||
         !C::validReceipt(receipt,true)||receipt.profileRef!=canonical.local.selectedProfileRef||

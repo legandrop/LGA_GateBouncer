@@ -12,16 +12,18 @@ inline constexpr const char *GeneralProfile = "GB_GENERAL_SNIPPETS_ULTRA_1";
 enum class StorageState : std::uint8_t { Uninitialized, Ready, Busy, UnsafeRoot, Corrupt, Unreadable, IoUncertain };
 enum class CredentialState : std::uint8_t { Absent, Stored, Corrupt, Unavailable };
 enum class ModeChoice : std::uint8_t { Unchosen, Automatic, Manual };
+// Proposito elegido por el usuario; no acredita cuenta, cuota ni permiso productivo.
+enum class ServiceUse : std::uint8_t { Unchosen, InternalEvaluation, HostedProduction };
 enum class EvidenceState : std::uint8_t { Missing, Applicable, Restricted, Expired, Conflict };
 enum class ActivationCause : std::uint16_t {
     Ready, LocalConfigurationUnavailable, CredentialMissing, CredentialCorrupt,
     EntitlementMissing, OperationalUseRestricted, EntitlementExpired, EntitlementConflict,
     ModelConsentMissing, WebConsentMissing, SearchConfigurationMissing,
     PublicQueryApprovalMissing, ProviderPolicyChanged, SessionStale, ServiceUnavailable,
-    PayloadNotSealed, TechnicalPrerequisitesMissing, LocalMutationUncertain
+    PayloadNotSealed, TechnicalPrerequisitesMissing, LocalMutationUncertain, ServiceUseMissing
 };
 enum class ConfigFailure : std::uint16_t { None, Malformed, Unauthorized, Stale, Busy, UnsafeRoot, Corrupt, Unreadable, IoUncertain, UnsupportedProfile, RevisionExhausted };
-enum class ConfigurationVerb : std::uint8_t { Store=1, Forget, Consent, Mode, Profile, Search };
+enum class ConfigurationVerb : std::uint8_t { Store=1, Forget, Consent, Mode, Profile, Search, ServiceUse };
 enum class ConsentTarget : std::uint8_t { Model=1, Web };
 enum class Modality : std::uint8_t { HostedOperational=1, LocalDeployment, InternalEvaluation };
 struct Epochs {
@@ -55,10 +57,11 @@ struct ConfigurationSnapshot {
     Epochs epochs;
     ConsentReceipt modelConsent,webConsent;
     ModeChoice mode=ModeChoice::Unchosen;
+    ServiceUse serviceUse=ServiceUse::Unchosen;
     std::string selectedProfileRef=GeneralProfile;
     std::optional<SearchBindingRef> search;
     std::uint64_t revision=1;
-    auto values() const { return std::tie(storeInstance,storage,credential,epochs,modelConsent,webConsent,mode,selectedProfileRef,search,revision); }
+    auto values() const { return std::tie(storeInstance,storage,credential,epochs,modelConsent,webConsent,mode,serviceUse,selectedProfileRef,search,revision); }
     bool operator==(const ConfigurationSnapshot &o) const { return values()==o.values(); }
 };
 struct NetworkActivationSnapshot {
@@ -74,6 +77,7 @@ struct ConfigurationMutation {
     ConsentTarget target=ConsentTarget::Model;
     ConsentReceipt receipt;
     ModeChoice mode=ModeChoice::Manual;
+    ServiceUse serviceUse=ServiceUse::Unchosen;
     std::string profileRef;
     std::uint32_t profileRevision=1;
     std::optional<SearchBindingRef> search;

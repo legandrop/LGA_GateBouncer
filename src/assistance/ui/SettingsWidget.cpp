@@ -15,12 +15,13 @@ namespace {
 QString activationMessage(const C::NetworkActivationSnapshot& activation){
     switch(activation.cause){
     case C::ActivationCause::Ready:
-        return activation.technicallyAvailable?"Ready to explain reviewed public information":"Configuration could not be confirmed. Refresh to check it again.";
+        return activation.technicallyAvailable?"Ready for internal testing and evaluation, subject to trial credits and request limits":"Configuration could not be confirmed. Refresh to check it again.";
     case C::ActivationCause::LocalConfigurationUnavailable:return "Local assistance settings are unavailable. Refresh to inspect them.";
-    case C::ActivationCause::CredentialMissing:return "You can save your NVIDIA API key locally. Saving it does not enable explanations; your account type and service offer still need to be confirmed.";
+    case C::ActivationCause::CredentialMissing:return "Save your own NVIDIA API key locally, select a purpose and review the data notices. A saved key does not verify account rights or remaining trial credits.";
     case C::ActivationCause::CredentialCorrupt:return "The saved API key cannot be read safely. Forget it before storing it again.";
     case C::ActivationCause::EntitlementMissing:return "Explanations are unavailable. Confirm your NVIDIA account type and a service offer that permits everyday use.";
-    case C::ActivationCause::OperationalUseRestricted:return "Explanations are unavailable. Saving an API key does not enable this service. The API Catalog trial is for development and testing; confirm your account type and a service offer that permits everyday use.";
+    case C::ActivationCause::OperationalUseRestricted:return "Everyday use is unavailable. The API Catalog trial permits internal testing and evaluation only. Your account and a separate production service offer still need to be resolved.";
+    case C::ActivationCause::ServiceUseMissing:return "Select the purpose of use. Internal evaluation and everyday use have different service terms.";
     case C::ActivationCause::EntitlementExpired:return "The reviewed service permission has expired. Explanations are unavailable.";
     case C::ActivationCause::EntitlementConflict:return "The reviewed permission does not match this account, model or service configuration.";
     case C::ActivationCause::ModelConsentMissing:return "Read the current model notice and agree before explanations can start.";
@@ -55,10 +56,15 @@ SettingsWidget::SettingsWidget(GeneralSession* session,QWidget* parent):QFrame(p
     key_=new QLineEdit(this);key_->setObjectName("nvidia-key-input");key_->setEchoMode(QLineEdit::Password);
     key_->setMaxLength(512);key_->setPlaceholderText("Your NVIDIA Developer API key");key_->setInputMethodHints(Qt::ImhSensitiveData|Qt::ImhNoPredictiveText);layout->addWidget(key_);
     store_=addButton("Store API key","store-assistance-key");forget_=addButton("Forget API key","forget-assistance-key");
-    addText("Saving a key stores it locally. It does not verify your NVIDIA account or enable explanations. Confirm which service offer your account covers.","faint");
+    addText("Saving a key stores it locally. It does not check NVIDIA account rights or trial credits, send a request, or grant data consent.","faint");
+    auto* purposeLabel=addText("Purpose of use","heading");
+    serviceUse_=new QComboBox(this);serviceUse_->setObjectName("assistance-service-use");
+    serviceUse_->addItems({"Not selected","Internal testing and evaluation","Everyday use · service offer pending"});
+    serviceUse_->setAccessibleName("Purpose of use");purposeLabel->setBuddy(serviceUse_);layout->addWidget(serviceUse_);
+    addText("Choose internal evaluation only for internal testing, within your trial time and credits. This choice is not account verification. Production or everyday use requires a separate service subscription and is currently unavailable. Changing purpose withdraws both data consents.","faint");
     addText("When to explain","heading");
     mode_=new QComboBox(this);mode_->setObjectName("assistance-mode");mode_->addItems({"Not selected","Automatic","Manual"});layout->addWidget(mode_);
-    addText("Automatic is the default after setup and consent. It explains each new request using the executable name observed by the service when current permissions are available. The name can reveal which app you use. Manual waits for Explain.","faint");
+    addText("Automatic is the default after evaluation setup and both data consents. It explains each new request only while current settings and request limits permit it. The executable name can reveal which app you use. Manual waits for Explain.","faint");
     selectSearch_=addButton("Set up web search","select-assistance-search");
     auto* permissions=new QGroupBox("Permissions · read each notice before agreeing",this);
     permissions->setObjectName("assistance-permissions");
@@ -86,6 +92,7 @@ SettingsWidget::SettingsWidget(GeneralSession* session,QWidget* parent):QFrame(p
     });
     connect(forget_,&QPushButton::clicked,this,[this]{key_->clear();if(session_)session_->forget();});
     connect(mode_,&QComboBox::activated,this,[this](int index){if(session_&&index)session_->mode(index==1?C::ModeChoice::Automatic:C::ModeChoice::Manual);});
+    connect(serviceUse_,&QComboBox::activated,this,[this](int index){if(session_)session_->serviceUse(C::ServiceUse(index));});
     connect(selectSearch_,&QPushButton::clicked,this,[this]{if(session_)session_->selectSearch();});
     connect(grantModel_,&QPushButton::clicked,this,[this]{if(session_)session_->consent(C::ConsentTarget::Model,true);});
     connect(revokeModel_,&QPushButton::clicked,this,[this]{if(session_)session_->consent(C::ConsentTarget::Model,false);});
@@ -106,10 +113,12 @@ void SettingsWidget::refresh(){
             .arg(view->local.webConsent.granted?"consented":"consent needed"));
     connect_->setEnabled(!connected&&!busy);refresh_->setEnabled(connected&&!busy);progress_->setVisible(busy);
     key_->setEnabled(writable);store_->setEnabled(writable);forget_->setEnabled(writable);mode_->setEnabled(writable);
+    serviceUse_->setEnabled(writable);
+    const QSignalBlocker purposeBlocker(serviceUse_);serviceUse_->setCurrentIndex(view?int(view->local.serviceUse):0);
     const QSignalBlocker blocker(mode_);mode_->setCurrentIndex(!view?0:view->local.mode==C::ModeChoice::Automatic?1:view->local.mode==C::ModeChoice::Manual?2:0);
     model_->setText(session_&&!session_->modelBody().isEmpty()?session_->modelBody():"The current model notice is unavailable. Consent cannot be granted.");
     web_->setText(session_&&!session_->webBody().isEmpty()?session_->webBody():"The current web search notice is unavailable. Consent cannot be granted.");
-    grantModel_->setEnabled(writable&&session_&&!session_->modelBody().isEmpty());grantWeb_->setEnabled(writable&&session_&&!session_->webBody().isEmpty());
+    grantModel_->setEnabled(writable&&view->local.serviceUse==C::ServiceUse::InternalEvaluation&&session_&&!session_->modelBody().isEmpty());grantWeb_->setEnabled(writable&&session_&&!session_->webBody().isEmpty());
     revokeModel_->setEnabled(writable&&view->local.modelConsent.granted);revokeWeb_->setEnabled(writable&&view->local.webConsent.granted);
     selectSearch_->setEnabled(writable&&session_&&session_->presentation()&&session_->presentation()->searchReference());
     problem_->setText(session_?session_->problem():QString{});

@@ -1,7 +1,6 @@
 #include "WindowsConfigurationStore.h"
 #include "ConfigurationAuthority.h"
 #include "ConfigurationCodec.h"
-#include "ProviderEntitlementInternal.h"
 #include "../broker/BrokerVault.h"
 #include <chrono>
 #include <shlobj.h>
@@ -25,17 +24,6 @@ bool capturePublication(HANDLE h,const Broker::SensitiveBytes &bytes,const char 
     p.bytesDigest=digest(domain,bytes.data(),bytes.size());return p.captured=nonzero(p.bytesDigest);
 }
 struct ReadResult { StorageState state=StorageState::Unreadable;DWORD error=0;std::optional<Detail::PersistentRecord> record;FileStamp file;Digest256 envelopeDigest{}; };
-bool sameEntitlementPublication(const ReadResult &read,const Detail::EntitlementContext &proof) {
-    return read.record&&read.state==StorageState::Ready&&read.record->secret.size()&&
-        read.file.identity.VolumeSerialNumber==proof.volume&&fileSize(read.file)==proof.size&&
-        !std::memcmp(read.file.identity.FileId.Identifier,proof.fileId.data(),16)&&
-        ((std::uint64_t(read.file.info.ftLastWriteTime.dwHighDateTime)<<32)|read.file.info.ftLastWriteTime.dwLowDateTime)==proof.writeTime&&
-        read.envelopeDigest==proof.envelope&&read.record->integrity==proof.integrity&&
-        read.record->committedRevision==proof.committedRevision&&
-        read.record->metadata.storeInstance==proof.image.snapshot.storeInstance&&
-        read.record->metadata.epochs.credential==proof.image.snapshot.epochs.credential&&
-        read.record->metadata.credential==CredentialState::Stored;
-}
 bool validComponent(const QString &part){
     if(part.isEmpty()||part=="."||part==".."||part.endsWith('.')||part.endsWith(' '))return false;
     for(auto c:part)if(c.unicode()<32||QStringLiteral("<>:\\|?*\"").contains(c))return false;
@@ -136,13 +124,13 @@ MutationResult WindowsConfigurationStore::apply(ConfigurationController &control
     auto before=impl_->read();const bool usable=before.state==StorageState::Ready||before.state==StorageState::Uninitialized||(before.state==StorageState::Corrupt&&d->verb==ConfigurationVerb::Forget);
     if(!impl_->loaded||!usable||!impl_->samePrecedent(before)||(before.state==StorageState::Uninitialized&&impl_->legacyPresent())){observation.primaryError_=before.error;return controller.finish(std::move(ticket),std::move(observation));}
     Detail::PersistentRecord candidate;candidate.metadata=d->candidate;candidate.committedRevision=d->committedRevision;
-    if(before.record){candidate.profileRevision=before.record->profileRevision;candidate.search=before.record->search;candidate.evidence=before.record->evidence;if(d->candidate.credential==CredentialState::Stored&&d->verb!=ConfigurationVerb::Store)candidate.secret=std::move(before.record->secret);
+    if(before.record){candidate.profileRevision=before.record->profileRevision;candidate.search=before.record->search;if(d->candidate.credential==CredentialState::Stored&&d->verb!=ConfigurationVerb::Store)candidate.secret=std::move(before.record->secret);
         if(!d->failureLatchedAtBegin&&!d->candidate.webConsent.granted&&d->candidate.epochs.webConsent==before.record->metadata.epochs.webConsent)candidate.metadata.webConsent=before.record->metadata.webConsent;
     }
     if(d->verb==ConfigurationVerb::Store)candidate.secret=std::move(d->secret);
     if(d->verb==ConfigurationVerb::Search&&d->candidate.search){const auto &s=*d->candidate.search;candidate.search=Detail::SearchPreference{s.provider,s.configurationBinding,s.providerPolicyEpoch};}
     auto plain=Detail::encodeRecord(candidate);auto encrypted=plain?Detail::protectRecord(*plain):std::nullopt;if(!encrypted)return controller.finish(std::move(ticket),std::move(observation));
-    const auto candidateDigest=digest("LGA_GATEBOUNCER_CONFIGURATION_V2",plain->data(),plain->size()-32);
+    const auto candidateDigest=digest("LGA_GATEBOUNCER_CONFIGURATION_V3",plain->data(),plain->size()-32);
     Id128 nonce{};if(!Broker::randomId(nonce))return controller.finish(std::move(ticket),std::move(observation));const char hex[]="0123456789abcdef";std::wstring pending=impl_->root+L"\\pending-";for(auto b:nonce){pending+=wchar_t(hex[b>>4]);pending+=wchar_t(hex[b&15]);}pending+=L".tmp";
     SECURITY_ATTRIBUTES sa{sizeof(sa),impl_->descriptor,FALSE};Handle file(CreateFileW(pending.c_str(),GENERIC_WRITE|READ_CONTROL,0,&sa,CREATE_NEW,FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));FileStamp temporary;DWORD count=0;
     if(!file){observation.primaryError_=GetLastError();return controller.finish(std::move(ticket),std::move(observation));}
@@ -168,97 +156,6 @@ bool WindowsConfigurationStore::withSecret(NetworkPermit &permit,const Digest256
     try{consumer(read.record->secret.data(),read.record->secret.size());}catch(...){return false;}
     {std::lock_guard<std::mutex> operation(impl_->mutex);auto after=impl_->read();if(!after.record||!impl_->samePrecedent(after)||after.record->integrity!=read.record->integrity)return false;}
     return permit.current(ActivationStage::BeforeSecret,binding,seal);
-}
-std::unique_ptr<Detail::EntitlementContext> WindowsConfigurationStore::captureEntitlementContext(
-    ConfigurationController &controller,const std::shared_ptr<WindowsConfigurationStore> &owner) {
-    if(owner.get()!=this)return {};
-    std::lock_guard<std::mutex> operation(impl_->mutex);
-    const auto a=controller.authority_;
-    if(impl_->authority.lock()!=a)return {};
-    const auto read=impl_->read();
-    if(!read.record||read.state!=StorageState::Ready||!impl_->samePrecedent(read)||
-        !read.record->secret.size()||read.record->metadata.credential!=CredentialState::Stored)return {};
-    std::lock_guard<std::mutex> lock(a->mutex);
-    if(!a->alive||a->failureLatched||nonzero(a->pendingTicket)||!a->entitlement||!a->entitlement->catalog||
-        a->snapshot.storage!=StorageState::Ready||a->snapshot.credential!=CredentialState::Stored||
-        a->snapshot.storeInstance!=read.record->metadata.storeInstance||
-        a->snapshot.epochs.credential!=read.record->metadata.epochs.credential||
-        a->committedRevision!=read.record->committedRevision)return {};
-    auto proof=std::unique_ptr<Detail::EntitlementContext>(new Detail::EntitlementContext);
-    proof->store=owner;proof->authority=a;proof->image=Detail::image(*a);
-    proof->capability=a->capability;proof->capabilityVerb=a->capabilityVerb;
-    proof->capabilityExpiry=a->capabilityExpiry;proof->pendingTicket=a->pendingTicket;
-    proof->catalogGeneration=a->entitlement->catalog->generation_;
-    proof->floorGeneration=a->entitlement->floorGeneration;
-    proof->volume=read.file.identity.VolumeSerialNumber;proof->size=fileSize(read.file);
-    std::copy_n(read.file.identity.FileId.Identifier,16,proof->fileId.begin());
-    proof->writeTime=(std::uint64_t(read.file.info.ftLastWriteTime.dwHighDateTime)<<32)|read.file.info.ftLastWriteTime.dwLowDateTime;
-    proof->envelope=read.envelopeDigest;proof->integrity=read.record->integrity;
-    proof->committedRevision=read.record->committedRevision;
-    return proof;
-}
-EntitlementReviewResult WindowsConfigurationStore::finishEntitlementReview(ConfigurationController &controller,
-    Detail::EntitlementContext &&proof,Detail::ReviewedSelection &&selection,bool explicitlySelect) {
-    auto result=selection.result;
-    const auto reject=[&](ReviewCause cause){result.recognized=false;result.decision=ReviewDecision::PendingReview;result.cause=cause;return result;};
-    const auto owner=proof.store.lock();const auto a=proof.authority.lock();
-    if(owner.get()!=this||!a||a!=controller.authority_)return reject(ReviewCause::LocalPublicationChanged);
-    std::lock_guard<std::mutex> operation(impl_->mutex);
-    if(impl_->authority.lock()!=a)return reject(ReviewCause::LocalPublicationChanged);
-    const auto read=impl_->read();
-    if(!impl_->samePrecedent(read)||!sameEntitlementPublication(read,proof))return reject(ReviewCause::LocalPublicationChanged);
-    std::lock_guard<std::mutex> lock(a->mutex);
-    if(!Detail::entitlementImageCurrent(*a,proof)||
-        a->entitlement->catalog!=selection.catalog||a->entitlement->catalog->generation_!=proof.catalogGeneration||
-        !result.recognized)return reject(ReviewCause::LocalPublicationChanged);
-    if(!Detail::entitlementFloorsCurrent(*a->entitlement,selection))return reject(ReviewCause::Rollback);
-    const auto elapsed=(GetTickCount64()-selection.checkedTick)/1000;
-    const auto now=impl_->permission->purpose_==LocalConfigurationPermission::Purpose::PrivateFixture?
-        selection.checkedUtc+elapsed:std::uint64_t(std::chrono::duration_cast<std::chrono::seconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count());
-    if(selection.provider.evidence!=EvidenceState::Missing&&
-        (now<selection.artifact.reviewedAt||now<selection.provider.notBefore||now>=selection.provider.notAfter)) {
-        selection.provider.evidence=EvidenceState::Expired;result.decision=ReviewDecision::PendingReview;result.cause=ReviewCause::ReviewExpired;
-    }
-    if(!explicitlySelect)return result;
-    const auto &runtime=*a->entitlement;
-    if(runtime.publishedReview==selection.artifact.revision&&runtime.publishedImage&&
-        *runtime.publishedImage==Detail::image(*a)&&a->provider==selection.provider) {
-        result.unchanged=true;return result;
-    }
-    const auto maximum=std::numeric_limits<std::uint64_t>::max();
-    if(runtime.floorGeneration==maximum||a->snapshot.revision==maximum||a->snapshot.epochs.entitlement==maximum||
-        a->snapshot.epochs.retrieval==maximum||a->transitionBarrier==maximum) {
-        a->alive=false;return reject(ReviewCause::RevisionExhausted);
-    }
-    // Preparar todas las asignaciones antes de publicar la transicion.
-    auto nextState=std::make_shared<Detail::EntitlementState>(runtime);auto nextImage=Detail::image(*a);
-    ++nextImage.snapshot.revision;++nextImage.snapshot.epochs.entitlement;
-    ++nextImage.snapshot.epochs.retrieval;++nextImage.barrier;
-    if(!(a->provider.notice==selection.provider.notice))nextImage.snapshot.modelConsent.granted=false;
-    nextImage.provider=selection.provider;
-    Detail::rememberEntitlement(*nextState,selection,nextImage);
-    a->snapshot=std::move(nextImage.snapshot);a->provider=std::move(selection.provider);
-    a->transitionBarrier=nextImage.barrier;a->capability={};a->capabilityExpiry=0;
-    a->entitlement=std::move(nextState);result.published=true;return result;
-}
-bool WindowsConfigurationStore::replaceEntitlementCatalog(ConfigurationController &controller,
-    Detail::EntitlementContext &&proof,std::shared_ptr<const ReviewedProviderCatalog> catalog) {
-    const auto owner=proof.store.lock();const auto a=proof.authority.lock();
-    if(owner.get()!=this||!a||a!=controller.authority_||!catalog)return false;
-    std::lock_guard<std::mutex> operation(impl_->mutex);
-    if(impl_->authority.lock()!=a)return false;
-    const auto read=impl_->read();if(!impl_->samePrecedent(read)||!sameEntitlementPublication(read,proof))return false;
-    std::lock_guard<std::mutex> lock(a->mutex);
-    if(!Detail::entitlementImageCurrent(*a,proof)||a->entitlement->catalog->generation_!=proof.catalogGeneration||
-        catalog->generation_<=proof.catalogGeneration)return false;
-    if(a->entitlement->floorGeneration==std::numeric_limits<std::uint64_t>::max()) {
-        a->alive=false;return false;
-    }
-    if(!Detail::advanceEntitlement(*a))return false;
-    auto &runtime=*a->entitlement;runtime.catalog=std::move(catalog);++runtime.floorGeneration;
-    runtime.publishedImage.reset();runtime.publishedReview={};
-    a->provider.evidence=EvidenceState::Missing;a->provider.scope={};a->provider.accountScope={};return true;
 }
 bool WindowsConfigurationStore::facadeAvailable(){std::lock_guard<std::mutex> operation(impl_->mutex);auto a=impl_->authority.lock();if(!a||!impl_->current())return false;std::lock_guard<std::mutex> lock(a->mutex);return a->alive;}
 CredentialState WindowsConfigurationStore::credentialStatus(){std::lock_guard<std::mutex> operation(impl_->mutex);auto a=impl_->authority.lock();if(!a)return CredentialState::Unavailable;auto read=impl_->read();{std::lock_guard<std::mutex> lock(a->mutex);if(!a->alive||a->failureLatched)return CredentialState::Unavailable;}if(read.state==StorageState::Uninitialized)return impl_->legacyPresent()?CredentialState::Unavailable:CredentialState::Absent;if(read.state==StorageState::Corrupt)return CredentialState::Corrupt;return read.record&&impl_->samePrecedent(read)?read.record->metadata.credential:CredentialState::Unavailable;}

@@ -9,20 +9,18 @@ AuthorityImage image(const Authority &a) {return {a.snapshot,a.incarnation,a.con
 static bool noticeMatches(const ConsentReceipt &r,const ConsentReceipt &n) {
     return r.granted&&r.noticeRevision==n.noticeRevision&&r.noticeDigest==n.noticeDigest&&r.profileRef==n.profileRef&&r.destinationPolicyBinding==n.destinationPolicyBinding;
 }
-ActivationCause availability(const AuthorityImage &a,std::uint64_t utc) {
+ActivationCause availability(const AuthorityImage &a,std::uint64_t) {
     const auto &s=a.snapshot;const auto &p=a.provider;
     if(!a.alive)return ActivationCause::SessionStale;
     if(a.latched||s.storage==StorageState::IoUncertain)return ActivationCause::LocalMutationUncertain;
     if(!validSnapshot(s)||s.storage==StorageState::Busy||s.storage==StorageState::UnsafeRoot||s.storage==StorageState::Unreadable)return ActivationCause::LocalConfigurationUnavailable;
     if(s.credential==CredentialState::Corrupt||s.storage==StorageState::Corrupt)return ActivationCause::CredentialCorrupt;
     if(s.credential!=CredentialState::Stored)return ActivationCause::CredentialMissing;
-    if(p.evidence==EvidenceState::Missing)return ActivationCause::EntitlementMissing;
-    if(p.evidence==EvidenceState::Restricted)return ActivationCause::OperationalUseRestricted;
-    if(p.evidence==EvidenceState::Expired)return ActivationCause::EntitlementExpired;
-    if(p.evidence==EvidenceState::Conflict)return ActivationCause::EntitlementConflict;
-    if(p.evidence!=EvidenceState::Applicable||!nonzero(p.evidenceId)||!nonzero(p.accountScope)||!nonzero(p.scope)||!nonzero(p.evidenceRevision)||!nonzero(p.destination)||!p.notAfter)return ActivationCause::EntitlementMissing;
-    if(utc<p.notBefore||utc>=p.notAfter)return ActivationCause::EntitlementExpired;
-    if(p.profile!=s.selectedProfileRef||p.profile!=GeneralProfile||p.profileRevision!=1||p.model!="nvidia/nemotron-3-ultra-550b-a55b"||p.modality!=Modality::HostedOperational)return ActivationCause::EntitlementConflict;
+    if(s.serviceUse==ServiceUse::Unchosen)return ActivationCause::ServiceUseMissing;
+    // La eleccion interna permite un intento sujeto a vault, consentimiento y presupuesto.
+    // No convierte la key ni el proposito local en derechos de produccion del proveedor.
+    if(s.serviceUse!=ServiceUse::InternalEvaluation)return ActivationCause::OperationalUseRestricted;
+    if(!(p==nvidiaTrial())||p.profile!=s.selectedProfileRef)return ActivationCause::ProviderPolicyChanged;
     if(!noticeMatches(s.modelConsent,p.notice))return ActivationCause::ModelConsentMissing;
     if(!noticeMatches(s.webConsent,a.searchNotice))return ActivationCause::WebConsentMissing;
     if(!s.search||!a.search)return ActivationCause::SearchConfigurationMissing;
@@ -31,17 +29,17 @@ ActivationCause availability(const AuthorityImage &a,std::uint64_t utc) {
     return ActivationCause::Ready;
 }
 const std::string &trialModelNoticeBody() {
-    static const std::string notice="Public application information and approved search evidence are sent to NVIDIA. Service terms and data handling apply. Explanations do not decide Allow or Block.";
+    static const std::string notice="For internal testing and evaluation only. Your API key does not verify production rights or remaining trial credits. Public application information, including the executable name, and approved search evidence are sent to NVIDIA. Do not include personal, confidential or sensitive information. NVIDIA may collect requests and responses to operate and improve its services and AI models, and log use for security, fraud and abuse monitoring with third-party providers. Trial time and credit limits apply; production use requires a separate service subscription. Explanations can be wrong and never decide Allow or Block or establish that a file is safe. Review the NVIDIA API Trial Terms of Service before use: https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf";
     return notice;
 }
 ProviderRecord nvidiaTrial() {
     ProviderRecord p;
-    const std::string destination="https://integrate.api.nvidia.com:443/v1/chat/completions|POST|TLS|no-redirect|"+p.model+"|HostedOperational|GB_GENERAL_SNIPPETS_ULTRA_1|1";
+    const std::string destination="https://integrate.api.nvidia.com:443/v1/chat/completions|POST|TLS|no-redirect|"+p.model+"|InternalEvaluation|GB_GENERAL_SNIPPETS_ULTRA_1|1";
     p.destination=digest("GB_DESTINATION_MODEL_MODE_1",reinterpret_cast<const unsigned char *>(destination.data()),destination.size());
-    const std::string trial="NVIDIA API Catalog Trial Terms 2025-09-19: operational use not verified";
+    const std::string trial="https://assets.ngc.nvidia.com/products/api-catalog/legal/NVIDIA%20API%20Trial%20Terms%20of%20Service.pdf|1.2|1.4|internal-testing-evaluation-only|production-subscription-pending";
     p.evidenceRevision=digest("GB_PROVIDER_EVIDENCE_REVISION_1",reinterpret_cast<const unsigned char *>(trial.data()),trial.size());
     const auto &notice=trialModelNoticeBody();
-    p.notice.granted=true;p.notice.noticeRevision=1;p.notice.profileRef=p.profile;p.notice.destinationPolicyBinding=p.destination;
+    p.notice.granted=true;p.notice.noticeRevision=2;p.notice.profileRef=p.profile;p.notice.destinationPolicyBinding=p.destination;
     p.notice.noticeDigest=digest("GB_MODEL_NOTICE_1",reinterpret_cast<const unsigned char *>(notice.data()),notice.size());return p;
 }
 static void number(std::vector<unsigned char> &v,std::uint64_t n,unsigned width) {for(unsigned i=0;i<width;++i)v.push_back(static_cast<unsigned char>(n>>(8*i)));}
@@ -51,6 +49,7 @@ static void receipt(std::vector<unsigned char> &v,const ConsentReceipt &r){numbe
 static Digest256 privateDigest(const PermitLease &l) {
     std::vector<unsigned char> v;const auto &a=l.image;const auto &s=a.snapshot;const auto &p=a.provider;const auto &e=s.epochs;
     bytes(v,s.storeInstance);bytes(v,a.incarnation);bytes(v,a.connection);number(v,a.committedRevision,8);number(v,s.revision,8);number(v,a.barrier,8);
+    number(v,std::uint8_t(s.serviceUse),1);
     for(auto n:{e.configuration,e.credential,e.consent,e.modelConsent,e.webConsent,e.retrieval,e.providerPolicy,e.entitlement,e.session})number(v,n,8);
     text(v,p.profile);number(v,p.profileRevision,4);bytes(v,p.destination);text(v,p.model);number(v,std::uint8_t(p.modality),1);bytes(v,p.accountScope);
     receipt(v,s.modelConsent);receipt(v,s.webConsent);bytes(v,p.evidenceId);bytes(v,p.evidenceRevision);bytes(v,p.scope);number(v,std::uint8_t(p.evidence),1);number(v,p.notBefore,8);number(v,p.notAfter,8);number(v,l.deadline,8);bytes(v,l.binding);bytes(v,l.seal);number(v,l.serial,8);

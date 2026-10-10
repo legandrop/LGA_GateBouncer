@@ -124,6 +124,7 @@ bool GeneralSession::store(Broker::SensitiveBytes secret){
 }
 bool GeneralSession::forget(){C::ConfigurationMutation mutation;mutation.verb=C::ConfigurationVerb::Forget;return mutate(mutation);}
 bool GeneralSession::mode(C::ModeChoice choice){C::ConfigurationMutation mutation;mutation.verb=C::ConfigurationVerb::Mode;mutation.mode=choice;return mutate(mutation);}
+bool GeneralSession::serviceUse(C::ServiceUse choice){C::ConfigurationMutation mutation;mutation.verb=C::ConfigurationVerb::ServiceUse;mutation.serviceUse=choice;return mutate(mutation);}
 bool GeneralSession::selectSearch(){
     if(!presentation_||!presentation_->searchReference())return false;
     C::ConfigurationMutation mutation;mutation.verb=C::ConfigurationVerb::Search;mutation.search=presentation_->searchReference();

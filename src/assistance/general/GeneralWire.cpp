@@ -70,19 +70,19 @@ void searchBinding(Reader& r,bool update){
 }
 bool snapshot(const QByteArray& bytes){
     if(bytes.size()>1536)return false;
-    Reader r{bytes};if(r.n(2)!=1||r.n(2)!=0)return false;
-    const auto instance=r.fixed<16>();const auto revision=r.n(8),storage=r.n(1),credential=r.n(1),mode=r.n(1);const auto profile=r.text(96,storage==0);
-    if(!nonzero(instance)||!revision||storage>6||credential>3||mode>2)return false;
+    Reader r{bytes};if(r.n(2)!=2||r.n(2)!=0)return false;
+    const auto instance=r.fixed<16>();const auto revision=r.n(8),storage=r.n(1),credential=r.n(1),mode=r.n(1),serviceUse=r.n(1);const auto profile=r.text(96,storage==0);
+    if(!nonzero(instance)||!revision||storage>6||credential>3||mode>2||serviceUse>2)return false;
     for(int n=0;n<9;++n)if(!r.n(8))return false;
     const auto model=receipt(r,false),web=receipt(r,false);const auto hasSearch=r.n(1);if(hasSearch>1)return false;if(hasSearch)searchBinding(r,false);
     const auto cause=r.n(2),evidence=r.n(1),available=r.n(1);const auto activationProfile=r.text(96,true);const auto scope=r.fixed<32>(),entitlement=r.fixed<32>();
-    if(!r.end()||cause>17||evidence>4||available>1)return false;
+    if(!r.end()||cause>18||evidence>4||available>1||(model.granted&&serviceUse!=1))return false;
     if((storage==0&&(credential!=0||model.granted||web.granted))||
         ((storage==2||storage==3||storage==5)&&(credential!=3||model.granted||web.granted))||
         (storage==4&&(credential!=2||model.granted||web.granted))||
         (storage==6&&(cause!=17||available||model.granted||web.granted)))return false;
     if(cause==0&&(!available||!nonzero(scope)||!nonzero(entitlement)))return false;
-    if(available&&(storage!=1||credential!=1||cause!=0||evidence!=1||!model.granted||!web.granted||!hasSearch||
+    if(available&&(storage!=1||credential!=1||cause!=0||serviceUse!=1||evidence!=2||!model.granted||!web.granted||!hasSearch||
         activationProfile!=profile||model.profile!=profile||web.profile!=profile))return false;
     return true;
 }
@@ -94,6 +94,7 @@ bool update(const QByteArray& bytes){
     case 4:{const auto mode=r.n(1);if(mode<1||mode>2)return false;break;}
     case 5:{r.text(96);if(!r.n(4))return false;break;}
     case 6:searchBinding(r,true);break;
+    case 7:if(r.n(1)>2)return false;break;
     default:return false;
     }return r.end();
 }
@@ -108,8 +109,8 @@ bool configuration(const Broker::Frame& f,unsigned type){
         return canonical&&presentationContext(f.fields.at(76),*canonical,f.connection).has_value()&&
             (!f.fields.count(77)||pendingPresentationContext(f.fields.at(77)).has_value());
     }
-    case 32:return tags(f,{71,73})&&scalar(f,71,1,1,6)&&scalar(f,73,8,1,UINT64_MAX);
-    case 33:return tags(f,{71,72,73})&&scalar(f,71,1,1,6)&&scalar(f,73,8,1,UINT64_MAX)&&f.fields.at(72).size()==16&&nonzero(f.fields.at(72));
+    case 32:return tags(f,{71,73})&&scalar(f,71,1,1,7)&&scalar(f,73,8,1,UINT64_MAX);
+    case 33:return tags(f,{71,72,73})&&scalar(f,71,1,1,7)&&scalar(f,73,8,1,UINT64_MAX)&&f.fields.at(72).size()==16&&nonzero(f.fields.at(72));
     case 34:case 35:case 36:
         if(!tags(f,type==36?std::set<quint16>{72,73,74}:std::set<quint16>{72,73})||!scalar(f,73,8,1,UINT64_MAX)||f.fields.at(72).size()!=16||!nonzero(f.fields.at(72)))return false;
         return type!=36||update(f.fields.at(74));
@@ -183,7 +184,7 @@ void addSearch(QByteArray& b,const SearchBindingRef& s){addNumber(b,s.provider,1
 std::optional<ConfigurationView> configurationView(const QByteArray& bytes){
     if(!snapshot(bytes))return {};
     Reader r{bytes};r.n(4);ConfigurationView view;auto &s=view.local;auto &a=view.activation;
-    s.storeInstance=r.fixed<16>();s.revision=r.n(8);s.storage=Configuration::StorageState(r.n(1));s.credential=Configuration::CredentialState(r.n(1));s.mode=Configuration::ModeChoice(r.n(1));s.selectedProfileRef=r.text(96,true);
+    s.storeInstance=r.fixed<16>();s.revision=r.n(8);s.storage=Configuration::StorageState(r.n(1));s.credential=Configuration::CredentialState(r.n(1));s.mode=Configuration::ModeChoice(r.n(1));s.serviceUse=Configuration::ServiceUse(r.n(1));s.selectedProfileRef=r.text(96,true);
     std::uint64_t* epochs[]={&s.epochs.configuration,&s.epochs.credential,&s.epochs.consent,&s.epochs.modelConsent,&s.epochs.webConsent,&s.epochs.retrieval,&s.epochs.providerPolicy,&s.epochs.entitlement,&s.epochs.session};
     for(auto p:epochs)*p=r.n(8);
     s.modelConsent=readReceipt(r);s.webConsent=readReceipt(r);if(r.n(1))s.search=readSearch(r);
@@ -194,8 +195,8 @@ std::optional<QByteArray> configurationBytes(const ConfigurationView& view){
     const auto &s=view.local;const auto &a=view.activation;
     // Todos los strings se acotan antes de reservar; el máximo estructural cabe en 1536.
     if(!safeText(s.selectedProfileRef,96,true)||!safeText(a.profileRef,96,true)||!safeText(s.modelConsent.profileRef,96,true)||!safeText(s.webConsent.profileRef,96,true)||!(s.epochs==a.epochs))return {};
-    QByteArray b;b.reserve(1536);addNumber(b,1,2);addNumber(b,0,2);addFixed(b,s.storeInstance);addNumber(b,s.revision,8);
-    addNumber(b,unsigned(s.storage),1);addNumber(b,unsigned(s.credential),1);addNumber(b,unsigned(s.mode),1);addText(b,s.selectedProfileRef);
+    QByteArray b;b.reserve(1536);addNumber(b,2,2);addNumber(b,0,2);addFixed(b,s.storeInstance);addNumber(b,s.revision,8);
+    addNumber(b,unsigned(s.storage),1);addNumber(b,unsigned(s.credential),1);addNumber(b,unsigned(s.mode),1);addNumber(b,unsigned(s.serviceUse),1);addText(b,s.selectedProfileRef);
     const std::uint64_t epochs[]={s.epochs.configuration,s.epochs.credential,s.epochs.consent,s.epochs.modelConsent,s.epochs.webConsent,s.epochs.retrieval,s.epochs.providerPolicy,s.epochs.entitlement,s.epochs.session};
     for(auto e:epochs)addNumber(b,e,8);
     addReceipt(b,s.modelConsent);addReceipt(b,s.webConsent);addNumber(b,bool(s.search),1);if(s.search)addSearch(b,*s.search);
@@ -210,6 +211,7 @@ std::optional<Configuration::ConfigurationMutation> configurationUpdate(const QB
     case Configuration::ConfigurationVerb::Mode:m.mode=Configuration::ModeChoice(r.n(1));break;
     case Configuration::ConfigurationVerb::Profile:m.profileRef=r.text(96);m.profileRevision=std::uint32_t(r.n(4));break;
     case Configuration::ConfigurationVerb::Search:m.search=readSearch(r);break;
+    case Configuration::ConfigurationVerb::ServiceUse:m.serviceUse=Configuration::ServiceUse(r.n(1));break;
     default:return {};
     }return r.end()?std::optional<Configuration::ConfigurationMutation>(std::move(m)):std::nullopt;
 }
@@ -221,6 +223,7 @@ std::optional<QByteArray> configurationBytes(const Configuration::ConfigurationM
     case Configuration::ConfigurationVerb::Mode:addNumber(b,unsigned(m.mode),1);break;
     case Configuration::ConfigurationVerb::Profile:addText(b,m.profileRef);addNumber(b,m.profileRevision,4);break;
     case Configuration::ConfigurationVerb::Search:if(!m.search)return {};addSearch(b,*m.search);break;
+    case Configuration::ConfigurationVerb::ServiceUse:addNumber(b,unsigned(m.serviceUse),1);break;
     default:return {};
     }return update(b)?std::optional<QByteArray>(std::move(b)):std::nullopt;
 }

@@ -4,9 +4,6 @@
 namespace Gate::Assistance::Broker { class BrokerVault; struct GeneralReservation; }
 
 namespace Gate::Assistance::Configuration {
-namespace Detail { struct EntitlementContext; struct ReviewedSelection; }
-struct EntitlementReviewResult;
-class ReviewedProviderCatalog;
 class PrivateConfigurationStorageTest;
 class WindowsConfigurationStore final {
 public:
@@ -21,12 +18,6 @@ private:
     friend class PrivateConfigurationStorageTest;
     friend class Gate::Assistance::Broker::BrokerVault;
     friend class ProviderEntitlementVerifier;
-    std::unique_ptr<Detail::EntitlementContext> captureEntitlementContext(
-        ConfigurationController &,const std::shared_ptr<WindowsConfigurationStore> &);
-    EntitlementReviewResult finishEntitlementReview(ConfigurationController &,
-        Detail::EntitlementContext &&,Detail::ReviewedSelection &&,bool explicitlySelect);
-    bool replaceEntitlementCatalog(ConfigurationController &,Detail::EntitlementContext &&,
-        std::shared_ptr<const ReviewedProviderCatalog>);
     bool facadeAvailable();
     CredentialState credentialStatus();
     Broker::GeneralReservation reserveGeneral(NetworkPermit &,const Digest256 &,const Digest256 &);

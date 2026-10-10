@@ -29,7 +29,8 @@ bool validSearch(const SearchBindingRef &s,bool update) {
     return true;
 }
 bool validSnapshot(const ConfigurationSnapshot &s) {
-    if(!nonzero(s.storeInstance)||!s.revision||std::uint8_t(s.storage)>6||std::uint8_t(s.credential)>3||std::uint8_t(s.mode)>2||!reference(s.selectedProfileRef)||!validReceipt(s.modelConsent)||!validReceipt(s.webConsent))return false;
+    if(!nonzero(s.storeInstance)||!s.revision||std::uint8_t(s.storage)>6||std::uint8_t(s.credential)>3||std::uint8_t(s.mode)>2||std::uint8_t(s.serviceUse)>2||!reference(s.selectedProfileRef)||!validReceipt(s.modelConsent)||!validReceipt(s.webConsent))return false;
+    if(s.modelConsent.granted&&s.serviceUse!=ServiceUse::InternalEvaluation)return false;
     const auto &e=s.epochs;if(!e.configuration||!e.credential||!e.consent||!e.modelConsent||!e.webConsent||!e.retrieval||!e.providerPolicy||!e.entitlement||!e.session)return false;
     if(s.modelConsent.epoch!=e.modelConsent||s.webConsent.epoch!=e.webConsent||(s.search&&!validSearch(*s.search)))return false;
     const bool granted=s.modelConsent.granted||s.webConsent.granted;

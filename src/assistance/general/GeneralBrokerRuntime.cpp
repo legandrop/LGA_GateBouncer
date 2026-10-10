@@ -8,19 +8,6 @@ bool GeneralRuntime::initializeEntitlement(std::shared_ptr<Configuration::Window
     if(d->closed||!store||!d->configuration||d->verifier||QThread::currentThread()!=thread())return false;
     auto verifier=Configuration::ProviderEntitlementVerifier::forBroker(std::move(store),d->configuration);
     if(!verifier)return false;
-    d->reviewDispatcher=std::shared_ptr<QObject>(new QObject,[](QObject* object){
-        if(QThread::currentThread()==object->thread())delete object;else object->deleteLater();
-    });
-    const auto dispatcher=d->reviewDispatcher;
-    const std::weak_ptr<Data> weak=d;
-    verifier->setChangedCallback([weak,dispatcher]{
-        QMetaObject::invokeMethod(dispatcher.get(),[weak]{
-            const auto owner=weak.lock();if(!owner||owner->closed)return;
-            owner->job.reset();owner->approval.reset();
-            if(owner->serial!=UINT64_MAX)++owner->serial;else owner->closed=true;
-            if(owner->coordinator)owner->coordinator->cancel();
-        },Qt::AutoConnection);
-    });
     d->verifier=std::shared_ptr<Configuration::ProviderEntitlementVerifier>(std::move(verifier));
     return true;
 }

@@ -16,7 +16,6 @@ struct GeneralRuntime::Data {
     GeneralCoordinator::Current current;
     GeneralCoordinator::Clock clock;
     std::shared_ptr<Configuration::ConfigurationController> configuration;
-    std::shared_ptr<QObject> reviewDispatcher;
     std::shared_ptr<Configuration::ProviderEntitlementVerifier> verifier;
     std::shared_ptr<GeneralJobRegistry> registry;
     std::function<bool(const FullBinding&)> admission;

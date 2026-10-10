@@ -5,12 +5,12 @@
 #include <mutex>
 
 namespace Gate::Assistance::Configuration::Detail {
-struct EntitlementState;
 struct ProviderRecord {
     std::string profile=GeneralProfile,model="nvidia/nemotron-3-ultra-550b-a55b";
     std::uint32_t profileRevision=1;
-    Modality modality=Modality::HostedOperational;
+    Modality modality=Modality::InternalEvaluation;
     EvidenceState evidence=EvidenceState::Restricted;
+    // Las huellas enlazan aviso/alcance local; no prueban derechos ni una cuenta NVIDIA.
     Digest256 destination{},evidenceRevision{},scope{};
     Id128 accountScope{},evidenceId{};
     std::uint64_t notBefore=0,notAfter=0;
@@ -30,7 +30,6 @@ struct Authority {
     std::optional<ConfigurationSnapshot> observedRecord;
     std::optional<SearchBindingRef> currentSearch;
     ConsentReceipt searchNotice;
-    std::shared_ptr<EntitlementState> entitlement;
 };
 struct MutationData {
     std::weak_ptr<Authority> authority;
