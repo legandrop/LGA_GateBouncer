@@ -22,11 +22,17 @@ struct QNamePredicate {
     SourceFact<bool> match;
     QVector<ApplicationConstraint> applications;
     QVector<SourceFact<QString>> domains;
+    QVector<SourceFact<QString>> tags;
+    struct AddressRange {
+        SourceFact<QString> lexical;
+        SourceFact<quint32> first, last;
+    };
+    QVector<AddressRange> remoteRanges;
     bool complete = false;
 };
 struct QNameFilterFacts {
     int node = -1;
-    SourceFact<QString> id;
+    SourceFact<QString> id, filterType;
     ApplicationConstraint package;
     QVector<QNamePredicate> predicates;
     QVector<int> baseFilters, residues;
@@ -53,7 +59,25 @@ struct QNameProfileView {
     QVector<ApplicationConstraint> applications;
     QVector<QString> diagnostics;
     int graphVisits = 0, conflictComparisons = 0;
+    // Peso descendente; los índices dentro de un empate conservan orden fuente, no lo resuelven.
+    QVector<QVector<int>> weightGroups;
 };
+enum class QNameMatch { Unknown, No, Yes };
+// Datos para comparar semántica fuente. Ningún campo acredita identidad, zona OS o autoridad.
+struct QNameConnectionFacts {
+    SourceFact<quint32> remoteIpv4;
+    SourceFact<bool> internetZone, localNetworkZone;
+    SourceFact<QStringList> applicationTags;
+    Direction direction = Direction::Unknown;
+};
+struct QNamePolicyComparison {
+    QNameMatch matched = QNameMatch::Unknown;
+    SourceFact<SourceFwAction> action;
+    QVector<int> highestWeightCandidates;
+    bool tie = false;
+};
+QNameMatch compareQNameFilter(const QNameProfileView &view, int filter, const QNameConnectionFacts &facts);
+QNamePolicyComparison compareQNamePolicy(const QNameProfileView &view, const QNameConnectionFacts &facts);
 struct QNameImportResult {
     ImportReport report;
     std::optional<QNameEvidence> evidence;

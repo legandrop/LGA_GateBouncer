@@ -108,9 +108,15 @@ QString qnameFacts(const ImportedReviewView &view, const Data::QNameCandidateFac
             if (++shown > 12) { out << "Additional predicates retained in source evidence"; break; }
             out << "Predicate: " + p.kind + " · " + (p.complete ? "Known subset" : "Incomplete")
                 << "Match: " + (p.match.known() ? (p.match.value ? QString("True") : QString("False")) : QString("Unknown"));
+            if (p.kind == "FFIsInternetTraffic" || p.kind == "FFIsLocalNetworkTraffic")
+                out << "Zone classification: NetLimiter source · current Windows coverage Unknown";
+            else out << "Values: OR within this predicate · match applies to the combined result";
             for (const auto &a : p.applications) { if (out.size() >= 140) break; application(a); }
             for (const auto &domain : p.domains) { if (out.size() >= 140) break; out << "Domain source: " + (domain.known() ? domain.value : "Unknown"); }
+            for (const auto &tag : p.tags) { if (out.size() >= 140) break; out << "Tag source: " + (tag.known() ? tag.value : "Unknown"); }
+            for (const auto &range : p.remoteRanges) { if (out.size() >= 140) break; out << "Remote range source: " + (range.lexical.known() ? range.lexical.value : "Unknown") + " · inclusive endpoints"; }
         }
+        out << "Filter functions: AND · source weight: higher values take precedence; ties remain unresolved";
     } else out << "Constraints: Unknown · unresolved filter";
     out << "Profile diagnostics: " + QStringList(v.diagnostics.begin(), v.diagnostics.end()).join(" · ");
     return out.join('\n').left(32000);

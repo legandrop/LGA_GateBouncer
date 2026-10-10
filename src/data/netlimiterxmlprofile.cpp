@@ -4,12 +4,26 @@
 #include <QSet>
 #include <QUuid>
 #include <limits>
+#include <algorithm>
 
 namespace Gate::Data {
 namespace {
 const QString xsi = QStringLiteral("http://www.w3.org/2001/XMLSchema-instance");
 const QString arrays = QStringLiteral("http://schemas.microsoft.com/2003/10/Serialization/Arrays");
 const QString xsd = QStringLiteral("http://www.w3.org/2001/XMLSchema");
+bool ipv4(const QString &text, quint32 &result) {
+    const auto parts = text.split('.');
+    if (parts.size() != 4) return false;
+    result = 0;
+    for (const auto &part : parts) {
+        if (part.isEmpty() || part.size() > 3 || (part.size() > 1 && part[0] == '0')) return false;
+        quint32 byte = 0;
+        for (QChar c : part) { if (c < '0' || c > '9') return false; byte = byte * 10 + c.unicode() - '0'; }
+        if (byte > 255) return false;
+        result = (result << 8) | byte;
+    }
+    return true;
+}
 struct Deriver {
     const QNameEvidence &e;
     const ImportLimits &limits;
@@ -141,8 +155,14 @@ struct Deriver {
     }
     QNamePredicate predicate(int i) {
         QNamePredicate p; p.node = i; p.kind = type(i, "FilterFunction");
-        const bool ordered = order(i, {"match", "Values"});
         p.match = boolean(scalar(i, "match", {xsd, "boolean"}));
+        // Las funciones de zona heredan FilterFunction, no FilterFunctionT: no tienen Values.
+        if (p.kind == "FFIsInternetTraffic" || p.kind == "FFIsLocalNetworkTraffic") {
+            p.complete = order(i, {"match"}) && p.match.known();
+            if (!p.complete) diagnostic("PredicateIncomplete");
+            return p;
+        }
+        const bool ordered = order(i, {"match", "Values"});
         const auto vals = occurrences(i, "Values");
         if (vals.size() != 1 || !ordered || !container(vals[0]) || type(vals[0], "filterValues") != "filterValues") return p;
         const auto items = children(vals[0]);
@@ -159,6 +179,20 @@ struct Deriver {
                 auto domain = scalar(value, "DomainName", {xsd, "string"});
                 if (type(value, "DomainNameFilterValue") != "DomainNameFilterValue" || !order(value, {"DomainName"})) domain.status = FieldStatus::Unknown;
                 known = known && domain.known() && !domain.value.isEmpty(); p.domains.push_back(domain);
+            } else if (p.kind == "FFTagEqual") {
+                auto tag = scalar(value, "tag", {xsd, "string"});
+                if (type(value, "appTag") != "appTag" || !order(value, {"tag"})) tag.status = FieldStatus::Unknown;
+                known = known && tag.known() && !tag.value.isEmpty(); p.tags.push_back(tag);
+            } else if (p.kind == "FFRemoteAddressInRange") {
+                QNamePredicate::AddressRange range; range.lexical = scalar(value, "range", {xsd, "string"});
+                const bool shape = type(value, "IPRangeFilterValue") == "IPRangeFilterValue" && order(value, {"range"});
+                const auto ends = range.lexical.value.split('-'); quint32 first = 0, last = 0;
+                if (shape && range.lexical.known() && ends.size() == 2 && ipv4(ends[0], first) && ipv4(ends[1], last) && first <= last) {
+                    range.first = {FieldStatus::Known, first, range.lexical.node};
+                    range.last = {FieldStatus::Known, last, range.lexical.node};
+                }
+                // Otras sintaxis/familias permanecen conservadas, sin reinterpretación de alcance.
+                known = known && range.first.known() && range.last.known(); p.remoteRanges.push_back(range);
             } else known = false;
         }
         p.complete = known && p.match.known();
@@ -187,6 +221,7 @@ struct Deriver {
         for (int i : children(role)) {
             if (!is(i, "filter")) { diagnostic("FilterItemUnknown"); continue; }
             QNameFilterFacts f; f.node = i; f.id = scalar(i, "Id");
+            f.filterType = scalar(i, "FilterType", {"nlsettings", "FilterType"});
             QStringList memberOrder = common;
             const QString kind = type(i, "filter");
             bool packageComplete = true;
@@ -340,6 +375,15 @@ struct Deriver {
         QMap<QString, int> ids;
         for (const auto &c : view.candidates) if (c.id.known()) ids[c.id.value] = ids.value(c.id.value) + 1;
         for (auto &c : view.candidates) if (ids.value(c.id.value) != 1) c.complete = false;
+        QVector<int> weighted;
+        for (int i = 0; i < view.candidates.size(); ++i)
+            if (view.candidates[i].kind == "fwRule" && view.candidates[i].weight.known()) weighted.push_back(i);
+        std::stable_sort(weighted.begin(), weighted.end(), [this](int a, int b) { return view.candidates[a].weight.value > view.candidates[b].weight.value; });
+        for (int i : weighted) {
+            if (view.weightGroups.isEmpty() || view.candidates[view.weightGroups.back().front()].weight.value != view.candidates[i].weight.value)
+                view.weightGroups.push_back({});
+            view.weightGroups.back().push_back(i);
+        }
         for (int i = 0; i < view.candidates.size(); ++i) for (int j = i + 1; j < view.candidates.size(); ++j) {
             if (++view.conflictComparisons > 100000) { view.conflictsComplete = false; diagnostic("ConflictComparisonLimit"); return view; }
             auto &a = view.candidates[i]; auto &b = view.candidates[j];
@@ -351,6 +395,74 @@ struct Deriver {
     }
 };
 } // namespace
+namespace {
+QNameMatch comparePredicate(const QNamePredicate &p, const QNameConnectionFacts &facts) {
+    if (!p.complete || !p.match.known()) return QNameMatch::Unknown;
+    bool any = false;
+    if (p.kind == "FFIsInternetTraffic" || p.kind == "FFIsLocalNetworkTraffic") {
+        const auto &zone = p.kind == "FFIsInternetTraffic" ? facts.internetZone : facts.localNetworkZone;
+        if (!zone.known()) return QNameMatch::Unknown;
+        any = zone.value;
+    } else if (p.kind == "FFRemoteAddressInRange") {
+        if (!facts.remoteIpv4.known()) return QNameMatch::Unknown;
+        for (const auto &range : p.remoteRanges)
+            any = any || (range.first.value <= facts.remoteIpv4.value && facts.remoteIpv4.value <= range.last.value);
+    } else if (p.kind == "FFTagEqual") {
+        if (!facts.applicationTags.known()) return QNameMatch::Unknown;
+        for (const auto &tag : p.tags) any = any || facts.applicationTags.value.contains(tag.value);
+    } else {
+        // Identidad AppId/path y comparación de dominio requieren sus catálogos/normalización
+        // originales. Datos textuales declarados no cierran ese puente ni conceden autoridad.
+        return QNameMatch::Unknown;
+    }
+    return any == p.match.value ? QNameMatch::Yes : QNameMatch::No;
+}
+}
+QNameMatch compareQNameFilter(const QNameProfileView &view, int filter, const QNameConnectionFacts &facts) {
+    if (!view.valid || !view.profileKnown || !view.diagnosticsComplete || filter < 0 || filter >= view.filters.size()) return QNameMatch::Unknown;
+    const auto &f = view.filters[filter];
+    // El grafo se conserva; no se adivina aquí el operador de filtros Composite ni Package.
+    if (!f.complete || !f.baseFilters.isEmpty() || f.package.node >= 0 || f.predicates.isEmpty() ||
+        !f.filterType.known() || (f.filterType.value != "Filter" && f.filterType.value != "Zone")) return QNameMatch::Unknown;
+    bool unknown = false;
+    for (const auto &p : f.predicates) {
+        const auto result = comparePredicate(p, facts);
+        if (result == QNameMatch::No) return result;
+        unknown = unknown || result == QNameMatch::Unknown;
+    }
+    return unknown ? QNameMatch::Unknown : QNameMatch::Yes;
+}
+QNamePolicyComparison compareQNamePolicy(const QNameProfileView &view, const QNameConnectionFacts &facts) {
+    QNamePolicyComparison result;
+    if (!view.valid || !view.profileKnown || !view.diagnosticsComplete ||
+        (facts.direction != Direction::In && facts.direction != Direction::Out)) return result;
+    struct Compared { int index; QNameMatch match; };
+    QVector<Compared> compared;
+    std::optional<qint32> highest;
+    for (int i = 0; i < view.candidates.size(); ++i) {
+        const auto &c = view.candidates[i];
+        if (c.kind != "fwRule" || (c.enabled.known() && !c.enabled.value)) continue;
+        if (c.direction.known() && c.direction.value != Direction::Both && c.direction.value != facts.direction) continue;
+        const auto match = c.complete ? compareQNameFilter(view, c.filterIndex, facts) : QNameMatch::Unknown;
+        if (match == QNameMatch::No) continue;
+        if (!c.weight.known()) return result;
+        compared.push_back({i, match});
+        if (match == QNameMatch::Yes && (!highest || c.weight.value > *highest)) highest = c.weight.value;
+    }
+    if (!highest) { result.matched = compared.isEmpty() ? QNameMatch::No : QNameMatch::Unknown; return result; }
+    for (const auto &c : compared) {
+        const auto weight = view.candidates[c.index].weight.value;
+        if (c.match == QNameMatch::Unknown && weight >= *highest) return result;
+        if (c.match == QNameMatch::Yes && weight == *highest) result.highestWeightCandidates.push_back(c.index);
+    }
+    result.matched = QNameMatch::Yes;
+    result.tie = result.highestWeightCandidates.size() != 1;
+    if (!result.tie) {
+        const auto &winner = view.candidates[result.highestWeightCandidates[0]];
+        if (winner.action.known() && winner.action.value != SourceFwAction::None) result.action = winner.action;
+    }
+    return result;
+}
 QNameProfileView deriveQNameProfile(const QNameEvidence &evidence, const ImportLimits &limits) {
     return Deriver{evidence, limits, {}, 0, {}, {}}.run();
 }
