@@ -4,12 +4,20 @@
 #include <QUuid>
 #include <algorithm>
 #include <cstring>
+#include <QCryptographicHash>
+#include "../../../common/wire_iv.h"
 namespace Gate::Assistance::General {
 namespace {
 bool nonzero(const Id128& id){return std::any_of(id.begin(),id.end(),[](auto v){return v!=0;});}
 Id128 idAt(const QByteArray& b,int offset){Id128 id{};std::memcpy(id.data(),b.constData()+offset,16);return id;}
 bool header(const QByteArray& b,int length){return b.size()==length&&Broker::number(b.left(2))==1&&Broker::number(b.mid(2,2))==0;}
 void addId(QByteArray& b,const Id128& id){b.append(reinterpret_cast<const char*>(id.data()),16);}
+bool validPrincipal(const PrincipalObservationContext& p){
+    const auto& sid=p.accountSid;
+    return nonzero(p.owner)&&sid.size()>=8&&sid.size()<=68&&sid[0]==1&&sid[1]<=15&&
+        sid.size()==8+std::size_t(sid[1])*4&&
+        std::any_of(p.targetDigest.begin(),p.targetDigest.end(),[](auto c){return c!=0;});
+}
 }
 bool PendingServiceContext::operator==(const PendingServiceContext& o) const {
     return serviceEpoch==o.serviceEpoch&&boot==o.boot&&engineContext==o.engineContext&&engineBindingGeneration==o.engineBindingGeneration;
@@ -20,11 +28,31 @@ bool validLocalFilePresentation(const LocalFilePresentation& f){
         unsigned(f.signature)<=unsigned(LocalSignatureStatus::Cancelled)&&safeText(f.publisher,1024,true)&&
         (f.signature==LocalSignatureStatus::VerifiedOffline||f.publisher.empty());
 }
-std::optional<Id128> pendingQuery(const QByteArray& b){if(!header(b,20))return {};auto id=idAt(b,4);return nonzero(id)?std::optional<Id128>(id):std::nullopt;}
+std::optional<PrincipalObservationContext> principalObservationContext(const Id128& owner,
+    const gb::wire::Bytes& sid,const gb::wire::Bytes& target){
+    gb::wire::iv::OriginalTarget parsed;gb::wire::Bytes input;
+    if(gb::wire::iv::unpackOriginalTarget(target,parsed)!=gb::wire::Error::Ok||parsed.accountSid!=sid||
+       gb::wire::iv::principalTargetDigestInput(target,input)!=gb::wire::Error::Ok)return {};
+    const auto digest=QCryptographicHash::hash(QByteArray(reinterpret_cast<const char*>(input.data()),qsizetype(input.size())),QCryptographicHash::Sha256);
+    PrincipalObservationContext result{owner,sid,{}};std::memcpy(result.targetDigest.data(),digest.constData(),32);
+    return validPrincipal(result)?std::optional<PrincipalObservationContext>(std::move(result)):std::nullopt;
+}
+std::optional<PendingQuerySelection> pendingQuerySelection(const QByteArray& b){
+    if(header(b,20)){const auto id=idAt(b,4);return nonzero(id)?std::optional<PendingQuerySelection>(PendingQuerySelection{id,{},0}):std::nullopt;}
+    if(b.size()!=44||Broker::number(b.left(2))!=2||Broker::number(b.mid(2,2)))return {};
+    PendingQuerySelection s{idAt(b,4),idAt(b,20),Broker::number(b.mid(36,8))};
+    return nonzero(s.request)&&nonzero(s.owner)&&s.revision?std::optional<PendingQuerySelection>(s):std::nullopt;
+}
+std::optional<Id128> pendingQuery(const QByteArray& b){const auto s=pendingQuerySelection(b);return s?std::optional<Id128>(s->request):std::nullopt;}
 std::optional<QByteArray> pendingQueryBytes(const Id128& id){if(!nonzero(id))return {};auto b=Broker::integer(1,2)+Broker::integer(0,2);addId(b,id);return b;}
+std::optional<QByteArray> pendingQueryBytes(const PendingQuerySelection& s){
+    if(!nonzero(s.owner))return !s.revision?pendingQueryBytes(s.request):std::nullopt;
+    if(!nonzero(s.request)||!s.revision)return {};
+    auto b=Broker::integer(2,2)+Broker::integer(0,2);addId(b,s.request);addId(b,s.owner);b+=Broker::integer(s.revision,8);return b;
+}
 std::optional<PendingPresentationContext> pendingPresentationContext(const QByteArray& b){
     const auto version=Broker::number(b.left(2));
-    if(b.size()<141||b.size()>1250||(version!=2&&version!=3)||Broker::number(b.mid(2,2))!=0)return {};
+    if(b.size()<141||b.size()>1250||(version!=2&&version!=3&&version!=4)||Broker::number(b.mid(2,2))!=0)return {};
     PendingServiceContext s{idAt(b,4),idAt(b,20),idAt(b,36),Broker::number(b.mid(52,8))};
     const auto request=idAt(b,60),selector=idAt(b,76),token=idAt(b,116);
     const auto revision=Broker::number(b.mid(92,8)),selectorRevision=Broker::number(b.mid(100,8)),
@@ -40,7 +68,7 @@ std::optional<PendingPresentationContext> pendingPresentationContext(const QByte
         if(!validDestination(d))return {};destination=std::move(d);end=153+qsizetype(length);
     }
     std::optional<LocalFilePresentation> localFile;
-    if(version==3){
+    if(version>=3){
         if(b.size()<end+1)return {};const auto present=Broker::number(b.mid(end,1));++end;
         if(present>1)return {};
         if(present){
@@ -48,17 +76,27 @@ std::optional<PendingPresentationContext> pendingPresentationContext(const QByte
             LocalFilePresentation f{Broker::number(b.mid(end,8)),Broker::number(b.mid(end+8,8)),
                 Broker::number(b.mid(end+16,8)),LocalSignatureStatus(Broker::number(b.mid(end+24,1))),{}};
             const auto length=Broker::number(b.mid(end+25,2));end+=27;
-            if(length>1024||b.size()!=end+qsizetype(length))return {};
+            if(length>1024||b.size()<end+qsizetype(length))return {};
             f.publisher=b.mid(end,length).toStdString();end+=qsizetype(length);
             if(!validLocalFilePresentation(f))return {};localFile=std::move(f);
         }
     }
+    std::optional<PrincipalObservationContext> principal;
+    if(version==4){
+        if(b.size()<end+50)return {};PrincipalObservationContext p;p.owner=idAt(b,int(end));
+        const auto size=Broker::number(b.mid(end+16,2));end+=18;
+        if(size>68||b.size()!=end+qsizetype(size)+32)return {};
+        const auto sid=b.mid(end,qsizetype(size));p.accountSid.assign(sid.begin(),sid.end());end+=qsizetype(size);
+        std::memcpy(p.targetDigest.data(),b.constData()+end,32);end+=32;
+        if(!validPrincipal(p))return {};principal=std::move(p);
+    }
     if(b.size()!=end)return {};
     return PendingPresentationContext(s,request,selector,revision,selectorRevision,profile,token,generation,
-        std::move(destination),std::move(localFile),std::uint16_t(version));
+        std::move(destination),std::move(localFile),std::uint16_t(version),std::move(principal));
 }
 std::optional<QByteArray> pendingPresentationBytes(const PendingPresentationContext& p){
-    if((p.presentationVersion()!=2&&p.presentationVersion()!=3)||(p.presentationVersion()==2&&p.localFile()))return {};
+    if((p.presentationVersion()!=2&&p.presentationVersion()!=3&&p.presentationVersion()!=4)||
+       (p.presentationVersion()==2&&p.localFile())||((p.presentationVersion()==4)!=bool(p.principal())))return {};
     auto b=Broker::integer(p.presentationVersion(),2)+Broker::integer(0,2);const auto &s=p.service();
     addId(b,s.serviceEpoch);addId(b,s.boot);addId(b,s.engineContext);b+=Broker::integer(s.engineBindingGeneration,8);
     addId(b,p.request());addId(b,p.selector());b+=Broker::integer(p.requestRevision(),8);
@@ -68,11 +106,17 @@ std::optional<QByteArray> pendingPresentationBytes(const PendingPresentationCont
     if(p.destination()){const auto& d=*p.destination();if(!validDestination(d))return {};
         b+=Broker::integer(d.address.size(),1);b+=QByteArray::fromStdString(d.address);b+=Broker::integer(d.port,2);
         b+=Broker::integer(d.protocol,1);b+=Broker::integer(d.observedAtMs,8);}
-    if(p.presentationVersion()==3){
+    if(p.presentationVersion()>=3){
         b+=Broker::integer(p.localFile()?1:0,1);
         if(p.localFile()){const auto& f=*p.localFile();if(!validLocalFilePresentation(f))return {};
             b+=Broker::integer(f.size,8);b+=Broker::integer(f.modifiedAtMs,8);b+=Broker::integer(f.checkedAtMs,8);
             b+=Broker::integer(unsigned(f.signature),1);b+=Broker::integer(f.publisher.size(),2);b+=QByteArray::fromStdString(f.publisher);}
+    }
+    if(p.principal()) {
+        const auto& principal=*p.principal();if(!validPrincipal(principal))return {};
+        addId(b,principal.owner);b+=Broker::integer(principal.accountSid.size(),2);
+        b.append(reinterpret_cast<const char*>(principal.accountSid.data()),qsizetype(principal.accountSid.size()));
+        b.append(reinterpret_cast<const char*>(principal.targetDigest.data()),32);
     }
     return pendingPresentationContext(b)?std::optional<QByteArray>(std::move(b)):std::nullopt;
 }

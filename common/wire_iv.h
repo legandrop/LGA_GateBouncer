@@ -8,6 +8,7 @@ constexpr std::uint64_t NativeTraffic = 1ull << 26;
 constexpr std::uint64_t NativeProcessFacts = 1ull << 27;
 constexpr std::uint64_t FileFutureControl = 1ull << 28;
 constexpr std::uint64_t AdministrativePrincipalControl = 1ull << 29;
+constexpr std::uint64_t AdministrativeObservedRead = 1ull << 30;
 // Representación de condición original; no capability, admisión ni autoridad.
 enum class RemoteKind : std::uint8_t { None = 0, Ipv4Range = 1 };
 struct RemoteCondition {

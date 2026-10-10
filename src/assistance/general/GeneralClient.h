@@ -19,14 +19,15 @@ public:
     bool control(Broker::Frame,ControlCompletion);
     bool configurationStatus(bool presentation,std::function<bool()> currentContext,ControlCompletion);
     bool pendingStatus(const Id128& request,PendingServiceContext captured,
-        std::function<bool()> currentContext,ControlCompletion);
+        std::function<bool()> currentContext,ControlCompletion,Id128 owner={},std::uint64_t revision=0);
     bool storeCredential(Configuration::ConfigurationIntent,Broker::SensitiveBytes,ControlCompletion);
     void cancel();
     bool settled() const;
     void close();
 private:
     struct Data;
-    bool presentationStatus(std::optional<Id128>,PendingServiceContext,std::function<bool()>,ControlCompletion);
+    bool presentationStatus(std::optional<Id128>,PendingServiceContext,std::function<bool()>,ControlCompletion,
+        Id128 owner={},std::uint64_t revision=0);
     std::shared_ptr<Data> data_;
 };
 }

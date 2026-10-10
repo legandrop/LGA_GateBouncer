@@ -91,6 +91,8 @@ bool Client::authenticated() {
 bool Client::open(bool control, const std::filesystem::path &image) {
     close();
     if ((minor_ != 1 && minor_ != 2 && minor_ != 3) || (control && minor_ == 3)) return false;
+    if(intent_!=ReadIntent::OwnAccount &&
+       (intent_!=ReadIntent::AdministrativeObservation || control || minor_!=3))return false;
     control_ = control;
     image_ = image;
     auto name = control ? L"\\\\.\\pipe\\LGA.GateBouncer.Control.v1"
@@ -106,7 +108,7 @@ bool Client::open(bool control, const std::filesystem::path &image) {
     f.minor = minor_;
     f.type = wire::Type::Hello;
     f.correlation = native::randomIdentity();
-    f.fields = {wire::value(wire::Tag::ClientRole, control ? 2 : 1, 1)};
+    f.fields = {wire::value(wire::Tag::ClientRole, control || intent_==ReadIntent::AdministrativeObservation ? 2 : 1, 1)};
     wire::Frame response;
     if (!send(pipe_.value, f, nullptr) || !receive(pipe_.value, response, nullptr) ||
         response.minor != minor_ || response.type != wire::Type::HelloAck || response.sequence != 1 ||
@@ -120,6 +122,10 @@ bool Client::open(bool control, const std::filesystem::path &image) {
         wire::iv::ServiceContext context;
         if (wire::iv::decodeServiceContext(response, context) != wire::Error::Ok) {
             close(); return false;
+        }
+        if(intent_==ReadIntent::AdministrativeObservation &&
+           wire::get(response,wire::Tag::Capabilities)!=(wire::ReadStatus|wire::ObservedRead|wire::iv::AdministrativeObservedRead)) {
+            close();return false;
         }
     }
     tx_ = rx_ = 2;

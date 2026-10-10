@@ -12,6 +12,7 @@ struct GeneralClient::Data : std::enable_shared_from_this<Data> {
         GeneralCoordinator::Completion completion;GeneralCoordinator::Progress notify;ControlCompletion control;
         bool presentation=false;std::uint64_t presentationGeneration=0;std::function<bool()> presentationCurrent;
         std::optional<Id128> pendingRequest;PendingServiceContext service;
+        Id128 observationOwner{};std::uint64_t observedRevision=0;
     };
     std::shared_ptr<FrameChannel> channel;GeneralCoordinator::Current current;
     std::map<Id128,std::shared_ptr<Entry>> ledger;std::shared_ptr<Entry> pending;
@@ -64,7 +65,8 @@ struct GeneralClient::Data : std::enable_shared_from_this<Data> {
             if(p->presentation!=bool(f.fields.count(76))||bool(p->pendingRequest)!=bool(f.fields.count(77))){close();return;}
             bool matching=true;
             if(p->pendingRequest){const auto view=pendingPresentationContext(f.fields.at(77));
-                if(!view||view->request()!=*p->pendingRequest){close();return;}
+                if(!view||view->request()!=*p->pendingRequest||bool(view->principal())!=(p->observationOwner!=Id128{})||
+                   (view->principal()&&(view->principal()->owner!=p->observationOwner||view->requestRevision()!=p->observedRevision))){close();return;}
                 matching=view->service()==p->service;
             }
             if(p->presentation){
@@ -151,14 +153,14 @@ bool GeneralClient::configurationStatus(bool presentation,std::function<bool()> 
     return presentationStatus({}, {},std::move(currentContext),std::move(completion));
 }
 bool GeneralClient::pendingStatus(const Id128& request,PendingServiceContext captured,
-    std::function<bool()> currentContext,ControlCompletion completion){
-    if(QThread::currentThread()!=thread()||!currentContext||!completion||!pendingQueryBytes(request)||!validPendingService(captured))return false;
+    std::function<bool()> currentContext,ControlCompletion completion,Id128 owner,std::uint64_t revision){
+    if(QThread::currentThread()!=thread()||!currentContext||!completion||!pendingQueryBytes(PendingQuerySelection{request,owner,revision})||!validPendingService(captured))return false;
     const auto d=data_;if(d->closed||!d->greeted)return false;
     d->cancel();if(d->closed)return false;
-    return presentationStatus(request,captured,std::move(currentContext),std::move(completion));
+    return presentationStatus(request,captured,std::move(currentContext),std::move(completion),owner,revision);
 }
 bool GeneralClient::presentationStatus(std::optional<Id128> selected,PendingServiceContext captured,
-    std::function<bool()> currentContext,ControlCompletion completion){
+    std::function<bool()> currentContext,ControlCompletion completion,Id128 owner,std::uint64_t revision){
     if(QThread::currentThread()!=thread()||!currentContext||!completion)return false;
     const auto d=data_;if(d->closed||!d->greeted)return false;
     const auto before=d->serial;const bool current=currentContext();if(!current||d->closed||d->serial!=before)return false;
@@ -166,9 +168,9 @@ bool GeneralClient::presentationStatus(std::optional<Id128> selected,PendingServ
     if(active>=3)return false;
     auto p=std::make_shared<Data::Entry>();p->request=30;p->expected=31;p->presentation=true;p->presentationGeneration=before;
     p->presentationCurrent=std::move(currentContext);p->control=std::move(completion);
-    p->pendingRequest=selected;p->service=captured;
+    p->pendingRequest=selected;p->service=captured;p->observationOwner=owner;p->observedRevision=revision;
     Broker::Frame request;request.message=Broker::Message::ConfigurationStatus;request.fields[76]=Broker::integer(1,2);
-    if(selected)request.fields[77]=*pendingQueryBytes(*selected);
+    if(selected){const auto query=pendingQueryBytes(PendingQuerySelection{*selected,owner,revision});if(!query)return false;request.fields[77]=*query;}
     if(!d->registerFrame(std::move(request),p))return false;
     const std::weak_ptr<Data> weak=d;QTimer::singleShot(6000,[weak,p]{if(auto owner=weak.lock();owner&&!owner->closed&&!p->terminal){
         if(p->pendingRequest&&p->retired)return;

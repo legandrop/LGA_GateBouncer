@@ -24,7 +24,7 @@ struct GeneralConnection::SettingsView {
 };
 GeneralConnection::GeneralConnection(MainWindow& window):QObject(&window),window_(&window){
     connect(&window,&MainWindow::assistanceConnectRequested,this,&GeneralConnection::connectBroker);
-    connect(window.product()->ordinary(),&OrdinaryDecisionClient::changed,this,&GeneralConnection::synchronizePending);
+    connect(window.product(),&ProductController::changed,this,&GeneralConnection::synchronizePending);
     connect(window.product(),&ProductController::invalidated,this,&GeneralConnection::synchronizePending);
 }
 GeneralConnection::~GeneralConnection(){
@@ -118,6 +118,7 @@ void GeneralConnection::synchronizePending(){
     }
     owner->selected=selected;owner->attempted=selected;owner->attemptedConfiguration=revision;
     owner->publicAttempted=false;
-    session->selectPending(selected->record.observed,selected->service);
+    session->selectPending(selected->record.observed,selected->service,
+        selected->principal?selected->principal->owner:General::Id128{},selected->principal?selected->record.revision:0);
 }
 }

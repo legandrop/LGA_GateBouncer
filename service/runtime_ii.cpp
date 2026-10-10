@@ -1113,11 +1113,11 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                     (!control && (hello.minor == 0 || hello.minor == 3)))) && hello.type == Type::Hello &&
                 zero(hello.connection) && hello.sequence == 1 &&
                 (get(hello, Tag::ClientRole) == (control ? 2 : 1) ||
-                 (ordinary && get(hello, Tag::ClientRole) == 2))) {
+                 ((ordinary || (!control && hello.minor==3)) && get(hello, Tag::ClientRole) == 2))) {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
                 runtime_.tick();
                 principalReader = !ordinary && !control && hello.minor == 3;
-                administrative = ordinary && get(hello, Tag::ClientRole) == 2;
+                administrative = (ordinary || principalReader) && get(hello, Tag::ClientRole) == 2;
                 authenticated = runtime_.profileGeneration() == profile &&
                                 (ordinary || principalReader ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer, principalReader, administrative)
                                     : runtime_.peer(pipe.value, control, peer, true));

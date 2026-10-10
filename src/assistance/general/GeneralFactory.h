@@ -21,7 +21,7 @@ private:
     bool peerCurrent() const;
     struct PendingResolver {
         using Completion=std::function<void(std::shared_ptr<const OwnedPendingPresentation>)>;
-        std::function<void(const Id128&,Completion)> resolve;
+        std::function<void(const PendingQuerySelection&,Completion)> resolve;
         std::function<void()> retire;
     };
     static std::unique_ptr<GeneralFactory> forHost(std::unique_ptr<Broker::PipeSession>,

@@ -506,6 +506,9 @@ Schema schemaBase(const Frame &f) {
 }
 Schema schema(const Frame &f) {
   auto s=schemaBase(f);
+  if(find(f,T::PrincipalObservationOwner) &&
+     (f.type==Type::GetObservedRecord || f.type==Type::ObservedRecord))
+    s[T::PrincipalObservationOwner]=16;
   if(find(f,T::OriginalSourceSelection)) {
     switch(f.type) {
     case Type::PrepareFileFuturePolicy: case Type::FileFutureDraftRecord:
@@ -883,7 +886,7 @@ Error validate(const Frame &f) {
   unsigned previous = 0;
   for (const auto &v : f.fields) {
     auto tag = static_cast<unsigned>(v.tag);
-    if (tag < 1 || tag > static_cast<unsigned>(T::OriginalSourceSelection) || tag == 57 ||
+    if (tag < 1 || tag > static_cast<unsigned>(T::PrincipalObservationOwner) || tag == 57 ||
         (v.tag == T::ServiceContext && f.type != Type::HelloAck && f.type != Type::Status &&
          f.type != Type::SubscriptionAck && f.type != Type::Attempt &&
          f.type != Type::Authorization && f.type != Type::Traffic && f.type != Type::ObservationGap &&
@@ -918,7 +921,10 @@ Error validate(const Frame &f) {
           boot != idValue(f, T::BootId) || engine != idValue(f, T::SourceEpoch) ||
           zero(engine) != (generation == 0)) return Error::Malformed;
       auto c = number(*caps);
-      if ((c >> 30) || (c & ((0x3full << 6) | (1ull << 16))) ||
+      if ((c >> 31) || (c & ((0x3full << 6) | (1ull << 16))) ||
+          ((c & AdministrativeObservedRead) &&
+           (c!=(ReadStatus|ObservedRead|AdministrativeObservedRead) || number(*profile) ||
+            zero(engine) || get(f,T::ReviewProfileState)!=1)) ||
           ((c & NativeEvents) && (!(c & ObservedRead) || zero(engine) || get(f,T::ReviewProfileState)!=1)) ||
           ((c & NativeTraffic) && !(c & NativeEvents)) ||
           ((c & NativeProcessFacts) && !(c & NativeEvents)) ||
@@ -935,7 +941,7 @@ Error validate(const Frame &f) {
                         base.fields.end());
       for (auto &v : base.fields)
         if (v.tag == T::Capabilities)
-          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents | NativeTraffic | NativeProcessFacts | FileFutureControl | AdministrativePrincipalControl), 8);
+          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents | NativeTraffic | NativeProcessFacts | FileFutureControl | AdministrativePrincipalControl | AdministrativeObservedRead), 8);
     }
     if (f.type == Type::ProtocolError && get(f, T::ErrorCode) == 18)
       for (auto &v : base.fields)
@@ -954,6 +960,10 @@ Error validate(const Frame &f) {
       return Error::Malformed;
     if (it->second == 16 && v.tag != T::SnapshotId && zero(idValue(f, v.tag)))
       return Error::Malformed;
+  }
+  if(find(f,T::PrincipalObservationOwner)) {
+    if(!find(f,T::AdministrativeMode) || zero(idValue(f,T::PrincipalObservationOwner)) ||
+       !find(f,T::DestinationContext))return Error::Malformed;
   }
   if(find(f,T::AdministrativeMode)) {
     if(get(f,T::AdministrativeMode)!=1)return Error::Malformed;

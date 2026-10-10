@@ -12,10 +12,11 @@ struct ObservationSelection {
     gb::wire::Id connection{};
     gb::wire::iv::ObservedRecord record;
     std::uint64_t profile=0,desired=0,selection=0;
+    std::optional<General::PrincipalObservationContext> principal;
     bool operator==(const ObservationSelection& other) const {
         gb::wire::Bytes left,right;
         return service==other.service&&connection==other.connection&&profile==other.profile&&
-            desired==other.desired&&selection==other.selection&&
+            desired==other.desired&&selection==other.selection&&principal==other.principal&&
             gb::wire::iv::pack({record},left)==gb::wire::Error::Ok&&
             gb::wire::iv::pack({other.record},right)==gb::wire::Error::Ok&&left==right;
     }
@@ -27,7 +28,8 @@ struct ObservationSelection {
     }
     bool matches(const General::PendingPresentationContext& pending) const {
         return pending.service()==service&&pending.request()==record.observed&&pending.selector()==record.binding&&
-            pending.requestRevision()==record.revision&&pending.selectorRevision()==record.revision&&pending.profileGeneration()==profile;
+            pending.requestRevision()==record.revision&&pending.selectorRevision()==record.revision&&pending.profileGeneration()==profile&&
+            principal==pending.principal();
     }
 };
 namespace Detail {
@@ -48,10 +50,18 @@ template<class T>std::optional<ObservationSelection> currentObservation(const T*
             before->service.engineContext,before->service.engineBindingGeneration};
         if(!General::validPendingService(context))return {};
         ObservationSelection result{context,before->connection,*row,before->profile,before->desired,before->selection};
+        if(before->administrative){
+            result.principal=General::principalObservationContext(before->connection,before->selectedSid,before->originalTarget);
+            if(!result.principal)return {};
+        }
         const auto after=source->observationContext();const auto second=source->observed();
         if(!after||!second||!source->current()||!source->visible()||after->observedRevision!=second->revision)return {};
         ObservationSelection checked{{after->service.serviceEpoch,after->service.boot,after->service.engineContext,
             after->service.engineBindingGeneration},after->connection,*second,after->profile,after->desired,after->selection};
+        if(after->administrative){
+            checked.principal=General::principalObservationContext(after->connection,after->selectedSid,after->originalTarget);
+            if(!checked.principal)return {};
+        }
         return result==checked?std::optional<ObservationSelection>(std::move(result)):std::nullopt;
     }
 }

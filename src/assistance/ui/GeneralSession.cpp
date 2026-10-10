@@ -168,15 +168,17 @@ std::optional<G::PendingPresentationContext> GeneralSession::pendingObservation(
     return self&&second&&self->current(stamp)&&self->pendingPresentation_&&
         G::pendingPresentationBytes(*self->pendingPresentation_)==bytes?std::optional<G::PendingPresentationContext>(projection):std::nullopt;
 }
-bool GeneralSession::selectPending(const G::Id128& request,G::PendingServiceContext service){
-    if(busy_||!pendingCurrent_||!available()||!G::pendingQueryBytes(request)||!G::validPendingService(service))return false;
+bool GeneralSession::selectPending(const G::Id128& request,G::PendingServiceContext service,G::Id128 owner,std::uint64_t revision){
+    if(busy_||!pendingCurrent_||!available()||!G::pendingQueryBytes(G::PendingQuerySelection{request,owner,revision})||!G::validPendingService(service))return false;
     review_.reset();cancel();busy_=true;problem_.clear();const auto stamp=generation_;QPointer<GeneralSession> self(this);
     const bool sent=client_->pendingStatus(request,service,[self,stamp]{return self&&self->current(stamp);},
-        [self,stamp,request,service](Broker::Frame frame){
+        [self,stamp,request,service,owner,revision](Broker::Frame frame){
             if(!self||!self->current(stamp))return;
             const auto pending=frame.fields.count(77)?G::pendingPresentationContext(frame.fields.at(77)):std::nullopt;
             if(frame.message!=Broker::Message::ConfigurationStatusReply||!pending||pending->request()!=request||
-                !(pending->service()==service)||!self->adopt(frame,true)||!self->view_||!self->presentation_){
+                !(pending->service()==service)||bool(pending->principal())!=(owner!=G::Id128{})||
+                (pending->principal()&&(pending->principal()->owner!=owner||pending->requestRevision()!=revision))||
+                !self->adopt(frame,true)||!self->view_||!self->presentation_){
                 self->failed("The current pending request is unavailable. Your request remains undecided.");return;
             }
             const auto binding=G::pendingFullBinding(*pending,*self->presentation_,*self->view_,self->channel_->connection());
@@ -195,7 +197,7 @@ bool GeneralSession::selectPending(const G::Id128& request,G::PendingServiceCont
             self->pendingPresentation_=pending;self->pendingBinding_=binding;self->busy_=false;self->state_=G::State::Insufficient;
             if(!binding)self->problem_="Online explanation needs search setup. The local file check does not send information.";
             emit self->changed();
-        });
+        },owner,revision);
     if(!sent)failed("The current request could not be read. Your request remains undecided.");else emit changed();
     return sent;
 }

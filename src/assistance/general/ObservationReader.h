@@ -13,18 +13,22 @@ struct ObservationRead {
     std::uint64_t profile=0,desired=0;
     gb::wire::Bytes destinationContext;
     std::optional<Destination> destination;
+    std::optional<PrincipalObservationContext> principal;
+    gb::wire::Bytes originalTarget;
 };
 class PrivateObservationReaderTest;
 class ObservationReader final {
 public:
     static std::optional<ObservationRead> read(gb::ipc::ii::Client&,const Id128&,
         const ObservationRead* expected=nullptr);
+    static std::optional<ObservationRead> readPrincipal(gb::ipc::ii::Client&,
+        const PendingQuerySelection&,const ObservationRead* expected=nullptr);
     static bool sameRecord(const gb::wire::iv::ObservedRecord&,
         const gb::wire::iv::ObservedRecord&,bool projected=false);
 private:
     friend class PrivateObservationReaderTest;
     static std::optional<ObservationRead> observe(gb::ipc::ii::SessionChannel&,
         const Id128&,const Id128&,std::function<bool()>,std::function<std::int64_t()>,
-        const ObservationRead*);
+        const ObservationRead*,const PendingQuerySelection* principal=nullptr);
 };
 }

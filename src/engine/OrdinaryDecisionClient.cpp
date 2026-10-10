@@ -349,8 +349,13 @@ bool OrdinaryDecisionClient::ready() const {
     return current_ && visible_ && state_ == State::Ready && draft_ && draftAge_.isValid() && draftAge_.elapsed() < draft_->ttl;
 }
 std::optional<OrdinaryDecisionClient::ObservationContext> OrdinaryDecisionClient::observationContext() const {
-    // El ring y el catálogo de procesos propios no contienen causas foreign.
-    if (administrative_) return {};
+    // Copia del grupo obtenido por 27 del MISMO canal administrativo. No agrega
+    // esa causa al ring propio ni concede autoridad al broker de explicación.
+    if(administrative_) {
+        iv::OriginalTarget target;
+        if(session_.administrativeConnection()!=connection_ ||
+           iv::unpackOriginalTarget(selectedTarget_,target)!=Error::Ok || target.accountSid!=selectedSid_)return {};
+    }
     if (stopping_ || !connected_ || !current_ || !visible_ || !observed_ || observedGeneration_ != generation_ ||
         (state_ != State::Preparing && state_ != State::Ready) || !profile_ || !bindingGeneration_ ||
         zero(epoch_) || zero(boot_) || zero(source_) || zero(connection_) ||
@@ -360,7 +365,8 @@ std::optional<OrdinaryDecisionClient::ObservationContext> OrdinaryDecisionClient
             r.source == source_ && r.state == 1;
     });
     if (row == rows_.end() || (state_ == State::Ready && !ready())) return {};
-    return ObservationContext{{epoch_,boot_,source_,bindingGeneration_},connection_,profile_,desired_,generation_,observed_->revision};
+    return ObservationContext{{epoch_,boot_,source_,bindingGeneration_},connection_,profile_,desired_,generation_,observed_->revision,
+        administrative_,selectedSid_,selectedTarget_};
 }
 bool OrdinaryDecisionClient::decide(bool allow, bool consent, quint64 selection) {
     if (fileOwner_) return false; // El recorrido de archivo revalida su dueño en el worker.

@@ -31,7 +31,8 @@ class SessionChannel {
 };
 class Client final : public SessionChannel {
   public:
-    explicit Client(std::uint16_t minor = 1) : minor_(minor) {}
+    enum class ReadIntent : std::uint8_t { OwnAccount=1, AdministrativeObservation=2 };
+    explicit Client(std::uint16_t minor = 1, ReadIntent intent=ReadIntent::OwnAccount) : minor_(minor), intent_(intent) {}
     ~Client() override { close(); }
     bool open(bool control, const std::filesystem::path &serviceImage);
     bool transact(wire::Frame request, wire::Frame &reply);
@@ -39,6 +40,7 @@ class Client final : public SessionChannel {
     void close();
     const wire::Frame &hello() const { return hello_; }
     bool control() const { return control_; }
+    ReadIntent readIntent() const { return intent_; }
     std::shared_ptr<const ReadPeerLease> readonlyPeer() const override {
         return std::atomic_load(&peer_);
     }
@@ -58,6 +60,7 @@ class Client final : public SessionChannel {
     std::uint64_t tx_ = 1, rx_ = 1;
     bool control_ = false;
     std::uint16_t minor_;
+    const ReadIntent intent_;
     wire::Frame hello_;
     std::deque<wire::Frame> bufferedEvents_;
 };

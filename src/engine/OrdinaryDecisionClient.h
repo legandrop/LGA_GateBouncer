@@ -25,6 +25,8 @@ class OrdinaryDecisionClient final : public QObject {
         gb::wire::iv::ServiceContext service;
         gb::wire::Id connection{};
         quint64 profile = 0, desired = 0, selection = 0, observedRevision = 0;
+        bool administrative=false;
+        gb::wire::Bytes selectedSid,originalTarget;
     };
     std::optional<ObservationContext> observationContext() const;
     explicit OrdinaryDecisionClient(bool isolatedQa, QObject *parent = nullptr,

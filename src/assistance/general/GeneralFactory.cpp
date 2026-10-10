@@ -121,7 +121,7 @@ struct GeneralFactory::Data : std::enable_shared_from_this<Data> {
             f.fields[23]=Broker::integer(unsigned(Failure::Stale),2);completion(std::move(f),{});};
         if(!localThread()||!peer()||pendingInFlight||!pendingResolver.resolve||!pendingResolver.retire||
             pendingGeneration==UINT64_MAX){stale();return;}
-        const auto selected=pendingQuery(request.fields.at(77));
+        const auto selected=pendingQuerySelection(request.fields.at(77));
         const auto canonical=status();const auto initial=presentation(canonical);
         const auto bytes=initial?presentationBytes(*initial,canonical,request.connection):std::nullopt;
         if(!selected||!bytes){retirePending();stale();return;}
@@ -131,7 +131,9 @@ struct GeneralFactory::Data : std::enable_shared_from_this<Data> {
             if(*once)return;
             *once=true;d->pendingInFlight=false;
             if(d->closed||d->pendingGeneration!=generation){stale();return;}
-            if(!owner||!owner->lifetime_||!owner->current_||owner->view_.request()!=selected||
+            if(!owner||!owner->lifetime_||!owner->current_||owner->view_.request()!=selected.request||
+                bool(owner->view_.principal())!=(selected.owner!=Id128{})||
+                (owner->view_.principal()&&(owner->view_.principal()->owner!=selected.owner||owner->view_.requestRevision()!=selected.revision))||
                 !d->channel||owner->connection_!=d->channel->connection()){d->retirePending();stale();return;}
             auto current=[d,owner,generation,canonical,notice]{
                 const auto channel=d->channel;

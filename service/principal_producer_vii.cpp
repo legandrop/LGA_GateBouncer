@@ -369,7 +369,7 @@ bool NativeRuntime::principalPeerCurrent(const PrincipalPeer &peer) const noexce
                 // Role solicitado no concede autoridad: exigir el mismo primary
                 // original del actor y elegibilidad administrativa OS corriente.
                 HANDLE rawToken=nullptr;native::Handle primary;
-                if(c.peer.readonly || !c.peer.administrativePrimary || !c.runtime.deployment_ ||
+                if(!c.peer.administrativePrimary || !c.runtime.deployment_ ||
                    !c.runtime.deployment_->serviceAdmittedCurrent() ||
                    !c.runtime.profile_.accepts(fresh,true) ||
                    !OpenProcessToken(c.peer.actor.process.value,TOKEN_QUERY,&rawToken))return false;
@@ -404,7 +404,6 @@ bool NativeRuntime::principalPeerCurrent(const PrincipalPeer &peer) const noexce
     return PrincipalActorQuery::current(peer.actor, peer.identity, peer.cancelled, &check, accepts, principalActorApi_);
 }
 bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &peer, bool readonly, bool administrative) {
-    if(readonly && administrative)return false;
     if (peer) return peer->readonly == readonly && peer->administrative == administrative && principalPeerCurrent(*peer);
     if (ordinaryImage_.empty() || !native::fixedPath(ordinaryImage_) || !principalMode_ ||
         !deploymentCurrent() || ((!principalSource_ || !principalCatalog_ || principalWriteFault_) &&
@@ -448,7 +447,7 @@ bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &pe
         acquired->pipe.reset(duplicate);
         acquired->profile = profile_.value().generation;
         if (!principalPeerCurrent(*acquired)) return false;
-        if(administrative) {
+        if(administrative && !readonly) {
             for(auto &prior:principalAdministrativePeers_)
                 if(prior && prior->cancelled && prior.use_count()==1)prior.reset();
             auto slot=std::find_if(principalAdministrativePeers_.begin(),principalAdministrativePeers_.end(),
@@ -530,6 +529,13 @@ Frame NativeRuntime::ordinaryStatus(Type type, const std::shared_ptr<PrincipalPe
                     (deployment_ && deployment_->serviceAdmittedCurrent() ? wire::iv::FileFutureControl |
                         (administrativeReady ? wire::iv::AdministrativePrincipalControl : 0) : 0) : 0) : 0));
         if (field.tag == Tag::IVProfile) field = value(Tag::IVProfile, admitted && !peer->readonly && principalPolicyReady() ? 1 : 0, 1);
+    }
+    if(peer && peer->readonly && peer->administrative) {
+        for(auto &field:frame.fields) {
+            if(field.tag==Tag::Capabilities)field=value(Tag::Capabilities,
+                ReadStatus|(administrativeReady ? ObservedRead|wire::iv::AdministrativeObservedRead : 0));
+            if(field.tag==Tag::IVProfile)field=value(Tag::IVProfile,0,1);
+        }
     }
     return ordered(std::move(frame));
 }
@@ -1466,6 +1472,11 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
     return outcomeResult(frame.correlation, receipt);
 }
 Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<PrincipalPeer> &peer) {
+    // El Assistant administrativo sólo lee status y UN observado de un owner
+    // original. No puede crear páginas, suscripciones, drafts ni comandos.
+    if(peer && peer->readonly && peer->administrative &&
+       frame.type!=Type::GetStatus && frame.type!=Type::GetObservedRecord)
+        return principalError(Error::Unauthorized);
     if (peer && peer->readonly && frame.type != Type::GetStatus && frame.type != Type::ListObserved &&
         frame.type != Type::GetObservedRecord && frame.type != Type::SubscribeEvents &&
         frame.type != Type::GetNativeProcessContext) return principalError(Error::Unauthorized);
@@ -1476,8 +1487,12 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         return principalError(Error::IdentityUnavailable);
     }
     const bool administrative=find(frame,Tag::AdministrativeMode)!=nullptr;
-    if(administrative && (!peer->administrative || peer->readonly))return principalError(Error::Unauthorized);
+    const bool administrativeReader=peer->readonly && peer->administrative;
+    if(administrative && (!peer->administrative || (peer->readonly && !administrativeReader)))return principalError(Error::Unauthorized);
+    if(find(frame,Tag::PrincipalObservationOwner) && !administrativeReader)return principalError(Error::Unauthorized);
     if (frame.type == Type::GetStatus) return ordinaryStatus(Type::Status, peer);
+    if(administrativeReader && (!administrative || !find(frame,Tag::PrincipalObservationOwner) ||
+       !find(frame,Tag::DestinationContext)))return principalError(Error::Unauthorized);
     if (frame.type == Type::GetNativeProcessContext) return readPrincipalProcess(frame,peer);
     if (idValue(frame, Tag::ServiceEpoch) != epoch_) return principalError(Error::Stale);
     if (frame.type == Type::SubscribeEvents) return subscribePrincipalEvents(frame, peer);
@@ -1522,10 +1537,26 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         if (peer->readonly) peer->pages.clear();
         return principalError(Error::BackendUnavailable);
     }
+    std::shared_ptr<PrincipalPeer> observationOwner=peer;
+    const auto ownerCurrent=[&] {
+        return observationOwner && !observationOwner->readonly && observationOwner->administrative &&
+            observationOwner->profile==peer->profile && principalPeerCurrent(*observationOwner) &&
+            observationOwner->identity.account==peer->identity.account &&
+            observationOwner->identity.logon==peer->identity.logon &&
+            observationOwner->identity.session==peer->identity.session && principalPeerCurrent(*peer);
+    };
+    if(administrativeReader) {
+        const auto ownerId=idValue(frame,Tag::PrincipalObservationOwner);
+        observationOwner.reset();
+        for(const auto &retained:principalAdministrativePeers_)
+            if(retained && retained->connection==ownerId) {observationOwner=retained;break;}
+        if(!ownerCurrent())return principalError(Error::IdentityUnavailable);
+    }
     const auto causeCurrent = [&](const PrincipalObservation &o) {
-        return o.row.state == 1 && o.row.source == principalSource_->binding_->epoch &&
+        return (!administrativeReader || ownerCurrent()) &&
+            o.row.state == 1 && o.row.source == principalSource_->binding_->epoch &&
             o.source == principalSource_ && o.profile == peer->profile && o.event && o.proof &&
-            (o.foreign ? administrative && o.administrativeOwner==peer :
+            (o.foreign ? administrative && o.administrativeOwner==observationOwner :
                 o.event->owned().identity.userSid.bytes == peer->identity.account) &&
             principalSource_->retainedCause(*o.event,*o.proof,allnative::CatalogReceipt(principalCatalog_),allnative::Stage::Active);
     };
@@ -1596,8 +1627,9 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
                selectedContext.engineBindingGeneration!=selectedSource->binding_->generation ||
                !causeCurrent(observation))return principalError(Error::Stale);
         }
-        if(observation.foreign && (!administrative || observation.administrativeOwner!=peer || !causeCurrent(observation)))
+        if(observation.foreign && (!administrative || observation.administrativeOwner!=observationOwner || !causeCurrent(observation)))
             return principalError(Error::Unauthorized);
+        if(administrativeReader && !ownerCurrent())return principalError(Error::Unauthorized);
         principal::Target selected;
         if(administrative && (!causeCurrent(observation) || !principal::parseTarget(observation.target,selected) ||
            (frame.type==Type::OpenReview && !principalTargetSelected(frame,*peer,selected.user))))
@@ -1621,6 +1653,7 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         if(administrative)response.fields.insert(response.fields.end(),{
             {Tag::SelectedPrincipalSid,true,selected.user.copy()},value(Tag::AdministrativeMode,1,1),
             {Tag::OriginalTarget,true,observation.target.copy()}});
+        if(administrativeReader)response.fields.push_back(value(Tag::PrincipalObservationOwner,observationOwner->connection));
         if (row.state == 1 && causeCurrent(*found->second) && found->second->event) {
             const auto direction = found->second->event->owned().direction;
             if (direction == gatebouncer::service::windows::allapps::Direction::Inbound ||

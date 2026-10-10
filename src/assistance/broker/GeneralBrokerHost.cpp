@@ -42,6 +42,8 @@ struct GeneralBrokerHost::OwnedFacts {
     std::uint64_t profile=0,desired=0;
     gb::wire::Bytes destinationContext;
     std::optional<Destination> destination;
+    std::optional<PrincipalObservationContext> principal;
+    gb::wire::Bytes originalTarget;
     Id128 token{};
     std::uint64_t generation=0;
     L::detail::OpenFile pin;
@@ -88,17 +90,21 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
         std::uint64_t profile=0,desired=0;
         gb::wire::Bytes destinationContext;
         std::optional<Destination> destination;
+        std::optional<PrincipalObservationContext> principal;
+        gb::wire::Bytes originalTarget;
     };
     // Adquiere observaciones actuales del MISMO canal, nunca del cache de la GUI.
-    std::optional<ReadSource> readSource(const Id128& request) const;
+    std::optional<ReadSource> readSource(const PendingQuerySelection&) const;
     bool sourceCurrent(const OwnedFacts& owner) const {
         if(closed||!deployment||!deployment->current()||!owner.sourcePeer||owner.sourcePeer->checkLive()!=gb::ipc::ii::ReadPeerState::Current||!owner.fileCurrent())return false;
-        const auto observation=readSource(owner.record.observed);
+        const auto observation=readSource({owner.record.observed,owner.principal?owner.principal->owner:Id128{},
+            owner.principal?owner.record.revision:0});
         return !closed&&observation&&observation->context==owner.service&&observation->peer==owner.sourcePeer&&
             observation->peer->checkLive()==gb::ipc::ii::ReadPeerState::Current&&
             owner.sourcePeer&&owner.sourcePeer->checkLive()==gb::ipc::ii::ReadPeerState::Current&&
             observation->connection==owner.sourceConnection&&observation->profile==owner.profile&&observation->desired==owner.desired&&
             observation->destinationContext==owner.destinationContext&&observation->destination==owner.destination&&
+            observation->principal==owner.principal&&observation->originalTarget==owner.originalTarget&&
             ObservationReader::sameRecord(observation->record,owner.record)&&owner.fileCurrent()&&deployment->current();
     }
     bool current(const FullBinding& binding) const {
@@ -119,7 +125,7 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
         selected.reset();if(cancellation)cancellation->requested=true;
         if(serial==UINT64_MAX)closed=true;else ++serial;
     }
-    void resolve(const Id128& request,GeneralFactory::PendingResolver::Completion completion){
+    void resolve(const PendingQuerySelection& request,GeneralFactory::PendingResolver::Completion completion){
         retire();
         if(closed||worker||!host||!deployment||!deployment->current()){completion({});return;}
         const auto observation=readSource(request);
@@ -129,6 +135,7 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
         auto owner=std::make_shared<OwnedFacts>();owner->service=observation->context;owner->record=observation->record;owner->profile=observation->profile;owner->desired=observation->desired;owner->generation=serial;
         owner->sourceConnection=observation->connection;owner->sourcePeer=observation->peer;
         owner->destinationContext=observation->destinationContext;owner->destination=observation->destination;
+        owner->principal=observation->principal;owner->originalTarget=observation->originalTarget;
         if(!Broker::randomId(owner->token)){completion({});return;}
         cancellation=std::make_shared<L::Cancellation>();const auto cancelled=cancellation;
         const auto path=text(owner->record.display.path).toStdWString();const auto before=serial;
@@ -155,7 +162,8 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
             if(self->closed||self->serial!=before||cancelled->requested||!self->sourceCurrent(*owner)){completion({});return;}
             self->selected=owner;
             PendingPresentationContext view(owner->service,owner->record.observed,owner->record.binding,
-                owner->record.revision,owner->record.revision,owner->profile,owner->token,owner->generation,owner->destination,owner->localPresentation());
+                owner->record.revision,owner->record.revision,owner->profile,owner->token,owner->generation,owner->destination,owner->localPresentation(),
+                owner->principal?4:3,owner->principal);
             const std::weak_ptr<Data> weak=self;
             auto owned=std::shared_ptr<const OwnedPendingPresentation>(new OwnedPendingPresentation(
                 std::move(view),self->connection,owner,[weak,owner]{const auto state=weak.lock();
@@ -171,23 +179,30 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
         factory.reset();deployment.reset();
     }
 };
-std::optional<GeneralBrokerHost::Data::ReadSource> GeneralBrokerHost::Data::readSource(const Id128& request) const {
-    if(closed||gb::wire::zero(request))return {};
+std::optional<GeneralBrokerHost::Data::ReadSource> GeneralBrokerHost::Data::readSource(const PendingQuerySelection& request) const {
+    if(closed||!pendingQueryBytes(request))return {};
+    const auto intent=gb::wire::zero(request.owner)?gb::ipc::ii::Client::ReadIntent::OwnAccount:
+        gb::ipc::ii::Client::ReadIntent::AdministrativeObservation;
+    if(source&&source->readIntent()!=intent){source->close();source.reset();}
     if(!source){
-        source=std::make_unique<gb::ipc::ii::Client>(3);
+        source=std::make_unique<gb::ipc::ii::Client>(3,intent);
         const auto image=QDir(QCoreApplication::applicationDirPath()).filePath("GateBouncerService.exe");
         if(!source->open(false,std::filesystem::path(image.toStdWString()))){source.reset();return {};}
     }
     std::optional<ObservationRead> expected;
     const auto owner=selected;
-    if(owner&&owner->record.observed==request){
+    if(owner&&owner->record.observed==request.request){
         expected=ObservationRead{owner->service,owner->sourceConnection,owner->sourcePeer,
-            owner->record,owner->profile,owner->desired,owner->destinationContext,owner->destination};
+            owner->record,owner->profile,owner->desired,owner->destinationContext,owner->destination,
+            owner->principal,owner->originalTarget};
     }
-    const auto observed=ObservationReader::read(*source,request,expected?&*expected:nullptr);
+    const auto observed=intent==gb::ipc::ii::Client::ReadIntent::AdministrativeObservation?
+        ObservationReader::readPrincipal(*source,request,expected?&*expected:nullptr):
+        ObservationReader::read(*source,request.request,expected?&*expected:nullptr);
     if(closed||!observed){source->close();source.reset();return {};}
     return ReadSource{observed->service,observed->connection,observed->peer,observed->record,
-        observed->profile,observed->desired,observed->destinationContext,observed->destination};
+        observed->profile,observed->desired,observed->destinationContext,observed->destination,
+        observed->principal,observed->originalTarget};
 }
 GeneralBrokerHost::GeneralBrokerHost(QObject* parent):QObject(parent),data_(std::make_shared<Data>()){
     data_->host=this;
@@ -208,7 +223,7 @@ std::unique_ptr<GeneralBrokerHost> GeneralBrokerHost::forCurrentUser(std::unique
     data->connection=session->connection();
     const std::weak_ptr<Data> weak=data;
     GeneralFactory::PendingResolver resolver;
-    resolver.resolve=[weak](const Id128& id,GeneralFactory::PendingResolver::Completion complete){
+    resolver.resolve=[weak](const PendingQuerySelection& id,GeneralFactory::PendingResolver::Completion complete){
         if(const auto owner=weak.lock())owner->resolve(id,std::move(complete));else complete({});};
     resolver.retire=[weak]{if(const auto owner=weak.lock())owner->retire();};
     data->factory=GeneralFactory::forHost(std::move(session),[weak](const FullBinding& binding){

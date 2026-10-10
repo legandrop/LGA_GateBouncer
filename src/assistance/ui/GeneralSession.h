@@ -23,7 +23,7 @@ public:
     bool mode(Configuration::ModeChoice);
     bool serviceUse(Configuration::ServiceUse);
     bool selectSearch();
-    bool selectPending(const General::Id128&,General::PendingServiceContext);
+    bool selectPending(const General::Id128&,General::PendingServiceContext,General::Id128 owner={},std::uint64_t revision=0);
     std::optional<General::FullBinding> pendingBinding() const;
     // Proyección readonly del pendiente autenticado, independiente de elegibilidad de envío.
     std::optional<General::PendingPresentationContext> pendingObservation() const;
