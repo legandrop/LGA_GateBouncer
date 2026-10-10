@@ -404,7 +404,7 @@ QString ProductController::revisionSummary() const {
 namespace Gate {
 void ProductController::clearProcessHistory() {
     for (auto &p : catalog_.processes) {
-        p.historySubjects.clear(); p.identityEvidence.clear(); p.sourceImage.reset();
+        p.historySubjects.clear(); p.historyCauses.clear(); p.identityEvidence.clear(); p.sourceImage.reset();
         p.lastAttemptUtc = {}; p.lastAuthorizedUtc = {}; p.lastTrafficUtc = {};
     }
 }
@@ -412,24 +412,10 @@ void ProductController::cancelNativeProcesses() {
     nativeProcessTick_.stop(); nativeProcessJob_.reset(); source_.revokeNative(); clearProcessHistory();
 }
 void ProductController::projectProcessHistory(Data::ProcessCatalogResult &result) {
-    for (auto &p : result.processes) {
-        if (p.identityEvidence != "SourceRetainedImageAndOwnInstance") continue;
-        std::optional<Data::EventFact> facts[3];
-        bool ambiguous[3]{};
-        for (const auto &subject : p.historySubjects) {
-            const auto aggregate = history_.state().subjects.constFind(subject);
-            if (aggregate == history_.state().subjects.cend()) continue;
-            const std::optional<Data::EventFact> incoming[3]{aggregate->lastAttempt,aggregate->lastAuthorized,aggregate->lastTraffic};
-            for (int i=0;i<3;++i) if (incoming[i]) {
-                if (facts[i] && (facts[i]->sourceId != incoming[i]->sourceId || facts[i]->sourceEpoch != incoming[i]->sourceEpoch)) {
-                    ambiguous[i]=true; continue;
-                }
-                if (!facts[i] || incoming[i]->sequence.toULongLong() > facts[i]->sequence.toULongLong()) facts[i]=incoming[i];
-            }
-        }
-        p.lastAttemptUtc = !ambiguous[0] && facts[0] ? facts[0]->atUtc : QDateTime{};
-        p.lastAuthorizedUtc = !ambiguous[1] && facts[1] ? facts[1]->atUtc : QDateTime{};
-        p.lastTrafficUtc = !ambiguous[2] && facts[2] ? facts[2]->atUtc : QDateTime{};
+    for (auto &p:result.processes) {
+        if (p.identityEvidence!="SourceRetainedImageAndOwnInstance") continue;
+        const auto dates=Data::nativeProcessHistoryDates(history_.state(),p.historyCauses);
+        p.lastAttemptUtc=dates.attempt; p.lastAuthorizedUtc=dates.authorization; p.lastTrafficUtc=dates.traffic;
     }
 }
 void ProductController::advanceNativeProcesses() {

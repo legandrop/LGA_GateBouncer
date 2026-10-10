@@ -7,6 +7,7 @@
 #include <QByteArray>
 #include <QVector>
 #include <optional>
+#include <memory>
 #include "qnameevidence.h"
 
 namespace Gate::Data {
@@ -39,6 +40,7 @@ struct ProcessInstance {
                creationFiletime == other.creationFiletime;
     }
 };
+struct ActivityEvent;
 struct ProcessObservation {
     ProcessInstance instance;
     QString name, imagePath;
@@ -49,6 +51,8 @@ struct ProcessObservation {
     QString identityEvidence;
     std::optional<NativeProcessFacts> sourceImage;
     QStringList historySubjects;
+    // Sólo copias de Attempts cuyos recibos originales pasaron ambas READs del batch propio.
+    QVector<std::shared_ptr<const ActivityEvent>> historyCauses;
     QDateTime lastAttemptUtc, lastAuthorizedUtc, lastTrafficUtc;
 };
 struct XmlNode {

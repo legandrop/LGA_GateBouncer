@@ -36,5 +36,8 @@ bool validNativeProcessFacts(const NativeProcessFacts &facts);
 bool validNativeEvent(const ActivityEvent &event);
 bool nativeCauseMatches(const ActivityEvent &attempt, const ActivityEvent &authorization);
 bool nativeTrafficMatches(const ActivityEvent &attempt, const ActivityEvent &authorization, const ActivityEvent &traffic);
+struct NativeHistoryDates { QDateTime attempt, authorization, traffic; };
+// Selector de datos, sin construir custodia/autoridad: el caller aporta sólo sus causas originales admitidas.
+NativeHistoryDates nativeProcessHistoryDates(const HistoryState &, const QVector<std::shared_ptr<const ActivityEvent>> &);
 bool validNativeHistory(const HistoryState &state);
 } // namespace Gate::Data

@@ -73,7 +73,7 @@ if(GATEBOUNCER_OBSERVER_SOURCE)
     target_include_directories(GateBouncerObserver PRIVATE src common)
     target_link_libraries(GateBouncerObserver PRIVATE Qt6::Widgets gatebouncer_data gatebouncer_assistance
         gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire
-        gatebouncer_lifecycle gatebouncer_native_ii advapi32 shell32)
+        gatebouncer_lifecycle gatebouncer_native_ii advapi32 shell32 fwpuclnt)
 endif()
 
 # Componentes de decisiones: no habilitan endpoints ni ejecución elevada.

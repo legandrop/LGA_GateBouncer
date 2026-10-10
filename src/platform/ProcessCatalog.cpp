@@ -382,6 +382,7 @@ ProcessCatalogResult ProcessCatalog::finishNative(const std::shared_ptr<NativeOw
         row->identityEvidence = "SourceRetainedImageAndOwnInstance";
         row->sourceImage = f;
         row->observedAtUtc = QDateTime::currentDateTimeUtc(); row->historySubjects.push_back(e.subjectId);
+        row->historyCauses.push_back(std::make_shared<const ActivityEvent>(e));
     }
     { std::lock_guard<std::mutex> lock(native_->mutex); if (!native_->error.isEmpty()) result.error = native_->error; }
     return result;

@@ -119,6 +119,47 @@ bool nativeTrafficMatches(const ActivityEvent &a, const ActivityEvent &auth, con
         auth.native->command == traffic.native->command &&
         auth.native->effectiveRevision == traffic.native->effectiveRevision && auth.native->scope == traffic.native->scope;
 }
+NativeHistoryDates nativeProcessHistoryDates(const HistoryState &state,
+    const QVector<std::shared_ptr<const ActivityEvent>> &causes) {
+    std::optional<EventFact> selected[3]; bool ambiguous[3]{};
+    QMap<QString,const ActivityEvent *> admitted, authorizations;
+    const auto select=[&](int slot,const ActivityEvent &event) {
+        // El cursor se compara únicamente dentro de la fuente/epoch del set admitido.
+        const EventFact fact{event.observedAtUtc,event.sourceId,event.sourceEpoch,event.sequence};
+        if (selected[slot] && (selected[slot]->sourceId!=fact.sourceId || selected[slot]->sourceEpoch!=fact.sourceEpoch)) {
+            ambiguous[slot]=true; return;
+        }
+        if (!selected[slot] || fact.sequence.toULongLong()>selected[slot]->sequence.toULongLong()) selected[slot]=fact;
+    };
+    for (const auto &cause:causes) {
+        if (!cause || !validNativeEvent(*cause) || cause->kind!=ActivityKind::Attempt ||
+            !cause->native->process || cause->native->externalPartial) continue;
+        const auto key=nativeEventKey(*cause); const auto stored=state.nativeAttempts.constFind(key);
+        // Resolver la secuencia al compacto original; subject/PID/path nunca sustituyen el descriptor.
+        if (stored==state.nativeAttempts.cend() || !validNativeEvent(*stored) || stored->native->externalPartial || !equivalent(*cause,*stored)) continue;
+        admitted.insert(key,cause.get()); select(0,*stored);
+    }
+    for (const auto &auth:state.nativeAuthorizations) {
+        if (!validNativeEvent(auth) || auth.native->externalPartial || auth.action!=Action::Allow) continue;
+        auto link=auth; link.sequence=QString::number(auth.native->attemptSequence);
+        const auto cause=admitted.constFind(nativeEventKey(link));
+        if (cause==admitted.cend() || !nativeCauseMatches(**cause,auth)) continue;
+        // Command y source/epoch resuelven el Authorization compacto para la cadena Traffic.
+        authorizations.insert(sequenceKey(auth.sourceId,auth.sourceEpoch)+':'+auth.native->command,&auth);
+        select(1,auth);
+    }
+    for (const auto &traffic:state.nativeTraffic) {
+        if (!validNativeEvent(traffic) || traffic.native->externalPartial) continue;
+        auto link=traffic; link.sequence=QString::number(traffic.native->attemptSequence);
+        const auto cause=admitted.constFind(nativeEventKey(link));
+        const auto auth=authorizations.constFind(sequenceKey(traffic.sourceId,traffic.sourceEpoch)+':'+traffic.native->command);
+        if (cause==admitted.cend() || auth==authorizations.cend() || !nativeTrafficMatches(**cause,**auth,traffic)) continue;
+        select(2,traffic);
+    }
+    return {!ambiguous[0] && selected[0] ? selected[0]->atUtc:QDateTime{},
+        !ambiguous[1] && selected[1] ? selected[1]->atUtc:QDateTime{},
+        !ambiguous[2] && selected[2] ? selected[2]->atUtc:QDateTime{}};
+}
 bool validNativeHistory(const HistoryState &s) {
     if (s.nativeAttempts.size() > 20000 || s.nativeAuthorizations.size() > 20000 || s.nativeTraffic.size() > 20000) return false;
     for (const auto &c : s.coverage) {
