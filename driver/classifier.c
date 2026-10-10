@@ -102,6 +102,9 @@ static UINT32 gbCalloutIds[GB_CALLOUT_COUNT];
 static UINT64 gbSession, gbSequence, gbLoss;
 static PFILE_OBJECT gbFile;
 static PEPROCESS gbOwner;
+static PACCESS_TOKEN gbOwnerToken;
+static ULONG gbOwnerNamespace;
+static ULONG gbProviderNamespace; // El catálogo iniciado conserva su namespace hasta el fin físico del driver.
 static PDEVICE_OBJECT gbDevice;
 static HANDLE gbEngine;
 static BOOLEAN gbStarted, gbFault;
@@ -116,6 +119,7 @@ static HANDLE gbInjection[2];
 static NDIS_HANDLE gbPacketPool;
 static UNICODE_STRING gbLink=RTL_CONSTANT_STRING(L"\\DosDevices\\LgaGateBouncerClassifier");
 static NTSTATUS startClassifier(void);
+static BOOLEAN serviceOwner(void);
 static void queueInbound(GB_ENTRY *e,HANDLE completion);
 static void discardOwnedPacket(GB_ENTRY *e,BOOLEAN locked);
 static BOOLEAN reservePacketLocked(GB_ENTRY *e) {
@@ -328,9 +332,10 @@ static NTSTATUS imageRead(PIRP irp,PIO_STACK_LOCATION stack,BOOLEAN fast,ULONG_P
     }
     controlEnter();
     KeAcquireSpinLock(&gbLock,&irql);e=byCause(query.session,query.cause);KeReleaseSpinLock(&gbLock,irql);
-    identity=e && currentEntry(e);status=irp->Cancel ? STATUS_CANCELLED : STATUS_INVALID_CID;
+    identity=e && currentEntry(e) && serviceOwner();status=irp->Cancel ? STATUS_CANCELLED : STATUS_INVALID_CID;
     KeAcquireSpinLock(&gbLock,&irql);
-    if(!irp->Cancel && valid && identity && stack->FileObject==gbFile && owner==gbOwner && imageEntryLocked(e,origin,&facts)) {
+    if(!irp->Cancel && valid && identity && stack->FileObject==gbFile && owner==gbOwner &&
+       imageEntryLocked(e,origin,&facts)) {
         if(!e->imageFactsValid){e->imageFacts=facts;e->imageFactsValid=TRUE;}
         if(RtlCompareMemory(&e->imageFacts,&facts,sizeof(facts))==sizeof(facts)) {
             RtlCopyMemory(irp->AssociatedIrp.SystemBuffer,&facts,sizeof(facts));*bytes=sizeof(facts);status=STATUS_SUCCESS;
@@ -416,23 +421,36 @@ static void freeEntry(GB_ENTRY *e) {
     imageDrop(e->imageOrigin);
     PsDereferencePrimaryToken(e->token); ObDereferenceObject(e->process); ExFreePoolWithTag(e,GB_TAG);
 }
-static BOOLEAN serviceOwner(void) {
-    PACCESS_TOKEN token=PsReferencePrimaryToken(PsGetCurrentProcess());
-    PTOKEN_USER user=NULL; PTOKEN_GROUPS groups=NULL; BOOLEAN accepted=FALSE;
+static ULONG serviceNamespace(PACCESS_TOKEN token) {
+    PTOKEN_USER user=NULL; PTOKEN_GROUPS groups=NULL; ULONG accepted=0,present=0;
     SID_IDENTIFIER_AUTHORITY authority=SECURITY_NT_AUTHORITY;
-    UCHAR storage[SECURITY_MAX_SID_SIZE]; PSID service=(PSID)storage; ULONG i;
+    UCHAR storage[SECURITY_MAX_SID_SIZE]; PSID service=(PSID)storage; ULONG i,n;
+    // S-1-5-80 de los dos nombres cerrados; RID derivados de SHA1 UTF-16 mayúsculas.
+    const ULONG rid[2][5]={{3214374501u,3171112237u,353839067u,2960396895u,4188265254u},
+        {261359355u,3591545304u,103058424u,11622622u,265084995u}};
     RtlInitializeSid(service,&authority,6); *RtlSubAuthoritySid(service,0)=SECURITY_SERVICE_ID_BASE_RID;
-    *RtlSubAuthoritySid(service,1)=261359355; *RtlSubAuthoritySid(service,2)=3591545304;
-    *RtlSubAuthoritySid(service,3)=103058424; *RtlSubAuthoritySid(service,4)=11622622; *RtlSubAuthoritySid(service,5)=265084995;
     if(NT_SUCCESS(SeQueryInformationToken(token,TokenUser,(PVOID *)&user)) && user &&
        RtlEqualSid(user->User.Sid,SeExports->SeLocalSystemSid) &&
        NT_SUCCESS(SeQueryInformationToken(token,TokenGroups,(PVOID *)&groups)) && groups)
-        for(i=0;i<groups->GroupCount;++i)
-            if((groups->Groups[i].Attributes & 4L) && !(groups->Groups[i].Attributes & 0x10L) &&
-               RtlEqualSid(groups->Groups[i].Sid,service)) { accepted=TRUE; break; }
+        for(n=0;n<2;++n) {
+            for(i=0;i<5;++i)*RtlSubAuthoritySid(service,i+1)=rid[n][i];
+            for(i=0;i<groups->GroupCount;++i)if(RtlEqualSid(groups->Groups[i].Sid,service)) {
+                ++present;
+                if((groups->Groups[i].Attributes & SE_GROUP_ENABLED) &&
+                   !(groups->Groups[i].Attributes & SE_GROUP_USE_FOR_DENY_ONLY))accepted=n+1;
+            }
+        }
     if(user) ExFreePool(user);
     if(groups) ExFreePool(groups);
-    PsDereferencePrimaryToken(token); return accepted;
+    return present==1 ? accepted : 0;
+}
+static BOOLEAN serviceOwner(void) {
+    PACCESS_TOKEN token;
+    BOOLEAN accepted;
+    if(!gbOwner || !gbOwnerToken || !gbOwnerNamespace)return FALSE;
+    token=PsReferencePrimaryToken(gbOwner);
+    accepted=token==gbOwnerToken && serviceNamespace(token)==gbOwnerNamespace;
+    PsDereferencePrimaryToken(token);return accepted;
 }
 static BOOLEAN tuple(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA_VALUES0 *m,GB_TUPLE *t) {
     ULONG la,ra,lp,rp,c,protocol; BOOLEAN packet,flow,closure,datagram; UINT32 compartment;
@@ -1384,6 +1402,9 @@ static void maintenance(void *ignored) {
     GB_ENTRY *packets[GB_CLASSIFIER_CAPACITY]; ULONG np=0;
     GB_ENTRY *discard[GB_CLASSIFIER_CAPACITY]; ULONG nc=0,na=0,nd=0,i; KIRQL irql; UINT64 now=KeQueryInterruptTime();
     UNREFERENCED_PARAMETER(ignored); controlEnter();imageSweep();
+    if(gbFile && !gbFault && !serviceOwner()) {
+        KeAcquireSpinLock(&gbLock,&irql);gbFault=TRUE;loss();KeReleaseSpinLock(&gbLock,irql);
+    }
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
         GB_ENTRY *e;
         KeAcquireSpinLock(&gbLock,&irql); e=gbEntries[i]; KeReleaseSpinLock(&gbLock,irql);
@@ -1437,6 +1458,7 @@ static BOOLEAN cancelValid(const GB_SCOPE_DECISION *d) {
 static NTSTATUS NTAPI dispatch(PDEVICE_OBJECT device,PIRP irp) {
     PIO_STACK_LOCATION s=IoGetCurrentIrpStackLocation(irp); NTSTATUS status=STATUS_INVALID_DEVICE_REQUEST;
     ULONG_PTR bytes=0; UINT32 code,i; KIRQL irql; HANDLE completion=NULL; PEPROCESS owner=NULL;
+    PACCESS_TOKEN ownerToken=NULL;ULONG ownerNamespace=0;
     GB_ENTRY *inboundEffect=NULL,*inboundDiscard=NULL;
     UNREFERENCED_PARAMETER(device);
     if(s->MajorFunction==IRP_MJ_CLOSE) return finish(irp,STATUS_SUCCESS,0);
@@ -1445,20 +1467,26 @@ static NTSTATUS NTAPI dispatch(PDEVICE_OBJECT device,PIRP irp) {
         if(s->FileObject==gbFile) {
             for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) if(gbEntries[i]) revoke(gbEntries[i]);
             gbFile=NULL; owner=gbOwner; gbOwner=NULL;
+            ownerToken=gbOwnerToken;gbOwnerToken=NULL;gbOwnerNamespace=0;
         }
         KeReleaseSpinLock(&gbLock,irql); controlLeave(); if(owner) ObDereferenceObject(owner);
+        if(ownerToken)PsDereferencePrimaryToken(ownerToken);
         return finish(irp,STATUS_SUCCESS,0);
     }
     if(KeGetCurrentIrql()!=PASSIVE_LEVEL || irp->RequestorMode!=UserMode ||
        PsGetCurrentProcess()!=IoGetRequestorProcess(irp)) return finish(irp,STATUS_ACCESS_DENIED,0);
     controlEnter();
     if(s->MajorFunction==IRP_MJ_CREATE) {
-        if(!gbFile && gbSession!=GB_MAX64 && serviceOwner()) {
+        ownerToken=PsReferencePrimaryToken(PsGetCurrentProcess());ownerNamespace=serviceNamespace(ownerToken);
+        if(!gbFile && gbSession!=GB_MAX64 && ownerNamespace &&
+           (!gbProviderNamespace || gbProviderNamespace==ownerNamespace)) {
             owner=PsGetCurrentProcess(); ObReferenceObject(owner);
-            KeAcquireSpinLock(&gbLock,&irql); gbFile=s->FileObject; gbOwner=owner; ++gbSession;
+            KeAcquireSpinLock(&gbLock,&irql); gbFile=s->FileObject; gbOwner=owner;
+            gbOwnerToken=ownerToken;gbOwnerNamespace=ownerNamespace;ownerToken=NULL;++gbSession;
             for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) if(gbEntries[i]) revoke(gbEntries[i]);
             gbLoss=0; KeReleaseSpinLock(&gbLock,irql); status=STATUS_SUCCESS;
         } else status=STATUS_SHARING_VIOLATION;
+        if(ownerToken){PsDereferencePrimaryToken(ownerToken);ownerToken=NULL;}
     } else if(s->MajorFunction==IRP_MJ_DEVICE_CONTROL && s->FileObject==gbFile && PsGetCurrentProcess()==gbOwner && serviceOwner()) {
         code=s->Parameters.DeviceIoControl.IoControlCode;
         if(code==GB_CLASSIFIER_START && !s->Parameters.DeviceIoControl.InputBufferLength && !s->Parameters.DeviceIoControl.OutputBufferLength)
@@ -1647,6 +1675,7 @@ static NTSTATUS startClassifier(void) {
     status=PsSetCreateProcessNotifyRoutineEx(processExit,FALSE); if(!NT_SUCCESS(status)) goto fail;
     status=FwpmTransactionBegin0(gbEngine,0); if(!NT_SUCCESS(status)) goto fail;
     provider.providerKey=GbClassifierProvider; provider.displayData.name=L"LGA GateBouncer scoped classifier";
+    provider.serviceName=gbOwnerNamespace==1 ? L"LGAGateBouncer" : L"LGAGateBouncerLab";
     status=FwpmProviderAdd0(gbEngine,&provider,NULL); if(!NT_SUCCESS(status)) goto abort;
     sublayer.subLayerKey=GbClassifierSublayer; sublayer.providerKey=(GUID *)&GbClassifierProvider;
     sublayer.displayData.name=L"LGA GateBouncer scoped packets"; sublayer.weight=65535;
@@ -1673,7 +1702,7 @@ static NTSTATUS startClassifier(void) {
         status=FwpmFilterAdd0(gbEngine,&filter,NULL,NULL); if(!NT_SUCCESS(status)) goto abort;
     }
     status=FwpmTransactionCommit0(gbEngine); if(!NT_SUCCESS(status)) goto fail;
-    gbStarted=TRUE; due.QuadPart=-1000000;
+    gbProviderNamespace=gbOwnerNamespace;gbStarted=TRUE; due.QuadPart=-1000000;
     KeSetTimerEx(&gbTimer,due,100,&gbDpc); return STATUS_SUCCESS;
 abort:
     FwpmTransactionAbort0(gbEngine);

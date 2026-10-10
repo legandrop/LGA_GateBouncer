@@ -7,6 +7,7 @@
 #include <thread>
 #include <atomic>
 namespace gb::decisions { class NativeRuntime; class NativeServer; }
+namespace gb::controller { class Deployment; }
 
 namespace gatebouncer::service::windows::allapps::native {
 class ClassifierCause;
@@ -18,7 +19,9 @@ class NativeClassifier final : public std::enable_shared_from_this<NativeClassif
     friend class ClassifierCause;
     friend class NativeImageWorker;
     NativeClassifier() = default;
-    static std::shared_ptr<NativeClassifier> open() noexcept;
+    static std::shared_ptr<NativeClassifier> open(std::shared_ptr<gb::controller::Deployment>) noexcept;
+    bool registrationCurrent() const noexcept;
+    bool serviceCaller() const noexcept;
     std::shared_ptr<ClassifierCause> take(bool &lost) noexcept;
     bool start() noexcept;
     bool reset() noexcept;
@@ -26,6 +29,7 @@ class NativeClassifier final : public std::enable_shared_from_this<NativeClassif
     bool readback(const GB_SCOPE_DECISION &, GB_SCOPE_RECEIPT &) noexcept;
     bool activity(const ClassifierCause &, const GB_SCOPE_DECISION &, HANDLE, GB_ACTIVITY_SNAPSHOT &) const noexcept;
     bool originalProcess(const ClassifierCause &) const noexcept;
+    bool originalProcessIdentity(const ClassifierCause &) const noexcept;
     bool imageCurrent(const ClassifierCause &, HANDLE, GB_PROCESS_IMAGE_FACTS &) const noexcept;
     bool cancel(const GB_SCOPE_DECISION &, GB_CANCEL_RECEIPT &) noexcept;
     bool cancelReadback(const GB_SCOPE_DECISION &, GB_CANCEL_RECEIPT &) const noexcept;
@@ -35,8 +39,11 @@ class NativeClassifier final : public std::enable_shared_from_this<NativeClassif
     bool current(const ClassifierCause &) const noexcept;
     bool filterCurrent(const ClassifierCause &, HANDLE) const noexcept;
     bool catalogCurrent(const ClassifierCause &, HANDLE) const noexcept;
+    bool catalogIdentity(const ClassifierCause &, HANDLE) const noexcept;
     void release(const GB_CLASSIFIER_QUERY &) noexcept;
     gb::native::Handle device_;
+    std::shared_ptr<gb::controller::Deployment> deployment_;
+    gb::native::Handle ownerToken_;
     std::shared_ptr<ClassifierCause> pendingApp_;
     UINT64 session_ = 0, loss_ = 0;
     mutable std::mutex mutex_;

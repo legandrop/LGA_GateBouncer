@@ -288,7 +288,9 @@ bool NativeRuntime::initialize(bool provision) {
     if (!deploymentCurrent()) return false;
     // Adquisición real opcional del dispositivo del servicio. Su ausencia deja
     // el productor de netevents existente; no anuncia scopes de proceso/Once.
-    principalClassifier_ = allnative::NativeClassifier::open();
+    if (!deployment_->serviceAdmittedCurrent() ||
+        (deployment_->mode() == controller::DeploymentMode::Product && backend_.deployment_ != deployment_)) return false;
+    principalClassifier_ = allnative::NativeClassifier::open(deployment_);
     provisionRequested_ = provision;
     if (!loadPrincipalImage()) return false;
     if (principalMode_) {
