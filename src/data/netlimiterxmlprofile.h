@@ -31,7 +31,8 @@ struct QNamePredicate {
         SourceFact<quint32> first, last;
     };
     QVector<AddressRange> remoteRanges;
-    bool complete = false;
+    // Forma original íntegra; nil SID conserva la forma y sigue sin semántica de principal.
+    bool structureKnown = false, complete = false;
 };
 struct QNameFilterFacts {
     int node = -1;
@@ -40,7 +41,8 @@ struct QNameFilterFacts {
     QVector<QNamePredicate> predicates;
     QVector<int> baseFilters, residues;
     int height = 1;
-    bool complete = false;
+    // Sólo AND íntegro y sin base/paquete. No acredita que cada predicado sea resoluble.
+    bool conjunctionKnown = false, complete = false;
 };
 struct QNameCandidateFacts {
     QString candidateId, kind;
@@ -51,7 +53,7 @@ struct QNameCandidateFacts {
     SourceFact<bool> enabled;
     SourceFact<qint32> weight;
     QVector<int> directionOccurrences, residues;
-    bool complete = false, potentialConflict = false, overlapUnknown = true;
+    bool scopeKnown = false, complete = false, potentialConflict = false, overlapUnknown = true;
 };
 struct QNameProfileView {
     static constexpr bool inactive = true, unverified = true, engineEligible = false;

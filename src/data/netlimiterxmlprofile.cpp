@@ -87,6 +87,28 @@ struct Deriver {
         for (const auto &c : e.nodes[i].content) if (c.child < 0 && !c.text.trimmed().isEmpty()) return false;
         return true;
     }
+    bool attributesKnown(int i) const {
+        for (const auto &a : e.nodes[i].attributes) {
+            if (a.name != ExpandedName{xsi, "type"} && a.name != ExpandedName{xsi, "nil"}) return false;
+            if (a.name == ExpandedName{xsi, "type"} && !e.nodes[i].resolvedType) return false;
+            if (a.name == ExpandedName{xsi, "nil"}) {
+                const auto value = a.value.trimmed();
+                if (!QStringList{"true", "false", "0", "1"}.contains(value)) return false;
+                if (value == "true" || value == "1") for (const auto &c : e.nodes[i].content)
+                    if (c.child >= 0 || !c.text.trimmed().isEmpty()) return false;
+            }
+        }
+        return true;
+    }
+    bool subtreeAttributesKnown(int i) const {
+        QVector<int> pending{i};
+        while (!pending.isEmpty()) {
+            const int node = pending.takeLast();
+            if (!attributesKnown(node)) return false;
+            for (int child : children(node)) pending.push_back(child);
+        }
+        return true;
+    }
     bool order(int i, const QStringList &memberOrder, QVector<int> *residues = nullptr) {
         int cursor = 0;
         bool ok = container(i);
@@ -183,6 +205,7 @@ struct Deriver {
         // Las funciones de zona heredan FilterFunction, no FilterFunctionT: no tienen Values.
         if (p.kind == "FFIsInternetTraffic" || p.kind == "FFIsLocalNetworkTraffic") {
             p.complete = order(i, {"match"}) && p.match.known();
+            p.structureKnown = p.complete && subtreeAttributesKnown(i);
             if (!p.complete) diagnostic("PredicateIncomplete");
             return p;
         }
@@ -191,13 +214,15 @@ struct Deriver {
         if (vals.size() != 1 || !ordered || !container(vals[0]) || type(vals[0], "filterValues") != "filterValues") return p;
         const auto items = children(vals[0]);
         if (items.size() > limits.values) { diagnostic("ValueLimit"); return p; }
-        bool known = !items.isEmpty();
+        bool known = !items.isEmpty(), structureKnown = known;
         for (int value : items) {
-            if (!is(value, "value")) { known = false; continue; }
+            if (!is(value, "value")) { known = structureKnown = false; continue; }
             if (p.kind == "FFAppIdEqual" || p.kind == "FFPathEqual") {
                 const bool appId = p.kind == "FFAppIdEqual";
                 auto app = application(value, appId ? "AppId" : "appPath");
                 known = known && app.pathExact && (!appId || app.sidBytes.known());
+                structureKnown = structureKnown && app.pathExact && (!appId || app.sidBytes.known() ||
+                    (app.sidExplicitNil.known() && app.sidExplicitNil.value));
                 p.applications.push_back(app);
             } else if (p.kind == "FFDomainNameEqual") {
                 auto domain = scalar(value, "DomainName", {xsd, "string"});
@@ -218,7 +243,9 @@ struct Deriver {
                 // Otras sintaxis/familias permanecen conservadas, sin reinterpretación de alcance.
                 known = known && range.first.known() && range.last.known(); p.remoteRanges.push_back(range);
             } else known = false;
+            if (p.kind != "FFAppIdEqual") structureKnown = known;
         }
+        p.structureKnown = structureKnown && p.match.known() && subtreeAttributesKnown(i);
         p.complete = known && p.match.known();
         if (!p.complete) diagnostic("PredicateIncomplete");
         return p;
@@ -263,15 +290,21 @@ struct Deriver {
             bool complete = order(i, memberOrder, &f.residues) && f.id.known() && !f.id.value.isEmpty();
             complete = complete && container(role) && packageComplete;
             if (!QStringList{"filter", "PackageFilter", "SvcPackageFilter", "StorePackageFilter"}.contains(kind)) complete = false;
+            bool conjunction = complete && subtreeAttributesKnown(i) && e.nodes[role].attributes.isEmpty() &&
+                f.package.node < 0 && f.filterType.known() &&
+                (f.filterType.value == "Filter" || f.filterType.value == "Zone");
             const auto functions = occurrences(i, "FunctionList");
             if (functions.size() == 1 && container(functions[0]) && type(functions[0], "filterFunctions") == "filterFunctions") {
+                conjunction = conjunction && attributesKnown(functions[0]);
                 const auto list = children(functions[0]);
-                if (list.size() > limits.functions || list.isEmpty()) complete = false;
+                if (list.size() > limits.functions || list.isEmpty()) complete = conjunction = false;
                 else for (int function : list) {
-                    if (!is(function, "function")) { complete = false; continue; }
-                    auto p = predicate(function); complete = complete && p.complete; f.predicates.push_back(p);
+                    if (!is(function, "function")) { complete = conjunction = false; continue; }
+                    auto p = predicate(function); complete = complete && p.complete;
+                    conjunction = conjunction && p.structureKnown; f.predicates.push_back(p);
                 }
-            } else complete = false;
+            } else complete = conjunction = false;
+            f.conjunctionKnown = conjunction;
             f.complete = complete; localComplete.push_back(complete); view.filters.push_back(f);
         }
     }
@@ -290,11 +323,17 @@ struct Deriver {
         QVector<int> remaining(size), ready;
         for (int i = 0; i < size; ++i) {
             auto &f = view.filters[i];
-            if (!f.id.known() || ids.value(f.id.value, -1) != i) localComplete[i] = false;
+            if (!f.id.known() || ids.value(f.id.value, -1) != i) {
+                localComplete[i] = false; f.conjunctionKnown = false;
+            }
             const auto bases = occurrences(f.node, "BaseFilters");
-            if (bases.size() != 1) { localComplete[i] = false; diagnostic("BaseScopeUnknown"); }
+            if (bases.size() != 1) { localComplete[i] = false; f.conjunctionKnown = false; diagnostic("BaseScopeUnknown"); }
             if (bases.size() == 1) {
-                if (!container(bases[0])) localComplete[i] = false;
+                if (!container(bases[0])) {
+                    localComplete[i] = false; f.conjunctionKnown = false;
+                }
+                // No se infiere el tipo de una colección de bases declarada con atributos.
+                if (!e.nodes[bases[0]].attributes.isEmpty() || !children(bases[0]).isEmpty()) f.conjunctionKnown = false;
                 for (int ref : children(bases[0])) {
                     const auto name = text(ref, {xsd, "string"}); const int target = name.known() ? ids.value(name.value, -1) : -1;
                     if (!is(ref, "string", arrays) || target < 0) { localComplete[i] = false; diagnostic("BaseFilterUnknown"); }
@@ -319,7 +358,7 @@ struct Deriver {
             if (remaining[i] || view.filters[i].height > limits.depth) diagnostic("FilterCycleOrDepth");
         }
     }
-    void candidate(const QNameRowBinding &row, bool rulesComplete) {
+    void candidate(const QNameRowBinding &row, bool rulesComplete, bool rulesScopeKnown) {
         const int i = row.node;
         QNameCandidateFacts f; f.node = i; f.candidateId = row.candidateId; f.kind = type(i, "rule");
         f.id = scalar(i, "Id"); f.filterId = scalar(i, "FilterId"); f.enabled = boolean(scalar(i, "IsEnabled", {xsd, "boolean"}));
@@ -353,6 +392,9 @@ struct Deriver {
         if (!conditions.isEmpty() && (!container(conditions[0]) || !children(conditions[0]).isEmpty() || conditions.size() != 1)) {
             complete = false; diagnostic("ScheduleUnsupported");
         }
+        f.scopeKnown = view.profileKnown && complete && rulesScopeKnown && subtreeAttributesKnown(i) &&
+            (conditions.isEmpty() || e.nodes[conditions[0]].attributes.isEmpty()) && f.kind == "fwRule" && f.filterIndex >= 0 &&
+            view.filters[f.filterIndex].conjunctionKnown && f.id.known() && !f.id.value.isEmpty();
         f.complete = view.profileKnown && complete && f.kind == "fwRule" && f.action.known() && f.direction.known() && f.enabled.known() && f.weight.known() &&
                      f.filterIndex >= 0 && view.filters[f.filterIndex].complete && f.id.known() && !f.id.value.isEmpty();
         view.candidates.push_back(f);
@@ -393,12 +435,15 @@ struct Deriver {
         for (int role : e.roles) if (is(role, "Filters")) filters(role);
         if (view.filters.size() + view.applications.size() > limits.dependencies) { view.valid = false; view.error = "DependencyLimit"; return view; }
         graph(); enrich();
-        bool rulesComplete = false;
-        for (int role : e.roles) if (is(role, "Rules")) rulesComplete = container(role);
-        for (const auto &row : e.rows) candidate(row, rulesComplete);
+        bool rulesComplete = false, rulesScopeKnown = false;
+        for (int role : e.roles) if (is(role, "Rules")) {
+            rulesComplete = container(role);
+            rulesScopeKnown = rulesComplete && e.nodes[role].attributes.isEmpty();
+        }
+        for (const auto &row : e.rows) candidate(row, rulesComplete, rulesScopeKnown);
         QMap<QString, int> ids;
         for (const auto &c : view.candidates) if (c.id.known()) ids[c.id.value] = ids.value(c.id.value) + 1;
-        for (auto &c : view.candidates) if (ids.value(c.id.value) != 1) c.complete = false;
+        for (auto &c : view.candidates) if (ids.value(c.id.value) != 1) c.complete = c.scopeKnown = false;
         QVector<int> weighted;
         for (int i = 0; i < view.candidates.size(); ++i)
             if (view.candidates[i].kind == "fwRule" && view.candidates[i].weight.known()) weighted.push_back(i);
@@ -414,7 +459,7 @@ struct Deriver {
             if (a.complete && b.complete && a.filterIndex == b.filterIndex && a.action.value != b.action.value &&
                 (a.direction.value == b.direction.value || a.direction.value == Direction::Both || b.direction.value == Direction::Both)) a.potentialConflict = b.potentialConflict = true;
         }
-        if (!view.diagnosticsComplete) for (auto &c : view.candidates) c.complete = false;
+        if (!view.diagnosticsComplete) for (auto &c : view.candidates) c.complete = c.scopeKnown = false;
         return view;
     }
 };
@@ -446,7 +491,7 @@ QNameMatch compareQNameFilter(const QNameProfileView &view, int filter, const QN
     if (!view.valid || !view.profileKnown || !view.diagnosticsComplete || filter < 0 || filter >= view.filters.size()) return QNameMatch::Unknown;
     const auto &f = view.filters[filter];
     // El grafo se conserva; no se adivina aquí el operador de filtros Composite ni Package.
-    if (!f.complete || !f.baseFilters.isEmpty() || f.package.node >= 0 || f.predicates.isEmpty() ||
+    if (!f.conjunctionKnown || !f.baseFilters.isEmpty() || f.package.node >= 0 || f.predicates.isEmpty() ||
         !f.filterType.known() || (f.filterType.value != "Filter" && f.filterType.value != "Zone")) return QNameMatch::Unknown;
     bool unknown = false;
     for (const auto &p : f.predicates) {
@@ -467,8 +512,10 @@ QNamePolicyComparison compareQNamePolicy(const QNameProfileView &view, const QNa
         const auto &c = view.candidates[i];
         if (c.kind != "fwRule" || (c.enabled.known() && !c.enabled.value)) continue;
         if (c.direction.known() && c.direction.value != Direction::Both && c.direction.value != facts.direction) continue;
-        const auto match = c.complete ? compareQNameFilter(view, c.filterIndex, facts) : QNameMatch::Unknown;
+        auto match = c.scopeKnown ? compareQNameFilter(view, c.filterIndex, facts) : QNameMatch::Unknown;
         if (match == QNameMatch::No) continue;
+        // La nueva prueba de exclusión nunca convierte una fila incompleta en ganadora.
+        if (match == QNameMatch::Yes && !c.complete) match = QNameMatch::Unknown;
         if (!c.weight.known()) return result;
         compared.push_back({i, match});
         if (match == QNameMatch::Yes && (!highest || c.weight.value > *highest)) highest = c.weight.value;
@@ -522,7 +569,7 @@ QNameMatch compareApplicationFilter(const QNameProfileView &view, int index, con
     const QByteArray &accountSid, const QString &image, const QMap<int, QByteArray> &canonical) {
     if (index < 0 || index >= view.filters.size()) return QNameMatch::Unknown;
     const auto &filter = view.filters[index];
-    if (!filter.complete || !filter.baseFilters.isEmpty() || filter.package.node >= 0 ||
+    if (!filter.conjunctionKnown || !filter.baseFilters.isEmpty() || filter.package.node >= 0 ||
         !filter.filterType.known() || (filter.filterType.value != "Filter" && filter.filterType.value != "Zone") ||
         filter.predicates.isEmpty()) return QNameMatch::Unknown;
     bool unknown = false;
@@ -533,24 +580,58 @@ QNameMatch compareApplicationFilter(const QNameProfileView &view, int index, con
     }
     return unknown ? QNameMatch::Unknown : QNameMatch::Yes;
 }
+QString actionReviewReason(const QNameCandidateFacts &candidate) {
+    if (candidate.enabled.known() && !candidate.enabled.value)
+        return "Original rule is disabled; its source action remains inactive";
+    if (candidate.action.known() && candidate.action.value == SourceFwAction::Ask)
+        return "Original Ask requires a pending connection decision; fixed Allow or Deny is not equivalent";
+    if (candidate.action.known() && candidate.action.value == SourceFwAction::Block)
+        return "Original Block is distinct from Deny; native equivalence requires review";
+    return {};
+}
+QString membershipReviewReason(const QNameFilterFacts &filter) {
+    for (const auto &p : filter.predicates) {
+        if (p.kind == "FFIsInternetTraffic" || p.kind == "FFIsLocalNetworkTraffic")
+            return "Original editable zone membership is unknown; address classes do not establish equivalence";
+        if (p.kind == "FFTagEqual")
+            return "Original tag membership is incomplete; retained definitions do not establish an empty set";
+    }
+    return {};
+}
 }
 QNameApplicationComparison compareQNameApplicationScope(const QNameProfileView &view, int index,
     const QByteArray &appId, const QByteArray &accountSid, const QString &originalImage,
     const QMap<int, QByteArray> &canonicalApplications) {
     QNameApplicationComparison result;
     result.reason = "Source scope is not representable by the original application selector";
-    if (!view.valid || !view.profileKnown || !view.diagnosticsComplete || index < 0 || index >= view.candidates.size() ||
+    if (!view.valid || !view.profileKnown || index < 0 || index >= view.candidates.size() ||
         !applicationSidShape(accountSid) || appId.size() < 4 || appId.size() > 8192 || (appId.size() & 1) ||
         appId[appId.size()-1] != 0 || appId[appId.size()-2] != 0 || originalImage.isEmpty()) return result;
     const auto &selected = view.candidates[index];
-    if (!selected.complete || selected.kind != "fwRule" || !selected.enabled.known() || !selected.enabled.value ||
+    const auto actionReason = actionReviewReason(selected);
+    if (!actionReason.isEmpty()) { result.reason = actionReason; return result; }
+    if (selected.filterIndex >= 0 && selected.filterIndex < view.filters.size()) {
+        const auto &filter = view.filters[selected.filterIndex];
+        const auto membershipReason = membershipReviewReason(filter);
+        if (!membershipReason.isEmpty()) { result.reason = membershipReason; return result; }
+        for (const auto &p : filter.predicates) for (const auto &a : p.applications)
+            if (a.sidExplicitNil.known() && a.sidExplicitNil.value) {
+                result.reason = "Original AppId has explicit nil SID; its principal scope is unknown";
+                return result;
+            }
+    }
+    if (!view.diagnosticsComplete) {
+        result.reason = "Original source diagnostics are incomplete; precedence requires review";
+        return result;
+    }
+    if (!selected.complete || !selected.scopeKnown || selected.kind != "fwRule" || !selected.enabled.known() || !selected.enabled.value ||
         !selected.weight.known() || !selected.action.known() ||
         (selected.action.value != SourceFwAction::Allow && selected.action.value != SourceFwAction::Deny) ||
         !selected.direction.known() || selected.direction.value == Direction::Unknown ||
         selected.filterIndex < 0 || selected.filterIndex >= view.filters.size()) return result;
     const auto &filter = view.filters[selected.filterIndex];
     // Sólo un AppId positivo único conserva exactamente el ámbito del selector aplicación/cuenta.
-    if (!filter.complete || !filter.baseFilters.isEmpty() || filter.package.node >= 0 ||
+    if (!filter.complete || !filter.conjunctionKnown || !filter.baseFilters.isEmpty() || filter.package.node >= 0 ||
         !filter.filterType.known() || filter.filterType.value != "Filter" || filter.predicates.size() != 1) return result;
     const auto &p = filter.predicates[0];
     if (p.kind != "FFAppIdEqual" || !p.complete || !p.match.known() || !p.match.value || p.applications.size() != 1) return result;
@@ -571,7 +652,7 @@ QNameApplicationComparison compareQNameApplicationScope(const QNameProfileView &
         if (candidate.weight.known() && candidate.weight.value < selected.weight.value) continue;
         // Incluso una fila incompleta puede quedar disjunta por un SID exacto conocido.
         // Zona/tag/rango/domain/Package/Composite no se aplanan para fabricar esa exclusión.
-        if (compareApplicationFilter(view, candidate.filterIndex, appId, accountSid, originalImage,
+        if (candidate.scopeKnown && compareApplicationFilter(view, candidate.filterIndex, appId, accountSid, originalImage,
                 canonicalApplications) == QNameMatch::No) continue;
         result.interferingCandidates.push_back(other);
     }
@@ -591,7 +672,7 @@ QNameMatch compareConditionalFilter(const QNameProfileView &view, int index, qui
     const QMap<int, QByteArray> &canonical) {
     if (index < 0 || index >= view.filters.size()) return QNameMatch::Unknown;
     const auto &f = view.filters[index];
-    if (!f.complete || !f.baseFilters.isEmpty() || f.package.node >= 0 ||
+    if (!f.conjunctionKnown || !f.baseFilters.isEmpty() || f.package.node >= 0 ||
         !f.filterType.known() || (f.filterType.value != "Filter" && f.filterType.value != "Zone") ||
         f.predicates.isEmpty()) return QNameMatch::Unknown;
     for (const auto &p : f.predicates) {
@@ -618,7 +699,7 @@ QNameConditionalComparison compareQNameConditionalScope(const QNameEvidence &ori
     QNameConditionalComparison result;
     result.reason = "Original conditional source is incomplete or unsupported";
     const auto view = deriveQNameProfile(original, limits);
-    if (!view.valid || !view.profileKnown || !view.diagnosticsComplete || candidateId.isEmpty()) return result;
+    if (!view.valid || !view.profileKnown || candidateId.isEmpty()) return result;
     int index = -1;
     for (int i = 0; i < view.candidates.size(); ++i) if (view.candidates[i].candidateId == candidateId) {
         if (index >= 0) return result;
@@ -627,9 +708,13 @@ QNameConditionalComparison compareQNameConditionalScope(const QNameEvidence &ori
     if (index < 0) return result;
     const auto &selected = view.candidates[index];
     result.candidate = selected; result.sourceOrdinal = index;
+    const auto actionReason = actionReviewReason(selected);
+    if (!actionReason.isEmpty()) { result.reason = actionReason; return result; }
     if (selected.filterIndex < 0 || selected.filterIndex >= view.filters.size()) return result;
     const auto &filter = view.filters[selected.filterIndex];
     result.filterId = filter.id;
+    const auto membershipReason = membershipReviewReason(filter);
+    if (!membershipReason.isEmpty()) { result.reason = membershipReason; return result; }
     if (!filter.baseFilters.isEmpty() || filter.package.node >= 0 || !filter.filterType.known() ||
         filter.filterType.value != "Filter" || filter.predicates.size() != 2) return result;
     const QNamePredicate *application = nullptr, *remote = nullptr;
@@ -641,6 +726,12 @@ QNameConditionalComparison compareQNameConditionalScope(const QNameEvidence &ori
     }
     if (!application || !remote) return result;
     result.application = application->applications[0]; result.range = remote->remoteRanges[0];
+    if (!view.diagnosticsComplete) {
+        result.reason = result.application.sidExplicitNil.known() && result.application.sidExplicitNil.value ?
+            "Original AppId has explicit nil SID; its principal scope is unknown and diagnostics are incomplete" :
+            "Original source diagnostics are incomplete; precedence requires review";
+        return result;
+    }
     if (!remote->complete || !result.range.first.known() || !result.range.last.known() ||
         result.range.first.value > result.range.last.value) return result;
     // Se conserva todo posible competidor antes de rechazar el principal. Nunca
@@ -660,7 +751,7 @@ QNameConditionalComparison compareQNameConditionalScope(const QNameEvidence &ori
             selected.direction.value != c.direction.value) continue;
         if (selected.weight.known() && c.weight.known() && c.weight.value < selected.weight.value) continue;
         result.closureCandidates.push_back(c.candidateId);
-        if (compareConditionalFilter(view, c.filterIndex,
+        if (!c.scopeKnown || compareConditionalFilter(view, c.filterIndex,
             result.range.first.value, result.range.last.value, appId, accountSid, originalImage,
             canonicalApplications) != QNameMatch::No) result.interferingCandidates.push_back(c.candidateId);
     }
@@ -668,10 +759,10 @@ QNameConditionalComparison compareQNameConditionalScope(const QNameEvidence &ori
         result.reason = "Original AppId has explicit nil SID; its principal scope is unknown";
         return result;
     }
-    if (!selected.complete || selected.kind != "fwRule" || !selected.enabled.known() || !selected.enabled.value ||
+    if (!selected.complete || !selected.scopeKnown || selected.kind != "fwRule" || !selected.enabled.known() || !selected.enabled.value ||
         !selected.weight.known() || selected.weight.value < 0 || !selected.action.known() ||
         (selected.action.value != SourceFwAction::Allow && selected.action.value != SourceFwAction::Deny) ||
-        !selected.direction.known() || selected.direction.value != Direction::Out || !filter.complete ||
+        !selected.direction.known() || selected.direction.value != Direction::Out || !filter.complete || !filter.conjunctionKnown ||
         !applicationSidShape(accountSid) || appId.size() < 4 || appId.size() > 8192 || (appId.size() & 1) ||
         appId[appId.size()-1] != 0 || appId[appId.size()-2] != 0 || originalImage.isEmpty() ||
         result.application.packageId.node >= 0 || result.application.serviceName.node >= 0 ||
