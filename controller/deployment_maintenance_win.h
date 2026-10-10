@@ -14,10 +14,14 @@ MaintenanceResult updateGuestDeployment(const std::filesystem::path &current,
     const std::filesystem::path &source, const std::filesystem::path &replacement);
 MaintenanceResult uninstallGuestDeployment(const std::filesystem::path &current);
 MaintenanceResult finalizeGuestDeployment(const std::filesystem::path &current);
+MaintenanceResult updateProductDeployment(const std::filesystem::path &current,
+    const std::filesystem::path &source, const std::filesystem::path &replacement);
+MaintenanceResult uninstallProductDeployment(const std::filesystem::path &current);
+MaintenanceResult finalizeProductDeployment(const std::filesystem::path &current);
 namespace deployment_detail {
 bool pinSource(const std::filesystem::path &, std::vector<native::Handle> &);
 bool stagePackage(const std::filesystem::path &, const std::filesystem::path &,
-                  std::shared_ptr<Deployment> &);
+                  std::shared_ptr<Deployment> &, DeploymentMode = DeploymentMode::Laboratory);
 bool setString(HKEY, const wchar_t *, const std::wstring &);
 bool setDword(HKEY, const wchar_t *, DWORD);
 class AdministrativeLease;
@@ -26,15 +30,18 @@ bool disjoint(const std::filesystem::path &, const std::filesystem::path &);
 // Sólo operaciones administrativas; no es prueba de invitado o contención.
 class AdministrativeLease {
   public:
+    explicit AdministrativeLease(DeploymentMode mode = DeploymentMode::Laboratory) : mode_(mode) {}
     ~AdministrativeLease();
-    bool acquire();
+    bool acquire(bool fresh = false);
     bool current() const;
     bool ownsConfiguration(HKEY) const;
     HKEY gate() const { return gate_; }
     const std::filesystem::path &image() const { return image_; }
   private:
+    const DeploymentMode mode_;
     native::Handle mutex_, token_;
     HKEY gate_ = nullptr;
+    HKEY parent_ = nullptr;
     native::TokenEvidence actor_;
     std::filesystem::path image_;
     std::vector<native::Handle> source_;

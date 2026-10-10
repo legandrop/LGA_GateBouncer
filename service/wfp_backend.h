@@ -5,6 +5,7 @@
 #include "policy.h"
 #include "coordinator_iii.h"
 #include "catalog_plan_iv.h"
+#include "../controller/deployment_win.h"
 #include <windows.h>
 #include <fwpmu.h>
 #include <atomic>
@@ -18,6 +19,7 @@ public:
     explicit WfpBackend(SelectorRegistry& registry):registry_(registry){}
     ~WfpBackend() override;
     bool connectGuest();
+    bool connectProduct(std::shared_ptr<controller::Deployment>);
     bool available()const override;
     bool actualOs()const override{return available();}
     bool apply(const std::vector<Rule>& rules,std::uint64_t revision)override;
@@ -28,6 +30,10 @@ public:
     bool directionalCoverageValidated() const { return false; }
     void attachCollector(decisions::NativeCollector* collector);
 private:
+    bool connect();
+    bool authorized() const;
+    const wchar_t *serviceName() const;
+    std::shared_ptr<controller::Deployment> deployment_;
     friend class decisions::NativeRuntime;
     decisions::CatalogPlanBuilder::WriteOutcome applyPrincipalPlan(
         decisions::CatalogPlanBuilder &,

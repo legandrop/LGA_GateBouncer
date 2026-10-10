@@ -29,6 +29,18 @@ std::uint64_t number(const wire::Bytes &b, std::size_t at, unsigned n) {
     return value;
 }
 } // namespace
+const wchar_t *deploymentService(DeploymentMode mode) {
+    return mode == DeploymentMode::Product ? L"LGAGateBouncer" : L"LGAGateBouncerLab";
+}
+const wchar_t *deploymentRegistry(DeploymentMode mode) {
+    return mode == DeploymentMode::Product ? L"SOFTWARE\\LGA\\GateBouncer" : L"SOFTWARE\\LGA\\GateBouncerLab";
+}
+const wchar_t *deploymentConfiguration(DeploymentMode mode) {
+    return mode == DeploymentMode::Product ? L"Deployment" : L"DeploymentVIII";
+}
+std::wstring deploymentCommand(const std::filesystem::path &image, DeploymentMode mode) {
+    return L"\"" + image.native() + (mode == DeploymentMode::Product ? L"\" --service" : L"\" --service --guest-wfp");
+}
 const std::vector<std::wstring> &deploymentFiles(DeploymentRole role) {
     static const std::vector<std::wstring> decision = {
         L"GateBouncerDecisionBootstrap.exe", L"GateBouncerDecisionStage.dll", L"Qt6Core.dll",
@@ -97,10 +109,10 @@ bool serviceDescriptor(PSECURITY_DESCRIPTOR descriptor) {
     }
     return fullSy && fullBa;
 }
-bool serviceConfiguration(SC_HANDLE service, const std::filesystem::path &image, DWORD pid) {
-    return serviceConfigurationPhase(service,image,SERVICE_AUTO_START,pid);
+bool serviceConfiguration(SC_HANDLE service, const std::filesystem::path &image, DWORD pid, DeploymentMode mode) {
+    return serviceConfigurationPhase(service,image,SERVICE_AUTO_START,pid,mode);
 }
-bool serviceConfigurationPhase(SC_HANDLE service, const std::filesystem::path &image, DWORD startType, DWORD pid) {
+bool serviceConfigurationPhase(SC_HANDLE service, const std::filesystem::path &image, DWORD startType, DWORD pid, DeploymentMode mode) {
     if (!service || !native::fixedPath(image)) return false;
     DWORD needed = 0;
     QueryServiceConfigW(service, nullptr, 0, &needed);
@@ -120,7 +132,7 @@ bool serviceConfigurationPhase(SC_HANDLE service, const std::filesystem::path &i
     SERVICE_SID_INFO sid{}; SERVICE_STATUS_PROCESS status{}; DWORD done = 0;
     if ((startType != SERVICE_AUTO_START && startType != SERVICE_DISABLED) ||
         config->dwServiceType != SERVICE_WIN32_OWN_PROCESS || config->dwStartType != startType ||
-        !text(config->lpBinaryPathName, L"\"" + image.native() + L"\" --service --guest-wfp") ||
+        !text(config->lpBinaryPathName, deploymentCommand(image,mode)) ||
         !text(config->lpServiceStartName, L"LocalSystem") ||
         !QueryServiceConfig2W(service, SERVICE_CONFIG_SERVICE_SID_INFO, reinterpret_cast<BYTE *>(&sid), sizeof(sid), &done) ||
         sid.dwServiceSidType != SERVICE_SID_TYPE_UNRESTRICTED ||
@@ -145,14 +157,15 @@ bool maintenanceState(HKEY key, bool &present, DWORD &state) {
     present = true; return true;
 }
 struct Deployment::Registration {
-    HKEY key = nullptr, gate = nullptr;
+    HKEY key = nullptr, gate = nullptr, parent = nullptr;
     SC_HANDLE service = nullptr;
     std::filesystem::path root, store, ordinary;
     wire::Bytes account;
     std::wstring sid;
     bool provision = false;
     bool marker = false;
-    ~Registration() { if (key) RegCloseKey(key); if (gate) RegCloseKey(gate); if (service) CloseServiceHandle(service); }
+    DeploymentMode mode = DeploymentMode::Laboratory;
+    ~Registration() { if (key) RegCloseKey(key); if (gate) RegCloseKey(gate); if (parent) RegCloseKey(parent); if (service) CloseServiceHandle(service); }
     bool read(const wchar_t *name, std::wstring &out) const {
         wchar_t text[32768]{}; DWORD size = sizeof(text);
         if (RegGetValueW(key, nullptr, name, RRF_RT_REG_SZ, nullptr, text, &size) != ERROR_SUCCESS ||
@@ -161,21 +174,40 @@ struct Deployment::Registration {
         out = text; return true;
     }
     bool current() const {
+        if (mode == DeploymentMode::Product) {
+            HKEY repeated = nullptr; DWORD bytes = 0;
+            const bool originalParent = parent && native::protectedRegistry(parent) &&
+                RegQueryValueExW(parent,L"SymbolicLinkValue",nullptr,nullptr,nullptr,&bytes) == ERROR_FILE_NOT_FOUND &&
+                RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA",REG_OPTION_OPEN_LINK,
+                    KEY_QUERY_VALUE | READ_CONTROL,&repeated) == ERROR_SUCCESS && CompareObjectHandles(parent,repeated);
+            if (repeated) RegCloseKey(repeated);
+            if (!originalParent) return false;
+        }
+        HKEY reopenedGate = nullptr, reopenedKey = nullptr;
+        const bool original = RegOpenKeyExW(HKEY_LOCAL_MACHINE,deploymentRegistry(mode),0,
+            KEY_QUERY_VALUE | READ_CONTROL,&reopenedGate) == ERROR_SUCCESS &&
+            CompareObjectHandles(gate,reopenedGate) &&
+            RegOpenKeyExW(reopenedGate,deploymentConfiguration(mode),0,
+                KEY_QUERY_VALUE | READ_CONTROL,&reopenedKey) == ERROR_SUCCESS && CompareObjectHandles(key,reopenedKey);
+        if (reopenedKey) RegCloseKey(reopenedKey);
+        if (reopenedGate) RegCloseKey(reopenedGate);
+        if (!original) return false;
         DWORD enabled = 0, size = sizeof(enabled), initial = 0, initialSize = sizeof(initial);
         bool present = false; DWORD state = 0;
         std::wstring packageText, storeText, ordinaryText, sidText;
         return native::protectedRegistry(key) && native::protectedRegistry(gate) &&
             maintenanceState(key,present,state) && present == marker && !state &&
-            RegGetValueW(gate,nullptr,L"EnableWfp",RRF_RT_REG_DWORD,nullptr,&enabled,&size) == ERROR_SUCCESS && enabled == 1 &&
+            (mode != DeploymentMode::Product || present) &&
+            (mode == DeploymentMode::Product || (RegGetValueW(gate,nullptr,L"EnableWfp",RRF_RT_REG_DWORD,nullptr,&enabled,&size) == ERROR_SUCCESS && enabled == 1)) &&
             RegGetValueW(key,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&initial,&initialSize) == ERROR_SUCCESS &&
             initial == (provision ? 1u : 0u) && read(L"PackageRoot", packageText) && packageText == root.native() &&
             read(L"StoreRoot", storeText) && storeText == store.native() &&
             read(L"OrdinaryImage", ordinaryText) && ordinaryText == ordinary.native() &&
             read(L"ViewSid", sidText) && sidText == sid &&
-            serviceConfiguration(service, root / L"GateBouncerService.exe", GetCurrentProcessId());
+            serviceConfiguration(service, root / L"GateBouncerService.exe", GetCurrentProcessId(),mode);
     }
 };
-Deployment::Deployment(std::filesystem::path root) : root_(std::move(root)), directory_(root_, true) {}
+Deployment::Deployment(std::filesystem::path root, DeploymentMode mode) : root_(std::move(root)), mode_(mode), directory_(root_, true) {}
 Deployment::~Deployment() = default;
 bool parseInventory(const wire::Bytes &b, Inventory &out) {
     if (b.size() < 48 || b.size() > 32768 || !std::equal(b.begin(), b.begin() + 4, "GBD1") ||
@@ -372,13 +404,17 @@ bool Deployment::signatureHelperInventory(std::filesystem::path &path, wire::Dig
 bool Deployment::admitServiceConfiguration(wire::Bytes &account, std::filesystem::path &store, bool &provision) {
     if (role_ != DeploymentRole::Service || registration_ || !current()) return false;
     auto candidate = std::make_unique<Registration>();
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",0,KEY_QUERY_VALUE | READ_CONTROL,&candidate->gate) != ERROR_SUCCESS ||
-        RegOpenKeyExW(candidate->gate,L"DeploymentVIII",0,KEY_QUERY_VALUE | READ_CONTROL,&candidate->key) != ERROR_SUCCESS ||
+    candidate->mode = mode_;
+    if (mode_ == DeploymentMode::Product && RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA",
+        REG_OPTION_OPEN_LINK,KEY_QUERY_VALUE | READ_CONTROL,&candidate->parent) != ERROR_SUCCESS) return false;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,deploymentRegistry(mode_),0,KEY_QUERY_VALUE | READ_CONTROL,&candidate->gate) != ERROR_SUCCESS ||
+        RegOpenKeyExW(candidate->gate,deploymentConfiguration(mode_),0,KEY_QUERY_VALUE | READ_CONTROL,&candidate->key) != ERROR_SUCCESS ||
         !native::protectedRegistry(candidate->gate) || !native::protectedRegistry(candidate->key)) return false;
     std::wstring root, ordinary, storeText;
     DWORD initial = 0, size = sizeof(initial);
     DWORD state = 0;
-    if (!maintenanceState(candidate->key,candidate->marker,state) || state) return false;
+    if (!maintenanceState(candidate->key,candidate->marker,state) || state ||
+        (mode_ == DeploymentMode::Product && !candidate->marker)) return false;
     if (!candidate->read(L"PackageRoot",root) || root != root_.native() ||
         !candidate->read(L"OrdinaryImage",ordinary) || ordinary != (root_ / L"GateBouncer.exe").native() ||
         !candidate->read(L"StoreRoot",storeText) || !candidate->read(L"ViewSid",candidate->sid) ||
@@ -392,11 +428,17 @@ bool Deployment::admitServiceConfiguration(wire::Bytes &account, std::filesystem
     candidate->account.assign(static_cast<BYTE *>(sid),static_cast<BYTE *>(sid) + GetLengthSid(sid)); LocalFree(sid);
     SC_HANDLE manager = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
     if (!manager) return false;
-    candidate->service = OpenServiceW(manager,L"LGAGateBouncerLab",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL);
+    candidate->service = OpenServiceW(manager,deploymentService(mode_),SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL);
     CloseServiceHandle(manager);
     if (!candidate->current()) return false;
     account = candidate->account; store = candidate->store; provision = candidate->provision;
     registration_ = std::move(candidate); return true;
+}
+bool Deployment::serviceAdmittedCurrent() noexcept {
+    try {
+        const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+        return role_ == DeploymentRole::Service && registration_ && current();
+    } catch (...) { return false; }
 }
 bool Deployment::prepareEnvironment() {
     if (!current())

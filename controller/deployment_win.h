@@ -9,16 +9,22 @@ using Inventory = std::map<std::wstring, wire::Digest>;
 bool parseInventory(const wire::Bytes &bytes, Inventory &inventory);
 bool encodeInventory(const Inventory &, wire::Bytes &);
 enum class DeploymentRole { DecisionController, OrdinaryGui, Service, AssistantBroker };
+enum class DeploymentMode { Laboratory, Product };
+const wchar_t *deploymentService(DeploymentMode);
+const wchar_t *deploymentRegistry(DeploymentMode);
+const wchar_t *deploymentConfiguration(DeploymentMode);
+std::wstring deploymentCommand(const std::filesystem::path &, DeploymentMode);
 const std::vector<std::wstring> &deploymentFiles(DeploymentRole);
 bool serviceDescriptor(PSECURITY_DESCRIPTOR);
-bool serviceConfiguration(SC_HANDLE, const std::filesystem::path &, DWORD expectedPid = 0);
+bool serviceConfiguration(SC_HANDLE, const std::filesystem::path &, DWORD expectedPid = 0,
+                          DeploymentMode = DeploymentMode::Laboratory);
 // El mantenimiento exige su fase exacta; la admisión normal sigue AUTO_START.
 bool serviceConfigurationPhase(SC_HANDLE, const std::filesystem::path &, DWORD startType,
-                               DWORD expectedPid = 0);
+                               DWORD expectedPid = 0, DeploymentMode = DeploymentMode::Laboratory);
 bool maintenanceState(HKEY, bool &present, DWORD &state);
 class Deployment {
   public:
-    explicit Deployment(std::filesystem::path root);
+    explicit Deployment(std::filesystem::path root, DeploymentMode = DeploymentMode::Laboratory);
     ~Deployment();
     bool verify(const std::filesystem::path &ownImage,
                 DeploymentRole role = DeploymentRole::DecisionController);
@@ -28,6 +34,8 @@ class Deployment {
     bool signatureHelperInventory(std::filesystem::path &, wire::Digest &);
     bool admitServiceConfiguration(wire::Bytes &account, std::filesystem::path &store,
                                    bool &provision);
+    bool serviceAdmittedCurrent() noexcept;
+    DeploymentMode mode() const { return mode_; }
     bool prepareEnvironment();
     const std::filesystem::path &root() const { return root_; }
 
@@ -39,6 +47,7 @@ class Deployment {
     struct FilePin { std::filesystem::path path; BY_HANDLE_FILE_INFORMATION identity{};
                      std::size_t handle = 0; };
     std::filesystem::path root_;
+    const DeploymentMode mode_;
     native::ProtectedDirectory directory_;
     std::vector<native::Handle> held_;
     std::vector<FilePin> files_;

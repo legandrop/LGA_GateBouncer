@@ -153,7 +153,7 @@ bool pinSource(const std::filesystem::path &source,std::vector<native::Handle> &
     return true;
 }
 bool stagePackage(const std::filesystem::path &source,const std::filesystem::path &package,
-                  std::shared_ptr<Deployment> &owner) {
+                  std::shared_ptr<Deployment> &owner, DeploymentMode mode) {
     if (owner || !disjoint(source,package)) return false;
     std::vector<native::Handle> held, inputs;
     if (!parents(package,held) || !pinSource(source,inputs)) return false;
@@ -183,28 +183,22 @@ bool stagePackage(const std::filesystem::path &source,const std::filesystem::pat
     }
     wire::Bytes manifest;
     if (!encodeInventory(inventory,manifest) || !createFile(package/L"deployment.gbd",manifest,readable.value,held)) return false;
-    auto candidate = std::make_shared<Deployment>(package);
+    auto candidate = std::make_shared<Deployment>(package,mode);
     if (!candidate->verify(package/L"GateBouncerService.exe",DeploymentRole::Service) || !candidate->current()) return false;
     owner = std::move(candidate); return true;
 }
 }
-bool prepareGuestDeployment(const std::filesystem::path &source,const std::filesystem::path &package,
+static bool prepareDeployment(DeploymentMode mode, const std::filesystem::path &source,const std::filesystem::path &package,
     const std::filesystem::path &store,const std::wstring &accountSid) {
     try {
-        deployment_detail::AdministrativeLease lease;
-        if (!lease.acquire() || lease.image() != source/L"GateBouncerService.exe") return false;
+        deployment_detail::AdministrativeLease lease(mode);
+        if (!lease.acquire(mode == DeploymentMode::Product) || lease.image() != source/L"GateBouncerService.exe") return false;
         native::Handle token; HANDLE raw = nullptr;
         if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw)) return false;
         token.reset(raw); native::TokenEvidence identity;
         if (!native::tokenEvidence(token.value,identity) || !identity.administrator || !identity.elevated ||
             identity.uiAccess || identity.integrity < SECURITY_MANDATORY_HIGH_RID) return false;
-        Key gate;
-        DWORD enabled = 0, enabledSize = sizeof(enabled);
-        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",0,
-            KEY_QUERY_VALUE | KEY_CREATE_SUB_KEY | READ_CONTROL,&gate.value) != ERROR_SUCCESS ||
-            !native::protectedRegistry(gate.value) ||
-            RegGetValueW(gate.value,nullptr,L"EnableWfp",RRF_RT_REG_DWORD,nullptr,&enabled,&enabledSize) != ERROR_SUCCESS || enabled != 1)
-            return false; // El comando nunca crea su propio gate invitado.
+        const auto gate = lease.gate();
         if (!native::fixedPath(source) || !native::fixedPath(package) || !native::fixedPath(store) ||
             source == package || source == store || package == store || source == source.root_path() ||
             package == package.root_path() || store == store.root_path()) return false;
@@ -226,12 +220,12 @@ bool prepareGuestDeployment(const std::filesystem::path &source,const std::files
             return attr == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND; };
         if (!absent(package) || !absent(store)) return false;
         Key old;
-        const auto oldKey = RegOpenKeyExW(gate.value,L"DeploymentVIII",0,KEY_QUERY_VALUE,&old.value);
+        const auto oldKey = RegOpenKeyExW(gate,deploymentConfiguration(mode),0,KEY_QUERY_VALUE,&old.value);
         if (oldKey != ERROR_FILE_NOT_FOUND) return false;
         Service manager, service;
         manager.value = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
         if (!manager.value) return false;
-        service.value = OpenServiceW(manager.value,L"LGAGateBouncerLab",SERVICE_QUERY_CONFIG);
+        service.value = OpenServiceW(manager.value,deploymentService(mode),SERVICE_QUERY_CONFIG);
         if (service.value || GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST) return false;
         Descriptor readable(L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;BU)");
         Descriptor privateObject(L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)");
@@ -239,31 +233,31 @@ bool prepareGuestDeployment(const std::filesystem::path &source,const std::files
         Descriptor scm(L"O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;BU)");
         if (!readable.value || !privateObject.value || !registry.value || !scm.value) return false;
         std::shared_ptr<Deployment> packageOwner;
-        if (!deployment_detail::stagePackage(source,package,packageOwner) ||
+        if (!deployment_detail::stagePackage(source,package,packageOwner,mode) ||
             !createDirectory(store,privateObject.value,held,false)) return false;
-        const auto command = L"\"" + (package/L"GateBouncerService.exe").native() + L"\" --service --guest-wfp";
+        const auto command = deploymentCommand(package/L"GateBouncerService.exe",mode);
         Key configuration; DWORD disposition = 0;
         SECURITY_ATTRIBUTES attributes{sizeof(attributes),registry.value,FALSE};
-        if (!lease.current() || RegCreateKeyExW(gate.value,L"DeploymentVIII",0,nullptr,REG_OPTION_NON_VOLATILE,
+        if (!lease.current() || RegCreateKeyExW(gate,deploymentConfiguration(mode),0,nullptr,REG_OPTION_NON_VOLATILE,
             KEY_QUERY_VALUE | KEY_SET_VALUE | READ_CONTROL,&attributes,&configuration.value,&disposition) != ERROR_SUCCESS ||
             disposition != REG_CREATED_NEW_KEY || !native::protectedRegistry(configuration.value) ||
             !deployment_detail::setDword(configuration.value,L"MaintenanceVersion",1) ||
             !deployment_detail::setDword(configuration.value,L"MaintenanceState",1)) return false;
-        service.value = CreateServiceW(manager.value,L"LGAGateBouncerLab",L"LGA GateBouncer laboratory",
+        service.value = CreateServiceW(manager.value,deploymentService(mode),mode == DeploymentMode::Product ? L"LGA GateBouncer" : L"LGA GateBouncer laboratory",
             SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG | READ_CONTROL | WRITE_DAC | WRITE_OWNER,
             SERVICE_WIN32_OWN_PROCESS,SERVICE_DISABLED,SERVICE_ERROR_NORMAL,command.c_str(),nullptr,nullptr,nullptr,L"LocalSystem",nullptr);
         SERVICE_SID_INFO sid{SERVICE_SID_TYPE_UNRESTRICTED};
         if (!service.value || !ChangeServiceConfig2W(service.value,SERVICE_CONFIG_SERVICE_SID_INFO,&sid) ||
             !SetServiceObjectSecurity(service.value,OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,scm.value) ||
-            !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED) || !packageOwner->current()) return false;
+            !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode) || !packageOwner->current()) return false;
         if (!native::protectedRegistry(configuration.value) ||
             !stringValue(configuration.value,L"PackageRoot",package.native()) ||
             !stringValue(configuration.value,L"OrdinaryImage",(package/L"GateBouncer.exe").native()) ||
             !stringValue(configuration.value,L"StoreRoot",store.native()) ||
             !stringValue(configuration.value,L"ViewSid",accountSid) ||
-            !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED) || !packageOwner->current() ||
-            !native::protectedRegistry(gate.value)) return false;
+            !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode) || !packageOwner->current() ||
+            !native::protectedRegistry(gate)) return false;
         DWORD initial = 1, repeated = 0, repeatedSize = sizeof(repeated);
         const bool recorded = RegSetValueExW(configuration.value,L"ProvisionPrincipal",0,REG_DWORD,
             reinterpret_cast<const BYTE *>(&initial),sizeof(initial)) == ERROR_SUCCESS &&
@@ -276,7 +270,7 @@ bool prepareGuestDeployment(const std::filesystem::path &source,const std::files
         else return false; // Flush/readback incierto: no escribir otro marker ni reintentar.
         if (!ChangeServiceConfigW(service.value,SERVICE_NO_CHANGE,SERVICE_AUTO_START,SERVICE_NO_CHANGE,
                 nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr) ||
-            !serviceConfiguration(service.value,package/L"GateBouncerService.exe") || !lease.current() || !packageOwner->current()) {
+            !serviceConfiguration(service.value,package/L"GateBouncerService.exe",0,mode) || !lease.current() || !packageOwner->current()) {
             DWORD actual = 0, size = sizeof(actual);
             if (packageOwner->current() && lease.ownsConfiguration(configuration.value) &&
                 stringMatches(configuration.value,L"PackageRoot",package.native()) &&
@@ -290,5 +284,13 @@ bool prepareGuestDeployment(const std::filesystem::path &source,const std::files
         }
         return true;
     } catch (...) { return false; }
+}
+bool prepareGuestDeployment(const std::filesystem::path &source,const std::filesystem::path &package,
+    const std::filesystem::path &store,const std::wstring &accountSid) {
+    return prepareDeployment(DeploymentMode::Laboratory,source,package,store,accountSid);
+}
+bool prepareProductDeployment(const std::filesystem::path &source,const std::filesystem::path &package,
+    const std::filesystem::path &store,const std::wstring &accountSid) {
+    return prepareDeployment(DeploymentMode::Product,source,package,store,accountSid);
 }
 }

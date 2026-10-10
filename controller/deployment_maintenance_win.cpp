@@ -56,29 +56,59 @@ namespace deployment_detail {
 AdministrativeLease::~AdministrativeLease() {
     if (owns_) ReleaseMutex(mutex_.value);
     if (gate_) RegCloseKey(gate_);
+    if (parent_) RegCloseKey(parent_);
 }
-bool AdministrativeLease::acquire() {
+bool AdministrativeLease::acquire(bool fresh) {
     if (owns_ || gate_ || token_) return false;
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token)) return false;
     token_.reset(token);
-    if (!native::tokenEvidence(token_.value,actor_)) return false;
+    if (!native::tokenEvidence(token_.value,actor_) || !actor_.administrator || !actor_.elevated ||
+        actor_.uiAccess || actor_.integrity < SECURITY_MANDATORY_HIGH_RID ||
+        (fresh && mode_ != DeploymentMode::Product)) return false;
     PSECURITY_DESCRIPTOR sd = nullptr;
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)",
         SDDL_REVISION_1,&sd,nullptr)) return false;
     SECURITY_ATTRIBUTES attributes{sizeof(attributes),sd,FALSE};
-    mutex_.reset(CreateMutexExW(&attributes,mutexName,0,MUTEX_ALL_ACCESS)); LocalFree(sd);
+    mutex_.reset(CreateMutexExW(&attributes,mode_ == DeploymentMode::Product ? L"Global\\LGA.GateBouncer.Maintenance" : mutexName,0,MUTEX_ALL_ACCESS)); LocalFree(sd);
     if (!mutex_ || !mutexSecurity(mutex_.value)) return false;
     const auto wait = WaitForSingleObject(mutex_.value,0);
     owns_ = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
     if (wait != WAIT_OBJECT_0) return false; // No adoptar abandono ni esperar otro mantenimiento.
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",0,
-        KEY_QUERY_VALUE | KEY_CREATE_SUB_KEY | READ_CONTROL,&gate_) != ERROR_SUCCESS) return false;
     wchar_t path[32768]{}; const auto count = GetModuleFileNameW(nullptr,path,32768);
     if (!count || count >= 32768) return false;
     image_ = std::filesystem::path(std::wstring(path,count));
     if (image_.filename() != L"GateBouncerService.exe" || !native::fixedPath(image_) ||
         !pinSource(image_.parent_path(),source_)) return false;
+    // Crear sólo la raíz propia nueva, después del token y la fuente originales.
+    if (fresh) {
+        PSECURITY_DESCRIPTOR registry = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"O:BAG:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KR;;;BU)",SDDL_REVISION_1,&registry,nullptr)) return false;
+        SECURITY_ATTRIBUTES attributes{sizeof(attributes),registry,FALSE}; DWORD disposition = 0;
+        auto error = RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA",REG_OPTION_OPEN_LINK,
+            KEY_QUERY_VALUE | KEY_CREATE_SUB_KEY | READ_CONTROL,&parent_);
+        if (error == ERROR_FILE_NOT_FOUND) {
+            error = RegCreateKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA",0,nullptr,REG_OPTION_NON_VOLATILE,
+                KEY_QUERY_VALUE | KEY_CREATE_SUB_KEY | READ_CONTROL,&attributes,&parent_,&disposition);
+            if (disposition != REG_CREATED_NEW_KEY) error = ERROR_ALREADY_EXISTS;
+        }
+        DWORD bytes = 0;
+        if (error != ERROR_SUCCESS || !native::protectedRegistry(parent_) ||
+            RegQueryValueExW(parent_,L"SymbolicLinkValue",nullptr,nullptr,nullptr,&bytes) != ERROR_FILE_NOT_FOUND) {
+            LocalFree(registry); return false;
+        }
+        error = RegCreateKeyExW(parent_,L"GateBouncer",0,nullptr,
+            REG_OPTION_NON_VOLATILE,KEY_QUERY_VALUE | KEY_CREATE_SUB_KEY | READ_CONTROL,
+            &attributes,&gate_,&disposition);
+        LocalFree(registry);
+        if (error != ERROR_SUCCESS || disposition != REG_CREATED_NEW_KEY ||
+            !native::protectedRegistry(gate_) || RegFlushKey(gate_) != ERROR_SUCCESS) return false;
+    } else if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,deploymentRegistry(mode_),0,
+        KEY_QUERY_VALUE | KEY_CREATE_SUB_KEY | READ_CONTROL,&gate_) != ERROR_SUCCESS) return false;
+    if (mode_ == DeploymentMode::Product && !parent_ &&
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA",REG_OPTION_OPEN_LINK,
+            KEY_QUERY_VALUE | READ_CONTROL,&parent_) != ERROR_SUCCESS) return false;
     return current();
 }
 bool AdministrativeLease::current() const {
@@ -88,7 +118,22 @@ bool AdministrativeLease::current() const {
         !native::tokenEvidence(token_.value,fresh) || fresh.account != actor_.account || fresh.logon != actor_.logon ||
         fresh.session != actor_.session || !fresh.administrator || !fresh.elevated || fresh.uiAccess ||
         fresh.integrity < SECURITY_MANDATORY_HIGH_RID || !native::protectedRegistry(gate_) ||
-        !readDword(gate_,L"EnableWfp",enabled) || enabled != 1) return false;
+        (mode_ == DeploymentMode::Laboratory && (!readDword(gate_,L"EnableWfp",enabled) || enabled != 1))) return false;
+    HKEY repeated = nullptr;
+    const auto opened = RegOpenKeyExW(HKEY_LOCAL_MACHINE,deploymentRegistry(mode_),0,
+        KEY_QUERY_VALUE | READ_CONTROL,&repeated);
+    const bool sameGate = opened == ERROR_SUCCESS && CompareObjectHandles(gate_,repeated);
+    if (repeated) RegCloseKey(repeated);
+    if (!sameGate) return false;
+    if (mode_ == DeploymentMode::Product) {
+        HKEY repeatedParent = nullptr; DWORD bytes = 0;
+        const bool original = parent_ && native::protectedRegistry(parent_) &&
+            RegQueryValueExW(parent_,L"SymbolicLinkValue",nullptr,nullptr,nullptr,&bytes) == ERROR_FILE_NOT_FOUND &&
+            RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA",REG_OPTION_OPEN_LINK,
+                KEY_QUERY_VALUE | READ_CONTROL,&repeatedParent) == ERROR_SUCCESS && CompareObjectHandles(parent_,repeatedParent);
+        if (repeatedParent) RegCloseKey(repeatedParent);
+        if (!original) return false;
+    }
     for (const auto &handle : source_) {
         FILE_ATTRIBUTE_TAG_INFO shape{};
         if (!GetFileInformationByHandleEx(handle.value,FileAttributeTagInfo,&shape,sizeof(shape)) ||
@@ -101,10 +146,10 @@ bool AdministrativeLease::current() const {
 bool AdministrativeLease::ownsConfiguration(HKEY key) const {
     if (!key || !current() || !native::protectedRegistry(key)) return false;
     HKEY gate = nullptr, configuration = nullptr;
-    const auto opened = RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",0,
+    const auto opened = RegOpenKeyExW(HKEY_LOCAL_MACHINE,deploymentRegistry(mode_),0,
         KEY_QUERY_VALUE | READ_CONTROL,&gate);
     bool ok = opened == ERROR_SUCCESS && CompareObjectHandles(gate_,gate) &&
-        RegOpenKeyExW(gate,L"DeploymentVIII",0,KEY_QUERY_VALUE | READ_CONTROL,&configuration) == ERROR_SUCCESS &&
+        RegOpenKeyExW(gate,deploymentConfiguration(mode_),0,KEY_QUERY_VALUE | READ_CONTROL,&configuration) == ERROR_SUCCESS &&
         CompareObjectHandles(key,configuration) && native::protectedRegistry(configuration);
     if (configuration) RegCloseKey(configuration);
     if (gate) RegCloseKey(gate);
@@ -112,6 +157,7 @@ bool AdministrativeLease::ownsConfiguration(HKEY key) const {
 }
 }
 class GuestMaintenance {
+    const DeploymentMode mode_;
     deployment_detail::AdministrativeLease lease_;
     std::shared_ptr<Deployment> package_, replacement_;
     HKEY key_ = nullptr;
@@ -140,7 +186,7 @@ class GuestMaintenance {
     }
     bool current() const {
         if (!tuple() || !package_ || !package_->current() || (replacement_ && !replacement_->current()) ||
-            !service_ || !serviceConfigurationPhase(service_,active_/L"GateBouncerService.exe",start_)) return false;
+            !service_ || !serviceConfigurationPhase(service_,active_/L"GateBouncerService.exe",start_,0,mode_)) return false;
         SERVICE_STATUS_PROCESS info{};
         if (!status(service_,info)) return false;
         if (closed_) return info.dwCurrentState == SERVICE_STOPPED && !info.dwProcessId &&
@@ -175,11 +221,12 @@ class GuestMaintenance {
         finalizing_ = finalization;
         if (!lease_.acquire() || !native::fixedPath(root) || !deployment_detail::disjoint(root,lease_.image().parent_path())) return false;
         active_ = original_ = root; recoveryRoot_ = root.native();
-        recoveryOrdinary_ = (root/L"GateBouncer.exe").native(); package_ = std::make_shared<Deployment>(root);
+        recoveryOrdinary_ = (root/L"GateBouncer.exe").native(); package_ = std::make_shared<Deployment>(root,mode_);
         if (!package_->verify(root/L"GateBouncerService.exe",DeploymentRole::Service) || !package_->current() ||
-            RegOpenKeyExW(lease_.gate(),L"DeploymentVIII",0,KEY_QUERY_VALUE | READ_CONTROL |
+            RegOpenKeyExW(lease_.gate(),deploymentConfiguration(mode_),0,KEY_QUERY_VALUE | READ_CONTROL |
                 (finalization ? 0 : KEY_SET_VALUE),&key_) != ERROR_SUCCESS ||
             !native::protectedRegistry(key_) || !maintenanceState(key_,hadMarker_,marker_) || marker_ != 0 ||
+            (mode_ == DeploymentMode::Product && !hadMarker_) ||
             (finalization && (!hadMarker_ || !lease_.ownsConfiguration(key_)))) return false;
         std::wstring store;
         if (!readString(key_,L"StoreRoot",store) || !readString(key_,L"ViewSid",view_) ||
@@ -196,12 +243,12 @@ class GuestMaintenance {
             static_cast<BYTE *>(sid)+GetLengthSid(sid))) == view_; LocalFree(sid); if (!valid) return false;
         manager_ = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
         if (!manager_) return false;
-        service_ = OpenServiceW(manager_,L"LGAGateBouncerLab",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS |
+        service_ = OpenServiceW(manager_,deploymentService(mode_),SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS |
             SERVICE_CHANGE_CONFIG | READ_CONTROL | (finalization ? 0 : SERVICE_STOP | DELETE));
         if (finalization) {
             closed_ = true;
             // Sólo esta operación explícita admite Disabled; Auto requiere el mismo readback íntegro.
-            start_ = serviceConfigurationPhase(service_,root/L"GateBouncerService.exe",SERVICE_DISABLED) ?
+            start_ = serviceConfigurationPhase(service_,root/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode_) ?
                 SERVICE_DISABLED : SERVICE_AUTO_START;
         }
         return current(); // Legado sin marker sólo después del tuple/ACL/SCM/paquete completos.
@@ -228,11 +275,11 @@ class GuestMaintenance {
         if (before.dwCurrentState == SERVICE_STOPPED && !before.dwProcessId) { closed_ = true; return current(); }
         if (before.dwCurrentState != SERVICE_RUNNING || !before.dwProcessId || !process_.acquire(before.dwProcessId) ||
             process_.image != active_/L"GateBouncerService.exe" || !current() ||
-            !serviceConfigurationPhase(service_,active_/L"GateBouncerService.exe",SERVICE_DISABLED,process_.pid)) return false;
+            !serviceConfigurationPhase(service_,active_/L"GateBouncerService.exe",SERVICE_DISABLED,process_.pid,mode_)) return false;
         HANDLE raw = nullptr; native::Handle token;
         if (!OpenProcessToken(process_.process.value,TOKEN_QUERY,&raw)) return false;
         token.reset(raw);
-        if (!native::systemServiceToken(token.value) || !process_.current()) return false;
+        if (!native::systemServiceToken(token.value,deploymentService(mode_)) || !process_.current()) return false;
         SERVICE_STATUS stopped{};
         if (!ControlService(service_,SERVICE_CONTROL_STOP,&stopped)) return false;
         const auto deadline = GetTickCount64()+10000;
@@ -252,7 +299,7 @@ class GuestMaintenance {
     }
     bool loadPolicy() {
         if (!closed_ || !current() || policy_) return false;
-        policy_.reset(new decisions::MaintenanceRuntime(store_,provision_ == 1,&retained,this));
+        policy_.reset(new decisions::MaintenanceRuntime(store_,provision_ == 1,&retained,this,mode_));
         return policy_->prepare() && policy_->current();
     }
     bool removeConfiguration() {
@@ -274,12 +321,13 @@ class GuestMaintenance {
         if (RegQueryInfoKeyW(key_,nullptr,nullptr,nullptr,&subkeys,nullptr,nullptr,&values,nullptr,nullptr,nullptr,nullptr) != ERROR_SUCCESS) return false;
         if (subkeys || values) return true; // Registro contenedor con datos extranjeros: no DeleteTree.
         RegCloseKey(key_); key_ = nullptr;
-        if (RegDeleteKeyW(lease_.gate(),L"DeploymentVIII") != ERROR_SUCCESS || RegFlushKey(lease_.gate()) != ERROR_SUCCESS) return false;
-        HKEY probe = nullptr; const auto query = RegOpenKeyExW(lease_.gate(),L"DeploymentVIII",0,KEY_QUERY_VALUE,&probe);
+        if (RegDeleteKeyW(lease_.gate(),deploymentConfiguration(mode_)) != ERROR_SUCCESS || RegFlushKey(lease_.gate()) != ERROR_SUCCESS) return false;
+        HKEY probe = nullptr; const auto query = RegOpenKeyExW(lease_.gate(),deploymentConfiguration(mode_),0,KEY_QUERY_VALUE,&probe);
         if (probe) RegCloseKey(probe);
         return query == ERROR_FILE_NOT_FOUND;
     }
   public:
+    explicit GuestMaintenance(DeploymentMode mode = DeploymentMode::Laboratory) : mode_(mode), lease_(mode) {}
     ~GuestMaintenance() {
         policy_.reset(); if (service_) CloseServiceHandle(service_);
         if (manager_) CloseServiceHandle(manager_); if (key_) RegCloseKey(key_);
@@ -315,16 +363,16 @@ class GuestMaintenance {
             if (!admit(root) || lease_.image() != source/L"GateBouncerService.exe" ||
                 !deployment_detail::disjoint(root,replacement) || !deployment_detail::disjoint(store_,replacement)) return fail();
             result_.phase = MaintenancePhase::Package;
-            if (!deployment_detail::stagePackage(source,replacement,replacement_) || !current()) return fail();
+            if (!deployment_detail::stagePackage(source,replacement,replacement_,mode_) || !current()) return fail();
             result_.phase = MaintenancePhase::Marker; if (!begin(2)) return fail(GetLastError());
             result_.phase = MaintenancePhase::Stop; if (!stop()) return fail(GetLastError());
             result_.phase = MaintenancePhase::Store; if (!loadPolicy()) return fail(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
             result_.phase = MaintenancePhase::Switch;
             if (!current() || !policy_->current() || !replacement_->current()) return fail();
-            const auto command = L"\""+(replacement/L"GateBouncerService.exe").native()+L"\" --service --guest-wfp";
+            const auto command = deploymentCommand(replacement/L"GateBouncerService.exe",mode_);
             if (!ChangeServiceConfigW(service_,SERVICE_NO_CHANGE,SERVICE_DISABLED,SERVICE_NO_CHANGE,command.c_str(),
                 nullptr,nullptr,nullptr,nullptr,nullptr,nullptr)) return fail(GetLastError());
-            if (!serviceConfigurationPhase(service_,replacement/L"GateBouncerService.exe",SERVICE_DISABLED) ||
+            if (!serviceConfigurationPhase(service_,replacement/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode_) ||
                 !lease_.current() || !package_->current() || !replacement_->current() || !tuple()) return fail();
             // Durante el switch el callback normal se cierra por tuple discordante; no llama Runtime/Initial.
             if (!deployment_detail::setString(key_,L"PackageRoot",replacement.native())) return fail();
@@ -362,7 +410,7 @@ class GuestMaintenance {
             const auto deadline = GetTickCount64()+2000; DWORD error = ERROR_SERVICE_MARKED_FOR_DELETE;
             do {
                 if (!tuple() || !package_->current()) return fail();
-                SC_HANDLE probe = OpenServiceW(manager_,L"LGAGateBouncerLab",SERVICE_QUERY_STATUS);
+                SC_HANDLE probe = OpenServiceW(manager_,deploymentService(mode_),SERVICE_QUERY_STATUS);
                 error = probe ? ERROR_SERVICE_MARKED_FOR_DELETE : GetLastError();
                 if (probe) CloseServiceHandle(probe);
                 if (error == ERROR_SERVICE_DOES_NOT_EXIST) break;
@@ -385,5 +433,14 @@ MaintenanceResult uninstallGuestDeployment(const std::filesystem::path &root) {
 }
 MaintenanceResult finalizeGuestDeployment(const std::filesystem::path &root) {
     GuestMaintenance owner; return owner.finalize(root);
+}
+MaintenanceResult updateProductDeployment(const std::filesystem::path &root,const std::filesystem::path &source,const std::filesystem::path &replacement) {
+    GuestMaintenance owner(DeploymentMode::Product); return owner.update(root,source,replacement);
+}
+MaintenanceResult uninstallProductDeployment(const std::filesystem::path &root) {
+    GuestMaintenance owner(DeploymentMode::Product); return owner.uninstall(root);
+}
+MaintenanceResult finalizeProductDeployment(const std::filesystem::path &root) {
+    GuestMaintenance owner(DeploymentMode::Product); return owner.finalize(root);
 }
 } // namespace gb::controller

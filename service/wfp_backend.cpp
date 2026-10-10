@@ -58,23 +58,23 @@ bool enumerate(HANDLE engine,std::vector<GUID>& keys){
     bool ok=true;for(;;){FWPM_FILTER0** filters=nullptr;UINT32 count=0;auto e=FwpmFilterEnum0(engine,enumeration,256,&filters,&count);if(e!=ERROR_SUCCESS){ok=false;break;}for(UINT32 i=0;i<count;++i)keys.push_back(filters[i]->filterKey);FwpmFreeMemory0(reinterpret_cast<void**>(&filters));if(count==0)break;if(keys.size()>MaxRules*6+64){ok=false;break;}}
     if(FwpmFilterDestroyEnumHandle0(engine,enumeration)!=ERROR_SUCCESS)ok=false;return ok;
 }
-bool objectIdentity(HANDLE engine){
+bool objectIdentity(HANDLE engine,const wchar_t *serviceName){
     FWPM_PROVIDER0* provider=nullptr;FWPM_SUBLAYER0* sublayer=nullptr;
     bool ok=FwpmProviderGetByKey0(engine,&Provider,&provider)==ERROR_SUCCESS;
-    if(ok)ok=provider->serviceName&&std::wcscmp(provider->serviceName,ServiceName)==0&&provider->flags==FWPM_PROVIDER_FLAG_PERSISTENT;
+    if(ok)ok=provider->serviceName&&std::wcscmp(provider->serviceName,serviceName)==0&&provider->flags==FWPM_PROVIDER_FLAG_PERSISTENT;
     if(ok)ok=FwpmSubLayerGetByKey0(engine,&Sublayer,&sublayer)==ERROR_SUCCESS;
     if(ok)ok=sublayer->providerKey&&same(*sublayer->providerKey,Provider)&&sublayer->flags==FWPM_SUBLAYER_FLAG_PERSISTENT&&sublayer->weight==0x7d00;
     if(provider)FwpmFreeMemory0(reinterpret_cast<void**>(&provider));if(sublayer)FwpmFreeMemory0(reinterpret_cast<void**>(&sublayer));return ok;
 }
-bool objects(HANDLE engine){
+bool objects(HANDLE engine,const wchar_t *serviceName){
     PSECURITY_DESCRIPTOR sd=nullptr;if(!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;BA)",SDDL_REVISION_1,&sd,nullptr))return false;
-    FWPM_PROVIDER0 p{};p.providerKey=Provider;p.displayData.name=const_cast<wchar_t*>(L"LGA GateBouncer lab");p.flags=FWPM_PROVIDER_FLAG_PERSISTENT;p.serviceName=const_cast<wchar_t*>(ServiceName);
+    FWPM_PROVIDER0 p{};p.providerKey=Provider;p.displayData.name=const_cast<wchar_t*>(std::wcscmp(serviceName,ServiceName) == 0 ? L"LGA GateBouncer lab" : L"LGA GateBouncer");p.flags=FWPM_PROVIDER_FLAG_PERSISTENT;p.serviceName=const_cast<wchar_t*>(serviceName);
     auto error=FwpmProviderAdd0(engine,&p,sd);
     bool ok=error==ERROR_SUCCESS||error==FWP_E_ALREADY_EXISTS;
-    if(ok){FWPM_PROVIDER0* current=nullptr;ok=FwpmProviderGetByKey0(engine,&Provider,&current)==ERROR_SUCCESS;if(ok)ok=current->serviceName&&std::wcscmp(current->serviceName,ServiceName)==0&&(current->flags&FWPM_PROVIDER_FLAG_PERSISTENT);if(current)FwpmFreeMemory0(reinterpret_cast<void**>(&current));}
-    if(ok){FWPM_SUBLAYER0 s{};s.subLayerKey=Sublayer;s.displayData.name=const_cast<wchar_t*>(L"LGA GateBouncer lab");s.flags=FWPM_SUBLAYER_FLAG_PERSISTENT;s.providerKey=const_cast<GUID*>(&Provider);s.weight=0x7d00;error=FwpmSubLayerAdd0(engine,&s,sd);ok=error==ERROR_SUCCESS||error==FWP_E_ALREADY_EXISTS;}
+    if(ok){FWPM_PROVIDER0* current=nullptr;ok=FwpmProviderGetByKey0(engine,&Provider,&current)==ERROR_SUCCESS;if(ok)ok=current->serviceName&&std::wcscmp(current->serviceName,serviceName)==0&&(current->flags&FWPM_PROVIDER_FLAG_PERSISTENT);if(current)FwpmFreeMemory0(reinterpret_cast<void**>(&current));}
+    if(ok){FWPM_SUBLAYER0 s{};s.subLayerKey=Sublayer;s.displayData.name=p.displayData.name;s.flags=FWPM_SUBLAYER_FLAG_PERSISTENT;s.providerKey=const_cast<GUID*>(&Provider);s.weight=0x7d00;error=FwpmSubLayerAdd0(engine,&s,sd);ok=error==ERROR_SUCCESS||error==FWP_E_ALREADY_EXISTS;}
     if(ok){FWPM_SUBLAYER0* current=nullptr;ok=FwpmSubLayerGetByKey0(engine,&Sublayer,&current)==ERROR_SUCCESS;if(ok)ok=current->providerKey&&same(*current->providerKey,Provider)&&current->flags==FWPM_SUBLAYER_FLAG_PERSISTENT&&current->weight==0x7d00;if(current)FwpmFreeMemory0(reinterpret_cast<void**>(&current));}
-    LocalFree(sd);return ok&&objectIdentity(engine);
+    LocalFree(sd);return ok&&objectIdentity(engine,serviceName);
 }
 bool initialAbsent(HANDLE engine) {
     FWPM_PROVIDER0 *provider = nullptr; FWPM_SUBLAYER0 *sublayer = nullptr;
@@ -106,40 +106,57 @@ bool guestActivationAuthorized(){
     return e==ERROR_SUCCESS&&enabled==1&&IsUserAnAdmin();
 }
 WfpBackend::~WfpBackend(){if(subscription_)FwpmNetEventUnsubscribe0(engine_,subscription_);if(engine_)FwpmEngineClose0(engine_);}
-bool WfpBackend::available()const{if(!engine_)return false;FWP_VALUE0* value=nullptr;auto error=FwpmEngineGetOption0(engine_,FWPM_ENGINE_COLLECT_NET_EVENTS,&value);if(value)FwpmFreeMemory0(reinterpret_cast<void**>(&value));return error==ERROR_SUCCESS;}
+bool WfpBackend::authorized() const {
+    return deployment_ ? deployment_->mode() == controller::DeploymentMode::Product &&
+        deployment_->serviceAdmittedCurrent() : guestActivationAuthorized();
+}
+const wchar_t *WfpBackend::serviceName() const {
+    return controller::deploymentService(deployment_ ? deployment_->mode() : controller::DeploymentMode::Laboratory);
+}
+bool WfpBackend::connectGuest() {
+    return !deployment_ && guestActivationAuthorized() && connect();
+}
+bool WfpBackend::connectProduct(std::shared_ptr<controller::Deployment> owner) {
+    if (engine_ || deployment_ || !owner || owner->mode() != controller::DeploymentMode::Product ||
+        !owner->serviceAdmittedCurrent()) return false;
+    deployment_ = std::move(owner);
+    return connect() && authorized();
+}
+bool WfpBackend::available()const{if(!engine_||!authorized())return false;FWP_VALUE0* value=nullptr;auto error=FwpmEngineGetOption0(engine_,FWPM_ENGINE_COLLECT_NET_EVENTS,&value);if(value)FwpmFreeMemory0(reinterpret_cast<void**>(&value));return error==ERROR_SUCCESS;}
 decisions::CatalogPlanBuilder::WriteOutcome WfpBackend::applyPrincipalPlan(
     decisions::CatalogPlanBuilder &plan,
     const std::shared_ptr<const decisions::allnative::CatalogSnapshot> &before,
     decisions::CatalogPlanBuilder::VerifyBeforeWrite verify, void *context) noexcept {
-    if (!engine_ || !guestActivationAuthorized() || !verify || !context) return {};
+    if (!engine_ || !authorized() || !verify || !context) return {};
     struct Check {
+        WfpBackend *backend;
         HANDLE engine;
         decisions::CatalogPlanBuilder::VerifyBeforeWrite verify;
         void *context;
-    } check{engine_, verify, context};
+    } check{this, engine_, verify, context};
     auto inside = [](void *raw) noexcept {
         auto &check = *static_cast<Check *>(raw);
-        try { return objectIdentity(check.engine) && check.verify(check.context); }
+        try { return check.backend->authorized() && objectIdentity(check.engine,check.backend->serviceName()) && check.verify(check.context) && check.backend->authorized(); }
         catch (...) { return false; }
     };
     return plan.transact(engine_, decisions::CatalogPlanBuilder::WriteApi{}, before, inside, &check);
 }
 decisions::CatalogPlanBuilder::WriteOutcome WfpBackend::applyInitialPrincipalPlan(
     decisions::CatalogPlanBuilder &plan,decisions::CatalogPlanBuilder::VerifyBeforeWrite verify,void *context) noexcept {
-    if (!engine_ || !guestActivationAuthorized() || !verify || !context) return {};
-    struct Check { HANDLE engine; decisions::CatalogPlanBuilder::VerifyBeforeWrite verify; void *context; }
-        check{engine_,verify,context};
+    if (!engine_ || !authorized() || !verify || !context) return {};
+    struct Check { WfpBackend *backend; HANDLE engine; decisions::CatalogPlanBuilder::VerifyBeforeWrite verify; void *context; }
+        check{this,engine_,verify,context};
     const auto inside = [](void *raw) noexcept {
         auto &c = *static_cast<Check *>(raw);
-        try { return c.verify(c.context) && initialAbsent(c.engine) && objects(c.engine) &&
-            objectIdentity(c.engine) && c.verify(c.context); }
+        try { return c.backend->authorized() && c.verify(c.context) && initialAbsent(c.engine) && objects(c.engine,c.backend->serviceName()) &&
+            objectIdentity(c.engine,c.backend->serviceName()) && c.verify(c.context) && c.backend->authorized(); }
         catch (...) { return false; }
     };
     return plan.transactInitial(engine_,decisions::CatalogPlanBuilder::WriteApi{},inside,&check);
 }
-bool WfpBackend::connectGuest(){
-    if(!guestActivationAuthorized()||engine_)return false;
-    FWPM_SESSION0 session{};session.displayData.name=const_cast<wchar_t*>(L"LGA GateBouncer lab");session.txnWaitTimeoutInMSec=5000;
+bool WfpBackend::connect(){
+    if(!authorized()||engine_)return false;
+    FWPM_SESSION0 session{};session.displayData.name=const_cast<wchar_t*>(deployment_ ? L"LGA GateBouncer" : L"LGA GateBouncer lab");session.txnWaitTimeoutInMSec=5000;
     if(FwpmEngineOpen0(nullptr,RPC_C_AUTHN_WINNT,nullptr,&session,&engine_)!=ERROR_SUCCESS)return false;
     wchar_t path[32768]{};auto n=GetModuleFileNameW(nullptr,path,32768);if(!n||n>=32768||n<3||path[1]!=L':'||GetDriveTypeW(std::wstring(path,path+3).c_str())!=DRIVE_FIXED)return false;
     std::wstring own(path,n);auto slash=own.find_last_of(L"\\/");if(slash==std::wstring::npos)return false;
@@ -161,10 +178,10 @@ void CALLBACK WfpBackend::eventCallback(void* context,const FWPM_NET_EVENT1* eve
 }
 void WfpBackend::attachCollector(decisions::NativeCollector* collector){std::lock_guard<std::mutex> lock(callbackMutex_);collector_=collector;if(collector_){collector_->whitelist(ownTools_);if(!subscription_)collector_->unavailable(2);}}
 bool WfpBackend::apply(const std::vector<Rule>& rules,std::uint64_t revision){
-    if(!available()||!guestActivationAuthorized()||rules.size()>MaxRules)return false;
+    if(!available()||!authorized()||rules.size()>MaxRules)return false;
     for(const auto& r:rules)if(std::find(ownTools_.begin(),ownTools_.end(),r.appId)==ownTools_.end())return false;
     if(FwpmTransactionBegin0(engine_,0)!=ERROR_SUCCESS)return false;
-    bool ok=objects(engine_);std::vector<GUID> old;
+    bool ok=objects(engine_,serviceName());std::vector<GUID> old;
     if(ok)ok=enumerate(engine_,old);
     if(ok)for(auto& id:old)if(FwpmFilterDeleteByKey0(engine_,&id)!=ERROR_SUCCESS){ok=false;break;}
     auto data=metadata(revision);auto wanted=specs(rules);
@@ -173,7 +190,7 @@ bool WfpBackend::apply(const std::vector<Rule>& rules,std::uint64_t revision){
     if(FwpmTransactionCommit0(engine_)!=ERROR_SUCCESS){FwpmTransactionAbort0(engine_);return false;}return true;
 }
 bool WfpBackend::matches(const std::vector<Rule>& rules,std::uint64_t revision){
-    if(!available()||!objectIdentity(engine_))return false;auto wanted=specs(rules);std::vector<GUID> actual;if(!enumerate(engine_,actual)||actual.size()!=wanted.size())return false;
+    if(!available()||!objectIdentity(engine_,serviceName()))return false;auto wanted=specs(rules);std::vector<GUID> actual;if(!enumerate(engine_,actual)||actual.size()!=wanted.size())return false;
     auto meta=metadata(revision);std::vector<decisions::LedgerFilter> ledger;
     for(const auto& s:wanted){FWPM_FILTER0* f=nullptr;if(FwpmFilterGetByKey0(engine_,&s.id,&f)!=ERROR_SUCCESS)return false;FWP_BYTE_BLOB blob{};auto c=conditions(s,blob);
         bool ok=f->providerKey&&same(*f->providerKey,Provider)&&same(f->subLayerKey,Sublayer)&&same(f->layerKey,s.layer)&&f->flags==s.flags&&f->action.type==s.action&&f->weight.type==FWP_UINT64&&f->weight.uint64&&*f->weight.uint64==s.weight&&f->numFilterConditions==c.size()&&f->providerData.size==meta.size()&&f->providerData.data&&std::memcmp(f->providerData.data,meta.data(),meta.size())==0;
@@ -215,11 +232,11 @@ Spec nativeSpec(const directional::FilterSpec& s) {
 }
 bool WfpBackend::applyDirections(const std::vector<directional::Rule>& rules,std::uint64_t revision) {
     std::vector<directional::FilterSpec> wanted;
-    if(!available()||!guestActivationAuthorized()||!directional::generate(rules,revision,wanted))return false;
+    if(!available()||!authorized()||!directional::generate(rules,revision,wanted))return false;
     for(const auto& r:rules)
         if(std::find(ownTools_.begin(),ownTools_.end(),r.appId)==ownTools_.end())return false;
     if(FwpmTransactionBegin0(engine_,0)!=ERROR_SUCCESS)return false;
-    bool ok=objects(engine_);std::vector<GUID> old;
+    bool ok=objects(engine_,serviceName());std::vector<GUID> old;
     if(ok)ok=enumerate(engine_,old);
     if(ok)for(const auto& id:old)
         if(FwpmFilterDeleteByKey0(engine_,&id)!=ERROR_SUCCESS){ok=false;break;}
@@ -239,7 +256,7 @@ bool WfpBackend::applyDirections(const std::vector<directional::Rule>& rules,std
 }
 bool WfpBackend::matchDirections(const std::vector<directional::Rule>& rules,std::uint64_t revision) {
     std::vector<directional::FilterSpec> wanted;
-    if(!available()||!objectIdentity(engine_)||!directional::generate(rules,revision,wanted))return false;
+    if(!available()||!objectIdentity(engine_,serviceName())||!directional::generate(rules,revision,wanted))return false;
     std::vector<GUID> actual;
     if(!enumerate(engine_,actual)||actual.size()!=wanted.size())return false;
     std::vector<decisions::LedgerFilter> ledger;

@@ -42,8 +42,8 @@ bool wfpDescriptor(PSECURITY_DESCRIPTOR sd) {
     return fullSy && fullBa;
 }
 }
-MaintenanceRuntime::MaintenanceRuntime(std::filesystem::path store,bool allowMissing,Current check,void *context)
-    : check_(check), context_(context), allowMissing_(allowMissing), file_(std::move(store)) {}
+MaintenanceRuntime::MaintenanceRuntime(std::filesystem::path store,bool allowMissing,Current check,void *context,controller::DeploymentMode mode)
+    : check_(check), context_(context), allowMissing_(allowMissing), mode_(mode), file_(std::move(store)) {}
 MaintenanceRuntime::~MaintenanceRuntime() {
     plan_.reset(); reserved_.reset(); read_ = {}; store_.reset(); binding_.reset();
     if (observation_) observation_->retire();
@@ -59,7 +59,7 @@ bool MaintenanceRuntime::current() const {
             read_.snapshot.encoded.size(),sameBytes,exists) && sameBytes && exists;
 }
 bool MaintenanceRuntime::prepare() {
-    if (store_ || !check_ || !context_ || !check_(context_) || !guestActivationAuthorized()) return false;
+    if (store_ || !check_ || !context_ || !check_(context_) || (mode_ == controller::DeploymentMode::Laboratory && !guestActivationAuthorized())) return false;
     try {
         reserved_.reset(new CatalogPlanBuilder(registry_,allnative::MaxPolicyArenaBytes,allnative::MaxCatalogRules,allnative::MaxCatalogSlots));
         auto file = std::shared_ptr<directional::SnapshotFile>(&file_,[](auto *) {});
@@ -92,7 +92,7 @@ bool MaintenanceRuntime::objectSecurity() const {
     FWPM_PROVIDER0 *p = nullptr; FWPM_SUBLAYER0 *s = nullptr;
     const auto a = FwpmProviderGetByKey0(write_,&provider,&p), b = FwpmSubLayerGetByKey0(write_,&sublayer,&s);
     bool ok = a == ERROR_SUCCESS && b == ERROR_SUCCESS && p && s && p->serviceName &&
-        std::wcscmp(p->serviceName,ServiceName) == 0 && same(p->providerKey,provider) &&
+        std::wcscmp(p->serviceName,controller::deploymentService(mode_)) == 0 && same(p->providerKey,provider) &&
         p->flags == FWPM_PROVIDER_FLAG_PERSISTENT && s->providerKey && same(*s->providerKey,provider) &&
         same(s->subLayerKey,sublayer) && s->flags == FWPM_SUBLAYER_FLAG_PERSISTENT && s->weight == 0x7d00;
     if (p) FwpmFreeMemory0(reinterpret_cast<void **>(&p));

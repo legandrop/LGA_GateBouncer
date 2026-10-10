@@ -13,7 +13,7 @@ bool tokenEvidence(HANDLE token, TokenEvidence &evidence);
 bool equalSidBytes(const wire::Bytes &a, const wire::Bytes &b);
 wire::Id sidKey(const wire::Bytes &sid);
 std::wstring sidString(const wire::Bytes &sid);
-bool systemServiceToken(HANDLE token);
+bool systemServiceToken(HANDLE token, const wchar_t *serviceName = L"LGAGateBouncerLab");
 struct ProcessEvidence {
     Handle process;
     DWORD pid = 0;

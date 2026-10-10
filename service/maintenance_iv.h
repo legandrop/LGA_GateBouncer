@@ -2,13 +2,15 @@
 #include "catalog_plan_iv.h"
 #include "engine_resource_iv.h"
 #include "store_iv.h"
+#include "../controller/deployment_win.h"
 namespace gb::controller { class GuestMaintenance; }
 namespace gb::decisions {
 // Owner administrativo de store/inventario detenido; no crea Source ni permisos.
 class MaintenanceRuntime final {
     friend class gb::controller::GuestMaintenance;
     using Current = bool (*)(void *) noexcept;
-    explicit MaintenanceRuntime(std::filesystem::path store, bool allowMissing, Current, void *);
+    explicit MaintenanceRuntime(std::filesystem::path store, bool allowMissing, Current, void *,
+                                controller::DeploymentMode);
     bool prepare();
     bool current() const;
     bool inspect(bool insideWrite);
@@ -20,6 +22,7 @@ class MaintenanceRuntime final {
     bool attempted_ = false, committed_ = false, cleanupUnknown_ = false;
     Current check_; void *context_;
     bool allowMissing_;
+    const controller::DeploymentMode mode_;
     directional::NativeSnapshotFile file_;
     allnative::CatalogRegistry registry_;
     std::unique_ptr<principal::SnapshotStore> store_;

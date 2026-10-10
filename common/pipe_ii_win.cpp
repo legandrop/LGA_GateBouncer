@@ -245,7 +245,9 @@ bool serverEvidence(HANDLE pipe, native::ProcessEvidence &process) {
     if (!OpenProcessToken(process.process.value, TOKEN_QUERY, &raw))
         return false;
     token.reset(raw);
-    return native::systemServiceToken(token.value) && GetNamedPipeServerProcessId(pipe, &after) &&
+    const bool product = native::systemServiceToken(token.value,L"LGAGateBouncer");
+    const bool laboratory = native::systemServiceToken(token.value,L"LGAGateBouncerLab");
+    return product != laboratory && GetNamedPipeServerProcessId(pipe, &after) &&
            before == after && process.current();
 }
 bool ownClient(const native::ProcessEvidence &peer, const std::filesystem::path &image) {
@@ -269,43 +271,34 @@ bool readableServerEvidence(HANDLE pipe, const std::filesystem::path &image,
     SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (!manager)
         return false;
-    SC_HANDLE service =
-        OpenServiceW(manager, L"LGAGateBouncerLab", SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG | READ_CONTROL);
     bool ok = false;
-    if (service) {
-        SERVICE_STATUS_PROCESS status{};
-        DWORD n = 0, needed = 0;
-        QueryServiceConfigW(service, nullptr, 0, &needed);
-        wire::Bytes b(needed <= 65536 ? needed : 0);
-        if (needed && needed <= 65536 &&
-            QueryServiceConfigW(service, reinterpret_cast<QUERY_SERVICE_CONFIGW *>(b.data()),
-                                needed, &needed) &&
-            QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, reinterpret_cast<BYTE *>(&status),
-                                 sizeof(status), &n)) {
-            auto config = reinterpret_cast<QUERY_SERVICE_CONFIGW *>(b.data());
-            std::wstring command = config->lpBinaryPathName ? config->lpBinaryPathName : L"";
-            ok = controller::serviceConfiguration(service,image,pid) &&
-                 config->dwServiceType == SERVICE_WIN32_OWN_PROCESS && config->lpServiceStartName &&
-                 _wcsicmp(config->lpServiceStartName, L"LocalSystem") == 0 &&
-                 command == L"\"" + image.native() + L"\" --service --guest-wfp" &&
-                 status.dwCurrentState == SERVICE_RUNNING && status.dwProcessId == pid;
-            SERVICE_STATUS_PROCESS repeated{};
-            ok = ok && GetNamedPipeServerProcessId(pipe, &after) && after == pid &&
-                 QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
-                                      reinterpret_cast<BYTE *>(&repeated), sizeof(repeated), &n) &&
-                 repeated.dwCurrentState == SERVICE_RUNNING && repeated.dwProcessId == pid;
+    unsigned admitted = 0;
+    for (const auto mode : {controller::DeploymentMode::Product,controller::DeploymentMode::Laboratory}) {
+        SC_HANDLE service = OpenServiceW(manager,controller::deploymentService(mode),
+            SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG | READ_CONTROL);
+        if (!service) continue;
+        SERVICE_STATUS_PROCESS status{}, repeated{}; DWORD n = 0;
+        bool exact = controller::serviceConfiguration(service,image,pid,mode) &&
+            QueryServiceStatusEx(service,SC_STATUS_PROCESS_INFO,reinterpret_cast<BYTE *>(&status),sizeof(status),&n) &&
+            status.dwCurrentState == SERVICE_RUNNING && status.dwProcessId == pid &&
+            GetNamedPipeServerProcessId(pipe,&after) && after == pid;
+        HANDLE raw = nullptr;
+        if (exact) {
+            if (OpenProcessToken(process.process.value,TOKEN_QUERY,&raw)) {
+                native::Handle token(raw);
+                exact = native::systemServiceToken(token.value,controller::deploymentService(mode)) &&
+                    !native::systemServiceToken(token.value,controller::deploymentService(
+                        mode == controller::DeploymentMode::Product ? controller::DeploymentMode::Laboratory : controller::DeploymentMode::Product));
+            } else exact = GetLastError() == ERROR_ACCESS_DENIED; // Sólo View conserva este fallback SCM original.
         }
+        exact = exact && controller::serviceConfiguration(service,image,pid,mode) &&
+            QueryServiceStatusEx(service,SC_STATUS_PROCESS_INFO,reinterpret_cast<BYTE *>(&repeated),sizeof(repeated),&n) &&
+            repeated.dwCurrentState == SERVICE_RUNNING && repeated.dwProcessId == pid && process.current();
+        if (exact) ++admitted;
         CloseServiceHandle(service);
     }
     CloseServiceHandle(manager);
-    if (ok) {
-        HANDLE raw = nullptr;
-        if (OpenProcessToken(process.process.value, TOKEN_QUERY, &raw)) {
-            native::Handle token(raw);
-            ok = native::systemServiceToken(token.value);
-        } else if (GetLastError() != ERROR_ACCESS_DENIED)
-            ok = false;
-    }
+    ok = admitted == 1; // La coincidencia de path sola nunca elige namespace; ambigüedad se rechaza.
     return ok && GetNamedPipeServerProcessId(pipe, &after) && after == pid && process.current();
 }
 } // namespace gb::ipc::ii

@@ -92,7 +92,7 @@ bool tokenEvidence(HANDLE h, TokenEvidence &out) {
     out = std::move(e);
     return true;
 }
-bool systemServiceToken(HANDLE token) {
+bool systemServiceToken(HANDLE token, const wchar_t *serviceName) {
     auto user = tokenData(token, TokenUser), groups = tokenData(token, TokenGroups);
     if (user.size() < sizeof(TOKEN_USER) || groups.size() < sizeof(TOKEN_GROUPS))
         return false;
@@ -104,7 +104,9 @@ bool systemServiceToken(HANDLE token) {
     wchar_t domain[256]{};
     DWORD sidSize = sizeof(service), domainSize = 256;
     SID_NAME_USE use{};
-    if (!LookupAccountNameW(L".", L"NT SERVICE\\LGAGateBouncerLab", service, &sidSize, domain,
+    if (!serviceName || (wcscmp(serviceName,L"LGAGateBouncer") && wcscmp(serviceName,L"LGAGateBouncerLab"))) return false;
+    const auto principal = std::wstring(L"NT SERVICE\\") + serviceName;
+    if (!LookupAccountNameW(L".", principal.c_str(), service, &sidSize, domain,
                             &domainSize, &use))
         return false;
     auto list = reinterpret_cast<TOKEN_GROUPS *>(groups.data());

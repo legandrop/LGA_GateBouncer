@@ -628,7 +628,9 @@ bool NativeRuntime::principals(ipc::ii::Principals &out) const {
     DWORD bytes = sizeof(sid), domainBytes = 256;
     wchar_t domain[256]{};
     SID_NAME_USE use{};
-    if (!LookupAccountNameW(L".", L"NT SERVICE\\LGAGateBouncerLab", sid, &bytes, domain,
+    const auto service = std::wstring(L"NT SERVICE\\") + controller::deploymentService(
+        deployment_ ? deployment_->mode() : controller::DeploymentMode::Laboratory);
+    if (!LookupAccountNameW(L".", service.c_str(), sid, &bytes, domain,
                             &domainBytes, &use))
         return false;
     out = {profile_.account(), profile_.logon(), Bytes(sid, sid + bytes)};
@@ -642,7 +644,8 @@ bool NativeRuntime::peer(HANDLE pipe, bool control, VerifiedControl &out, bool a
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw))
         return false;
     ownToken.reset(raw);
-    bool full = native::systemServiceToken(ownToken.value);
+    bool full = native::systemServiceToken(ownToken.value,controller::deploymentService(
+        deployment_ ? deployment_->mode() : controller::DeploymentMode::Laboratory));
     if (!full || !ipc::ii::clientEvidence(pipe, token, process) ||
         !profile_.accepts(token, control))
         return false;
