@@ -1,4 +1,5 @@
 #include "deployment_win.h"
+#include "../driver/package_identity.h"
 #include <algorithm>
 #include <set>
 #include <aclapi.h>
@@ -191,6 +192,16 @@ bool maintenanceState(HKEY key, bool &present, DWORD &state) {
 bool driverPackageSignature(HANDLE sys, HANDLE inf, const wire::Bytes &catalog) {
     if (catalog.empty() || catalog.size() > 32*1024*1024 ||
         !native::protectedObject(sys,false,false,true) || !native::protectedObject(inf,false,false,true)) return false;
+    // La confianza del CAT no autoriza instrucciones de otro INF, aunque esté firmado.
+    LARGE_INTEGER infBegin{}, infSize{}; DWORD read = 0;
+    if (!GetFileSizeEx(inf,&infSize) || infSize.QuadPart != static_cast<LONGLONG>(driver_package::infSize) ||
+        !SetFilePointerEx(inf,infBegin,nullptr,FILE_BEGIN)) return false;
+    wire::Bytes infBytes(driver_package::infSize);
+    if (!ReadFile(inf,infBytes.data(),DWORD(infBytes.size()),&read,nullptr) || read != infBytes.size()) return false;
+    const auto infHash = native::digest(infBytes); constexpr char infHex[] = "0123456789ABCDEF";
+    for (std::size_t i = 0; i < infHash.size(); ++i)
+        if (driver_package::infSha256[2*i] != infHex[infHash[i] >> 4] ||
+            driver_package::infSha256[2*i+1] != infHex[infHash[i] & 15]) return false;
     struct Libraries {
         HMODULE trust = LoadLibraryExW(L"wintrust.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
         HMODULE crypto = LoadLibraryExW(L"crypt32.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);

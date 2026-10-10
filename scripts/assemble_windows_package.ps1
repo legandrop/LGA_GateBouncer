@@ -288,6 +288,22 @@ try {
     if ($notices.Count -ne 65) { throw 'Notice input set must contain exactly 65 original files' }
     $readers=[ordered]@{}
     foreach ($name in $source.Keys) { if ($null -ne $source[$name]) { $readers[$name]=Hold-File $source[$name] } }
+    if (-not $Laboratory) {
+        # Recurso propio retenido de esta versión, nunca un digest del paquete suministrado.
+        $identityReader=Hold-File (Join-Path $repo 'driver\package_identity.h')
+        $ownInfReader=Hold-File (Join-Path $repo 'driver\GateBouncerClassifier.inf')
+        $identityText=[System.Text.Encoding]::ASCII.GetString([GateBouncer.Package.Native]::Read($identityReader))
+        $sizeRows=[regex]::Matches($identityText,'inline constexpr std::size_t infSize = ([0-9]{1,5});')
+        $hashRows=[regex]::Matches($identityText,'inline constexpr char infSha256\[\] = "([0-9A-F]{64})";')
+        if ($identityText.Length -gt 1024 -or $sizeRows.Count -ne 1 -or $hashRows.Count -ne 1) { throw 'Invalid product INF identity resource' }
+        $infSize=[int]$sizeRows[0].Groups[1].Value
+        $infHash=$hashRows[0].Groups[1].Value
+        foreach ($reader in @($ownInfReader,$readers['driver\GateBouncerClassifier.inf'])) {
+            $infBytes=[GateBouncer.Package.Native]::Read($reader)
+            $observedHash=[System.BitConverter]::ToString([GateBouncer.Package.Native]::Hash($infBytes)).Replace('-','')
+            if ($infBytes.Length -ne $infSize -or $observedHash -cne $infHash) { throw 'Product INF differs from the exact package version' }
+        }
+    }
     $noticeReaders=[ordered]@{}
     foreach ($name in $notices.Keys) { $noticeReaders[$name]=Hold-File $notices[$name] }
     # Nada se crea hasta retener todos los inputs requeridos, incluidas licencias reales.
