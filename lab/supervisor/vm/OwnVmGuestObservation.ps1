@@ -49,8 +49,22 @@ public static class GbGuestReadCustody {
                 Identities=[Collections.Generic.List[object]]::new();Complete=$false}
             foreach ($path in @('C:\GateBouncerLab\bin\guest_broker.exe','C:\GateBouncerLab\bin\desktop_worker.exe',
                 'C:\GateBouncerLab\supervisor\GuestCommands.ps1','C:\GateBouncerLab\bin\capture_netevent.psm1',
-                'C:\GateBouncerLab\bin\guest_conversion.dll','C:\GateBouncerLab\bin\conversion_worker.exe')) {
-                $stream=[IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+                'C:\GateBouncerLab\bin\guest_conversion.dll','C:\GateBouncerLab\bin\conversion_worker.exe',
+                'C:\GateBouncerLab\bin\guest_native_controller.dll')) {
+                $stage=Get-Variable -Name GbVmEnrollmentAttempt -Scope Global -ErrorAction SilentlyContinue
+                if($stage) {
+                    $original=$stage.Value
+                    if($original.Owner -cne $ownerId -or -not $original.Complete -or $original.Writes.Count -ne 7) {
+                        throw 'GuestOriginalReadersRequired'
+                    }
+                    $slot=$original.Writes[$global:GbGuestOwnObservation.Streams.Count]
+                    if($slot.Path -cne $path -or -not $slot.Written -or -not $slot.Stream.CanRead) {
+                        throw 'GuestOriginalReaderChanged'
+                    }
+                    $stream=$slot.Stream
+                } else {
+                    $stream=[IO.FileStream]::new($path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+                }
                 $global:GbGuestOwnObservation.Streams.Add($stream)
                 $global:GbGuestOwnObservation.Identities.Add([GbGuestReadCustody]::Inspect($stream.SafeFileHandle,$path,$false))
                 $parent=[IO.Path]::GetDirectoryName($path)
@@ -67,7 +81,7 @@ public static class GbGuestReadCustody {
             $global:GbGuestOwnObservation.Complete=$true
         }
         $item=$global:GbGuestOwnObservation
-        if ($item.Owner -cne $ownerId -or -not $item.Complete -or $item.Streams.Count -ne 6) { throw 'GuestCustodyUnknown' }
+        if ($item.Owner -cne $ownerId -or -not $item.Complete -or $item.Streams.Count -ne 7) { throw 'GuestCustodyUnknown' }
         $hashes=[Collections.Generic.List[string]]::new()
         for ($i=0;$i -lt $item.Parents.Count;$i++) { $null=[GbGuestReadCustody]::Inspect($item.Parents[$i],$item.ParentPaths[$i],$true) }
         for ($i=0;$i -lt $item.Streams.Count;$i++) {
@@ -104,7 +118,7 @@ function Invoke-VmGuestObservationOwn($owner) {
     if ($script:VmBoundary.Busy) { throw 'ProvisioningBusy' }
     # Sólo el productor propio puede dar la sesión y paquete vivos; sin setters de DTO.
     if (-not $owner.GuestPackage -or -not [object]::ReferenceEquals($owner.GuestPackage.Owner,$owner) -or
-        $owner.GuestPackage.Generation -ne $owner.Generation -or $owner.GuestPackage.Hashes.Count -ne 6 -or
+        $owner.GuestPackage.Generation -ne $owner.Generation -or $owner.GuestPackage.Hashes.Count -ne 7 -or
         $owner.Kind -cne 'Windows' -or -not $owner.GuestEnrollment -or $owner.GuestEnrollment.Revoked -or
         -not [object]::ReferenceEquals($owner.GuestEnrollment.Owner,$owner) -or
         -not [object]::ReferenceEquals($owner.GuestEnrollment.Package,$owner.GuestPackage) -or
@@ -139,8 +153,8 @@ function Invoke-VmGuestObservationOwn($owner) {
         $reply=$reply[0]
         if ($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
             $reply.Boot -isnot [long] -or $reply.Boot -le 0 -or ($guest.Boot -and $guest.Boot -ne $reply.Boot) -or
-            $reply.Sid -cne $guest.Package.Sid -or @($reply.Hashes).Count -ne 6 -or @($reply.Files).Count -ne 6) { throw 'GuestBootPinChanged' }
-        for ($i=0;$i -lt 6;$i++) {
+            $reply.Sid -cne $guest.Package.Sid -or @($reply.Hashes).Count -ne 7 -or @($reply.Files).Count -ne 7) { throw 'GuestBootPinChanged' }
+        for ($i=0;$i -lt 7;$i++) {
             if ($guest.Package.Hashes[$i] -cnotmatch '^[0-9A-F]{64}$' -or $reply.Hashes[$i] -cne $guest.Package.Hashes[$i]) { throw 'GuestImagePinChanged' }
             $file=$guest.Package.GuestIdentities[$i]
             if ($file.Volume -ne $reply.Files[$i].Volume -or $file.IdHi -ne $reply.Files[$i].IdHi -or
@@ -166,13 +180,21 @@ function Invoke-VmGuestObservationOwn($owner) {
         Set-VmOwnRevoked $owner $_.Exception.Message
     } finally { $script:VmBoundary.Frame=$null; $script:VmBoundary.Busy=$false }
 }
-function Close-VmGuestObservationOwn($owner) {
+function Close-VmGuestObservationOwn($owner,[bool]$enrollmentFrame=$false) {
     if (-not [object]::ReferenceEquals((Get-VmOwnRecord $owner.Id),$owner)) { throw 'GuestOwnerUnknown' }
     $guest=$owner.GuestObservation
     if (-not $guest) { return }
     $guest.Confirmed=$false
-    if ($script:VmBoundary.Busy) { throw 'ProvisioningBusy' }
-    $script:VmBoundary.Busy=$true
+    if ($enrollmentFrame) {
+        if (-not $script:VmBoundary.Busy -or -not $script:VmBoundary.Frame -or
+            -not $script:VmBoundary.Frame.Cleanup -or
+            -not [object]::ReferenceEquals($script:VmBoundary.Frame.Owner,$owner) -or
+            -not $owner.GuestEnrollment) { throw 'GuestCleanupFrameUnknown' }
+        Test-VmOwnFrame
+    } else {
+        if ($script:VmBoundary.Busy) { throw 'ProvisioningBusy' }
+        $script:VmBoundary.Busy=$true
+    }
     try {
     if (-not $guest.ObserveSubmitted) {
         foreach ($session in @($guest.Resources)) {
@@ -197,5 +219,5 @@ function Close-VmGuestObservationOwn($owner) {
     # El canal pertenece al enrollment; éste lo cierra después de captura/cuenta/streams.
     if (-not $owner.GuestEnrollment) { & $script:VmGuestRemove $guest.Session }
     $guest.Session=$null; $guest.Resources.Clear(); $owner.GuestObservation=$null
-    } finally { $script:VmBoundary.Busy=$false }
+    } finally { if (-not $enrollmentFrame) { $script:VmBoundary.Busy=$false } }
 }

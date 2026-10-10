@@ -16,6 +16,7 @@ class GuestNoJobObserver;
 class LinuxSshCreator;
 class PrivateDesktopOwner;
 class WindowsNativeOwnedLaunchContext;
+class FixedGuestBrokerSource;
 class OwnedSuspendedProcess final : public std::enable_shared_from_this<OwnedSuspendedProcess> {
 public:
     enum class State { Creating, Suspended, Running, ClosePending, Closed };
@@ -37,6 +38,7 @@ private:
     friend class LinuxSshCreator;
     friend class PrivateDesktopOwner;
     friend class WindowsNativeOwnedLaunchContext;
+    friend class FixedGuestBrokerSource;
     OwnedSuspendedProcess() = default;
     // Hoja sin entry productivo: el adapter debe aportar guards y sello admitidos.
     static std::shared_ptr<OwnedSuspendedProcess> CreateSuspendedOwn(

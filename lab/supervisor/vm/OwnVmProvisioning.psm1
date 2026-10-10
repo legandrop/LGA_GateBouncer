@@ -86,7 +86,12 @@ function Set-VmOwnRevoked($owner,[string]$cause) {
         if ($owner.Generation -lt [long]::MaxValue) { $owner.Generation++ }
     }
     $owner.State='CleanupPending'; $owner.Cause=$cause
+    # Revocación host corta las hojas nativas originales, no sólo el diagnóstico.
+    $null=Revoke-VmGuestNativeOwn $owner
     $owner.Pending=[bool]($owner.Resources.Count -or $script:VmBoundary.Lease -or $script:VmBoundary.UnknownEffect)
+    if ($owner.GuestEnrollment -is [Collections.IDictionary] -and
+        $owner.GuestEnrollment.Contains('NativeRevokeUncertain') -and
+        $owner.GuestEnrollment.NativeRevokeUncertain) { $owner.Pending=$true }
 }
 function Read-VmOwnClock([bool]$cleanup=$false) {
     $now=[long](& $script:VmClock)
@@ -347,5 +352,6 @@ function Close-GbOwnVmProvisioning {
 }
 . (Join-Path $PSScriptRoot 'OwnVmBootAdapters.ps1')
 . (Join-Path $PSScriptRoot 'OwnVmGuestObservation.ps1')
+. (Join-Path $PSScriptRoot 'OwnVmGuestNativeCustody.ps1')
 . (Join-Path $PSScriptRoot 'OwnVmGuestEnrollment.ps1')
 Export-ModuleMember -Function Open-GbOwnVmProvisioning,Get-GbOwnVmProvisioningState,Revoke-GbOwnVmProvisioning,Close-GbOwnVmProvisioning,Prepare-GbOwnVmBoot,Start-GbOwnVmBoot,Initialize-GbOwnVmGuestEnrollment,Open-GbOwnVmCapture

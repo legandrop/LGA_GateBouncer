@@ -591,7 +591,7 @@ Error validate(const Frame &f) {
     if (a < 1 || a > 2 || p < 1 || p > 2 || scope < 2 || scope > 5 ||
         (scope == 2 ? get(f, T::AcceptedScope) !=
             (1u | (p == 1 ? 2u : 0u) | (a == 2 && d == 3 ? 4u : 0u)) :
-            p != 1 || d != 1 || get(f,T::AcceptedScope) != (1u << scope)))
+            p != 1 || d != 1 || get(f,T::AcceptedScope) != (std::uint64_t{1} << scope)))
       return Error::Malformed;
   }
   if (f.type == Type::PrepareFuturePolicy || f.type == Type::CommitFuturePolicy) {

@@ -73,7 +73,8 @@ function Open-VmEnrollmentPackageOwn($owner,$enrollment) {
         @('supervisor\GuestCommands.ps1','C:\GateBouncerLab\supervisor\GuestCommands.ps1'),
         @('supervisor\capture\capture_netevent.psm1','C:\GateBouncerLab\bin\capture_netevent.psm1'),
         @('bin\guest_conversion.dll','C:\GateBouncerLab\bin\guest_conversion.dll'),
-        @('bin\conversion_worker.exe','C:\GateBouncerLab\bin\conversion_worker.exe'))
+        @('bin\conversion_worker.exe','C:\GateBouncerLab\bin\conversion_worker.exe'),
+        @('bin\guest_native_controller.dll','C:\GateBouncerLab\bin\guest_native_controller.dll'))
     foreach ($source in $sources) {
         Test-VmOwnFrame
         $path=[IO.Path]::GetFullPath((Join-Path $root $source[0]))
@@ -107,7 +108,7 @@ function Confirm-VmEnrollmentPackageOwn($owner,[bool]$cleanup=$false) {
         ($package.Generation -ne $owner.Generation -and -not ($cleanup -and $owner.GuestEnrollment -and
             [object]::ReferenceEquals($owner.GuestEnrollment.Package,$package) -and
             $package.Generation -eq $owner.GuestEnrollment.Generation)) -or -not $package.Complete -or
-        $package.Entries.Count -ne 6 -or $package.Hashes.Count -ne 6 -or $package.Paths.Count -ne 6) { throw 'EnrollmentPackageRevoked' }
+        $package.Entries.Count -ne 7 -or $package.Hashes.Count -ne 7 -or $package.Paths.Count -ne 7) { throw 'EnrollmentPackageRevoked' }
     foreach ($entry in $package.Entries) {
         if (-not $entry.Stream.CanRead -or -not [GbVmEnrollmentCustody]::Same($entry.Identity,
             [GbVmEnrollmentCustody]::Inspect($entry.Stream.SafeFileHandle,$entry.Path,$false))) { throw 'EnrollmentPackageChanged' }
@@ -161,11 +162,12 @@ $script:VmEnrollmentInstall={
         param($ownerId,$challenge,$name,$password,$targets,$hashes)
         if ($ownerId -cnotmatch '^[0-9a-f]{32}$' -or $challenge -cnotmatch '^[0-9a-f]{64}$' -or
             $name -cne ('gb'+$ownerId.Substring(0,18)) -or $password -isnot [Security.SecureString] -or
-            @($targets).Count -ne 6 -or @($hashes).Count -ne 6) { throw 'EnrollmentInstallInvalid' }
+            @($targets).Count -ne 7 -or @($hashes).Count -ne 7) { throw 'EnrollmentInstallInvalid' }
         $fixed=@('C:\GateBouncerLab\bin\guest_broker.exe','C:\GateBouncerLab\bin\desktop_worker.exe',
             'C:\GateBouncerLab\supervisor\GuestCommands.ps1','C:\GateBouncerLab\bin\capture_netevent.psm1',
-            'C:\GateBouncerLab\bin\guest_conversion.dll','C:\GateBouncerLab\bin\conversion_worker.exe')
-        for ($i=0;$i -lt 6;$i++) {
+            'C:\GateBouncerLab\bin\guest_conversion.dll','C:\GateBouncerLab\bin\conversion_worker.exe',
+            'C:\GateBouncerLab\bin\guest_native_controller.dll')
+        for ($i=0;$i -lt 7;$i++) {
             if ($targets[$i] -cne $fixed[$i] -or $hashes[$i] -cnotmatch '^[0-9A-F]{64}$') { throw 'EnrollmentPackageInvalid' }
         }
         if (Get-Variable -Name GbVmEnrollmentAttempt -Scope Global -ErrorAction SilentlyContinue) { throw 'EnrollmentInstallReplay' }
@@ -196,18 +198,6 @@ public static class GbVmEnrollmentWrittenFile {
         }
         if (Test-Path -LiteralPath 'C:\GateBouncerLab' -ErrorAction Stop) { throw 'EnrollmentRootPreexisting' }
         if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { throw 'EnrollmentAccountPreexisting' }
-        $attempt.AccountSubmitted=$true
-        $account=New-LocalUser -Name $name -Password $password -Description ('GateBouncer guest '+$ownerId) -ErrorAction Stop
-        $attempt.Account=$account
-        if ($account -isnot [Microsoft.PowerShell.Commands.LocalUser] -or $account.Name -cne $name -or
-            $account.SID.Value -cnotmatch '^S-1-5-21-[0-9-]+$') { throw 'EnrollmentAccountUnconfirmed' }
-        $attempt.Sid=$account.SID.Value
-        # PowerShell Direct requiere una cuenta administradora; sólo dentro de esta VM propia.
-        $group=Get-LocalGroup -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')) -ErrorAction Stop
-        $attempt.GroupSubmitted=$true
-        Add-LocalGroupMember -Group $group -Member $account -ErrorAction Stop
-        $members=@(Get-LocalGroupMember -Group $group -ErrorAction Stop | Where-Object { $_.SID.Value -ceq $attempt.Sid })
-        if ($members.Count -ne 1) { throw 'EnrollmentGroupUnconfirmed' }
         foreach ($path in @('C:\GateBouncerLab','C:\GateBouncerLab\bin','C:\GateBouncerLab\supervisor')) {
             $attempt.Directories.Add($path)
             $null=New-Item -ItemType Directory -Path $path -ErrorAction Stop
@@ -223,7 +213,7 @@ $script:VmEnrollmentWrite={
         param($ownerId,$challenge,$index,$bytes)
         $a=$global:GbVmEnrollmentAttempt
         if (-not $a -or $a.Owner -cne $ownerId -or $a.Complete -or $challenge -cnotmatch '^[0-9a-f]{64}$' -or
-            $index -ne $a.Writes.Count -or $index -lt 0 -or $index -gt 5 -or $bytes -isnot [byte[]] -or
+            $index -ne $a.Writes.Count -or $index -lt 0 -or $index -gt 6 -or $bytes -isnot [byte[]] -or
             $bytes.Length -le 0 -or $bytes.Length -gt 16777216) { throw 'EnrollmentWriteInvalid' }
         # No sobrescribe archivos ajenos; slot custodiado antes de CreateNew/Flush.
         $slot=@{Path=$a.Targets[$index];Submitted=$false;Stream=$null;Written=$false;Identity=$null}
@@ -244,11 +234,18 @@ $script:VmEnrollmentSeal={
     Microsoft.PowerShell.Core\Invoke-Command -Session $session -ScriptBlock {
         param($ownerId,$challenge)
         $a=$global:GbVmEnrollmentAttempt
-        if (-not $a -or $a.Owner -cne $ownerId -or $a.Complete -or $a.Writes.Count -ne 6 -or
+        if (-not $a -or $a.Owner -cne $ownerId -or $a.Complete -or $a.Writes.Count -ne 7 -or
             $challenge -cnotmatch '^[0-9a-f]{64}$') { throw 'EnrollmentSealInvalid' }
         foreach ($slot in $a.Writes) {
             if (-not $slot.Written -or -not $slot.Stream.CanRead) { throw 'EnrollmentSealIncomplete' }
             $slot.Stream.Dispose(); $slot.Stream=$null
+            # Captura lector en la hoja ORIGINAL antes de validar el hueco de close/open.
+            $slot.Stream=[IO.FileStream]::new($slot.Path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::Read)
+            $reader=[GbVmEnrollmentWrittenFile]::Inspect($slot.Stream.SafeFileHandle)
+            if($reader.Volume -ne $slot.Identity.Volume -or $reader.IdHi -ne $slot.Identity.IdHi -or
+                $reader.IdLo -ne $slot.Identity.IdLo -or $reader.SizeHi -ne $slot.Identity.SizeHi -or
+                $reader.SizeLo -ne $slot.Identity.SizeLo -or $reader.WriteHi -ne $slot.Identity.WriteHi -or
+                $reader.WriteLo -ne $slot.Identity.WriteLo) { throw 'EnrollmentOriginalReaderChanged' }
         }
         $a.Complete=$true
         [pscustomobject]@{Owner=$ownerId;Challenge=$challenge;Sid=$a.Sid;Sealed=$true;
@@ -256,12 +253,51 @@ $script:VmEnrollmentSeal={
                 IdHi=[uint32]$_.Identity.IdHi;IdLo=[uint32]$_.Identity.IdLo} })}
     } -ArgumentList $ownerId,$challenge -ErrorAction Stop
 }
+
+$script:VmEnrollmentAccount={
+    param($session,$ownerId,$challenge,$name,$password)
+    Microsoft.PowerShell.Core\Invoke-Command -Session $session -ScriptBlock {
+        param($ownerId,$challenge,$name,$password)
+        $attempt=$global:GbVmEnrollmentAttempt
+        if(-not $attempt -or $attempt.Owner -cne $ownerId -or $attempt.Name -cne $name -or
+           -not $attempt.Complete -or $attempt.Writes.Count -ne 7 -or $attempt.AccountSubmitted -or
+           $challenge -cnotmatch '^[0-9a-f]{64}$' -or $password -isnot [Security.SecureString]) {throw 'EnrollmentAccountInvalid'}
+        if(-not $global:GbGuestNativeCustody.ReadyOwn()){throw 'EnrollmentOriginalKeeperRequired'}
+        if(Get-LocalUser -Name $name -ErrorAction SilentlyContinue){throw 'EnrollmentAccountPreexisting'}
+        $attempt.AccountSubmitted=$true
+        $global:GbGuestNativeCustody.BeginAccountOwn()
+        $account=New-LocalUser -Name $name -Password $password -Description ('GateBouncer guest '+$ownerId) -ErrorAction Stop
+        $attempt.Account=$account
+        if($account -isnot [Microsoft.PowerShell.Commands.LocalUser] -or $account.Name -cne $name -or
+           $account.SID.Value -cnotmatch '^S-1-5-21-[0-9-]+$'){throw 'EnrollmentAccountUnconfirmed'}
+        $attempt.Sid=$account.SID.Value
+        $readback=@(Get-LocalUser -SID $account.SID -ErrorAction Stop)
+        if($readback.Count -ne 1 -or $readback[0].Name -cne $name -or -not $readback[0].Enabled -or
+           $readback[0].SID.Value -cne $attempt.Sid){throw 'EnrollmentAccountChanged'}
+        $group=Get-LocalGroup -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')) -ErrorAction Stop
+        $attempt.GroupSubmitted=$true
+        Add-LocalGroupMember -Group $group -Member $account -ErrorAction Stop
+        $members=@(Get-LocalGroupMember -Group $group -ErrorAction Stop|Where-Object {$_.SID.Value -ceq $attempt.Sid})
+        if($members.Count -ne 1){throw 'EnrollmentGroupUnconfirmed'}
+        $global:GbGuestNativeCustody.AccountOwn()
+        [pscustomobject]@{Owner=$ownerId;Challenge=$challenge;Sid=$attempt.Sid;Created=$true}
+    } -ArgumentList $ownerId,$challenge,$name,$password -ErrorAction Stop
+}
+
 function Invoke-VmEnrollmentEffectOwn($owner,$enrollment,[scriptblock]$port,[object[]]$arguments) {
     Test-VmOwnFrame; Confirm-VmStoragePeers $owner
     Confirm-VmEnrollmentChannelOwn $owner $enrollment.Bootstrap
     $null=Confirm-VmEnrollmentPackageOwn $owner
     $before=Read-VmEnrollmentBootOwn $owner $enrollment.Bootstrap
     Confirm-VmEnrollmentBootPairOwn $enrollment.BootstrapObservation $before $true
+    $target=$enrollment.Bootstrap
+    if($enrollment.Channel -and [object]::ReferenceEquals($arguments[0],$enrollment.Channel.Session)) {
+        $target=$enrollment.Channel
+        Confirm-VmEnrollmentChannelOwn $owner $target
+        $observed=Read-VmEnrollmentBootOwn $owner $target
+        Confirm-VmEnrollmentBootPairOwn $enrollment.AuthenticatedObservation $observed $true
+        Confirm-VmEnrollmentBootPairOwn $before $observed $false
+    }
     if ($enrollment.Revoked -or $owner.Revoked -or $enrollment.Generation -ne $owner.Generation) { throw 'EnrollmentRevoked' }
     # Un retorno tardío queda capturado antes de volver a comprobar guards.
     $attempt=@{Submitted=$false;Outputs=[Collections.Generic.List[object]]::new();Confirmed=$false}
@@ -273,6 +309,12 @@ function Invoke-VmEnrollmentEffectOwn($owner,$enrollment,[scriptblock]$port,[obj
     $null=Confirm-VmEnrollmentPackageOwn $owner
     $after=Read-VmEnrollmentBootOwn $owner $enrollment.Bootstrap
     Confirm-VmEnrollmentBootPairOwn $enrollment.BootstrapObservation $after $true
+    if(-not [object]::ReferenceEquals($target,$enrollment.Bootstrap)) {
+        Confirm-VmEnrollmentChannelOwn $owner $target
+        $observed=Read-VmEnrollmentBootOwn $owner $target
+        Confirm-VmEnrollmentBootPairOwn $enrollment.AuthenticatedObservation $observed $true
+        Confirm-VmEnrollmentBootPairOwn $after $observed $false
+    }
     if ($enrollment.Revoked -or $owner.Revoked -or $enrollment.Generation -ne $owner.Generation -or
         $attempt.Outputs.Count -ne 1) { throw 'EnrollmentEffectUnconfirmed' }
     $owner.Observed=Read-VmOwnClock
@@ -307,6 +349,16 @@ function Confirm-VmGuestEnrollmentOwn($enrollment,[bool]$cleanup=$false) {
             Confirm-VmEnrollmentBootPairOwn $enrollment.AuthenticatedObservation $right $true
             Confirm-VmEnrollmentBootPairOwn $left $right $false
             if ($right.Sid -cne $owner.GuestPackage.Sid) { throw 'EnrollmentAccountChanged' }
+            if(-not $enrollment.NativeConfirmed -or -not $enrollment.NativeBootstrapSubmitted -or
+               -not $enrollment.NativeControllerSubmitted){throw 'EnrollmentNativeRequired'}
+            foreach($nativeChannel in @($enrollment.Bootstrap,$enrollment.Channel)){
+                $challenge=New-VmEnrollmentChallengeOwn
+                $nativeReply=@(& $script:VmNativeCall $nativeChannel.Session $owner.Id.ToString('N') $challenge 'Current' @())
+                Test-VmOwnFrame;Confirm-VmEnrollmentChannelOwn $owner $nativeChannel
+                if($nativeReply.Count -ne 1 -or $nativeReply[0].Owner -cne $owner.Id.ToString('N') -or
+                   $nativeReply[0].Challenge -cne $challenge -or $nativeReply[0].Confirmed -isnot [bool] -or
+                   -not $nativeReply[0].Confirmed){throw 'EnrollmentNativeCurrentUnconfirmed'}
+            }
             # Volver a leer las hojas retenidas por AMBOS canales, además del boot.
             foreach ($channel in @($enrollment.Bootstrap,$enrollment.Channel)) {
                 $challenge=New-VmEnrollmentChallengeOwn
@@ -314,8 +366,8 @@ function Confirm-VmGuestEnrollmentOwn($enrollment,[bool]$cleanup=$false) {
                 Test-VmOwnFrame; Confirm-VmEnrollmentChannelOwn $owner $channel
                 if ($reply.Count -ne 1 -or $reply[0].Owner -cne $owner.Id.ToString('N') -or
                     $reply[0].Challenge -cne $challenge -or $reply[0].Boot -ne $left.Boot -or
-                    @($reply[0].Hashes).Count -ne 6 -or @($reply[0].Files).Count -ne 6) { throw 'EnrollmentPinsLost' }
-                for ($i=0;$i -lt 6;$i++) {
+                    @($reply[0].Hashes).Count -ne 7 -or @($reply[0].Files).Count -ne 7) { throw 'EnrollmentPinsLost' }
+                for ($i=0;$i -lt 7;$i++) {
                     $file=$owner.GuestPackage.GuestIdentities[$i]; $actual=$reply[0].Files[$i]
                     if ($reply[0].Hashes[$i] -cne $owner.GuestPackage.Hashes[$i] -or
                         $file.Volume -ne $actual.Volume -or $file.IdHi -ne $actual.IdHi -or
@@ -323,6 +375,12 @@ function Confirm-VmGuestEnrollmentOwn($enrollment,[bool]$cleanup=$false) {
                 }
             }
             $owner.Observed=Read-VmOwnClock
+            # Diagnóstico fresco sólo después de revalidar recursos/canales originales.
+            $guest=$owner.GuestObservation
+            if ($guest -and $guest.Confirmed -and
+                [object]::ReferenceEquals($guest.Session,$enrollment.Channel.Session) -and
+                [object]::ReferenceEquals($guest.Package,$enrollment.Package) -and
+                $guest.Boot -eq $right.Boot) { $guest.Observed=$owner.Observed }
         }
     } catch {
         $enrollment.Confirmed=$false; $enrollment.Revoked=$true
@@ -346,7 +404,9 @@ function Initialize-GbOwnVmGuestEnrollment {
             Credential=$null;Secret=$null;BootstrapObservation=$null;AuthenticatedObservation=$null;BootstrapPinsSubmitted=$false;
             Attempts=[Collections.Generic.List[object]]::new();Supervisor=$null;SupervisorModule=$null;
             AccountName=('gb'+$owner.Id.ToString('N').Substring(0,18));AccountSid='';InstallSubmitted=$false;
-            DisableSubmitted=$false;DisableObserved=$false;CloseObserved=$false}
+            DisableSubmitted=$false;DisableObserved=$false;CloseObserved=$false;
+            AccountSubmitted=$false;NativeBootstrapSubmitted=$false;NativeControllerSubmitted=$false;
+            NativeConfirmed=$false;NativeBootstrapClosed=$false;NativeControllerClosed=$false}
         $owner.GuestEnrollment=$e
         $null=Open-VmEnrollmentPackageOwn $owner $e
         $bytes=New-Object byte[] 48; $rng=[Security.Cryptography.RandomNumberGenerator]::Create()
@@ -369,9 +429,9 @@ function Initialize-GbOwnVmGuestEnrollment {
             $e.Package.Paths.ToArray(),$e.Package.Hashes.ToArray())
         $reply=$attempt.Outputs[0]
         if ($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
-            $reply.Prepared -isnot [bool] -or -not $reply.Prepared -or $reply.Sid -cnotmatch '^S-1-5-21-[0-9-]+$') { throw 'EnrollmentAccountUnconfirmed' }
-        $e.AccountSid=$reply.Sid; $e.Package.Sid=$reply.Sid; $attempt.Confirmed=$true
-        for ($i=0;$i -lt 6;$i++) {
+            $reply.Prepared -isnot [bool] -or -not $reply.Prepared -or $reply.Sid -cne '') { throw 'EnrollmentStageUnconfirmed' }
+        $attempt.Confirmed=$true
+        for ($i=0;$i -lt 7;$i++) {
             $entry=$e.Package.Entries[$i]; $null=Confirm-VmEnrollmentPackageOwn $owner
             $payload=New-Object byte[] ([int]$entry.Stream.Length)
             try {
@@ -396,7 +456,7 @@ function Initialize-GbOwnVmGuestEnrollment {
         $reply=$attempt.Outputs[0]
         if ($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
             $reply.Sid -cne $e.AccountSid -or $reply.Sealed -isnot [bool] -or -not $reply.Sealed -or
-            @($reply.Files).Count -ne 6) { throw 'EnrollmentPackageSealUnconfirmed' }
+            @($reply.Files).Count -ne 7) { throw 'EnrollmentPackageSealUnconfirmed' }
         $attempt.Confirmed=$true
         $writtenIdentities=@($reply.Files)
         $challenge=New-VmEnrollmentChallengeOwn; $e.BootstrapPinsSubmitted=$true
@@ -405,18 +465,79 @@ function Initialize-GbOwnVmGuestEnrollment {
         $reply=$attempt.Outputs[0]
         if ($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
             $reply.Boot -ne $e.BootstrapObservation.Boot -or $reply.Sid -cne $e.BootstrapObservation.Sid -or
-            @($reply.Hashes).Count -ne 6 -or @($reply.Files).Count -ne 6) { throw 'EnrollmentBootstrapPinsUnconfirmed' }
-        for ($i=0;$i -lt 6;$i++) {
+            @($reply.Hashes).Count -ne 7 -or @($reply.Files).Count -ne 7) { throw 'EnrollmentBootstrapPinsUnconfirmed' }
+        for ($i=0;$i -lt 7;$i++) {
             if ($reply.Hashes[$i] -cne $e.Package.Hashes[$i] -or $reply.Files[$i].Volume -ne $writtenIdentities[$i].Volume -or
                 $reply.Files[$i].IdHi -ne $writtenIdentities[$i].IdHi -or $reply.Files[$i].IdLo -ne $writtenIdentities[$i].IdLo) { throw 'EnrollmentWrittenFileChanged' }
         }
         $e.Package.GuestIdentities=@($reply.Files); $attempt.Confirmed=$true
+        $challenge=New-VmEnrollmentChallengeOwn; $e.NativeBootstrapSubmitted=$true
+        $attempt=Invoke-VmEnrollmentEffectOwn $owner $e $script:VmNativeLoad @(
+            $e.Bootstrap.Session,$owner.Id.ToString('N'),$challenge,'Bootstrap')
+        $reply=$attempt.Outputs[0]
+        if($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
+           $reply.Reserved -isnot [bool] -or -not $reply.Reserved){throw 'EnrollmentKeeperUnconfirmed'}
+        $attempt.Confirmed=$true
+        $challenge=New-VmEnrollmentChallengeOwn; $e.AccountSubmitted=$true
+        $attempt=Invoke-VmEnrollmentEffectOwn $owner $e $script:VmEnrollmentAccount @(
+            $e.Bootstrap.Session,$owner.Id.ToString('N'),$challenge,$e.AccountName,$e.Secret)
+        $reply=$attempt.Outputs[0]
+        if($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
+           $reply.Created -isnot [bool] -or -not $reply.Created -or
+           $reply.Sid -cnotmatch '^S-1-5-21-[0-9-]+$'){throw 'EnrollmentAccountUnconfirmed'}
+        $e.AccountSid=$reply.Sid; $e.Package.Sid=$reply.Sid; $attempt.Confirmed=$true
         $null=Open-VmEnrollmentChannelOwn $owner $e.Credential $e 'Channel'
         $e.AuthenticatedObservation=Read-VmEnrollmentBootOwn $owner $e.Channel
         $left=Read-VmEnrollmentBootOwn $owner $e.Bootstrap
         Confirm-VmEnrollmentBootPairOwn $e.BootstrapObservation $left $true
         Confirm-VmEnrollmentBootPairOwn $left $e.AuthenticatedObservation $false
         if ($e.AuthenticatedObservation.Sid -cne $e.AccountSid) { throw 'EnrollmentAccountChanged' }
+        # Readers del mismo Channel original ANTES del ingreso nativo.
+        $challenge=New-VmEnrollmentChallengeOwn
+        $attempt=Invoke-VmEnrollmentEffectOwn $owner $e $script:VmGuestCall @(
+            $e.Channel.Session,'Observe',$owner.Id.ToString('N'),$challenge)
+        $reply=$attempt.Outputs[0]
+        if($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
+           $reply.Boot -ne $e.AuthenticatedObservation.Boot -or $reply.Sid -cne $e.AccountSid -or
+           @($reply.Hashes).Count -ne 7 -or @($reply.Files).Count -ne 7){throw 'EnrollmentControllerPinsUnconfirmed'}
+        for($i=0;$i -lt 7;$i++){
+            if($reply.Hashes[$i] -cne $e.Package.Hashes[$i] -or $reply.Files[$i].Volume -ne $writtenIdentities[$i].Volume -or
+               $reply.Files[$i].IdHi -ne $writtenIdentities[$i].IdHi -or $reply.Files[$i].IdLo -ne $writtenIdentities[$i].IdLo){
+                throw 'EnrollmentControllerReaderChanged'
+            }
+        }
+        $attempt.Confirmed=$true
+        $challenge=New-VmEnrollmentChallengeOwn; $e.NativeControllerSubmitted=$true
+        $attempt=Invoke-VmEnrollmentEffectOwn $owner $e $script:VmNativeLoad @(
+            $e.Channel.Session,$owner.Id.ToString('N'),$challenge,'Controller')
+        $candidate=$attempt.Outputs[0]
+        if($candidate.Owner -cne $owner.Id.ToString('N') -or $candidate.Challenge -cne $challenge -or
+           $candidate.Reserved -isnot [bool] -or -not $candidate.Reserved -or
+           [uint64]$candidate.Pid -eq 0 -or [uint64]$candidate.Creation -eq 0 -or
+           [uint64]$candidate.Correlation -eq 0){throw 'EnrollmentOriginalCandidateUnconfirmed'}
+        $attempt.Confirmed=$true
+        $challenge=New-VmEnrollmentChallengeOwn
+        $attempt=Invoke-VmEnrollmentEffectOwn $owner $e $script:VmNativeCall @(
+            $e.Bootstrap.Session,$owner.Id.ToString('N'),$challenge,'Original',
+            @($candidate.Pid,$candidate.Creation,$candidate.Correlation))
+        $reply=$attempt.Outputs[0]
+        if($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
+           $reply.Confirmed -isnot [bool] -or -not $reply.Confirmed){throw 'EnrollmentOriginalDeliveryUnconfirmed'}
+        $attempt.Confirmed=$true
+        $challenge=New-VmEnrollmentChallengeOwn
+        $attempt=Invoke-VmEnrollmentEffectOwn $owner $e $script:VmNativeCall @(
+            $e.Channel.Session,$owner.Id.ToString('N'),$challenge,'Bind',@())
+        $reply=$attempt.Outputs[0]
+        if($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
+           $reply.Confirmed -isnot [bool] -or -not $reply.Confirmed){throw 'EnrollmentNativeBindUnconfirmed'}
+        $attempt.Confirmed=$true
+        $challenge=New-VmEnrollmentChallengeOwn
+        $attempt=Invoke-VmEnrollmentEffectOwn $owner $e $script:VmNativeCall @(
+            $e.Bootstrap.Session,$owner.Id.ToString('N'),$challenge,'Seal',@())
+        $reply=$attempt.Outputs[0]
+        if($reply.Owner -cne $owner.Id.ToString('N') -or $reply.Challenge -cne $challenge -or
+           $reply.Confirmed -isnot [bool] -or -not $reply.Confirmed){throw 'EnrollmentNativeDeliveryUnconfirmed'}
+        $attempt.Confirmed=$true; $e.NativeConfirmed=$true
         $owner.Observed=Read-VmOwnClock
     } catch {
         if ($owner.GuestEnrollment) { $owner.GuestEnrollment.Revoked=$true; $owner.GuestEnrollment.Confirmed=$false }
@@ -426,7 +547,7 @@ function Initialize-GbOwnVmGuestEnrollment {
         # Segundo canal retiene la misma imagen instalada antes de emitir enrollment.
         Invoke-VmGuestObservationOwn $owner
         if (-not $owner.Revoked -and $owner.GuestObservation -and $owner.GuestObservation.Confirmed) {
-            $owner.GuestEnrollment.Confirmed=$true; $owner.State='GuestEnrolled'; $owner.Cause='BrokerNoJobNotObserved'
+            $owner.GuestEnrollment.Confirmed=$true; $owner.State='GuestEnrolled'; $owner.Cause='LinuxSshProducerPending'
         }
     }
     Get-VmOwnView $owner
@@ -480,12 +601,44 @@ function Close-VmGuestEnrollmentOwn($owner) {
         & $e.SupervisorModule { param($bound) Close-GbOwnEnrollmentSupervisor $bound } $e | Out-Null
         if ($e.Supervisor.State -cne 'Closed') { throw 'EnrollmentCaptureClosePending' }
     }
-    if ($owner.GuestObservation) { Close-VmGuestObservationOwn $owner }
     if ($script:VmBoundary.Busy) { throw 'ProvisioningBusy' }
     $script:VmBoundary.Busy=$true
     try {
         Enter-VmOwnFrame $owner $true; Test-VmOwnFrame; Confirm-VmStoragePeers $owner
-        if ($e.InstallSubmitted -and -not $e.DisableObserved) {
+        # Cierre usa custodia original incluso si el enrollment quedó parcial/revocado.
+        if ($e.NativeControllerSubmitted -and -not $e.NativeControllerClosed) {
+            Confirm-VmEnrollmentChannelOwn $owner $e.Channel $true
+            $challenge=New-VmEnrollmentChallengeOwn
+            $reply=@(& $script:VmNativeCall $e.Channel.Session $owner.Id.ToString('N') $challenge 'Close' @())
+            Test-VmOwnFrame; Confirm-VmEnrollmentChannelOwn $owner $e.Channel $true
+            if ($reply.Count -ne 1 -or $reply[0].Owner -cne $owner.Id.ToString('N') -or
+                $reply[0].Challenge -cne $challenge -or $reply[0].Confirmed -isnot [bool] -or
+                -not $reply[0].Confirmed) { throw 'EnrollmentControllerCloseUnconfirmed' }
+            $e.NativeControllerClosed=$true
+        }
+        if ($owner.GuestObservation) { Close-VmGuestObservationOwn $owner $true }
+        # El keeper retiene la sección hasta observar exit del receptor real.
+        if ($e.Channel -and -not $e.Channel.Closed) {
+            foreach ($session in @($e.Channel.Resources)) {
+                if ($session -isnot [System.Management.Automation.Runspaces.PSSession] -or
+                    $session.Runspace.ConnectionInfo -isnot [System.Management.Automation.Runspaces.VMConnectionInfo] -or
+                    $session.Runspace.ConnectionInfo.VMGuid -ne $owner.VmId) { throw 'EnrollmentCleanupIdentityUnknown' }
+                & $script:VmGuestRemove $session
+                $null=$e.Channel.Resources.Remove($session)
+            }
+            $e.Channel.Session=$null; $e.Channel.Closed=$true
+        }
+        if ($e.NativeBootstrapSubmitted -and -not $e.NativeBootstrapClosed) {
+            Confirm-VmEnrollmentChannelOwn $owner $e.Bootstrap $true
+            $challenge=New-VmEnrollmentChallengeOwn
+            $reply=@(& $script:VmNativeCall $e.Bootstrap.Session $owner.Id.ToString('N') $challenge 'Close' @())
+            Test-VmOwnFrame; Confirm-VmEnrollmentChannelOwn $owner $e.Bootstrap $true
+            if ($reply.Count -ne 1 -or $reply[0].Owner -cne $owner.Id.ToString('N') -or
+                $reply[0].Challenge -cne $challenge -or $reply[0].Confirmed -isnot [bool] -or
+                -not $reply[0].Confirmed) { throw 'EnrollmentBootstrapCloseUnconfirmed' }
+            $e.NativeBootstrapClosed=$true
+        }
+        if ($e.AccountSubmitted -and -not $e.DisableObserved) {
             Confirm-VmEnrollmentChannelOwn $owner $e.Bootstrap $true
             if (-not $e.AccountSid -or -not $e.BootstrapObservation) { throw 'EnrollmentAccountEffectUncertain' }
             # Una respuesta incierta no habilita volver a emitir Disable.
