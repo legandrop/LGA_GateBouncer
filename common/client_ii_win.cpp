@@ -33,10 +33,12 @@ ReadPeerState ReadPeerLease::checkLive() const noexcept {
         if (!lock.owns_lock()) return ReadPeerState::Unavailable;
         if (state_->revoked) return ReadPeerState::Closed;
         if (!state_->pipe || !state_->generation || wire::zero(state_->connection) ||
+            !state_->process.current() ||
             !state_->api.peek(state_->pipe, nullptr, 0, nullptr, nullptr, nullptr))
             return ReadPeerState::Unavailable;
         native::ProcessEvidence current;
-        if (!state_->api.evidence(state_->pipe, state_->image, current))
+        if (!state_->api.evidence(state_->pipe, state_->image, current) ||
+            !current.current() || !state_->process.current())
             return ReadPeerState::Unavailable;
         return current.pid == state_->process.pid &&
                CompareFileTime(&current.created, &state_->process.created) == 0 &&

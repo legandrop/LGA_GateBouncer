@@ -239,6 +239,11 @@ bool budgetQNameReview(const ReviewDocument &d, qint64 *bound) {
         if (event.instance && (!fixed(b, 32, 512) || !b.string(event.instance->sourceEpoch))) return false;
         if (event.native && (!fixed(b, 256, 2048) || !strings(b, {event.native->connection,
             event.native->observed, event.native->captureBinding, event.native->command}))) return false;
+        if (event.native && event.native->process) {
+            const auto &f = *event.native->process;
+            if (!fixed(b, 256, 4096) || !strings(b, {f.image, QString::fromLatin1(f.appId.toBase64()),
+                QString::fromLatin1(f.accountSid.toBase64()), QString::fromLatin1(f.logonSid.toBase64())})) return false;
+        }
         return true;
     };
     for (const auto &event : d.history.events) if (!eventBudget(event)) return false;

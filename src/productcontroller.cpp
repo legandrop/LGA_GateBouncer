@@ -5,8 +5,20 @@
 #include <QStandardPaths>
 #include <QMetaObject>
 #include <QBuffer>
+#include <algorithm>
 
 namespace Gate {
+struct ProductController::NativeProcessJob {
+    enum Phase { StatusBefore, Acquire, ReadBefore, Validate, ReadAfter, StatusAfter, Finish };
+    Phase phase = StatusBefore;
+    NativeContextSnapshot context;
+    std::shared_ptr<Data::NativeOwnBatch> batch;
+    QVector<QString> subjects;
+    int cursor = 0;
+    quint64 generation = 0, tag = 0;
+    bool pending = false;
+    QElapsedTimer age;
+};
 ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QObject *parent,
                                      std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel,
                                      std::unique_ptr<gb::ipc::ii::SessionChannel> ordinaryChannel)
@@ -32,6 +44,11 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
             records_.rejectHistory(historyError_); return;
         }
         historyChanged();
+        if (event.kind == Data::ActivityKind::Attempt && event.native && event.native->process) {
+            const auto context = records_.currentNativeContext(false);
+            if (context && source_.setNativeContext(context->binding,context->peer,context->connection) && source_.queueNativeAttempt(event))
+                QTimer::singleShot(0,this,[this] { if (!nativeProcessJob_) refreshProcesses(); });
+        }
     });
     connect(&records_, &DecisionViewClient::nativeGap, this,
         [this](const Data::NativeSourceBinding &binding, quint64 after, quint64 resync, quint64 revision,
@@ -44,6 +61,7 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
         });
     connect(&records_, &DecisionViewClient::nativeSourceLost, this,
         [this](const Data::NativeSourceBinding &binding, const QString &reason) {
+            cancelNativeProcesses();
             history_.disconnectNative(binding, reason); historyChanged();
         });
     historyFlush_.setInterval(1000);
@@ -51,6 +69,43 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
         if (!stopped_ && !simulation() && historyDirty_ && history_.flushDue(QDateTime::currentDateTimeUtc())) flushHistory();
     });
     historyFlush_.start();
+    nativeProcessTick_.setInterval(50);
+    connect(&nativeProcessTick_, &QTimer::timeout, this, &ProductController::advanceNativeProcesses);
+    connect(&records_, &DecisionViewClient::nativeSnapshotContext, this,
+        [this](quint64 tag,const NativeContextSnapshot &context) {
+            if (!nativeProcessJob_ || nativeProcessJob_->tag != tag || !nativeProcessJob_->pending) return;
+            auto &job = *nativeProcessJob_;
+            if (!(context.capabilities & gb::wire::iv::NativeProcessFacts) ||
+                !(context.binding == job.context.binding) || context.peer != job.context.peer ||
+                context.connection != job.context.connection || !context.peer ||
+                context.peer->checkLive() != gb::ipc::ii::ReadPeerState::Current ||
+                (job.phase == NativeProcessJob::StatusAfter && context.serial <= job.context.serial)) {
+                cancelNativeProcesses(); return;
+            }
+            job.pending = false; job.context = context;
+            if (job.phase == NativeProcessJob::StatusBefore) {
+                if (!source_.setNativeContext(context.binding,context.peer,context.connection)) { cancelNativeProcesses(); return; }
+                job.phase = NativeProcessJob::Acquire;
+            } else if (job.phase == NativeProcessJob::StatusAfter) job.phase = NativeProcessJob::Finish;
+            else { cancelNativeProcesses(); return; }
+            advanceNativeProcesses();
+        });
+    connect(&records_, &DecisionViewClient::nativeProcessContext, this,
+        [this](quint64 tag,const QString &subject,bool accepted,const NativeContextSnapshot &context,const QString &reason,
+               std::shared_ptr<const NativeProcessReceipt> receipt) {
+            if (!nativeProcessJob_ || nativeProcessJob_->tag != tag || !nativeProcessJob_->pending) return;
+            auto &job = *nativeProcessJob_;
+            if (!(context.binding == job.context.binding) || context.peer != job.context.peer ||
+                context.connection != job.context.connection || job.cursor >= job.subjects.size() ||
+                job.subjects[job.cursor] != subject ||
+                (job.phase != NativeProcessJob::ReadBefore && job.phase != NativeProcessJob::ReadAfter) ||
+                !receipt || receipt->accepted()!=accepted || receipt->descriptor()!=subject ||
+                !source_.admitNativeRead(job.batch,receipt,job.phase == NativeProcessJob::ReadBefore ? 1 : 2)) {
+                cancelNativeProcesses(); return;
+            }
+            if (!accepted && !reason.isEmpty()) catalog_.error = reason;
+            ++job.cursor; job.pending = false; advanceNativeProcesses();
+        });
     connect(&engine_, &EngineViewClient::changed, this, [this] {
         if (recordsSelected_) return;
         const auto &status = engine_.status();
@@ -61,6 +116,10 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
         emit changed();
     });
     connect(&records_, &DecisionViewClient::changed, this, [this] {
+        const bool paired = std::any_of(catalog_.processes.begin(),catalog_.processes.end(),
+            [](const Data::ProcessObservation &p) { return !p.identityEvidence.isEmpty(); });
+        if (paired && !records_.currentNativeContext()) cancelNativeProcesses();
+        else if (nativeProcessJob_) advanceNativeProcesses();
         if (!recordsSelected_) return;
         const auto &status = records_.status();
         if (!status.current || status.serviceEpoch != lastEpoch_ || status.bootId != lastBoot_ || records_.profile() != lastProfile_) {
@@ -73,7 +132,7 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
 }
 ProductController::~ProductController() {
     // La destrucción de miembros no emite hacia una ventana parcialmente destruida.
-    stopped_ = true; cancelImport(); semanticJob_ = QUuid{};
+    stopped_ = true; cancelNativeProcesses(); cancelImport(); semanticJob_ = QUuid{};
     if (worker_) { worker_->wait(); delete worker_; }
     if (semanticWorker_) { semanticWorker_->wait(); delete semanticWorker_; }
     if (importWorker_) { importWorker_->wait(); delete importWorker_; }
@@ -106,7 +165,7 @@ bool ProductController::flushHistory() {
 }
 void ProductController::stop() {
     if (stopped_) return;
-    stopped_ = true; historyFlush_.stop(); ++generation_; cancelImport();
+    stopped_ = true; cancelNativeProcesses(); historyFlush_.stop(); ++generation_; cancelImport();
     semanticJob_ = QUuid{}; draftView_ = {}; reviewView_ = {};
     engine_.invalidate(); records_.stop(); ordinary_.stop();
     flushHistory();
@@ -187,7 +246,7 @@ const Data::QNameCandidateFacts *ProductController::derivedQNameCandidate(bool d
 }
 void ProductController::setMode(UiMode mode) {
     if (stopped_ || mode_ == mode) return;
-    mode_ = mode; ++generation_; emit invalidated();
+    cancelNativeProcesses(); mode_ = mode; ++generation_; emit invalidated();
     cancelImport();
     engine_.invalidate();
     records_.invalidate();
@@ -198,15 +257,25 @@ void ProductController::setMode(UiMode mode) {
     emit changed();
 }
 bool ProductController::refreshProcesses() {
-    if (stopped_ || simulation() || (worker_ && worker_->isRunning())) return false;
+    if (stopped_ || simulation() || nativeProcessJob_ || (worker_ && worker_->isRunning())) return false;
     if (worker_) { delete worker_; worker_ = nullptr; }
+    const auto context = records_.currentNativeContext(false);
+    if (context && source_.hasNativeCandidates()) {
+        nativeProcessJob_ = std::make_unique<NativeProcessJob>();
+        nativeProcessJob_->context = *context; nativeProcessJob_->generation = generation_;
+        nativeProcessJob_->age.start(); nativeProcessTick_.start(); advanceNativeProcesses(); return true;
+    }
     const auto generation = generation_;
     worker_ = QThread::create([this, generation] {
         const auto result = source_.refresh();
         QMetaObject::invokeMethod(this, [this, generation, result] {
-            if (simulation() || generation != generation_) return;
+            if (stopped_ || simulation() || generation != generation_) return;
             catalog_ = result; emit changed();
         }, Qt::QueuedConnection);
+    });
+    connect(worker_, &QThread::finished, this, [this] {
+        if (!stopped_ && !simulation() && !nativeProcessJob_ && source_.hasNativeCandidates() && records_.currentNativeContext(false))
+            QTimer::singleShot(0,this,&ProductController::refreshProcesses);
     });
     worker_->start(); return true;
 }
@@ -329,5 +398,111 @@ QString ProductController::revisionSummary() const {
     if (!e.effectiveKnown) return "Desired revision " + QString::number(e.desired) + " · applied revision unknown" + suffix;
     return "Desired revision " + QString::number(e.desired) + " · applied revision " + QString::number(e.effective) +
            (e.desired == e.effective ? "" : " · changes not confirmed") + suffix;
+}
+} // namespace Gate
+
+namespace Gate {
+void ProductController::clearProcessHistory() {
+    for (auto &p : catalog_.processes) {
+        p.historySubjects.clear(); p.identityEvidence.clear(); p.sourceImage.reset();
+        p.lastAttemptUtc = {}; p.lastAuthorizedUtc = {}; p.lastTrafficUtc = {};
+    }
+}
+void ProductController::cancelNativeProcesses() {
+    nativeProcessTick_.stop(); nativeProcessJob_.reset(); source_.revokeNative(); clearProcessHistory();
+}
+void ProductController::projectProcessHistory(Data::ProcessCatalogResult &result) {
+    for (auto &p : result.processes) {
+        if (p.identityEvidence != "SourceRetainedImageAndOwnInstance") continue;
+        std::optional<Data::EventFact> facts[3];
+        bool ambiguous[3]{};
+        for (const auto &subject : p.historySubjects) {
+            const auto aggregate = history_.state().subjects.constFind(subject);
+            if (aggregate == history_.state().subjects.cend()) continue;
+            const std::optional<Data::EventFact> incoming[3]{aggregate->lastAttempt,aggregate->lastAuthorized,aggregate->lastTraffic};
+            for (int i=0;i<3;++i) if (incoming[i]) {
+                if (facts[i] && (facts[i]->sourceId != incoming[i]->sourceId || facts[i]->sourceEpoch != incoming[i]->sourceEpoch)) {
+                    ambiguous[i]=true; continue;
+                }
+                if (!facts[i] || incoming[i]->sequence.toULongLong() > facts[i]->sequence.toULongLong()) facts[i]=incoming[i];
+            }
+        }
+        p.lastAttemptUtc = !ambiguous[0] && facts[0] ? facts[0]->atUtc : QDateTime{};
+        p.lastAuthorizedUtc = !ambiguous[1] && facts[1] ? facts[1]->atUtc : QDateTime{};
+        p.lastTrafficUtc = !ambiguous[2] && facts[2] ? facts[2]->atUtc : QDateTime{};
+    }
+}
+void ProductController::advanceNativeProcesses() {
+    if (!nativeProcessJob_) return;
+    auto &job=*nativeProcessJob_;
+    const auto context=records_.currentNativeContext(false);
+    if (stopped_ || simulation() || job.age.elapsed()>=10000 || job.generation!=generation_ || !context ||
+        !(context->binding==job.context.binding) || context->peer!=job.context.peer || context->connection!=job.context.connection ||
+        (job.phase!=NativeProcessJob::StatusBefore && !(context->capabilities & gb::wire::iv::NativeProcessFacts))) {
+        catalog_.error="Original process window expired or was invalidated; history is retained.";
+        cancelNativeProcesses(); emit changed(); return;
+    }
+    if (job.pending || (worker_ && worker_->isRunning())) return;
+    if (job.phase==NativeProcessJob::Acquire || job.phase==NativeProcessJob::Validate || job.phase==NativeProcessJob::Finish) {
+        runNativeWorker(int(job.phase)); return;
+    }
+    if (job.phase==NativeProcessJob::ReadBefore || job.phase==NativeProcessJob::ReadAfter) {
+        if (job.cursor>=job.subjects.size()) {
+            job.phase=job.phase==NativeProcessJob::ReadBefore ? NativeProcessJob::Validate : NativeProcessJob::StatusAfter;
+            job.cursor=0; advanceNativeProcesses(); return;
+        }
+        const auto attempt=source_.nativeAttempt(job.batch,job.subjects[job.cursor]);
+        if (!attempt) { ++job.cursor; advanceNativeProcesses(); return; }
+        if (nativeProcessTag_==UINT64_MAX) { cancelNativeProcesses(); return; }
+        const auto tag=++nativeProcessTag_;
+        job.tag=tag; job.pending=true;
+        if (!records_.requestNativeProcessContext(tag,*attempt)) job.pending=false;
+        return;
+    }
+    if (nativeProcessTag_==UINT64_MAX) { cancelNativeProcesses(); return; }
+    const auto tag=++nativeProcessTag_;
+    job.tag=tag; job.pending=true;
+    if (!records_.requestNativeSnapshotContext(tag)) job.pending=false;
+}
+void ProductController::runNativeWorker(int phase) {
+    if (!nativeProcessJob_ || (worker_ && worker_->isRunning())) return;
+    if (worker_) { delete worker_; worker_=nullptr; }
+    const auto generation=nativeProcessJob_->generation;
+    const auto token=nativeProcessJob_->tag;
+    const auto batch=nativeProcessJob_->batch;
+    nativeProcessJob_->pending=true;
+    worker_=QThread::create([this,generation,token,phase,batch] {
+        std::shared_ptr<Data::NativeOwnBatch> acquired;
+        Data::ProcessCatalogResult result;
+        bool ok=false;
+        try {
+            if (phase==NativeProcessJob::Acquire) { acquired=source_.acquireNative(); ok=source_.batchCurrent(acquired); }
+            else if (phase==NativeProcessJob::Validate) ok=source_.validateNative(batch);
+            else { result=source_.finishNative(batch); ok=source_.batchCurrent(batch); }
+        } catch (...) { ok=false; }
+        QMetaObject::invokeMethod(this,[this,generation,token,phase,acquired,batch,result,ok] {
+            if (!nativeProcessJob_ || stopped_ || simulation() || nativeProcessJob_->generation!=generation ||
+                nativeProcessJob_->tag!=token || int(nativeProcessJob_->phase)!=phase) return;
+            auto &job=*nativeProcessJob_;
+            job.pending=false;
+            if (!ok) { cancelNativeProcesses(); emit changed(); return; }
+            if (phase==NativeProcessJob::Acquire) {
+                job.batch=acquired; job.subjects=source_.nativeSubjects(acquired); job.cursor=0;
+                job.phase=NativeProcessJob::ReadBefore;
+            } else if (phase==NativeProcessJob::Validate) {
+                job.subjects=source_.nativeSubjects(batch); job.cursor=0; job.phase=NativeProcessJob::ReadAfter;
+            } else {
+                const auto current=records_.currentNativeContext();
+                if (!current || !(current->binding==job.context.binding) || current->peer!=job.context.peer ||
+                    current->connection!=job.context.connection || !source_.publicationCurrent(batch) || job.age.elapsed()>=10000) {
+                    cancelNativeProcesses(); emit changed(); return;
+                }
+                auto published=result; projectProcessHistory(published); catalog_=std::move(published);
+                nativeProcessTick_.stop(); nativeProcessJob_.reset(); emit changed(); return;
+            }
+            advanceNativeProcesses();
+        },Qt::QueuedConnection);
+    });
+    worker_->start();
 }
 } // namespace Gate

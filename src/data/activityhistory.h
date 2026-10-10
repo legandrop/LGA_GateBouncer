@@ -32,6 +32,7 @@ QString nativeSourceId(const NativeSourceBinding &binding);
 QString nativeEpochKey(const NativeSourceBinding &binding);
 QString nativeEventKey(const ActivityEvent &event);
 bool validNativeBinding(const NativeSourceBinding &binding);
+bool validNativeProcessFacts(const NativeProcessFacts &facts);
 bool validNativeEvent(const ActivityEvent &event);
 bool nativeCauseMatches(const ActivityEvent &attempt, const ActivityEvent &authorization);
 bool nativeTrafficMatches(const ActivityEvent &attempt, const ActivityEvent &authorization, const ActivityEvent &traffic);

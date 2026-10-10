@@ -89,6 +89,15 @@ class ProductController final : public QObject {
     void startImport();
     bool flushHistory();
     void historyChanged();
+    void advanceNativeProcesses();
+    void runNativeWorker(int phase);
+    void cancelNativeProcesses();
+    void clearProcessHistory();
+    void projectProcessHistory(Data::ProcessCatalogResult &);
+    struct NativeProcessJob;
+    std::unique_ptr<NativeProcessJob> nativeProcessJob_;
+    QTimer nativeProcessTick_;
+    quint64 nativeProcessTag_ = 0;
     bool isolatedQa_;
     UiMode mode_ = UiMode::LiveReadOnly;
     quint64 generation_ = 1;

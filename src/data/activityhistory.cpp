@@ -27,7 +27,8 @@ bool equivalent(const ActivityEvent &a, const ActivityEvent &b) {
         x.effectiveRevision == y.effectiveRevision && x.source == y.source &&
         x.direction == y.direction && x.protocol == y.protocol && x.scope == y.scope &&
         x.durable == y.durable && x.currentEffect == y.currentEffect &&
-        a.bytes == b.bytes && x.packetCount == y.packetCount && x.packetDirection == y.packetDirection;
+        a.bytes == b.bytes && x.packetCount == y.packetCount && x.packetDirection == y.packetDirection &&
+        x.process == y.process;
 }
 void update(std::optional<EventFact> &target, const ActivityEvent &event) {
     if (!target || target->atUtc < event.observedAtUtc)
@@ -47,6 +48,27 @@ bool validNativeBinding(const NativeSourceBinding &b) {
     return id(b.serviceEpoch) && id(b.boot) && id(b.engineContext) &&
         b.sourceEpoch == b.engineContext && b.generation && b.profile;
 }
+bool validNativeProcessFacts(const NativeProcessFacts &f) {
+    const auto sid = [](const QByteArray &b) {
+        return b.size() >= 8 && b.size() <= 68 && quint8(b[0]) == 1 &&
+            b.size() == 8 + 4 * quint8(b[1]);
+    };
+    if (!f.pid || !f.created || !(f.indexHigh || f.indexLow) || !f.lastWrite ||
+        !sid(f.accountSid) || !sid(f.logonSid) || f.image.isEmpty() || f.image.contains(QChar(0)) ||
+        f.image.toUtf8().size() > 4096 || QString::fromUtf8(f.image.toUtf8()) != f.image ||
+        f.appId.size() < 4 || f.appId.size() > 8192 || f.appId.size() % 2 ||
+        f.appId[f.appId.size()-1] != 0 || f.appId[f.appId.size()-2] != 0) return false;
+    const auto unit = [&](qsizetype at) { return quint16(quint8(f.appId[at])) | (quint16(quint8(f.appId[at+1])) << 8); };
+    for (qsizetype at = 0; at + 2 < f.appId.size(); at += 2) {
+        const auto c = unit(at);
+        if (!c || (c >= 0xdc00 && c <= 0xdfff)) return false;
+        if (c >= 0xd800 && c <= 0xdbff) {
+            if (at + 4 >= f.appId.size() || unit(at+2) < 0xdc00 || unit(at+2) > 0xdfff) return false;
+            at += 2;
+        }
+    }
+    return true;
+}
 bool validNativeEvent(const ActivityEvent &e) {
     if (e.synthetic || !e.native || !utc(e.receivedAtUtc) || e.instance ||
         !e.requestId.isEmpty() || !e.flowId.isEmpty() || !e.winningRuleId.isEmpty() ||
@@ -54,7 +76,9 @@ bool validNativeEvent(const ActivityEvent &e) {
     const auto &n = *e.native;
     quint64 seq = 0;
     if (!decimalUnsigned(e.sequence, &seq) || !seq || !id(n.connection) || !id(n.observed) ||
-        !id(n.captureBinding) || !n.observedRevision || (n.presence & ~3ull) ||
+        !id(n.captureBinding) || !n.observedRevision || (n.presence & ~7ull) ||
+        bool(n.presence & 4) != n.process.has_value() ||
+        (n.process && (n.source != 2 || !validNativeProcessFacts(*n.process))) ||
         (n.routeMask != 3 && n.routeMask != 7) ||
         (n.source != 1 && n.source != 2) || (n.direction != 1 && n.direction != 2) ||
         ((n.presence & 1) ? !n.unixNanoseconds : n.unixNanoseconds != 0) ||
@@ -74,7 +98,7 @@ bool validNativeEvent(const ActivityEvent &e) {
         return applied && e.action && (*e.action == Action::Allow || *e.action == Action::Block) &&
             (n.routeMask == 7 || !(n.presence & 1)) && !e.bytes && !n.packetCount && !n.packetDirection;
     return e.kind == ActivityKind::Traffic && applied && !e.action && n.routeMask == 7 &&
-        n.presence == 3 && e.bytes.has_value() && n.packetCount &&
+        (n.presence == 3 || n.presence == 7) && e.bytes.has_value() && n.packetCount &&
         (n.packetDirection == 1 || n.packetDirection == 2);
 }
 bool nativeCauseMatches(const ActivityEvent &a, const ActivityEvent &b) {
@@ -86,7 +110,7 @@ bool nativeCauseMatches(const ActivityEvent &a, const ActivityEvent &b) {
         a.native->observedRevision == b.native->observedRevision &&
         a.native->captureBinding == b.native->captureBinding &&
         a.native->direction == b.native->direction && a.native->protocol == b.native->protocol &&
-        (a.native->presence & 2) == (b.native->presence & 2);
+        (a.native->presence & 6) == (b.native->presence & 6) && a.native->process == b.native->process;
 }
 bool nativeTrafficMatches(const ActivityEvent &a, const ActivityEvent &auth, const ActivityEvent &traffic) {
     return auth.kind == ActivityKind::Authorization && auth.action == Action::Allow &&

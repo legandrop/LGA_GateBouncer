@@ -3,6 +3,8 @@
 #include <QDateTime>
 #include <QMap>
 #include <QString>
+#include <QStringList>
+#include <QByteArray>
 #include <QVector>
 #include <optional>
 #include "qnameevidence.h"
@@ -15,6 +17,19 @@ enum class CandidateStatus { NeedsReview, Unsupported };
 enum class ActivityKind { Attempt, Authorization, Traffic, HumanDecision, PolicyApplied };
 enum class CoverageStatus { Unavailable, Partial, DeclaredScope };
 
+struct NativeProcessFacts {
+    quint32 pid = 0, volumeSerial = 0, indexHigh = 0, indexLow = 0;
+    quint32 sizeHigh = 0, sizeLow = 0, tokenSession = 0;
+    quint64 created = 0, lastWrite = 0;
+    QByteArray appId, accountSid, logonSid;
+    QString image;
+    bool operator==(const NativeProcessFacts &o) const {
+        return pid == o.pid && created == o.created && volumeSerial == o.volumeSerial &&
+            indexHigh == o.indexHigh && indexLow == o.indexLow && sizeHigh == o.sizeHigh &&
+            sizeLow == o.sizeLow && lastWrite == o.lastWrite && tokenSession == o.tokenSession &&
+            appId == o.appId && image == o.image && accountSid == o.accountSid && logonSid == o.logonSid;
+    }
+};
 struct ProcessInstance {
     QString sourceEpoch;
     quint32 pid = 0;
@@ -31,6 +46,10 @@ struct ProcessObservation {
     FieldStatus contentStatus = FieldStatus::Unsupported;
     QString publisher;
     QDateTime observedAtUtc;
+    QString identityEvidence;
+    std::optional<NativeProcessFacts> sourceImage;
+    QStringList historySubjects;
+    QDateTime lastAttemptUtc, lastAuthorizedUtc, lastTrafficUtc;
 };
 struct XmlNode {
     QString name, nameSpace, text;
@@ -80,6 +99,7 @@ struct NativeEvidence {
     quint8 source = 0, direction = 0, protocol = 0, scope = 0;
     quint8 routeMask = 3, packetDirection = 0;
     bool durable = false, currentEffect = false, externalPartial = false;
+    std::optional<NativeProcessFacts> process;
 };
 struct ActivityEvent {
     QString sourceId, sourceEpoch, sequence;

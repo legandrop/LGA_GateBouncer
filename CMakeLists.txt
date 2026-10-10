@@ -98,7 +98,7 @@ target_link_libraries(GateBouncerDecisionStage PRIVATE Qt6::Widgets gatebouncer_
 target_compile_options(GateBouncerDecisionStage PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_definitions(GateBouncerDecisionStage PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00)
 set_target_properties(GateBouncerDecisionStage PROPERTIES PREFIX "")
-target_link_libraries(GateBouncerGuiStage PRIVATE gatebouncer_native_ii shell32)
+target_link_libraries(GateBouncerGuiStage PRIVATE gatebouncer_native_ii shell32 fwpuclnt)
 qt_add_executable(GateBouncerAssistant WIN32 src/assistance/broker/BrokerMain.cpp)
 target_link_libraries(GateBouncerAssistant PRIVATE gatebouncer_general_live)
 target_compile_options(GateBouncerAssistant PRIVATE -Wall -Wextra -Wpedantic)

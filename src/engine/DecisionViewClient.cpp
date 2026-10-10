@@ -14,6 +14,27 @@ Id correlationId() {
     std::copy_n(reinterpret_cast<const unsigned char *>(bytes.constData()), id.size(), id.begin());
     return id;
 }
+bool processFacts(const Frame &frame, Data::NativeProcessFacts &f) {
+    const auto field = find(frame, Tag::Records);
+    std::vector<iv::ProcessFacts> facts;
+    if (!field || iv::unpack(field->bytes, 1, facts) != Error::Ok || facts.size() != 1 ||
+        facts[0].pid > UINT32_MAX) return false;
+    const auto &p = facts[0];
+    f.pid = quint32(p.pid); f.created = p.created; f.volumeSerial = p.volumeSerial;
+    f.indexHigh = p.fileIndexHigh; f.indexLow = p.fileIndexLow;
+    f.sizeHigh = p.fileSizeHigh; f.sizeLow = p.fileSizeLow;
+    f.lastWrite = p.lastWrite; f.tokenSession = p.tokenSession;
+    const auto bytes = [](const Bytes &b) { return QByteArray(reinterpret_cast<const char *>(b.data()), qsizetype(b.size())); };
+    f.appId = bytes(p.appId); f.accountSid = bytes(p.accountSid); f.logonSid = bytes(p.logonSid);
+    f.image = QString::fromUtf8(bytes(p.image));
+    return f.image.toUtf8() == bytes(p.image) && Data::validNativeProcessFacts(f);
+}
+Id identifier(const QString &hexadecimal) {
+    const auto b = QByteArray::fromHex(hexadecimal.toLatin1());
+    Id id{};
+    if (b.size() == qsizetype(id.size())) std::copy_n(reinterpret_cast<const unsigned char *>(b.constData()), id.size(), id.begin());
+    return id;
+}
 } // namespace
 DecisionViewClient::DecisionViewClient(bool isolatedQa, QObject *parent,
                                        std::unique_ptr<gb::ipc::ii::SessionChannel> channel)
@@ -47,7 +68,40 @@ bool DecisionViewClient::refresh() {
     }
     return send(Type::GetStatus);
 }
+std::optional<NativeContextSnapshot> DecisionViewClient::currentNativeContext(bool requireFacts) const {
+    if (!connected_ || !nativeSource_ || !serviceContext() ||
+        (requireFacts && !(status_.capabilities & iv::NativeProcessFacts))) return {};
+    return NativeContextSnapshot{*nativeSource_, readPeer_, QString::fromStdString(hex(status_.connection)),
+                                 nativeStatusSerial_, status_.capabilities};
+}
+bool DecisionViewClient::requestNativeSnapshotContext(quint64 tag) {
+    if (!tag || stopping_ || busy_ || !session_.idle() || !currentNativeContext(false)) return false;
+    nativeRequestTag_ = tag; nativeRequestAttempt_.reset(); busy_ = true;
+    return send(Type::GetStatus);
+}
+bool DecisionViewClient::requestNativeProcessContext(quint64 tag, const Data::ActivityEvent &attempt) {
+    const auto context = currentNativeContext();
+    if (!tag || stopping_ || busy_ || !session_.idle() || !context || !Data::validNativeEvent(attempt) ||
+        attempt.kind != Data::ActivityKind::Attempt || !attempt.native->process ||
+        attempt.native->externalPartial || attempt.sourceId != Data::nativeSourceId(context->binding) ||
+        attempt.sourceEpoch != Data::nativeEpochKey(context->binding)) return false;
+    Frame f; f.minor = 3; f.type = Type::GetNativeProcessContext;
+    f.connection = status_.connection; f.correlation = correlationId();
+    Bytes encoded;
+    if (iv::encodeServiceContext(*serviceContext_, encoded) != Error::Ok) return false;
+    f.fields = {value(Tag::ServiceEpoch, status_.serviceEpoch), value(Tag::SourceEpoch, serviceContext_->engineContext),
+        {Tag::ServiceContext, true, encoded}, value(Tag::ProfileGeneration, profile_),
+        value(Tag::ObservedId, identifier(attempt.native->observed)), value(Tag::ObservedRevision, attempt.native->observedRevision),
+        value(Tag::CaptureBindingId, identifier(attempt.native->captureBinding)),
+        value(Tag::AttemptLink, iv::attemptLink(attempt.sequence.toULongLong()))};
+    if (iv::validate(f) != Error::Ok) return false;
+    nativeRequestTag_ = tag; nativeRequestAttempt_ = attempt; busy_ = true;
+    expected_ = f.correlation; expectedType_ = f.type;
+    if (!session_.request(std::move(f))) { fail("Original process read queue unavailable"); return false; }
+    return true;
+}
 void DecisionViewClient::invalidate() {
+    nativeRequestTag_ = 0; nativeRequestAttempt_.reset();
     endNativeSource("ConnectionLost");
     poll_.stop();
     status_.current = false;
@@ -147,6 +201,7 @@ bool DecisionViewClient::adoptStatus(const Frame &f) {
     const auto capabilities = get(f, Tag::Capabilities);
     if ((capabilities & iv::NativeTraffic) &&
         ((capabilities & (iv::NativeEvents | ObservedRead)) != (iv::NativeEvents | ObservedRead))) return false;
+    if ((capabilities & iv::NativeProcessFacts) && (capabilities & (iv::NativeEvents | ObservedRead)) != (iv::NativeEvents | ObservedRead)) return false;
     const quint8 nextMask = capabilities & iv::NativeTraffic ? 7 : 3;
     if (contextChanged || epoch != status_.serviceEpoch || boot != status_.bootId || profile != profile_) {
         endNativeSource("SourceContextChanged");
@@ -270,11 +325,47 @@ void DecisionViewClient::received(bool ok, Frame f, Id correlation) {
             fail("View II status rejected");
             return;
         }
+        if (nativeStatusSerial_ == UINT64_MAX) { fail("Process context serial exhausted"); return; }
+        ++nativeStatusSerial_;
+        if (nativeRequestTag_ && !nativeRequestAttempt_) {
+            const auto tag = nativeRequestTag_; nativeRequestTag_ = 0; busy_ = false;
+            const auto context = currentNativeContext(false);
+            if (!context) { fail("Original process context unavailable"); return; }
+            emit nativeSnapshotContext(tag, *context); emit changed(); return;
+        }
         emit changed();
         if (stopping_ || !busy_ || !connected_) return;
         if (!supported(Type::ListPending, minor_)) { statusOnly(); return; }
         startPages(false);
         return;
+    }
+    if (expectedType_ == Type::GetNativeProcessContext) {
+        const auto context = currentNativeContext();
+        const auto binding = nativeBinding(f);
+        if (!nativeRequestTag_ || !nativeRequestAttempt_ || !context || !binding ||
+            f.type != Type::NativeProcessContext || !(*binding == context->binding)) {
+            fail("Original process response context rejected"); return;
+        }
+        const auto attempt = *nativeRequestAttempt_;
+        if (idValue(f, Tag::ObservedId) != identifier(attempt.native->observed) ||
+            get(f, Tag::ObservedRevision) != attempt.native->observedRevision ||
+            idValue(f, Tag::CaptureBindingId) != identifier(attempt.native->captureBinding) ||
+            iv::attemptSequence(idValue(f, Tag::AttemptLink)) != attempt.sequence.toULongLong()) {
+            fail("Original process response cause rejected"); return;
+        }
+        const bool accepted = get(f, Tag::ErrorCode) == unsigned(Error::Ok);
+        Data::NativeProcessFacts facts;
+        if (accepted && (!processFacts(f, facts) || !(facts == *attempt.native->process))) {
+            fail("Original process facts changed; history preserved"); return;
+        }
+        if (!currentNativeContext()) { fail("Original process peer lost after read"); return; }
+        const auto tag = nativeRequestTag_; nativeRequestTag_ = 0; nativeRequestAttempt_.reset(); busy_ = false;
+        auto receipt = std::shared_ptr<const NativeProcessReceipt>(new NativeProcessReceipt(
+            context->binding,context->peer,context->connection,Data::nativeEventKey(attempt),
+            QString::fromStdString(hex(f.correlation)),f.sequence,accepted,*attempt.native->process));
+        emit nativeProcessContext(tag, Data::nativeEventKey(attempt), accepted, *context,
+            accepted ? QString{} : "Original source process custody unavailable (" + QString::number(get(f, Tag::ErrorCode)) + ")",receipt);
+        emit changed(); return;
     }
     if (idValue(f, Tag::ServiceEpoch) != status_.serviceEpoch) {
         fail("View II service epoch changed");
@@ -405,6 +496,7 @@ void DecisionViewClient::observation(Frame f) {
             n.observedRevision = get(f, Tag::ObservedRevision); n.unixNanoseconds = get(f, Tag::Timestamp);
             n.presence = get(f, Tag::Presence); n.source = quint8(get(f, Tag::Source));
             n.routeMask = nativeMask_;
+            if (n.presence & 4) { Data::NativeProcessFacts facts; if (!processFacts(f, facts)) { fail("Original process facts rejected"); return; } n.process = std::move(facts); }
             n.direction = quint8(get(f, Tag::FlowDirection)); n.protocol = quint8(get(f, Tag::Protocol));
             if (n.presence & 1) e.observedAtUtc = QDateTime::fromMSecsSinceEpoch(qint64(n.unixNanoseconds / 1000000ull), Qt::UTC);
             if (n.presence & 2) e.protocol = n.protocol == 6 ? "TCP" : "UDP";

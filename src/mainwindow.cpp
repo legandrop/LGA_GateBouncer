@@ -1127,9 +1127,11 @@ void MainWindow::refreshTable(bool newPage) {
             const QString status = p.status == Data::FieldStatus::Known ? "Observed"
                 : p.status == Data::FieldStatus::Gone ? "Gone" : p.status == Data::FieldStatus::AccessDenied ? "Access denied" : "Unknown";
             const QString name = p.name.isEmpty() ? "Unattributed PID " + QString::number(p.instance.pid) : p.name;
+            const auto when = [](const QDateTime &at) { return at.isValid() ? at.toUTC().toString(Qt::ISODateWithMs) : QString("Unknown"); };
             result.push_back({product_.processId(p), {{name, "glyph:" + name.left(2).toUpper(), {}},
-                {"Policy unknown", "inactive", {}}, {"Unknown", {}, {}},
-                {"Unknown", {}, {}}, {status, {}, {}}}});
+                {"Policy unknown", "inactive", {}}, {when(p.lastAttemptUtc), {}, {}},
+                {when(p.lastAuthorizedUtc), {}, {}}, {when(p.lastTrafficUtc), {}, {}},
+                {p.identityEvidence.isEmpty() ? status : "Origin paired · snapshot", {}, {}}}});
         }
         else if (view_ == "import" || view_ == "rules") {
             if (view_ == "rules" && product_.recordsSelected() && product_.records()->recordsCurrent())
@@ -1196,9 +1198,10 @@ void MainWindow::refreshTable(bool newPage) {
                     : e.kind == Data::ActivityKind::Authorization
                         ? (n.routeMask == 7 ? "Causal applied decision · traffic recorded separately" : "Causal applied decision · traffic unknown")
                     : n.source == 2 ? "Retained classifier cause · traffic unknown" : "Copied SDK drop · subset only";
+                const QString image = n.process ? n.process->image.section('\\',-1) + " · source image\n" : QString{};
                 result.push_back({"history:" + Data::nativeEventKey(e),
                     {{at + "\nReceived " + received, {}, qulonglong(e.sequence.toULongLong())},
-                     {"Observed " + n.observed.left(12) + "\nBinding " + n.captureBinding.left(12), {}, {}},
+                     {image + "Observed " + n.observed.left(12) + "\nBinding " + n.captureBinding.left(12), {}, {}},
                      {kind, n.externalPartial ? "warning" : "", {}},
                      {(e.kind == Data::ActivityKind::Traffic ?
                         (n.packetDirection == 1 ? "Outbound packet activity" : "Inbound packet activity") :
@@ -1986,7 +1989,8 @@ void MainWindow::renderLive() {
         bar->addWidget(search, 1); auto *refresh = button("Refresh processes", "refresh-processes"); bar->addWidget(refresh);
         connect(refresh, &QPushButton::clicked, &product_, &ProductController::refreshProcesses);
         connect(search, &QLineEdit::textChanged, this, [this](const QString &q) { query_ = q; refreshTable(); });
-        makeTable({"Process", "Policy", "Last request", "Last allowed request", "State"}, {32, 15, 16, 22, 15});
+        makeTable({"Process", "Policy", "Last request", "Last allowed request", "Last traffic", "State"}, {27, 13, 16, 18, 14, 12});
+        pageLayout_->addWidget(label("Dates require a live original source and a retained local process instance. Traffic records bytes and network buffers observed by the OS; it does not confirm delivery. Unknown does not mean inactive.", "faint", true));
         count_ = label({}, "faint"); pageLayout_->addWidget(count_);
         if (!product_.catalog().error.isEmpty()) pageLayout_->addWidget(label(product_.catalog().error, "warning", true));
     } else if (view_ == "pending") {
@@ -2180,8 +2184,14 @@ void MainWindow::renderLiveDetail(const QString &id) {
     path->setMaximumHeight(78); path->setMinimumHeight(55);
     path->setStyleSheet("background: transparent; color: #70b8c8;"); body->addWidget(path);
     definition(body, "PID", QString::number(p->instance.pid)); definition(body, "Publisher", "Unknown"); definition(body, "Signature", "Unknown");
-    definition(body, "File inspection", "Not available"); definition(body, "Policy", "Unknown");
-    definition(body, "Last request", "Unknown · collector unavailable"); definition(body, "Last allowed", "Unknown · collector unavailable"); definition(body, "Last traffic", "Unknown · collector unavailable");
+    definition(body, "Image custody", p->sourceImage ? "Source-retained original image + local live process snapshot" : "Snapshot only · original image unknown");
+    if (p->sourceImage) {
+        const auto &f = *p->sourceImage;
+        definition(body, "Original NTFS file ID", QString("%1:%2%3").arg(f.volumeSerial,8,16,QChar('0')).arg(f.indexHigh,8,16,QChar('0')).arg(f.indexLow,8,16,QChar('0')));
+    }
+    definition(body, "Policy", "Unknown");
+    const auto observed = [](const QDateTime &at) { return at.isValid() ? at.toUTC().toString(Qt::ISODateWithMs) : QString("Unknown"); };
+    definition(body, "Last request", observed(p->lastAttemptUtc)); definition(body, "Last allowed", observed(p->lastAuthorizedUtc)); definition(body, "Last traffic", observed(p->lastTrafficUtc));
     body->addWidget(note("Public facts unavailable. A process name does not identify its purpose, reputation or network requests.", true)); body->addStretch(); l->addWidget(scrollArea(content), 1);
     l->addWidget(label("Administrator control is not available in this build.", "warning", true)); positionOverlays(); detail_->show(); detail_->raise();
 }

@@ -200,6 +200,41 @@ bool bindingRead(const QJsonValue &value, NativeSourceBinding &b) {
     return o.size() == 6 && decimalUnsigned(o["generation"].toString(), &b.generation) &&
         decimalUnsigned(o["profile"].toString(), &b.profile) && validNativeBinding(b);
 }
+QJsonObject processJson(const NativeProcessFacts &f) {
+    return {{"pid", QString::number(f.pid)}, {"created", QString::number(f.created)},
+        {"volumeSerial", QString::number(f.volumeSerial)}, {"indexHigh", QString::number(f.indexHigh)},
+        {"indexLow", QString::number(f.indexLow)}, {"sizeHigh", QString::number(f.sizeHigh)},
+        {"sizeLow", QString::number(f.sizeLow)}, {"lastWrite", QString::number(f.lastWrite)},
+        {"tokenSession", QString::number(f.tokenSession)}, {"image", f.image},
+        {"appId", QString::fromLatin1(f.appId.toBase64())},
+        {"accountSid", QString::fromLatin1(f.accountSid.toBase64())},
+        {"logonSid", QString::fromLatin1(f.logonSid.toBase64())}};
+}
+bool processRead(const QJsonValue &value, NativeProcessFacts &f) {
+    if (!value.isObject()) return false;
+    const auto o = value.toObject();
+    if (o.size() != 13 || !stringFields(o, {"image", "appId", "accountSid", "logonSid"})) return false;
+    for (const auto &field : {std::pair<const char *, quint64 *>{"created", &f.created}, {"lastWrite", &f.lastWrite}})
+        if (!decimalUnsigned(o[field.first].toString(), field.second)) return false;
+    for (const auto &field : {std::pair<const char *, quint32 *>{"pid", &f.pid}, {"volumeSerial", &f.volumeSerial},
+        {"indexHigh", &f.indexHigh}, {"indexLow", &f.indexLow}, {"sizeHigh", &f.sizeHigh},
+        {"sizeLow", &f.sizeLow}, {"tokenSession", &f.tokenSession}}) {
+        quint64 n = 0;
+        if (!decimalUnsigned(o[field.first].toString(), &n) || n > std::numeric_limits<quint32>::max()) return false;
+        *field.second = quint32(n);
+    }
+    for (const auto &field : {std::pair<const char *, QByteArray *>{"appId", &f.appId},
+        {"accountSid", &f.accountSid}, {"logonSid", &f.logonSid}}) {
+        const auto text = o[field.first].toString().toLatin1();
+        const auto limit = field.second == &f.appId ? 8192 : 68;
+        if (text.size() > 4 * ((limit+2)/3)) return false;
+        *field.second = QByteArray::fromBase64(text, QByteArray::AbortOnBase64DecodingErrors);
+        if (field.second->size() > limit || field.second->toBase64() != text ||
+            QString::fromLatin1(text) != o[field.first].toString()) return false;
+    }
+    f.image = o["image"].toString();
+    return validNativeProcessFacts(f);
+}
 QJsonObject evidenceJson(const NativeEvidence &n) {
     QJsonObject o{{"connection", n.connection}, {"observed", n.observed}, {"binding", n.captureBinding}, {"command", n.command},
         {"revision", QString::number(n.observedRevision)}, {"unixns", QString::number(n.unixNanoseconds)},
@@ -207,17 +242,23 @@ QJsonObject evidenceJson(const NativeEvidence &n) {
         {"effective", QString::number(n.effectiveRevision)}, {"source", int(n.source)},
         {"direction", int(n.direction)}, {"protocol", int(n.protocol)}, {"scope", int(n.scope)},
         {"durable", n.durable}, {"effect", n.currentEffect}, {"externalPartial", n.externalPartial}};
-    if (n.routeMask == 7) {
+    if (n.routeMask == 7 || n.process) {
         o["routeMask"] = int(n.routeMask); o["packetCount"] = QString::number(n.packetCount);
         o["packetDirection"] = int(n.packetDirection);
     }
+    if (n.process) o["process"] = processJson(*n.process);
     return o;
 }
 bool evidenceRead(const QJsonValue &value, NativeEvidence &n) {
     if (!value.isObject()) return false;
     const auto o = value.toObject();
-    if ((o.size() != 16 && o.size() != 19) || !stringFields(o, {"connection", "observed", "binding", "command"})) return false;
-    if (o.size() == 19) {
+    if ((o.size() != 16 && o.size() != 19 && o.size() != 20) || !stringFields(o, {"connection", "observed", "binding", "command"})) return false;
+    if (o.size() == 20) {
+        NativeProcessFacts f;
+        if (!processRead(o["process"], f)) return false;
+        n.process = std::move(f);
+    } else if (o.contains("process")) return false;
+    if (o.size() >= 19) {
         if (!o["routeMask"].isDouble() || o["routeMask"].toDouble() != o["routeMask"].toInt() ||
             (o["routeMask"].toInt() != 3 && o["routeMask"].toInt() != 7) ||
             !decimalUnsigned(o["packetCount"].toString(), &n.packetCount) ||

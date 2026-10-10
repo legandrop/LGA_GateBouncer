@@ -3,11 +3,18 @@
 #include "../../controller/session_qt.h"
 #include "EngineViewClient.h"
 #include "../data/contracts.h"
+#include "../platform/NativeProcessReceipt.h"
 #include <QElapsedTimer>
 #include <QTimer>
 #include <set>
 
 namespace Gate {
+struct NativeContextSnapshot {
+    Data::NativeSourceBinding binding;
+    std::shared_ptr<const gb::ipc::ii::ReadPeerLease> peer;
+    QString connection;
+    quint64 serial = 0, capabilities = 0;
+};
 // Cliente ordinary minor3: sólo status, páginas y observaciones. No verbos de mutación.
 class DecisionViewClient final : public QObject {
     Q_OBJECT
@@ -31,8 +38,15 @@ class DecisionViewClient final : public QObject {
     quint8 collector() const { return collector_; }
     std::uint16_t protocolMinor() const { return minor_; }
     void rejectHistory(const QString &reason);
+    std::optional<NativeContextSnapshot> currentNativeContext(bool requireFacts = true) const;
+    bool requestNativeSnapshotContext(quint64 tag);
+    bool requestNativeProcessContext(quint64 tag, const Data::ActivityEvent &attempt);
   signals:
     void changed();
+    void nativeSnapshotContext(quint64 tag, const Gate::NativeContextSnapshot &context);
+    void nativeProcessContext(quint64 tag, const QString &descriptor, bool accepted,
+                              const Gate::NativeContextSnapshot &context, const QString &reason,
+                              std::shared_ptr<const Gate::NativeProcessReceipt> receipt);
     void nativeSourceOpened(const Gate::Data::NativeSourceBinding &binding, quint64 baseline);
     void nativeEvent(const Gate::Data::ActivityEvent &event);
     void nativeGap(const Gate::Data::NativeSourceBinding &binding, quint64 after, quint64 resync,
@@ -63,6 +77,8 @@ class DecisionViewClient final : public QObject {
     bool recordsCurrent_ = false, historyGap_ = true, subscribed_ = false;
     bool observationUpdateQueued_ = false;
     quint64 profile_ = 0, lastEvent_ = 0, pageRevision_ = 0;
+    quint64 nativeRequestTag_ = 0, nativeStatusSerial_ = 0;
+    std::optional<Data::ActivityEvent> nativeRequestAttempt_;
     quint8 collector_ = 0, nativeMask_ = 3;
     std::uint16_t minor_ = 1;
     gb::wire::Id expected_{}, snapshot_{};
