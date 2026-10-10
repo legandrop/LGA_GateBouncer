@@ -57,8 +57,12 @@ bool readDword(HKEY key,const wchar_t *name,DWORD &out) {
 }
 bool status(SC_HANDLE service,SERVICE_STATUS_PROCESS &out) {
     DWORD count = 0;
+    // pcbBytesNeeded sólo está definido por Windows en ERROR_INSUFFICIENT_BUFFER.
+    // Conservar la guarda de tamaño en ese probe sobre el mismo SC_HANDLE original.
+    if (QueryServiceStatusEx(service,SC_STATUS_PROCESS_INFO,nullptr,0,&count) ||
+        GetLastError() != ERROR_INSUFFICIENT_BUFFER || count != sizeof(out)) return false;
     return QueryServiceStatusEx(service,SC_STATUS_PROCESS_INFO,reinterpret_cast<BYTE *>(&out),sizeof(out),&count) &&
-        count == sizeof(out) && out.dwServiceType == SERVICE_WIN32_OWN_PROCESS;
+        out.dwServiceType == SERVICE_WIN32_OWN_PROCESS;
 }
 struct DriverRetirement {
     DWORD version = 1, state = 1, restart = 0;
