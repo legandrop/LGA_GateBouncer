@@ -75,7 +75,7 @@ typedef struct GB_ENTRY {
     BOOLEAN imageFactsValid;
     UINT64 pendingDeadline, parent, udpAuthorizationFlow;
     BOOLEAN delivered, revoked, closed, associated, completing, consumed, deadFlow;
-    BOOLEAN cancelPin, futureRetired;
+    BOOLEAN cancelPin, futureRetired, udpFlowDrained;
     BOOLEAN listener, injectQueued, injectActive, injectSeen;
     ULONG injectPins;
     ULONG associationPins;
@@ -98,6 +98,8 @@ static EX_PUSH_LOCK gbControl;
 static KSPIN_LOCK gbLock;
 static ULONG gbPacketOwned;
 static GB_ENTRY *gbEntries[GB_CLASSIFIER_CAPACITY];
+// El cupo UDP retirado no se entrega antes del free físico fuera del spinlock.
+static BOOLEAN gbUdpClosing[GB_CLASSIFIER_CAPACITY];
 static UINT32 gbCalloutIds[GB_CALLOUT_COUNT];
 static UINT64 gbSession, gbSequence, gbLoss;
 static PFILE_OBJECT gbFile;
@@ -391,12 +393,34 @@ static void retireFutureRoots(GB_ENTRY *e) {
     }
     e->futureRetired=FALSE;
 }
+static BOOLEAN udpRetainedAnchor(const GB_ENTRY *e) {
+    ULONG i;
+    // Mantener el negativo original para ALE tardío sin FLOW_HANDLE.
+    // No reconstruir EPROCESS/TOKEN desde el PID del callback ni reciclar endpoint.
+    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
+        const GB_ENTRY *p=gbEntries[i];
+        if(p && p!=e && p->record.protocol==IPPROTO_UDP && !p->udpAuthorizationFlow &&
+           p->closed && p->revoked && p->record.session==e->record.session &&
+           p->record.endpoint==e->record.endpoint && p->record.family==e->record.family &&
+           p->record.compartment==e->record.compartment && p->record.localPort==e->record.localPort &&
+           p->record.remotePort==e->record.remotePort &&
+           RtlCompareMemory(p->record.localAddress,e->record.localAddress,16)==16 &&
+           RtlCompareMemory(p->record.remoteAddress,e->record.remoteAddress,16)==16 &&
+           sameAuthorization(p,e) && sameInstance(p,e))return TRUE;
+    }
+    return FALSE;
+}
 static BOOLEAN retireable(GB_ENTRY *e) {
     ULONG i;
-    // UDP: closure/idle no prueban ausencia de callback tardío sin contexto.
-    if(e->record.protocol==IPPROTO_UDP || e->associationPins)return FALSE;
+    if(e->associationPins)return FALSE;
+    // Delete DATAGRAM sólo drena esa asociación. La barrera ALE flowless falta:
+    // retirar únicamente generaciones con flow exacto y anchor negativo retenido.
+    if(e->record.protocol==IPPROTO_UDP && (!e->udpAuthorizationFlow || !e->udpFlowDrained ||
+       e->receipt.flow!=e->udpAuthorizationFlow || !e->revoked ||
+       PsGetProcessExitStatus(e->process)==STATUS_PENDING || !udpRetainedAnchor(e)))return FALSE;
     if(!e->closed || e->completion || e->completing || e->associated || e->cancelPin ||
-        e->packet || e->injectQueued || e->injectActive || e->injectPins)return FALSE;
+        e->packet || (e->record.protocol==IPPROTO_UDP && e->packetCharged) ||
+        e->injectQueued || e->injectActive || e->injectPins)return FALSE;
     for(i=0;!e->parent && i<GB_CLASSIFIER_CAPACITY;++i) {
         GB_ENTRY *p=gbEntries[i];
         if(p && p!=e && p->record.session==e->record.session && p->parent==e->record.cause)return FALSE;
@@ -536,7 +560,7 @@ static ULONG slotFor(GB_ENTRY *e,const GB_TUPLE *t,BOOLEAN *duplicate) {
     *duplicate=FALSE;
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
         GB_ENTRY *p=gbEntries[i];
-        if(!p){if(empty==GB_CLASSIFIER_CAPACITY)empty=i;continue;}
+        if(!p){if(!gbUdpClosing[i] && empty==GB_CLASSIFIER_CAPACITY)empty=i;continue;}
         if((!p->closed || p->record.protocol==IPPROTO_UDP) && p->record.endpoint==e->record.endpoint && sameTuple(p,t)) {
             if(p->record.protocol!=IPPROTO_UDP || !udpIdleGeneration(p) || !sameAuthorization(p,e) ||
                 !sameInstance(p,e) || !freshUdpFlow)*duplicate=TRUE;
@@ -610,9 +634,16 @@ static void NTAPI processExit(PEPROCESS process,HANDLE pid,PPS_CREATE_NOTIFY_INF
     imageDrain();
 }
 static void NTAPI flowDelete(UINT16 layer,UINT32 callout,UINT64 context) {
-    KIRQL irql; ULONG i; UNREFERENCED_PARAMETER(layer); UNREFERENCED_PARAMETER(callout);
+    KIRQL irql; ULONG i;
     KeAcquireSpinLock(&gbLock,&irql);
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) if(gbEntries[i] && gbEntries[i]->record.cause==context) {
+        GB_ENTRY *e=gbEntries[i];
+        if(e->record.protocol==IPPROTO_UDP) {
+            UINT16 expectedLayer=e->record.family==4 ? FWPS_LAYER_DATAGRAM_DATA_V4 : FWPS_LAYER_DATAGRAM_DATA_V6;
+            UINT32 expectedCallout=gbCalloutIds[e->record.family==4 ? 16 : 17];
+            if(layer!=expectedLayer || !expectedCallout || callout!=expectedCallout)break;
+            if(e->udpAuthorizationFlow && e->receipt.flow==e->udpAuthorizationFlow)e->udpFlowDrained=TRUE;
+        }
         // El grant de instancia vive aparte del primer socket; deny permanece hasta closure.
         gbEntries[i]->associated=FALSE; gbEntries[i]->deadFlow=TRUE; gbEntries[i]->receipt.current=0;
         gbEntries[i]->activity.flags|=GB_ACTIVITY_INCOMPLETE;
@@ -1225,7 +1256,7 @@ static void NTAPI listenerClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INC
     KeAcquireSpinLock(&gbLock,&irql);
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)if(gbEntries[i] && gbEntries[i]->record.endpoint==e->record.endpoint)break;
     if(i==GB_CLASSIFIER_CAPACITY && gbFile && !gbFault && gbSequence!=GB_MAX64) {
-        for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)if(!gbEntries[i])break;
+        for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)if(!gbEntries[i] && !gbUdpClosing[i])break;
         if(i<GB_CLASSIFIER_CAPACITY){e->record.session=gbSession;e->record.loss=gbLoss;e->record.cause=++gbSequence;gbEntries[i]=e;e=NULL;}
     }
     KeReleaseSpinLock(&gbLock,irql);if(e)freeEntry(e);
@@ -1462,7 +1493,8 @@ static void imageSweep(void) {
 static void maintenance(void *ignored) {
     HANDLE completions[GB_CLASSIFIER_CAPACITY]; UINT64 aborts[GB_CLASSIFIER_CAPACITY];
     GB_ENTRY *packets[GB_CLASSIFIER_CAPACITY]; ULONG np=0;
-    GB_ENTRY *discard[GB_CLASSIFIER_CAPACITY]; ULONG nc=0,na=0,nd=0,i; KIRQL irql; UINT64 now=KeQueryInterruptTime();
+    GB_ENTRY *discard[GB_CLASSIFIER_CAPACITY]; ULONG discardSlots[GB_CLASSIFIER_CAPACITY];
+    ULONG nc=0,na=0,nd=0,i; KIRQL irql; UINT64 now=KeQueryInterruptTime();
     UNREFERENCED_PARAMETER(ignored); controlEnter();imageSweep();
     if(gbFile && !gbFault && !serviceOwner()) {
         KeAcquireSpinLock(&gbLock,&irql);gbFault=TRUE;loss();KeReleaseSpinLock(&gbLock,irql);
@@ -1484,7 +1516,8 @@ static void maintenance(void *ignored) {
         }
         if(e->revoked && e->associated && e->receipt.flow) aborts[na++]=e->receipt.flow;
         if(retireable(e)) {
-            gbEntries[i]=NULL; discard[nd++]=e;
+            gbUdpClosing[i]=e->record.protocol==IPPROTO_UDP;
+            gbEntries[i]=NULL; discardSlots[nd]=i;discard[nd++]=e;
         }
     }
     KeReleaseSpinLock(&gbLock,irql);
@@ -1492,7 +1525,10 @@ static void maintenance(void *ignored) {
     for(i=0;i<nc;++i) FwpsCompleteOperation0(completions[i],NULL);
     for(i=0;i<np;++i)releasePacket(packets[i],packets[i]->packet,TRUE);
     for(i=0;i<na;++i) FwpsFlowAbort0(aborts[i]);
-    for(i=0;i<nd;++i) freeEntry(discard[i]);
+    for(i=0;i<nd;++i) {
+        freeEntry(discard[i]);
+        KeAcquireSpinLock(&gbLock,&irql);gbUdpClosing[discardSlots[i]]=FALSE;KeReleaseSpinLock(&gbLock,irql);
+    }
     controlLeave(); InterlockedExchange(&gbQueued,0);
 }
 static void NTAPI timerDpc(KDPC *dpc,void *context,void *arg1,void *arg2) {

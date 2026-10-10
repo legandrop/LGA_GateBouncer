@@ -134,12 +134,25 @@ cause retains that handle; reauthorization and establishment must match it.
 Callbacks for an older flow keep their original cause and are denied after
 idle. A callback without a distinguishable generation is denied. Flow-handle
 availability at initial authorization is not guaranteed by this source;
-regeneration outside this metadata subset remains unsupported. UDP tombstones
-remain for the driver lifetime, including after endpoint closure, RESET,
-session loss or cleanup. They are neither revived nor removed to make capacity.
+regeneration outside this metadata subset remains unsupported. The initial UDP
+entry remains as a negative tombstone for the driver lifetime, including after
+endpoint closure, RESET, session loss or cleanup. It is neither revived nor
+removed to make capacity. A distinguishable same-peer generation can retire
+only after its exact DATAGRAM layer/callout/cause deletion, endpoint closure,
+termination of its retained original process and complete drain of completion,
+association, injection, packet and child pins. Its original flow handle must
+match both authorization and association. Retirement also requires the closed,
+revoked initial tombstone of the same endpoint, tuple, original process and
+token to remain in the registry. That tombstone keeps late flowless callbacks
+denied; the retired cause is never reassigned. The UDP slot stays reserved until
+its physical resources have been freed outside the spinlock.
 Different peers and distinguishable same-peer generations can receive their
-own causes while registry capacity remains. Sustained operation beyond retained
-capacity is not implemented. Applied acknowledges the exact authorization, not packet
+own causes while registry capacity remains. This recovers drained generation
+slots, not initial endpoint tombstones. It does not establish sustained browser
+operation for hours or support beyond the 64 retained slots. Endpoint closure
+and flow-context deletion do not provide a documented rundown of all later ALE
+indications without a flow handle; those endpoints cannot be recycled safely by
+this source. Applied acknowledges the exact authorization, not packet
 delivery or successful flow association. Flow association without an immediate
 PASSIVE token proof is denied, including callbacks reached at DISPATCH_LEVEL.
 The driver buffers a supported first outbound UDP datagram before pending its
