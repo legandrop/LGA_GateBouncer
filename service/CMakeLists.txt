@@ -18,6 +18,9 @@ target_link_libraries(gatebouncer_qname_source PUBLIC Qt6::Core)
 target_include_directories(gatebouncer_qname_source PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/..")
 target_compile_options(gatebouncer_qname_source PRIVATE /W4 /permissive- /utf-8 /guard:cf)
 target_compile_definitions(gatebouncer_qname_source PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00)
+# qglobal puede importar datos de versionado antes del delay loader. La Qt
+# original conserva su cotejo de versión/hash en el loader, previo al parser.
+target_compile_definitions(gatebouncer_qname_source PRIVATE QT_NO_VERSION_TAGGING)
 add_library(gatebouncer_wire STATIC ../common/wire_v1.cpp ../common/wire_ii.cpp ../common/wire_iv.cpp ../common/review_open.cpp)
 add_library(gatebouncer_decisions STATIC decisions_ii.cpp observations_ii.cpp)
 add_subdirectory(windows/allapps/native)
@@ -30,6 +33,7 @@ add_library(gatebouncer_native_ii STATIC ../common/protected_file_win.cpp ../com
 target_link_libraries(gatebouncer_native_ii PUBLIC gatebouncer_decisions gatebouncer_policy gatebouncer_allapps_native bcrypt advapi32 wtsapi32 fwpuclnt)
 target_sources(gatebouncer_native_ii PRIVATE principal_producer_vii.cpp)
 target_sources(gatebouncer_native_ii PRIVATE principal_source_capture_vii.cpp)
+target_compile_definitions(gatebouncer_native_ii PRIVATE QT_NO_VERSION_TAGGING)
 target_sources(gatebouncer_native_ii PRIVATE scopes_v.cpp scoped_runtime_v.cpp)
 target_sources(gatebouncer_native_ii PRIVATE ../controller/deployment_prepare_win.cpp)
 target_sources(gatebouncer_native_ii PRIVATE maintenance_iv.cpp ../controller/deployment_maintenance_win.cpp)
