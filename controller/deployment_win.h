@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 namespace gb::controller {
+namespace deployment_detail { class AdministrativeLease; }
 // Inventory nativo cerrado, provisto por despliegue administrativo protegido.
 using Inventory = std::map<std::wstring, wire::Digest>;
 bool parseInventory(const wire::Bytes &bytes, Inventory &inventory);
@@ -17,6 +18,7 @@ std::wstring deploymentCommand(const std::filesystem::path &, DeploymentMode);
 const std::vector<std::wstring> &deploymentFiles(DeploymentRole,
     DeploymentMode = DeploymentMode::Laboratory);
 bool serviceDescriptor(PSECURITY_DESCRIPTOR);
+bool compareObjectHandles(HANDLE, HANDLE);
 bool serviceConfiguration(SC_HANDLE, const std::filesystem::path &, DWORD expectedPid = 0,
                           DeploymentMode = DeploymentMode::Laboratory);
 // El mantenimiento exige su fase exacta; la admisión normal sigue AUTO_START.
@@ -43,6 +45,10 @@ class Deployment {
                                    bool &provision);
     bool serviceAdmittedCurrent() noexcept;
     bool driverPackageSigned();
+    // Operación del actor administrativo original; no acepta rutas/digests como autoridad.
+    bool installProductDriver(const deployment_detail::AdministrativeLease &, HKEY originalConfiguration);
+    bool admitProductDriver();
+    bool driverInstalledCurrent() noexcept;
     DeploymentMode mode() const { return mode_; }
     bool prepareEnvironment();
     const std::filesystem::path &root() const { return root_; }
@@ -52,6 +58,7 @@ class Deployment {
     bool enumerate(const std::filesystem::path &relative, unsigned depth,
                    std::vector<std::wstring> &files, bool retain = true);
     struct Registration;
+    struct DriverRegistration;
     struct FilePin { std::filesystem::path path; BY_HANDLE_FILE_INFORMATION identity{};
                      std::size_t handle = 0; };
     std::filesystem::path root_;
@@ -60,6 +67,7 @@ class Deployment {
     std::vector<native::Handle> held_;
     std::vector<FilePin> files_;
     std::unique_ptr<Registration> registration_;
+    std::unique_ptr<DriverRegistration> driver_;
     Inventory inventory_;
     DeploymentRole role_ = DeploymentRole::DecisionController;
     bool verified_ = false;

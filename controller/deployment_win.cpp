@@ -1,4 +1,5 @@
 #include "deployment_win.h"
+#include "deployment_maintenance_win.h"
 #include "../driver/package_identity.h"
 #include <algorithm>
 #include <set>
@@ -7,12 +8,37 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <mscat.h>
+#include <newdev.h>
+#include <setupapi.h>
 // Constante del SDK, ausente en algunas versiones de los headers MinGW.
 #ifndef WTD_DISABLE_MD2_MD4
 #define WTD_DISABLE_MD2_MD4 0x00002000
 #endif
 namespace gb::controller {
 namespace {
+struct SystemModule {
+    HMODULE value = nullptr;
+    explicit SystemModule(const wchar_t *name) : value(LoadLibraryExW(name,nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32)) {}
+    ~SystemModule() { if (value) FreeLibrary(value); }
+    bool close() { const auto original = value; value = nullptr; return original && FreeLibrary(original); }
+    SystemModule(const SystemModule &) = delete;
+    SystemModule &operator=(const SystemModule &) = delete;
+};
+bool primitivePlatform() {
+    SYSTEM_INFO architecture{}; GetNativeSystemInfo(&architecture);
+    if (sizeof(void *) != 8 || architecture.wProcessorArchitecture != PROCESSOR_ARCHITECTURE_AMD64) {
+        SetLastError(ERROR_NOT_SUPPORTED); return false;
+    }
+    // Primitive driver/Dirid13 requiere Windows 10 1903; el EXE declara supportedOS.
+    OSVERSIONINFOEXW platform{}; platform.dwOSVersionInfoSize = sizeof(platform);
+    platform.dwMajorVersion = 10; platform.dwBuildNumber = 18362;
+    constexpr DWORD version = VER_MAJORVERSION | VER_MINORVERSION | VER_SERVICEPACKMAJOR | VER_SERVICEPACKMINOR;
+    DWORDLONG conditions = 0;
+    for (const auto field : {VER_MAJORVERSION,VER_MINORVERSION,VER_SERVICEPACKMAJOR,VER_SERVICEPACKMINOR})
+        conditions = VerSetConditionMask(conditions,field,VER_GREATER_EQUAL);
+    return VerifyVersionInfoW(&platform,version,conditions) &&
+        VerifyVersionInfoW(&platform,VER_BUILDNUMBER,VerSetConditionMask(0,VER_BUILDNUMBER,VER_GREATER_EQUAL));
+}
 std::wstring lower(std::wstring s) {
     for (auto &c : s) {
         if (c >= L'A' && c <= L'Z')
@@ -295,6 +321,198 @@ struct Deployment::Registration {
             serviceConfiguration(service, root / L"GateBouncerService.exe", GetCurrentProcessId(),mode);
     }
 };
+struct Deployment::DriverRegistration {
+    struct Pin { native::Handle handle; std::filesystem::path path; BY_HANDLE_FILE_INFORMATION identity{}; bool directory = false; };
+    SC_HANDLE service = nullptr;
+    std::filesystem::path image;
+    std::vector<Pin> pins;
+    DWORD state = SERVICE_STOPPED;
+    ~DriverRegistration() { if (service) CloseServiceHandle(service); }
+    static bool config(SC_HANDLE service,std::filesystem::path &image,DWORD &state) {
+        DWORD needed = 0, done = 0;
+        QueryServiceConfigW(service,nullptr,0,&needed);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(QUERY_SERVICE_CONFIGW) || needed > 65536) return false;
+        wire::Bytes bytes(needed);
+        if (!QueryServiceConfigW(service,reinterpret_cast<QUERY_SERVICE_CONFIGW *>(bytes.data()),needed,&done)) return false;
+        const auto row = reinterpret_cast<QUERY_SERVICE_CONFIGW *>(bytes.data());
+        const auto string = [&](const wchar_t *p,std::wstring &out) {
+            const auto first = reinterpret_cast<std::uintptr_t>(bytes.data()), at = reinterpret_cast<std::uintptr_t>(p);
+            if (!p || at < first || at-first >= bytes.size() || at % alignof(wchar_t)) return false;
+            const auto count = (bytes.size()-(at-first))/sizeof(wchar_t);
+            std::size_t n = 0; while (n < count && p[n]) ++n;
+            if (n == count) return false; out.assign(p,n); return true;
+        };
+        std::wstring binary, dependencies, group;
+        if (row->dwServiceType != SERVICE_KERNEL_DRIVER || row->dwStartType != SERVICE_DEMAND_START ||
+            row->dwErrorControl != SERVICE_ERROR_NORMAL || !string(row->lpBinaryPathName,binary) ||
+            !string(row->lpDependencies,dependencies) || !dependencies.empty() ||
+            !string(row->lpLoadOrderGroup,group) || !group.empty()) return false;
+        wchar_t windows[32768]{}; const auto count = GetWindowsDirectoryW(windows,32768);
+        if (!count || count >= 32768) return false;
+        const std::filesystem::path systemRoot(std::wstring(windows,count));
+        if (binary.rfind(L"\\SystemRoot\\",0) == 0) binary = (systemRoot/binary.substr(12)).native();
+        else if (_wcsnicmp(binary.c_str(),L"System32\\",9) == 0) binary = (systemRoot/binary).native();
+        else if (binary.rfind(L"\\??\\",0) == 0) binary.erase(0,4);
+        const std::filesystem::path candidate(binary), repository = systemRoot/L"System32"/L"DriverStore"/L"FileRepository";
+        if (!native::fixedPath(systemRoot) || !native::fixedPath(candidate) || candidate.filename() != L"GateBouncerClassifier.sys" ||
+            _wcsicmp(candidate.parent_path().parent_path().c_str(),repository.c_str()) != 0) return false;
+        SERVICE_STATUS status{};
+        if (!QueryServiceStatus(service,&status) || status.dwServiceType != SERVICE_KERNEL_DRIVER ||
+            (status.dwCurrentState != SERVICE_STOPPED && status.dwCurrentState != SERVICE_START_PENDING &&
+             status.dwCurrentState != SERVICE_RUNNING)) return false;
+        needed = 0;
+        constexpr DWORD information = OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+        QueryServiceObjectSecurity(service,information,nullptr,0,&needed);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || !needed || needed > 65536) return false;
+        bytes.resize(needed);
+        if (!QueryServiceObjectSecurity(service,information,bytes.data(),needed,&done) || !serviceDescriptor(bytes.data())) return false;
+        image = candidate; state = status.dwCurrentState; return true;
+    }
+    static bool inspect(Pin &pin,bool initial) {
+        BY_HANDLE_FILE_INFORMATION now{}; wchar_t final[32768]{};
+        // DriverStore es custodia Windows: propietario/ACL SY, BA o TrustedInstaller originales.
+        // El límite TCB sólo cubre filesystem/instalación; no concede tráfico a esos actores.
+        if (!native::protectedObject(pin.handle.value,true,pin.directory,true) ||
+            !GetFileInformationByHandle(pin.handle.value,&now) ||
+            bool(now.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != pin.directory) return false;
+        if (!pin.directory) {
+            // El helper de ancestros permite crear subdirectorios; en un file ese bit es Append.
+            PACL acl = nullptr; PSECURITY_DESCRIPTOR sd = nullptr; PSID ti = nullptr;
+            BYTE sy[SECURITY_MAX_SID_SIZE]{}, ba[SECURITY_MAX_SID_SIZE]{}; DWORD sn = sizeof(sy), bn = sizeof(ba);
+            bool sealed = CreateWellKnownSid(WinLocalSystemSid,nullptr,sy,&sn) &&
+                CreateWellKnownSid(WinBuiltinAdministratorsSid,nullptr,ba,&bn) &&
+                ConvertStringSidToSidW(L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",&ti) &&
+                GetSecurityInfo(pin.handle.value,SE_FILE_OBJECT,DACL_SECURITY_INFORMATION,nullptr,nullptr,&acl,nullptr,&sd) == ERROR_SUCCESS &&
+                acl && IsValidAcl(acl);
+            GENERIC_MAPPING mapping{FILE_GENERIC_READ,FILE_GENERIC_WRITE,FILE_GENERIC_EXECUTE,FILE_ALL_ACCESS};
+            for (DWORD i = 0; sealed && i < acl->AceCount; ++i) {
+                void *raw = nullptr; sealed = GetAce(acl,i,&raw) != FALSE;
+                if (!sealed) break;
+                const auto header = static_cast<ACE_HEADER *>(raw);
+                if ((header->AceFlags & INHERIT_ONLY_ACE) || header->AceType == ACCESS_DENIED_ACE_TYPE) continue;
+                if (header->AceType != ACCESS_ALLOWED_ACE_TYPE) { sealed = false; break; }
+                const auto ace = static_cast<ACCESS_ALLOWED_ACE *>(raw); auto mask = ace->Mask;
+                MapGenericMask(&mask,&mapping); const auto sid = &ace->SidStart;
+                sealed = IsValidSid(sid) && (!(mask & FILE_APPEND_DATA) || EqualSid(sid,sy) || EqualSid(sid,ba) || EqualSid(sid,ti));
+            }
+            if (sd) LocalFree(sd);
+            if (ti) LocalFree(ti);
+            if (!sealed) return false;
+        }
+        const auto count = GetFinalPathNameByHandleW(pin.handle.value,final,32768,FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (!count || count >= 32768 || _wcsicmp(final,(L"\\\\?\\"+pin.path.native()).c_str()) != 0 ||
+            (!initial && (now.dwVolumeSerialNumber != pin.identity.dwVolumeSerialNumber ||
+             now.nFileIndexHigh != pin.identity.nFileIndexHigh || now.nFileIndexLow != pin.identity.nFileIndexLow ||
+             (!pin.directory && (now.nFileSizeHigh != pin.identity.nFileSizeHigh || now.nFileSizeLow != pin.identity.nFileSizeLow ||
+              CompareFileTime(&now.ftLastWriteTime,&pin.identity.ftLastWriteTime)))))) return false;
+        if (initial) pin.identity = now;
+        return true;
+    }
+    bool hold(const std::filesystem::path &path,bool directory,wire::Bytes *bytes = nullptr) {
+        if (!native::fixedPath(path) || pins.size() >= 64) return false;
+        Pin pin; pin.path = path; pin.directory = directory;
+        pin.handle.reset(CreateFileW(path.c_str(),READ_CONTROL | FILE_READ_ATTRIBUTES | (directory ? 0 : GENERIC_READ),
+            FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT | (directory ? FILE_FLAG_BACKUP_SEMANTICS : 0),nullptr));
+        if (!pin.handle || !inspect(pin,true)) return false;
+        if (bytes) {
+            LARGE_INTEGER size{}; DWORD done = 0;
+            if (!GetFileSizeEx(pin.handle.value,&size) || size.QuadPart <= 0 || size.QuadPart > 32*1024*1024) return false;
+            bytes->resize(static_cast<std::size_t>(size.QuadPart));
+            if (!ReadFile(pin.handle.value,bytes->data(),DWORD(bytes->size()),&done,nullptr) || done != bytes->size() || !inspect(pin,false)) return false;
+        }
+        pins.push_back(std::move(pin)); return true;
+    }
+    bool current() {
+        std::filesystem::path actual; DWORD observed = 0;
+        if (!config(service,actual,observed) || actual != image) return false;
+        if (observed != state) {
+            // Única transición física de start admitida; no rebajar Running ni adoptar Stopped.
+            if (state != SERVICE_START_PENDING || observed != SERVICE_RUNNING) return false;
+            state = observed;
+        }
+        for (auto &pin : pins) if (!inspect(pin,false)) return false;
+        return !pins.empty();
+    }
+    bool acquire(Deployment &owner) {
+        if (!primitivePlatform() || !owner.current()) return false;
+        SC_HANDLE manager = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
+        if (!manager) return false;
+        service = OpenServiceW(manager,L"LGAGateBouncerClassifier",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | SERVICE_START | READ_CONTROL);
+        CloseServiceHandle(manager);
+        if (!service || !config(service,image,state)) return false;
+        std::vector<std::filesystem::path> ancestors;
+        for (auto p = image.parent_path(); !p.empty(); p = p.parent_path()) {
+            ancestors.push_back(p); if (p == p.parent_path()) break;
+        }
+        for (auto p = ancestors.rbegin(); p != ancestors.rend(); ++p) if (!hold(*p,true)) return false;
+        wire::Bytes sys, inf, cat;
+        for (const auto &name : {L"GateBouncerClassifier.sys",L"GateBouncerClassifier.inf",L"GateBouncerClassifier.cat"}) {
+            auto &bytes = std::wcscmp(name,L"GateBouncerClassifier.sys") == 0 ? sys :
+                std::wcscmp(name,L"GateBouncerClassifier.inf") == 0 ? inf : cat;
+            if (!hold(image.parent_path()/name,false,&bytes)) return false;
+            const auto expected = owner.inventory_.find(std::wstring(L"driver\\")+name);
+            if (expected == owner.inventory_.end() || native::digest(bytes) != expected->second) return false;
+            const auto original = std::find_if(owner.files_.begin(),owner.files_.end(),[&](const auto &p) {
+                return p.path == std::filesystem::path(L"driver")/name;
+            });
+            const auto &copied = pins.back().identity;
+            if (original == owner.files_.end() || (copied.dwVolumeSerialNumber == original->identity.dwVolumeSerialNumber &&
+                copied.nFileIndexHigh == original->identity.nFileIndexHigh && copied.nFileIndexLow == original->identity.nFileIndexLow)) return false;
+        }
+        const auto &sysPin = pins[pins.size()-3], &infPin = pins[pins.size()-2];
+        if (!driverPackageSignature(sysPin.handle.value,infPin.handle.value,cat) || !current()) return false;
+        SystemModule api(L"setupapi.dll");
+        if (!api.value) return false;
+        // ABI Setupapi.h documentado; MinGW puede no declarar esta exportación.
+        using Location = BOOL (WINAPI *)(PCWSTR,PSP_ALTPLATFORM_INFO,PCWSTR,PWSTR,DWORD,PDWORD);
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4191)
+#endif
+        const auto location = reinterpret_cast<Location>(GetProcAddress(api.value,"SetupGetInfDriverStoreLocationW"));
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+        wchar_t stored[MAX_PATH]{}; DWORD required = 0;
+        const bool located = location && location(infPin.path.c_str(),nullptr,nullptr,stored,MAX_PATH,&required) &&
+            required > 1 && required <= MAX_PATH && stored[required-1] == 0 &&
+            wcsnlen(stored,MAX_PATH)+1 == required && _wcsicmp(stored,infPin.path.c_str()) == 0;
+        const bool unloaded = api.close();
+        // No se adopta otro namespace ni un path/hash suministrado: proviene del SCM original.
+        return located && unloaded && current() && owner.current();
+    }
+    bool start(Deployment &owner,HANDLE originalActor) {
+        const auto admitted = [&]() {
+            native::Handle repeated; HANDLE raw = nullptr;
+            HANDLE impersonation = nullptr;
+            if (OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,TRUE,&impersonation)) {
+                CloseHandle(impersonation); return false;
+            }
+            if (GetLastError() != ERROR_NO_TOKEN) return false;
+            if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw)) return false;
+            repeated.reset(raw);
+            return compareObjectHandles(originalActor,repeated.value) &&
+                native::systemServiceToken(originalActor,deploymentService(owner.mode_)) && owner.current() && current();
+        };
+        if (!admitted()) return false;
+        if (state == SERVICE_RUNNING) return true;
+        if (state != SERVICE_STOPPED || !admitted() || !StartServiceW(service,0,nullptr)) return false;
+        // Running no expone el FileID de la imagen cargada ni una prueba pública de CI.
+        // La admisión del dispositivo/owner se realiza después por el bridge original.
+        state = SERVICE_START_PENDING;
+        const auto deadline = GetTickCount64()+10000;
+        do {
+            std::filesystem::path actual; DWORD observed = 0;
+            if (!config(service,actual,observed) || actual != image) return false;
+            state = observed;
+            if (!admitted()) return false;
+            if (state == SERVICE_RUNNING) return true;
+            if (state != SERVICE_START_PENDING) return false;
+            Sleep(25);
+        } while (GetTickCount64() < deadline);
+        SetLastError(ERROR_TIMEOUT); return false;
+    }
+};
 Deployment::Deployment(std::filesystem::path root, DeploymentMode mode) : root_(std::move(root)), mode_(mode), directory_(root_, true) {}
 Deployment::~Deployment() = default;
 bool parseInventory(const wire::Bytes &b, Inventory &out) {
@@ -492,6 +710,7 @@ bool Deployment::current() noexcept {
         if (!enumerate({},0,names,false) || names.size() != inventory_.size()) ok = false;
         for (const auto &n : names) if (!inventory_.count(n)) ok = false;
         if (registration_ && !registration_->current()) ok = false;
+        if (driver_ && !driver_->current()) ok = false;
         if (!ok) revoked_ = true;
         return ok;
     } catch (...) { revoked_ = true; return false; }
@@ -535,13 +754,23 @@ bool Deployment::admitServiceConfiguration(wire::Bytes &account, std::filesystem
     candidate->service = OpenServiceW(manager,deploymentService(mode_),SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL);
     CloseServiceHandle(manager);
     if (!candidate->current()) return false;
-    account = candidate->account; store = candidate->store; provision = candidate->provision;
-    registration_ = std::move(candidate); return true;
+    registration_ = std::move(candidate);
+    if (mode_ == DeploymentMode::Product) {
+        native::Handle actor; HANDLE raw = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&raw)) return false;
+        actor.reset(raw);
+        if (!native::systemServiceToken(actor.value,deploymentService(mode_)) || !registration_->current() ||
+            !admitProductDriver() || !current() || !driver_->start(*this,actor.value) || !current() ||
+            !native::systemServiceToken(actor.value,deploymentService(mode_))) return false;
+    }
+    account = registration_->account; store = registration_->store; provision = registration_->provision;
+    return current();
 }
 bool Deployment::serviceAdmittedCurrent() noexcept {
     try {
         const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
-        return role_ == DeploymentRole::Service && registration_ && current();
+        return role_ == DeploymentRole::Service && registration_ && current() &&
+            (mode_ != DeploymentMode::Product || (driver_ && driver_->state == SERVICE_RUNNING && driver_->current()));
     } catch (...) { return false; }
 }
 bool Deployment::driverPackageSigned() {
@@ -558,6 +787,68 @@ bool Deployment::driverPackageSigned() {
     wire::Bytes bytes(static_cast<std::size_t>(size.QuadPart));
     return ReadFile(cat,bytes.data(),DWORD(bytes.size()),&done,nullptr) && done == bytes.size() &&
         driverPackageSignature(handle(L"driver\\GateBouncerClassifier.sys"),handle(L"driver\\GateBouncerClassifier.inf"),bytes) && current();
+}
+bool Deployment::admitProductDriver() {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+    if (mode_ != DeploymentMode::Product || role_ != DeploymentRole::Service || !current()) return false;
+    if (driver_) return driver_->current();
+    auto candidate = std::make_unique<DriverRegistration>();
+    if (!candidate->acquire(*this) || !current()) return false;
+    driver_ = std::move(candidate); return current();
+}
+bool Deployment::driverInstalledCurrent() noexcept {
+    try {
+        const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+        return mode_ == DeploymentMode::Product && role_ == DeploymentRole::Service && driver_ && current();
+    } catch (...) { return false; }
+}
+bool Deployment::installProductDriver(const deployment_detail::AdministrativeLease &lease,HKEY configuration) {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+    const auto admitted = [&]() {
+        bool present = false; DWORD state = 0, initial = 0, size = sizeof(initial);
+        wchar_t root[32768]{}, ordinary[32768]{}; DWORD rootSize = sizeof(root), ordinarySize = sizeof(ordinary);
+        return mode_ == DeploymentMode::Product && role_ == DeploymentRole::Service && current() &&
+            lease.ownsConfiguration(configuration) && maintenanceState(configuration,present,state) && present && state == 1 &&
+            RegGetValueW(configuration,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&initial,&size) == ERROR_SUCCESS &&
+            size == sizeof(initial) && initial == 1 &&
+            RegGetValueW(configuration,nullptr,L"PackageRoot",RRF_RT_REG_SZ,nullptr,root,&rootSize) == ERROR_SUCCESS &&
+            rootSize == (root_.native().size()+1)*sizeof(wchar_t) && root_.native() == root &&
+            RegGetValueW(configuration,nullptr,L"OrdinaryImage",RRF_RT_REG_SZ,nullptr,ordinary,&ordinarySize) == ERROR_SUCCESS &&
+            ordinarySize == ((root_/L"GateBouncer.exe").native().size()+1)*sizeof(wchar_t) && (root_/L"GateBouncer.exe").native() == ordinary;
+    };
+    if (driver_ || !admitted() || !driverPackageSigned() || !admitted()) return false;
+    SC_HANDLE manager = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
+    if (!manager) return false;
+    SC_HANDLE prior = OpenServiceW(manager,L"LGAGateBouncerClassifier",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL);
+    const auto priorError = prior ? ERROR_SERVICE_EXISTS : GetLastError();
+    const auto absent = !prior && priorError == ERROR_SERVICE_DOES_NOT_EXIST;
+    if (prior) CloseServiceHandle(prior);
+    CloseServiceHandle(manager);
+    if (!absent) { SetLastError(priorError); return false; }
+    if (!primitivePlatform()) return false;
+    SystemModule api(L"newdev.dll");
+    if (!api.value) return false;
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4191)
+#endif
+    const auto install = reinterpret_cast<decltype(&DiInstallDriverW)>(GetProcAddress(api.value,"DiInstallDriverW"));
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    BOOL reboot = FALSE;
+    // Custodia: el staging NT-relative nació con ACL protegida, sólo SY/BA pueden mutar.
+    // Sus handles/FileIDs permanecen retenidos durante el reopen Windows. SY/BA/TI son
+    // TCB de instalación, no actores exentos de la política de tráfico. No se garantiza
+    // continuidad contra un administrador/TCB comprometido; ShareRead no bloquea atributos.
+    const bool installed = install && admitted() && install(nullptr,(root_/L"driver"/L"GateBouncerClassifier.inf").c_str(),0,&reboot);
+    const auto error = GetLastError();
+    const bool unloaded = api.close();
+    if (!installed || !unloaded) { SetLastError(error ? error : ERROR_INVALID_STATE); return false; }
+    if (!admitted() || !admitProductDriver() || !driverInstalledCurrent() || !admitted()) return false;
+    if (reboot) { SetLastError(ERROR_SUCCESS_REBOOT_REQUIRED); return false; }
+    // El resultado sólo admite registro/archivos DriverStore originales; no ReadyOS/CI.
+    return true;
 }
 bool Deployment::prepareEnvironment() {
     if (!current())

@@ -257,10 +257,10 @@ bool pinSource(const std::filesystem::path &source,std::vector<native::Handle> &
     }
     return true;
 }
-bool stagePackage(const std::filesystem::path &source,const std::filesystem::path &package,
-                  std::shared_ptr<Deployment> &owner, DeploymentMode mode) {
+static bool stagePackageRetained(const std::filesystem::path &source,const std::filesystem::path &package,
+                  std::shared_ptr<Deployment> &owner, OutputPins &held, DeploymentMode mode) {
     if (owner || !disjoint(source,package)) return false;
-    OutputPins held; std::vector<native::Handle> inputs;
+    std::vector<native::Handle> inputs;
     if (!pinOutputParents(package,held) || !pinSource(source,inputs,mode)) return false;
     const auto attr = GetFileAttributesW(package.c_str());
     if (attr != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) return false;
@@ -295,6 +295,11 @@ bool stagePackage(const std::filesystem::path &source,const std::filesystem::pat
         !candidate->matchesCreatedFile(row.first,row.second.handle.value)) return false;
     if (!candidate->current() || !outputsCurrent(held)) return false;
     owner = std::move(candidate); return true;
+}
+bool stagePackage(const std::filesystem::path &source,const std::filesystem::path &package,
+                  std::shared_ptr<Deployment> &owner, DeploymentMode mode) {
+    OutputPins held;
+    return stagePackageRetained(source,package,owner,held,mode);
 }
 }
 static bool prepareDeployment(DeploymentMode mode, const std::filesystem::path &source,const std::filesystem::path &package,
@@ -342,7 +347,7 @@ static bool prepareDeployment(DeploymentMode mode, const std::filesystem::path &
         Descriptor scm(L"O:BAG:BAD:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GR;;;BU)");
         if (!readable.value || !privateObject.value || !registry.value || !scm.value) return false;
         std::shared_ptr<Deployment> packageOwner;
-        if (!deployment_detail::stagePackage(source,package,packageOwner,mode) ||
+        if (!deployment_detail::stagePackageRetained(source,package,packageOwner,held,mode) ||
             !createDirectory(store,privateObject.value,held,false)) return false;
         const auto command = deploymentCommand(package/L"GateBouncerService.exe",mode);
         Key configuration; DWORD disposition = 0;
@@ -377,11 +382,11 @@ static bool prepareDeployment(DeploymentMode mode, const std::filesystem::path &
             packageOwner->current() && lease.current() && outputsCurrent(held);
         DWORD marker = 1;
         if (recorded && mode == DeploymentMode::Product) {
-            // Tuple original durable y servicio Disabled: falta instalación/admisión DriverStore.
-            // DiInstallDriverW reabre InfPath, sin RootDirectory/HANDLE ni FileID de salida.
-            // El binding original debe resolverse aquí antes de publicar marker0/AutoStart.
-            SetLastError(ERROR_NOT_SUPPORTED);
-            return false;
+            // Custodia de staging original hasta el último readback; fallo conserva marker1/Disabled.
+            if (!outputsCurrent(held) || !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode) ||
+                !packageOwner->installProductDriver(lease,configuration.value) || !packageOwner->driverInstalledCurrent() ||
+                !lease.current() || !outputsCurrent(held) ||
+                !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode)) return false;
         }
         if (recorded && deployment_detail::mark(configuration.value,0,marker,lease)) marker = 0;
         else return false; // Flush/readback incierto: no escribir otro marker ni reintentar.

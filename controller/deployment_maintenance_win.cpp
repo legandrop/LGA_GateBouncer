@@ -352,9 +352,8 @@ class GuestMaintenance {
         };
         try {
             if (!admit(root,true)) return recovery();
-            if (mode_ == DeploymentMode::Product) {
-                // El inventario firmado no admite por sí solo un driver original en DriverStore.
-                // Resolver ese binding antes de Runtime/store o de habilitar AutoStart.
+            if (mode_ == DeploymentMode::Product && (!package_->admitProductDriver() || !package_->driverInstalledCurrent())) {
+                // Sólo el SCM/DriverStore original admitido permite finalizar el tuple usuario.
                 result_.phase = MaintenancePhase::Service;
                 result_.outcome = MaintenanceOutcome::Pending;
                 result_.error = ERROR_NOT_SUPPORTED;
@@ -382,7 +381,8 @@ class GuestMaintenance {
             if (!admit(root) || lease_.image() != source/L"GateBouncerService.exe" ||
                 !deployment_detail::disjoint(root,replacement) || !deployment_detail::disjoint(store_,replacement)) return fail();
             if (mode_ == DeploymentMode::Product) {
-                // La instalación/admisión DriverStore de la versión nueva precede al switch.
+                // DriverUnload no existe: reemplazar una imagen cargada requiere otro recorrido/reboot.
+                // No cambiar registro/archivos bajo la imagen física actual ni fingir una actualización.
                 result_.phase = MaintenancePhase::Package;
                 result_.outcome = MaintenanceOutcome::Pending;
                 result_.error = ERROR_NOT_SUPPORTED;
@@ -424,6 +424,19 @@ class GuestMaintenance {
     MaintenanceResult uninstall(const std::filesystem::path &root) {
         try {
             if (!admit(root,false,true)) return fail();
+            if (mode_ == DeploymentMode::Product) {
+                SC_HANDLE kernel = OpenServiceW(manager_,L"LGAGateBouncerClassifier",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL);
+                const auto error = kernel ? ERROR_SERVICE_EXISTS : GetLastError();
+                const auto absent = !kernel && error == ERROR_SERVICE_DOES_NOT_EXIST;
+                if (kernel) CloseServiceHandle(kernel);
+                if (!absent) {
+                    // Driver Windows parcial/genuino retenido: conservar su tuple, no borrar por nombre.
+                    result_.phase = MaintenancePhase::Service;
+                    result_.outcome = MaintenanceOutcome::Pending;
+                    result_.error = error;
+                    return result_;
+                }
+            }
             if (pendingRemoval_) {
                 // Store físicamente Missing y catálogo ausente, leídos por el owner original.
                 // Un marker1 con snapshot o filtros no corresponde a esta preparación pendiente.

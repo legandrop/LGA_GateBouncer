@@ -28,7 +28,8 @@ foreach(target gatebouncer_wire gatebouncer_policy gatebouncer_decisions gatebou
   target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00)
 endforeach()
 target_link_options(GateBouncerService PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)
-target_link_options(GateBouncerService PRIVATE /DEPENDENTLOADFLAG:0x800)
+target_link_options(GateBouncerService PRIVATE /DEPENDENTLOADFLAG:0x800
+  "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../controller/deployment_ordinary.manifest")
 add_executable(GateBouncer WIN32 ../controller/deployment_ordinary_bootstrap.cpp ../resources/app.rc)
 target_include_directories(GateBouncer PRIVATE ../resources)
 target_link_libraries(GateBouncer PRIVATE gatebouncer_native_ii shell32)
