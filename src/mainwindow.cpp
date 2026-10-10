@@ -1438,6 +1438,22 @@ void MainWindow::refreshTable(bool newPage) {
                      {gap ? "Observation gap" : "Blocked attempt observed", gap ? "warning" : "", {}},
                      {"Unknown", {}, {}}, {gap ? "Coverage incomplete" : "WFP source · no traffic evidence", {}, {}}}});
             }
+        if (view_ == "activity") {
+            const auto gap = [](const Row &row) { return row.id.startsWith("history-gap:") ||
+                (row.cells.size() > 2 && row.cells[2].text == "Observation gap"); };
+            const auto total = std::count_if(result.begin(),result.end(),[&](const Row &row) { return !gap(row); });
+            if (!activityQuery_.isEmpty()) result.erase(std::remove_if(result.begin(),result.end(),[&](const Row &row) {
+                return !gap(row) && !std::any_of(row.cells.begin(),row.cells.end(),[&](const Cell &cell) {
+                    return cell.text.contains(activityQuery_,Qt::CaseInsensitive);
+                });
+            }),result.end());
+            const auto matching = std::count_if(result.begin(),result.end(),[&](const Row &row) { return !gap(row); });
+            if (auto *status = pageControl<QLabel>(page_,"history-match-status")) {
+                status->setText(matching ? QString("%1 of %2 recorded activity rows match · history gaps remain visible").arg(matching).arg(total)
+                    : QString("No matching recorded activity · %1 detail records retained; see monitoring coverage below. History gaps remain visible.").arg(total));
+                status->setVisible(!activityQuery_.isEmpty());
+            }
+        }
         if (count_) count_->setText(QString("%1 of %2 observed processes").arg(result.size()).arg(product_.catalog().processes.size()));
     } else if (view_ == "processes") {
         for (const auto &p : state.processes) {
@@ -1535,7 +1551,7 @@ void MainWindow::refreshTable(bool newPage) {
     if (emptyState_) {
         emptyState_->setText(!product_.simulation()
             ? view_ == "pending" ? product_.ordinary()->current() ? "No requests awaiting a decision" : "Requests unavailable · refresh to check the connection"
-                : view_ == "activity" ? "Network activity collector unavailable"
+                : view_ == "activity" ? (activityQuery_.isEmpty() ? "No retained activity records\nSee monitoring coverage below; missing records do not establish inactivity." : "No matching recorded activity\nChange or clear the search.")
                 : view_ == "rules" ? QString(query_.isEmpty() ? "No rules or saved review candidates" : "No matching rules or saved review candidates\nChange or clear the search.")
                     + (!product_.ordinary()->rulesCurrent() && !(!product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent())
                         ? "\nLive rule catalog unavailable" : "")
@@ -2305,9 +2321,14 @@ void MainWindow::renderLive() {
         auto *bar = line(pageLayout_);
         auto *connectHistory = button("Connect history", "connect-history");
         connectHistory->setEnabled(product_.records()->idle() && !product_.records()->refreshing());
-        bar->addWidget(connectHistory, 0, Qt::AlignLeft); bar->addStretch();
+        bar->addWidget(connectHistory, 0, Qt::AlignLeft);
+        auto *search = new QLineEdit(activityQuery_); search->setObjectName("activity-search");
+        search->setAccessibleName("Search recorded activity"); search->setPlaceholderText("Search application, event, direction or reason…");
+        search->setClearButtonEnabled(true); bar->addWidget(search,1);
+        connect(search,&QLineEdit::textChanged,this,[this](const QString &text) { activityQuery_ = text; refreshTable(); });
         connect(connectHistory, &QPushButton::clicked, &product_, &ProductController::selectDecisionRecords);
         makeTable({"Time", "Process", "Event", "Destination", "Reason"}, {19, 22, 19, 20, 20}, 42);
+        pageLayout_->addWidget(named(label({},"muted",true),"history-match-status"));
         const auto &history = product_.history();
         int liveSources = 0, nativeSources = 0, gaps = 0;
         for (const auto &coverage : history.coverage) if (coverage.native) {
