@@ -7,6 +7,11 @@
 #include <cwchar>
 #include <limits>
 
+// Valor de WinTrust del SDK de Windows, ausente en algunos headers de MinGW.
+#ifndef WTD_DISABLE_MD2_MD4
+#define WTD_DISABLE_MD2_MD4 0x00002000
+#endif
+
 using gatebouncer::localfacts::detail::SignatureWire;
 static bool parseHandle(const wchar_t* text, HANDLE& handle) {
     if (!text || !*text || *text == L'-' || *text == L'+') return false;
