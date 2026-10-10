@@ -12,10 +12,11 @@
 namespace gb {
 class BrokerAdmission;
 class DesktopWorkerEntry;
-// Credencial efímera del helper original; este productor no admite sesiones Linux.
+class OwnHostLinuxOriginal;
+// Credencial efímera: el helper guest conserva su admisión; el host usa su owner propio.
 class OwnMemorySshCredential final : public std::enable_shared_from_this<OwnMemorySshCredential> {
 public:
-    enum class State { Reserved, MemoryOwned, ClosePending, Closed };
+    enum class State { Reserved, MemoryOwned, SignatureSubmitted, ClosePending, Closed };
     enum class Cause { None, OriginalAdmissionLost, CryptoUnconfirmed, PipeUnconfirmed,
         LinuxBindingUnavailable, Cancelled, IoUnconfirmed, CloseUnconfirmed, ReplayRejected };
     struct Snapshot { State state; Cause cause; };
@@ -27,8 +28,14 @@ public:
     OwnMemorySshCredential& operator=(const OwnMemorySshCredential&) = delete;
 private:
     friend class DesktopWorkerEntry;
+    friend class OwnHostLinuxOriginal;
     OwnMemorySshCredential() = default;
     static std::shared_ptr<OwnMemorySshCredential> CreateOwn(const std::shared_ptr<BrokerAdmission>&);
+#ifdef GB_ORIGINAL_HOST_ONLY
+    static std::shared_ptr<OwnMemorySshCredential> CreateHostOwn(const std::shared_ptr<OwnHostLinuxOriginal>&);
+#endif
+    static std::shared_ptr<OwnMemorySshCredential> CreateCoreOwn(const std::shared_ptr<BrokerAdmission>&,const std::shared_ptr<OwnHostLinuxOriginal>&);
+    bool ReplyHostOwn(const std::vector<BYTE>&);
     bool OriginalCurrentOwn() const;
     bool CurrentOwn();
     bool PublicBlobOwn(std::vector<BYTE>&);
@@ -42,6 +49,8 @@ private:
     struct IoOwn;
     std::shared_ptr<IoOwn> io_;
     std::shared_ptr<BrokerAdmission> admission_;
+    std::weak_ptr<OwnHostLinuxOriginal> host_;
+    bool hostRoute_=false,signConsumed_=false;
     std::recursive_mutex mutex_;
     std::mutex signalMutex_;
     std::atomic<bool> cancelled_{false};

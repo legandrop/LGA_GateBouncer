@@ -1,0 +1,32 @@
+name: Build original Linux guest executables
+on:
+  push:
+    branches: [lga/linux-original-guest-build-xii]
+    paths:
+      - lab/supervisor/linux/original/**
+      - .github/workflows/linux-original-guest.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          sparse-checkout: lab/supervisor/linux/original
+      - name: Configure
+        run: cmake -S lab/supervisor/linux/original -B build-original -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++
+      - name: Build
+        run: cmake --build build-original --parallel 1 --target gatebouncer-linux-original gatebouncer-capture
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: original-linux-executables
+          path: |
+            build-original/gatebouncer-linux-original
+            build-original/gatebouncer-capture
+          if-no-files-found: error
+          retention-days: 1
+          include-hidden-files: false
+          overwrite: false
