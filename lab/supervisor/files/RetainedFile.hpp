@@ -13,6 +13,7 @@
 namespace gb {
 class LinuxSshCreator;
 class P3OwnedConversionFileSeal;
+class GuestConversionLauncher;
 class RetainedFile final : public std::enable_shared_from_this<RetainedFile> {
 public:
     bool CloseOwn();
@@ -22,12 +23,15 @@ public:
 private:
     friend class LinuxSshCreator;
     friend class P3OwnedConversionFileSeal;
+    friend class GuestConversionLauncher;
     RetainedFile() = default;
     static std::shared_ptr<RetainedFile> OpenOwn(const std::wstring&, bool, std::uint64_t);
+    static std::shared_ptr<RetainedFile> RetainInputOwn(HANDLE, const std::wstring&, std::uint64_t);
     bool CurrentOwn() const;
     bool HashOwn(const std::array<BYTE, 32>&) const;
     HANDLE file_ = nullptr;
     std::vector<HANDLE> parents_;
+    HANDLE partial_ = nullptr;
     BY_HANDLE_FILE_INFORMATION identity_{};
     std::wstring path_;
     bool output_ = false, acquired_ = false;

@@ -22,9 +22,9 @@ $script:GbBootstrapCommand = {
 # La tabla fija no recibe scripts, cmdlets, nombres ni rutas del consumidor.
 $script:GbCaptureSteps = @{
     PrepareCapture = @('Create','Configure'); StartCapture = @('Start')
-    CaptureStatus = @('Status'); StopCapture = @('Stop'); CleanupCapture = @('Cleanup')
+    CaptureStatus = @('Status'); StopCapture = @('Stop'); ConvertCapture = @('Convert'); CleanupCapture = @('Cleanup')
 }
 $script:GbRequiredComponents = @('LinuxChannel','GuestLaunchers','WfpActor','GuestBase','CaptureModule')
 $script:GbCapturePhases = @{ Create=@('Created'); Configure=@('Configured'); Start=@('StartSubmitted','Running');
     Status=@('Challenged','Created','Configured','StartSubmitted','Running','Stopped','FileFinal','Removed','NoResources');
-    Stop=@('Stopped','FileFinal'); Cleanup=@('Removed','NoResources') }
+    Stop=@('Stopped','FileFinal'); Convert=@('FileFinal'); Cleanup=@('Removed','NoResources') }

@@ -16,7 +16,7 @@ private:
     friend class GuestConversionLauncher;
     P3OwnedConversionFileSeal() = default;
     // Solo el launcher de captura propio podra invocarlo tras Stop/FileFinal actuales.
-    static std::shared_ptr<P3OwnedConversionFileSeal> AcquireOwn(const std::wstring&,
+    static std::shared_ptr<P3OwnedConversionFileSeal> AcquireOwn(HANDLE, const std::wstring&,
         std::uint32_t, std::int64_t, std::int64_t);
     bool CurrentOwn();
     bool LimitsOwn() const;

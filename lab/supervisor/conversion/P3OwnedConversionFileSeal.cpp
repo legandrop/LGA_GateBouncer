@@ -18,7 +18,7 @@ bool RunValid(const std::wstring& run) {
 }
 }
 std::shared_ptr<P3OwnedConversionFileSeal> P3OwnedConversionFileSeal::AcquireOwn(
-    const std::wstring& run, std::uint32_t interfaceIndex, std::int64_t start, std::int64_t end) {
+    HANDLE input, const std::wstring& run, std::uint32_t interfaceIndex, std::int64_t start, std::int64_t end) {
     auto owner = std::shared_ptr<P3OwnedConversionFileSeal>(new P3OwnedConversionFileSeal);
     { std::lock_guard<std::mutex> registry(registryMutex_); retained_.emplace(owner.get(), owner); }
     std::lock_guard<std::recursive_mutex> operation(owner->mutex_);
@@ -28,7 +28,7 @@ std::shared_ptr<P3OwnedConversionFileSeal> P3OwnedConversionFileSeal::AcquireOwn
             throw 1;
         owner->run_ = run; owner->interface_ = interfaceIndex; owner->start_ = start; owner->end_ = end;
         auto path = L"C:\\GateBouncerLab\\captures\\" + run;
-        owner->input_ = RetainedFile::OpenOwn(path + L"\\capture.etl", false, 8388608);
+        owner->input_ = RetainedFile::RetainInputOwn(input, path + L"\\capture.etl", 8388608);
         if (!owner->input_->CurrentOwn() || owner->cancelled_.load()) throw 1;
         owner->output_ = RetainedFile::OpenOwn(path + L"\\capture.pcapng", true, 8388608);
         if (!owner->output_->CurrentOwn() || owner->cancelled_.load()) throw 1;

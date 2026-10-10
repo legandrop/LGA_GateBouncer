@@ -26,9 +26,7 @@ $script:GbInspect = {
     if ([string]$session.Availability -ne 'Available') { throw 'SessionBusy' }
     [guid]$session.InstanceId
 }
-# El siguiente corte enlazara componentes aceptados; su ausencia es una dependencia.
-# Nunca se importa fuente mutable ni se fabrica un Gate de captura.
-$script:GbComposition = $null
+. (Join-Path $PSScriptRoot 'OwnCaptureComposition.ps1')
 
 function Get-GbOwner([guid]$OwnerId) {
     if (-not $script:GbOwners.ContainsKey($OwnerId)) { throw 'OwnerUnknown' }
@@ -98,14 +96,25 @@ function Close-GbOwnResource($owner) {
     }
     $owner.CleanupPending = @($owner.Resources | Where-Object { $_.Pending }).Count -gt 0
     if (-not $owner.CleanupPending) { $owner.Session = $null }
-    if (-not $owner.CleanupPending) { $owner.State = 'Closed' }
+    if (-not $owner.CleanupPending) {
+        try {
+            if ($owner.CapturePackage) {
+                foreach ($stream in $owner.CapturePackage.Streams) { $stream.Dispose() }
+                foreach ($parent in $owner.CapturePackage.Parents) { $parent.Dispose() }
+                $owner.CapturePackage.Streams.Clear(); $owner.CapturePackage=$null
+            }
+            $owner.CaptureCancel.Dispose()
+            $owner.State = 'Closed'
+        } catch { $owner.CleanupPending=$true; $owner.Cause='PackageCloseUnconfirmed' }
+    }
 }
 
 function Open-GbWindowsSupervisor {
     [CmdletBinding()]
     param([Parameter(Mandatory)][guid]$VmId, [Parameter(Mandatory)][pscredential]$Credential,
         [Parameter(Mandatory)][guid]$LabId, [Parameter(Mandatory)][string]$BootstrapHash,
-        [Parameter(Mandatory)][string]$TestMac, [Parameter(Mandatory)][string]$GuestUserSid)
+        [Parameter(Mandatory)][string]$TestMac, [Parameter(Mandatory)][string]$GuestUserSid,
+        [string]$CaptureLocal='', [string]$CapturePeer='')
     if ($VmId -eq [guid]::Empty -or $LabId -eq [guid]::Empty -or $BootstrapHash -cnotmatch '^[0-9A-F]{64}$' -or $TestMac -cnotmatch '^[0-9A-F]{12}$' -or $GuestUserSid -cnotmatch '^S-1-5-[0-9-]{1,160}$') { throw 'PlanInvalid' }
     if (@($script:GbOwners.Values | Where-Object { $_.VmId -eq $VmId -and $_.State -ne 'Closed' }).Count) { throw 'VmOwnershipPending' }
     $now = & $script:GbClock
@@ -114,7 +123,8 @@ function Open-GbWindowsSupervisor {
         Plan = @{ Hash = $BootstrapHash; Mac = $TestMac; Sid = $GuestUserSid }; State = 'CreatingWindows'; Cause = '';
         Created = $now; Observed = $now; Deadline = $now + 10000; Generation = [long]0;
         Revoked = $false; Busy = $true; CleanupPending = $false; StartSubmitted = $false;
-        StopObserved = $false; FileFinal = $false }
+        StopObserved = $false; FileFinal = $false; CapturePackage=$null;
+        CaptureLocal=$CaptureLocal;CapturePeer=$CapturePeer;CaptureCancel=[Threading.CancellationTokenSource]::new();Conversion=$null }
     $script:GbOwners[$owner.Id] = $owner
     try {
         $owner.Inventory = & $script:GbInventory $VmId
@@ -147,7 +157,7 @@ function Invoke-GbLabCommand {
     [CmdletBinding()]
     param([Parameter(Mandatory)][guid]$OwnerId, [Parameter(Mandatory)][long]$Generation,
         [Parameter(Mandatory)][guid]$AcquisitionRunId,
-        [Parameter(Mandatory)][ValidateSet('WindowsStatus','PrepareCapture','StartCapture','CaptureStatus','StopCapture','CleanupCapture')][string]$Operation)
+        [Parameter(Mandatory)][ValidateSet('WindowsStatus','PrepareCapture','StartCapture','CaptureStatus','StopCapture','ConvertCapture','CleanupCapture')][string]$Operation)
     $owner = Get-GbOwner $OwnerId
     if ($owner.Busy) { throw 'PipelineBusy' }
     $owner.Busy = $true
@@ -164,6 +174,7 @@ function Invoke-GbLabCommand {
         if (-not $gate -or -not [object]::ReferenceEquals($gate, $owner.Gate)) { throw 'CaptureGateMismatch' }
         if ($AcquisitionRunId -eq [guid]::Empty -or ($owner.Run -ne [guid]::Empty -and $owner.Run -ne $AcquisitionRunId)) { throw 'CaptureRunMismatch' }
         $owner.Run = $AcquisitionRunId
+        if ($Operation -eq 'ConvertCapture' -and (-not $owner.StopObserved -or -not $owner.FileFinal)) { throw 'StopFinalizationRequired' }
         if ($Operation -eq 'CleanupCapture' -and $owner.StartSubmitted -and (-not $owner.StopObserved -or -not $owner.FileFinal)) { throw 'StopFinalizationRequired' }
         foreach ($step in $script:GbCaptureSteps[$Operation]) {
             if ($step -eq 'Start') { $owner.StartSubmitted = $true }
@@ -178,6 +189,11 @@ function Invoke-GbLabCommand {
             if (-not $cleanup -and $receipt.Outcome -cin @('Invalid','ConfigFailed/NotStarted')) { throw 'CaptureOutcomeInvalid' }
             if ($receipt.Phase -ceq 'Removed' -and $receipt.Cleanup -ceq 'Observed' -and (-not $owner.StartSubmitted -or ($owner.StopObserved -and $owner.FileFinal))) { $owner.Gate = $null }
             if ($step -eq 'Stop') { $owner.StopObserved = $receipt.Stop -ceq 'Observed'; $owner.FileFinal = $receipt.FileFinal }
+            if ($step -eq 'Convert') {
+                if ($receipt.ConversionPending -isnot [bool] -or $receipt.ConversionPending -or
+                    -not $receipt.Conversion -or $receipt.Conversion.Outcome -cne 'ConvertedOriginalLengthUnknown') { throw 'ConversionUnconfirmed' }
+                $owner.Conversion=$receipt.Conversion
+            }
             if ($step -eq 'Cleanup' -and $receipt.Cleanup -ceq 'Observed') { $owner.Gate = $null }
             if ($step -eq 'Cleanup' -and $receipt.Cleanup -ceq 'NotRequired' -and $receipt.Phase -ceq 'NoResources' -and -not $receipt.CreateSubmitted -and -not $owner.StartSubmitted) { $owner.Gate = $null }
         }
@@ -190,6 +206,7 @@ function Invoke-GbLabCommand {
 function Revoke-GbLabSupervisor {
     [CmdletBinding()] param([Parameter(Mandatory)][guid]$OwnerId)
     $owner = Get-GbOwner $OwnerId
+    $owner.CaptureCancel.Cancel()
     if (-not $owner.Revoked) {
         if ($owner.Generation -lt [long]::MaxValue) { $owner.Generation++ }
         Set-GbInvalid $owner 'Cancelled'

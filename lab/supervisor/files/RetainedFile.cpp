@@ -60,6 +60,24 @@ bool RetainedFile::CurrentOwn() const {
     }
     return true;
 }
+std::shared_ptr<RetainedFile> RetainedFile::RetainInputOwn(HANDLE source, const std::wstring& path, std::uint64_t cap) {
+    // Abrir conserva los padres; el archivo adoptado es el HANDLE exacto del productor.
+    auto owner = OpenOwn(path, false, cap);
+    if (!owner->CurrentOwn() || !source || source == INVALID_HANDLE_VALUE) { owner->acquired_ = false; return owner; }
+    // Slot fijo del owner ya retenido ANTES de Duplicate: no asignacion posterior que pueda lanzar.
+    if (!DuplicateHandle(GetCurrentProcess(), source, GetCurrentProcess(), &owner->partial_, GENERIC_READ, FALSE, 0)) {
+        owner->acquired_ = false; return owner;
+    }
+    const HANDLE exact = owner->partial_;
+    BY_HANDLE_FILE_INFORMATION actual{};
+    if (!GetFileInformationByHandle(exact, &actual) || !SameFile(owner->identity_, actual, false) || !PathMatches(exact, path)) {
+        owner->acquired_ = false; return owner;
+    }
+    if (!CloseHandle(owner->file_)) { owner->acquired_ = false; return owner; }
+    owner->file_ = exact;
+    owner->partial_ = nullptr;
+    return owner;
+}
 bool RetainedFile::HashOwn(const std::array<BYTE, 32>& expected) const {
     if (!CurrentOwn() || output_) return false;
     BCRYPT_ALG_HANDLE algorithm = nullptr; BCRYPT_HASH_HANDLE hash = nullptr;
@@ -92,6 +110,7 @@ bool RetainedFile::HashOwn(const std::array<BYTE, 32>& expected) const {
 bool RetainedFile::CloseOwn() {
     acquired_ = false;
     if (file_) { if (!CloseHandle(file_)) return false; file_ = nullptr; }
+    if (partial_) { if (!CloseHandle(partial_)) return false; partial_ = nullptr; }
     for (auto& parent : parents_) {
         if (parent) { if (!CloseHandle(parent)) return false; parent = nullptr; }
     }
