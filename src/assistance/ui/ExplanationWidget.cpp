@@ -95,6 +95,7 @@ void ExplanationWidget::refresh(){
     state_->setText(!session_?"Assistance unavailable":busy?session_->publicApprovalPending()?"Registering reviewed public information…":session_->state()==G::State::Explaining?"Explaining public evidence…":session_->state()==G::State::Searching?"Searching for reviewed public information…":"Reading the current request or assistance configuration…":
         session_->state()==G::State::Cancelled?"Explanation cancelled · request remains undecided":
         session_->result()&&same?"Explanation finished · request remains undecided":
+        !session_->problem().isEmpty()?"Assistance unavailable · request remains undecided":
         reviewed?"Public information reviewed for this request":
         observedName_.isEmpty()?"Automatic explanation unavailable · no current application name":"Waiting for current configuration, consent and application information");
     QString text="Purpose and the effect of blocking are Unknown until evidence for this destination is available.";
