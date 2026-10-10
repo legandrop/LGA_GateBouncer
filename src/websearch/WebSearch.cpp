@@ -196,7 +196,7 @@ SearchResult parseResponse(const HttpResponse &response, SearchResult result,
         const auto url = QUrl(urlString, QUrl::StrictMode);
         if (!plain(urlString, 2048) || !safeCitationUrl(url)) continue;
         const auto title = text(obj.value(QStringLiteral("title")).toString(), 160);
-        if (title.isEmpty() || citations.size() >= 5) continue;
+        if (title.isEmpty()) continue;
         bool duplicate = false;
         for (const auto &citation : citations) if (citation.url == url) duplicate = true;
         if (!duplicate) citations.push_back({title,
@@ -204,14 +204,22 @@ SearchResult parseResponse(const HttpResponse &response, SearchResult result,
             (result.provider == Provider::MwmblV2 ? QStringLiteral("Mwmbl / ") : QStringLiteral("SearXNG / "))
                 + text(obj.value(QStringLiteral("engine")).toString(), 64), retrievalUtc.toUTC()});
     }
-    if(result.input.destination)for(auto& citation:citations){
-        citation.kind=2;citation.subject=result.input.destination->address;
-        const QRegularExpression literal("(?<![0-9A-Fa-f:.])"+QRegularExpression::escape(citation.subject)+"(?![0-9A-Fa-f:.])",QRegularExpression::CaseInsensitiveOption);
-        const bool exact=literal.match(citation.snippet+" "+citation.title).hasMatch();
-        citation.origin += exact?" / literal IP in search text":" / IP+app query association only";
-        citation.snippet=text(citation.snippet,850)+(exact
-            ?". Search text mentions this IP; endpoint purpose and shared hosting remain unverified."
-            :". Returned for an IP+app query; no literal IP match in this text. It may be unrelated to this connection.");
+    if(result.input.destination){
+        const QRegularExpression literal("(?<![0-9A-Fa-f:.])"+QRegularExpression::escape(result.input.destination->address)+"(?![0-9A-Fa-f:.])",QRegularExpression::CaseInsensitiveOption);
+        const auto mentions=[&literal](const Citation& citation){return literal.match(citation.snippet+" "+citation.title).hasMatch();};
+        // Relevancia textual sobre los candidatos ya normalizados; no acredita servicio ni propietario.
+        std::stable_partition(citations.begin(),citations.end(),mentions);
+        if(citations.size()>5)citations.resize(5);
+        for(auto& citation:citations){
+            citation.kind=2;citation.subject=result.input.destination->address;
+            const bool exact=mentions(citation);
+            citation.origin += exact?" / literal IP in search text":" / IP+app query association only";
+            citation.snippet=text(citation.snippet,850)+(exact
+                ?". Search text mentions this IP; endpoint purpose and shared hosting remain unverified."
+                :". Returned for an IP+app query; no literal IP match in this text. It may be unrelated to this connection.");
+        }
+    }else if(citations.size()>5){
+        citations.resize(5);
     }
     result.citations = std::move(citations);
     if(validating){result.diagnostic.local=LocalHttpFailure::None;result.diagnostic.failureObserved=false;}
