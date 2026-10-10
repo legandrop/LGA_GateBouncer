@@ -14,7 +14,7 @@ ExplanationWidget::ExplanationWidget(GeneralSession* session,Binding binding,con
         ? "The current application name is unavailable. You can review a public name manually. Paths, file hashes and local signature details are not sent. An explanation never decides Allow or Block."
         : "The query uses the executable name observed by the service. Publisher and file identity are unverified. Automatic starts after setup and consent; Manual waits for Explain. Paths, file hashes and local signature details are not sent. An explanation never decides Allow or Block.",this);
     notice->setTextFormat(Qt::PlainText);notice->setWordWrap(true);notice->setProperty("role","faint");layout->addWidget(notice);
-    auto* privacy=new QLabel("Web consent covers looking up the reviewed public IP in registration services. Model consent also covers the IP, port, protocol and retrieved evidence. Internal and reserved addresses remain local. Registration is not the final service; blocking may affect functionality.",this);
+    auto* privacy=new QLabel("Web consent covers public IP registration and routing lookups, plus searching the approved IP and app name together. Model consent also covers the IP, port, protocol and retrieved evidence. Internal and reserved addresses remain local. Registration is not the final service; blocking may affect functionality.",this);
     privacy->setTextFormat(Qt::PlainText);privacy->setWordWrap(true);layout->addWidget(privacy);
     destination_=new QLabel(this);destination_->setObjectName("observed-destination");destination_->setTextFormat(Qt::PlainText);destination_->setWordWrap(true);layout->addWidget(destination_);
     product_=new QLineEdit(suggested,this);product_->setObjectName("public-product");product_->setMaxLength(96);product_->setPlaceholderText("Public product name");layout->addWidget(product_);
@@ -54,9 +54,9 @@ void ExplanationWidget::refresh(){
         configuration->activation.cause==Configuration::ActivationCause::Ready;
     const auto binding=binding_?binding_():std::nullopt;
     const auto original=session_?session_->observedDestination():std::nullopt;
-    QString destination="Destination: Unknown\nObserved domain: Unknown\nRouting ASN: Unknown";
+    QString destination="Destination: Unknown\nObserved domain: Unknown";
     if(original){const auto& d=*original;
-        destination=QString("Destination: %1 · port %2 · %3\nObserved: %4 · original outbound connection\nObserved domain: Unknown\nRouting ASN: Unknown")
+        destination=QString("Destination: %1 · port %2 · %3\nObserved: %4 · original outbound connection\nObserved domain: Unknown")
             .arg(QString::fromUtf8(d.address)).arg(d.port).arg(d.protocol==6?"TCP":"UDP")
             .arg(QDateTime::fromMSecsSinceEpoch(qint64(d.observedAtMs),Qt::UTC).toString(Qt::ISODateWithMs));}
     destination_->setText(destination);
@@ -67,9 +67,9 @@ void ExplanationWidget::refresh(){
         session_->result()?"Explanation finished · file identity remains unverified":
         session_->publicReviewCurrent()?observedName_.isEmpty()?"Public information reviewed for this request · identity unverified":"Observed application name ready · identity unverified":
         observedName_.isEmpty()?"Automatic explanation unavailable · no current application name":"Waiting for current configuration, consent and application information");
-    QString text="Network operator (registration): Unknown\nService: Unknown\nLikely purpose: Unknown\nPossible impact of blocking: Unknown\nConditional suggestion: Unknown";const auto result=session_?session_->result():std::nullopt;
+    QString text="Network operator (registration): Unknown\nRouting ASN: Unknown\nService: Unknown\nLikely purpose: Unknown\nPossible impact of blocking: Unknown\nConditional suggestion: Unknown";const auto result=session_?session_->result():std::nullopt;
     if(result){const auto view=G::makeView(*result);text="Network operator (registration): "+QString::fromUtf8(view.networkOperator)+
-        "\nService (possible): "+QString::fromUtf8(view.service)+"\nLikely purpose (possible): "+QString::fromUtf8(view.purpose)+
+        "\nRouting ASN: "+QString::fromUtf8(view.routingAsn)+"\nService (possible): "+QString::fromUtf8(view.service)+"\nLikely purpose (possible): "+QString::fromUtf8(view.purpose)+
         "\nNetwork reason (possible): "+QString::fromUtf8(view.networkReason)+"\nPossible impact of blocking: "+QString::fromUtf8(view.impact)+
         "\nConditional suggestion: "+QString::fromUtf8(view.advice)+"\n"+
         QString::fromUtf8(view.uncertainty)+"\n"+QString::fromUtf8(view.identityNotice)+"\n"+QString::fromUtf8(view.providerNotice);
@@ -82,7 +82,7 @@ void ExplanationWidget::refresh(){
     if(result)for(const auto& citation:result->citations){
         auto* label=new QLabel(QString("[%1] %2\n%3\n%4\nChecked: %5 · %6").arg(citation.id).arg(QString::fromUtf8(citation.title),QString::fromUtf8(citation.url),QString::fromUtf8(citation.snippet),
             QDateTime::fromMSecsSinceEpoch(qint64(citation.retrievedAtMs),Qt::UTC).toString(Qt::ISODateWithMs),
-            citation.kind==1?QString("Registration record; service unknown"):citation.kind==2?QString("Official endpoint document; purpose possible"):QString("Public snippet; uncertain")),citations_);
+            citation.kind==1?QString("Registration record; service unknown"):citation.kind==2?QString("IP+app search association; service unverified"):citation.kind==3?QString("Announcing ASN from RIS; may lag routing"):QString("Public snippet; uncertain")),citations_);
         label->setTextFormat(Qt::PlainText);label->setWordWrap(true);label->setTextInteractionFlags(Qt::TextSelectableByMouse|Qt::TextSelectableByKeyboard);sources->addWidget(label);
     }
 }

@@ -33,7 +33,7 @@ struct Citation {
     QUrl url;
     QString origin;
     QDateTime retrievalUtc;
-    quint8 kind=0; // 0 snippet, 1 registro RDAP, 2 documentación oficial con IP literal.
+    quint8 kind=0; // 0 app, 1 registro RDAP, 2 asociación IP+app no verificada, 3 ASN anunciado RIS.
     QString subject;
 };
 struct SearchResult {
@@ -119,12 +119,15 @@ private:
     qint64 deadline_ = 0;
     bool working_=false;
     bool reusedDestinationCache_=false;
+    unsigned requests_=0;
     Resource resource_=Resource::Search;
     QUrl resourceUrl_;
     QByteArray bootstrap4_,bootstrap6_;
     qint64 bootstrap4At_=0,bootstrap6At_=0;
     struct DestinationCache { QString key;QVector<Citation> evidence;qint64 at=0; };
     QVector<DestinationCache> destinationCache_;
+    // Registro y routing dependen de IP; no repetirlos por cambiar el nombre de aplicación.
+    QVector<DestinationCache> networkCache_;
 };
 }
 Q_DECLARE_METATYPE(gatebouncer::websearch::SearchResult)

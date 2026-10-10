@@ -91,7 +91,7 @@ View makeView(const Result& r) {
     else if(r.state!=State::Evidence)v.providerNotice+=" No current grounded explanation is available.";
     const bool citationsValid=GeneralPayloadBuilder::citationsJson(r.citations).has_value();
     if(citationsValid)v.citations=r.citations;
-    if(citationsValid)for(const auto& c:r.citations)if(c.kind==1)v.networkOperator="Registration record: "+c.snippet;
+    if(citationsValid)for(const auto& c:r.citations){if(c.kind==1)v.networkOperator="Registration record: "+c.snippet;else if(c.kind==3)v.routingAsn=c.snippet;}
     if(r.state==State::Evidence&&r.failure==Failure::None&&r.observedHttpStatus==200&&validBinding(r.binding)&&
         !r.citations.empty()&&citationsValid&&r.inference&&Detail::inferenceJson(*r.inference,r.citations)){
         v.purpose=r.inference->purpose;v.networkReason=r.inference->networkReason;v.uncertainty+=" "+r.inference->caution;v.sourceIds=r.inference->sourceIds;

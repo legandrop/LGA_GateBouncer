@@ -5,6 +5,9 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QRegularExpression>
+#include <QUrlQuery>
+#include <QStringList>
+#include <cmath>
 #include <QStringDecoder>
 #include <algorithm>
 #include <array>
@@ -85,7 +88,14 @@ bool Destination::operator==(const Destination& d) const {
 std::optional<QString> canonicalAddress(const QString& input){const auto parsed=address(input);return parsed?std::optional<QString>(parsed->canonical):std::nullopt;}
 bool publicDestination(const Destination& d){const auto parsed=address(d.address);return parsed&&parsed->canonical==d.address&&global(*parsed)&&d.observedAtMs&&d.observedAtMs<=quint64(INT64_MAX)&&(d.protocol==6||d.protocol==17);}
 QUrl bootstrapUrl(const Destination& d){return publicDestination(d)?QUrl(d.address.contains(':')?"https://data.iana.org/rdap/ipv6.json":"https://data.iana.org/rdap/ipv4.json"):QUrl{};}
-QUrl adobeEndpointsUrl(){return QUrl("https://helpx.adobe.com/business/enterprise/manage-services/configure-services/network-endpoints.html");}
+QString destinationQuery(const QString& app,const Destination& d){
+    return validPublicQuery(app)&&publicDestination(d)?d.address+" "+app:QString{};
+}
+QUrl routingUrl(const Destination& d){
+    if(!publicDestination(d))return {};
+    QUrl url("https://stat.ripe.net/data/network-info/data.json");QUrlQuery query;
+    query.addQueryItem("resource",d.address);url.setQuery(query);return url;
+}
 std::optional<QUrl> registryUrl(const QByteArray& bytes,const Destination& d) {
     if(!publicDestination(d))return {};
     const auto value=address(d.address);const auto root=json(bytes);if(!root||root->value("version")!="1.0"||!root->value("services").isArray())return {};
@@ -108,11 +118,13 @@ std::optional<QUrl> registryUrl(const QByteArray& bytes,const Destination& d) {
     return result;
 }
 bool validResource(Resource kind,const QUrl& url,const std::optional<Destination>& d) {
-    if(!d||!publicDestination(*d)||!url.isValid()||url.hasQuery()||url.hasFragment()||url.scheme()!="https"||
+    if(!d||!publicDestination(*d)||!url.isValid()||url.hasFragment()||url.scheme()!="https"||
         !url.userName().isEmpty()||!url.password().isEmpty()||url.port(443)!=443)return false;
+    if(kind==Resource::Routing)return url==routingUrl(*d);
+    if(url.hasQuery())return false;
     if(kind==Resource::Bootstrap4||kind==Resource::Bootstrap6)return url==bootstrapUrl(*d)&&
         (kind==Resource::Bootstrap6)==d->address.contains(':');
-    if(kind==Resource::AdobeEndpoints)return url==adobeEndpointsUrl();
+
     if(kind!=Resource::Registry)return false;
     return std::any_of(Bases.begin(),Bases.end(),[&](const char* base){return url==QUrl(QString::fromLatin1(base)+"ip/"+d->address,QUrl::StrictMode);});
 }
@@ -142,20 +154,31 @@ std::optional<Citation> registrationEvidence(const HttpResponse& r,const Destina
         ". Registration does not identify the final service, routing ASN, telemetry purpose or safety.";
     return citation;
 }
-std::optional<Citation> officialDestinationEvidence(const HttpResponse& r,const Destination& d,quint64 checked) {
-    if(!checked||checked>quint64(INT64_MAX)||!publicDestination(d)||!response(r,"text/html"))return {};
-    QStringDecoder decoder(QStringDecoder::Utf8);QString html=decoder(r.body);if(decoder.hasError())return {};
-    html.remove(QRegularExpression("<(script|style|noscript)[^>]*>.*?</\\1>",QRegularExpression::CaseInsensitiveOption|QRegularExpression::DotMatchesEverythingOption));
-    html.remove(QRegularExpression("<!--.*?-->",QRegularExpression::DotMatchesEverythingOption));
-    html.remove(QRegularExpression("<[^>]*>"));html.replace("&amp;","&");html.replace("&nbsp;"," ");
-    // Sólo coincidencia IP literal en documento oficial fijo; nunca reverse DNS ni empresa=servicio.
-    const QRegularExpression literal("(?<![0-9A-Fa-f:.])"+QRegularExpression::escape(d.address)+"(?![0-9A-Fa-f:.])",QRegularExpression::CaseInsensitiveOption);
-    const auto match=literal.match(html);if(!match.hasMatch())return {};
-    auto excerpt=html.mid(std::max<qsizetype>(0,match.capturedStart()-180),400);
-    excerpt.remove(QRegularExpression("<[^>]*>"));excerpt.replace("&amp;","&");excerpt.replace("&nbsp;"," ");
-    Citation citation;citation.title="Adobe documented network endpoint";citation.url=adobeEndpointsUrl();citation.origin="Adobe official documentation";
-    citation.retrievalUtc=QDateTime::fromMSecsSinceEpoch(qint64(checked),Qt::UTC);citation.kind=2;citation.subject=d.address;
-    citation.snippet=plain(excerpt,320)+". Exact IP appears in this document; shared hosting and connection purpose remain uncertain.";
-    return citation;
+std::optional<Citation> routingEvidence(const HttpResponse& r,const Destination& d,quint64 checked) {
+    if(!checked||checked>quint64(INT64_MAX)||!publicDestination(d)||!response(r,"application/json"))return {};
+    const auto root=json(r.body);if(!root||root->value("status")!="ok"||root->value("data_call_name")!="network-info"||
+        root->value("version")!="1.1"||!root->value("data").isObject())return {};
+    const auto data=root->value("data").toObject();const auto cidr=data.value("prefix").toString().split('/');
+    if(cidr.size()!=2||!data.value("asns").isArray())return {};
+    const auto ip=address(d.address),network=address(cidr[0]);bool ok=false;const auto bits=cidr[1].toUInt(&ok);
+    if(!ip||!network||!ok||bits>ip->bits||!prefix(*ip,*network,bits))return {};
+    const auto asns=data.value("asns").toArray();if(asns.isEmpty()||asns.size()>16)return {};
+    QStringList names;
+    for(const auto& value:asns){
+        quint64 asn=0;
+        if(value.isString()){
+            const auto digits=value.toString();static const QRegularExpression decimal("^[1-9][0-9]{0,9}$");
+            bool parsed=false;if(!decimal.match(digits).hasMatch())return {};asn=digits.toULongLong(&parsed);if(!parsed)return {};
+        }else if(value.isDouble()){
+            const auto n=value.toDouble();if(n<1||n>4294967295.0||std::floor(n)!=n)return {};asn=quint64(n);
+        }else return {};
+        if(!asn||asn>4294967295ULL)return {};
+        const auto name="AS"+QString::number(asn);if(names.contains(name))return {};names.push_back(name);
+    }
+    Citation c;c.title="Announcing ASN (RIPE RIS)";c.url=routingUrl(d);c.origin="RIPEstat / RIS";
+    c.retrievalUtc=QDateTime::fromMSecsSinceEpoch(qint64(checked),Qt::UTC);c.kind=3;c.subject=d.address;
+    c.snippet="Announcing ASN: "+names.join(", ")+". Prefix: "+network->canonical+"/"+QString::number(bits)+
+        ". Based on RIS dumps updated about every 8 hours; may lag current routing. This is not the registrant, final service, telemetry purpose or safety.";
+    return c;
 }
 }

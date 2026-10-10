@@ -16,13 +16,14 @@ struct Destination {
     bool operator==(const Destination& other) const;
     bool operator!=(const Destination& other) const {return !(*this==other);}
 };
-enum class Resource : quint8 { Search=0, Bootstrap4, Bootstrap6, Registry, AdobeEndpoints };
+enum class Resource : quint8 { Search=0, Bootstrap4, Bootstrap6, Registry, DestinationSearch, Routing };
 std::optional<QString> canonicalAddress(const QString&);
 bool publicDestination(const Destination&);
 QUrl bootstrapUrl(const Destination&);
 std::optional<QUrl> registryUrl(const QByteArray& bootstrap,const Destination&);
-QUrl adobeEndpointsUrl();
+QString destinationQuery(const QString& approvedApp,const Destination&);
+QUrl routingUrl(const Destination&);
 bool validResource(Resource,const QUrl&,const std::optional<Destination>&);
 std::optional<Citation> registrationEvidence(const HttpResponse&,const Destination&,const QUrl&,quint64);
-std::optional<Citation> officialDestinationEvidence(const HttpResponse&,const Destination&,quint64);
+std::optional<Citation> routingEvidence(const HttpResponse&,const Destination&,quint64);
 }

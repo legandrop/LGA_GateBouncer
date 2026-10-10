@@ -71,7 +71,7 @@ struct View {
     bool identityUnverified=true;
     std::vector<Citation> citations;
     std::vector<std::uint8_t> sourceIds;
-    std::string networkOperator="Unknown",service="Unknown",impact="Unknown",advice="Unknown";
+    std::string networkOperator="Unknown",routingAsn="Unknown",service="Unknown",impact="Unknown",advice="Unknown";
 };
 bool validBinding(const FullBinding&,bool approvalPending=false);
 bool validPublicFields(const PublicFields&);

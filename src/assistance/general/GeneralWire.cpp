@@ -54,7 +54,7 @@ std::optional<std::vector<Citation>> readCitations(const QByteArray& bytes){
         const auto id=value.get("id")->integer(),at=value.get("retrieved_at_ms")->integer();const auto shortened=value.get("shortened")->boolean();
         if(!id||*id!=out.size()+1||!at||!*at||!shortened)return {};
         Citation c;c.id=std::uint8_t(*id);c.retrievedAtMs=*at;c.shortened=*shortened;
-        const auto kind=value.get("kind")->integer();const auto subject=value.get("subject")->text();if(!kind||*kind>2||!subject)return {};
+        const auto kind=value.get("kind")->integer();const auto subject=value.get("subject")->text();if(!kind||*kind>3||!subject)return {};
         c.kind=std::uint8_t(*kind);c.subject=subject->toStdString();
         std::string* destinations[]={&c.url,&c.title,&c.snippet,&c.origin};const char* keys[]={"url","title","snippet","origin"};
         for(int n=0;n<4;++n){const auto text=value.get(keys[n])->text();if(!text)return {};*destinations[n]=text->toUtf8().toStdString();}
