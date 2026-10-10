@@ -11,6 +11,27 @@ struct ProcessCatalogResult {
     quint64 generation = 0;
 };
 struct NativeOwnBatch;
+struct SelectedFileFacts {
+    QString image;
+    QByteArray appId, accountSid;
+    quint32 volumeSerial = 0, fileIndexHigh = 0, fileIndexLow = 0;
+    quint32 fileSizeHigh = 0, fileSizeLow = 0, attributes = 0;
+    quint64 lastWrite = 0;
+};
+// Sólo acquire obtiene el dueño Windows original; las copias de facts no lo recrean.
+class SelectedApplicationFile final {
+  public:
+    static std::shared_ptr<SelectedApplicationFile> acquire(const QString &path, QString &error);
+    static unsigned physicalJobs();
+    const SelectedFileFacts &facts() const { return facts_; }
+    bool current() const; // IO: ejecutar fuera del hilo de interfaz.
+    ~SelectedApplicationFile();
+  private:
+    struct Owner;
+    SelectedApplicationFile();
+    std::shared_ptr<Owner> owner_;
+    SelectedFileFacts facts_;
+};
 // Normaliza sólo una declaración de ruta local mediante API Windows. No obtiene FileID,
 // proceso, token, imagen mapeada, lease ni autoridad; el consumidor coteja causa original.
 std::optional<QByteArray> canonicalLocalApplicationId(const QString &path);

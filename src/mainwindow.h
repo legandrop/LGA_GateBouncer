@@ -78,11 +78,17 @@ class MainWindow final : public QMainWindow {
     void positionOverlays();
     void edit(const QString &id, bool candidate = false);
     void cleanup();
+    void cleanupLiveRule();
+    void prepareFileRules(const QStringList &candidates = {}, const std::optional<gb::wire::Id> &editing = {}, int backupIndex = -1);
+    void editSelectedFileRule();
+    void backupSelectedFileRules();
+    void openRuleBackup();
+    void prepareSelectedSourceFiles();
     void about();
     void updateLifecycle();
     void openEngineRequest(const QString &rowId);
     void finishShutdownWhenIdle();
-    enum class ModalOwner { General, Simulation, Live, ImportedDraft, ImportedReview, ImportedActivation };
+    enum class ModalOwner { General, Simulation, Live, ImportedDraft, ImportedReview, ImportedActivation, FileRule, FileBackup };
     QVBoxLayout *modal(const QString &title, ModalOwner owner = ModalOwner::General);
     void closeStaleModal();
     void closeModal();

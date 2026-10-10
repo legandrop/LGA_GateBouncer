@@ -1,7 +1,9 @@
 #pragma once
 #include "contracts.h"
 #include <QLockFile>
+#include <QUuid>
 #include <memory>
+#include "../../common/wire_iv.h"
 
 namespace Gate::Data {
 enum class StoreStatus { Ok, Missing, Busy, Corrupt, FutureSchema, IoError, StaleRevision, Invalid };
@@ -19,6 +21,9 @@ class ReviewStore final {
     ReviewStore &operator=(const ReviewStore &) = delete;
     StoreResult load();
     StoreResult save(const ReviewDocument &document, quint64 expectedRevision);
+    StoreResult saveRuleBackup(const QByteArray &archive, const QUuid &id);
+    static StoreResult parseRuleBackup(const QByteArray &, std::vector<gb::wire::iv::PrincipalRuleRecord> &);
+    static StoreResult loadRuleBackup(const QString &, std::vector<gb::wire::iv::PrincipalRuleRecord> &);
     QString filePath() const { return path_; }
   private:
     QString path_, rootError_;

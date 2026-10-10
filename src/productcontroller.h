@@ -32,6 +32,11 @@ struct ImportedActivationView {
     quint64 token = 0;
     bool busy = false, ready = false;
 };
+struct FileRuleView {
+    QString message;
+    quint64 token = 0;
+    bool busy = false, ready = false;
+};
 class ProductController final : public QObject {
     Q_OBJECT
   public:
@@ -72,6 +77,14 @@ class ProductController final : public QObject {
     bool confirmImportedRule(quint64 token, bool consent);
     void cancelImportedRule();
     const ImportedActivationView &importedActivation() const { return activationView_; }
+    bool prepareApplicationFile(const QString &path, Data::Action action, Data::Direction direction,
+        const std::optional<gb::wire::Id> &editing = {}, quint64 selection = 0,
+        const QString &candidate = {}, int backupIndex = -1);
+    bool confirmApplicationFile(quint64 token, bool consent);
+    void cancelApplicationFile();
+    const FileRuleView &fileRuleView() const { return fileRuleView_; }
+    bool loadSelectedRuleBackup(const QString &path);
+    const auto &inactiveRuleBackup() const { return inactiveRuleBackup_; }
     // View no concede autoridad de control, aun si la GUI tiene token elevado.
     bool canMutatePolicy() const { return false; }
     bool decideReal(const QString &, int) { return false; }
@@ -82,13 +95,16 @@ class ProductController final : public QObject {
     const OrdinaryDecisionClient *ordinary() const { return &ordinary_; }
     bool recordsSelected() const { return recordsSelected_; }
     bool selectDecisionRecords();
+    bool backupSelectedRules(const std::vector<gb::wire::Id> &, quint64 selection, bool consent);
+    bool ruleBackupBusy() const { return pendingRuleBackup_.has_value() || savingRuleBackup_; }
+    QString ruleBackupDirectory() const;
     void selectStatusOnly();
     QString engineSummary() const;
     QString revisionSummary() const;
     quint64 generation() const { return generation_; }
     void stop();
-    bool idle() const { return (!worker_ || !worker_->isRunning()) && (!semanticWorker_ || !semanticWorker_->isRunning()) && (!importWorker_ || !importWorker_->isRunning()) && (!storeWorker_ || !storeWorker_->isRunning()) && !storeLoading_ && !flushingHistory_ &&
-        !(reviewWritable_ && (storeWriteRequested_ || historyDirty_)) && engine_.idle() && records_.idle() && ordinary_.idle(); }
+    bool idle() const { return (!fileWorker_ || !fileWorker_->isRunning()) && !Data::SelectedApplicationFile::physicalJobs() && (!worker_ || !worker_->isRunning()) && (!semanticWorker_ || !semanticWorker_->isRunning()) && (!importWorker_ || !importWorker_->isRunning()) && (!storeWorker_ || !storeWorker_->isRunning()) && !storeLoading_ && !flushingHistory_ &&
+        !pendingRuleBackup_ && !savingRuleBackup_ && !(reviewWritable_ && (storeWriteRequested_ || historyDirty_)) && engine_.idle() && records_.idle() && ordinary_.idle(); }
   signals:
     void changed();
     void invalidated();
@@ -112,10 +128,22 @@ class ProductController final : public QObject {
     void finishImportedComparison(const NativeContextSnapshot &, const std::shared_ptr<Data::NativeOwnBatch> &,
                                   const Data::ProcessCatalogResult &);
     bool importedRuleCurrent() const;
+    void advanceApplicationFile();
+    void checkApplicationFile(bool committing);
+    struct FileActivation;
+    std::unique_ptr<FileActivation> fileActivation_;
+    FileRuleView fileRuleView_;
+    quint64 fileRuleToken_ = 0;
+    QThread *fileWorker_ = nullptr;
+    QTimer fileDrain_;
+    std::vector<gb::wire::iv::PrincipalRuleRecord> inactiveRuleBackup_;
     struct ImportedActivation;
     std::unique_ptr<ImportedActivation> activation_;
     ImportedActivationView activationView_;
     quint64 activationToken_ = 0;
+    std::optional<QByteArray> pendingRuleBackup_;
+    QUuid pendingRuleBackupId_;
+    bool savingRuleBackup_ = false;
     struct NativeProcessJob;
     std::unique_ptr<NativeProcessJob> nativeProcessJob_;
     QTimer nativeProcessTick_;

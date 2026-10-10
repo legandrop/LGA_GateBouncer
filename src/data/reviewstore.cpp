@@ -1,6 +1,7 @@
 #include "reviewstore.h"
 #include "qnamereviewcodec.h"
 #include "activityhistory.h"
+#include "../../common/wire_iv.h"
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
@@ -12,6 +13,7 @@
 #include <QUuid>
 #include <limits>
 #include <algorithm>
+#include <QCryptographicHash>
 
 namespace Gate::Data {
 namespace {
@@ -606,5 +608,89 @@ StoreResult ReviewStore::save(const ReviewDocument &document, quint64 expectedRe
     if (!file.open(QIODevice::WriteOnly) || file.write(bytes) != bytes.size() || !file.commit())
         return failure(StoreStatus::IoError, "Could not save; the previous review has been preserved");
     return {StoreStatus::Ok, {}, validated};
+}
+StoreResult ReviewStore::parseRuleBackup(const QByteArray &archive, std::vector<gb::wire::iv::PrincipalRuleRecord> &records) {
+    records.clear();
+    if (archive.isEmpty() || archive.size() > 2 * 1024 * 1024)
+        return failure(StoreStatus::Invalid,"Selected rule backup exceeds its bound");
+    QJsonParseError error;
+    const auto json = QJsonDocument::fromJson(archive,&error);
+    if (error.error != QJsonParseError::NoError || !json.isObject())
+        return failure(StoreStatus::Invalid,"Invalid selected rule backup");
+    const auto object = json.object();
+    if (json.toJson(QJsonDocument::Compact) != archive)
+        return failure(StoreStatus::Invalid,"Inactive backup is not in its original canonical format");
+    if (object.size() != 10 || object["kind"] != "ApplicationRuleBackup" || object["version"] != 1 ||
+        object["state"] != "Inactive" || !object["records"].isArray() || object["records"].toArray().isEmpty() ||
+        object["records"].toArray().size() > 128)
+        return failure(StoreStatus::Invalid,"Invalid selected rule backup");
+    for (const auto key : {"serviceEpoch","boot","sourceEpoch"}) {
+        const auto text = object[key].toString();
+        const auto bytes = QByteArray::fromHex(text.toLatin1());
+        if (!object[key].isString() || text.size() != 32 || bytes.size() != 16 || bytes.toHex() != text.toLatin1() ||
+            bytes == QByteArray(16,'\0')) return failure(StoreStatus::Invalid,"Invalid backup source metadata");
+    }
+    for (const auto key : {"profile","bindingGeneration","desired"}) {
+        quint64 value = 0;
+        if (!object[key].isString() || !decimalUnsigned(object[key].toString(),&value) || !value)
+            return failure(StoreStatus::Invalid,"Invalid backup revision metadata");
+    }
+    std::vector<gb::wire::iv::PrincipalRuleRecord> validated;
+    QSet<QString> ruleIds;
+    for (const auto &record : object["records"].toArray()) {
+        constexpr qsizetype maxRecordText = 4 * ((gb::wire::iv::MaxRecordsBytes + 2) / 3);
+        if (!record.isString() || record.toString().size() > maxRecordText)
+            return failure(StoreStatus::Invalid,"Invalid backup record");
+        const auto text = record.toString().toLatin1(); const auto bytes = QByteArray::fromBase64(text);
+        if (bytes.size() < 168 || bytes.toBase64() != text || quint8(bytes[6]) != 2 || bytes[7])
+            return failure(StoreStatus::Invalid,"Backup record has no original target");
+        quint32 length = 0;
+        for (int i=0;i<4;++i) length |= quint32(quint8(bytes[i])) << (i*8);
+        if (quint64(length)+8 != quint64(bytes.size())) return failure(StoreStatus::Invalid,"Invalid backup record length");
+        std::vector<gb::wire::iv::PrincipalRuleRecord> decoded;
+        const gb::wire::Bytes packed(reinterpret_cast<const unsigned char *>(bytes.constData()),
+            reinterpret_cast<const unsigned char *>(bytes.constData()) + bytes.size());
+        if (gb::wire::iv::unpack(packed,1,decoded) != gb::wire::Error::Ok || decoded.size() != 1 ||
+            decoded.front().scope != 2 || decoded.front().targetKind != 1 ||
+            decoded.front().admin != 1 || decoded.front().effective || decoded.front().proof != gb::wire::iv::Proof::Unknown ||
+            decoded.front().generation || decoded.front().presence || decoded.front().created || decoded.front().authorized ||
+            QString::number(decoded.front().desired) != object["desired"].toString())
+            return failure(StoreStatus::Invalid,"Invalid complete rule backup record");
+        gb::wire::Bytes digestInput;
+        if (gb::wire::iv::principalTargetDigestInput(decoded.front().originalTarget,digestInput) != gb::wire::Error::Ok)
+            return failure(StoreStatus::Invalid,"Invalid archived application and account");
+        const auto hash = QCryptographicHash::hash(QByteArray(reinterpret_cast<const char *>(digestInput.data()),qsizetype(digestInput.size())),QCryptographicHash::Sha256);
+        if (!std::equal(decoded.front().target.begin(),decoded.front().target.end(),reinterpret_cast<const unsigned char *>(hash.constData())))
+            return failure(StoreStatus::Invalid,"Archived target digest differs from its complete target");
+        const auto rule = QString::fromStdString(gb::wire::hex(decoded.front().rule));
+        if (ruleIds.contains(rule)) return failure(StoreStatus::Invalid,"Duplicate selected backup rule");
+        ruleIds.insert(rule);
+        validated.push_back(std::move(decoded.front()));
+    }
+    records = std::move(validated);
+    return {StoreStatus::Ok,{},std::nullopt};
+}
+StoreResult ReviewStore::loadRuleBackup(const QString &path, std::vector<gb::wire::iv::PrincipalRuleRecord> &records) {
+    records.clear();
+    if (!QDir::isAbsolutePath(path)) return failure(StoreStatus::Invalid,"Choose an absolute backup file");
+    QFile file(path);
+    if (!file.open(QIODevice::ReadOnly)) return failure(StoreStatus::IoError,"Inactive backup could not be opened");
+    const auto bytes = file.read(2 * 1024 * 1024 + 1);
+    if (file.error() != QFileDevice::NoError) return failure(StoreStatus::IoError,"Inactive backup read did not complete");
+    return parseRuleBackup(bytes,records);
+}
+StoreResult ReviewStore::saveRuleBackup(const QByteArray &archive,const QUuid &id) {
+    if (id.isNull()) return failure(StoreStatus::Invalid,"Invalid backup identifier");
+    std::vector<gb::wire::iv::PrincipalRuleRecord> records;
+    const auto validated = parseRuleBackup(archive,records);
+    if (!validated.ok()) return validated;
+    if (!ensureOwner()) return failure(StoreStatus::Busy,"Review is in use or the directory is unavailable");
+    const auto path = QDir(QFileInfo(path_).absolutePath()).filePath("rules-" + id.toString(QUuid::WithoutBraces) + ".json");
+    if (QFileInfo::exists(path)) return failure(StoreStatus::Invalid,"Selected rule backup already exists");
+    QSaveFile file(path); file.setDirectWriteFallback(false);
+    if (!file.open(QIODevice::WriteOnly) || file.write(archive) != archive.size() || !file.commit())
+        return failure(StoreStatus::IoError,"Selected rule backup was not saved; no rule was changed");
+    // El backup es sólo archivo de revisión. No modifica review.json ni admite autoridad.
+    return {StoreStatus::Ok,{},std::nullopt};
 }
 } // namespace Gate::Data

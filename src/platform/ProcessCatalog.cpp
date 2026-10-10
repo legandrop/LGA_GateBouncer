@@ -1,5 +1,7 @@
 #include "ProcessCatalog.h"
 #include <QUuid>
+#include <QCoreApplication>
+#include <QThread>
 #include "../data/activityhistory.h"
 #include "NativeProcessReceipt.h"
 #include "../../common/client_ii_win.h"
@@ -9,6 +11,7 @@
 #include <array>
 #include <set>
 #include <algorithm>
+#include <thread>
 #ifdef Q_OS_WIN
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -23,6 +26,200 @@
 #endif
 
 namespace Gate::Data {
+namespace {
+std::atomic<unsigned> selectedFileOwners{0};
+bool selectedFileWorker() { return !QCoreApplication::instance() || QThread::currentThread() != QCoreApplication::instance()->thread(); }
+#ifdef Q_OS_WIN
+quint64 selectedFileTime(FILETIME f) { return (quint64(f.dwHighDateTime) << 32) | f.dwLowDateTime; }
+QByteArray selectedAccount(HANDLE token) {
+    DWORD bytes = 0; GetTokenInformation(token, TokenUser, nullptr, 0, &bytes);
+    if (!bytes || bytes > 4096) return {};
+    std::vector<unsigned char> data(bytes);
+    if (!GetTokenInformation(token, TokenUser, data.data(), bytes, &bytes)) return {};
+    const auto sid = reinterpret_cast<TOKEN_USER *>(data.data())->User.Sid;
+    if (!IsValidSid(sid) || GetLengthSid(sid) > 68) return {};
+    return QByteArray(reinterpret_cast<const char *>(sid), int(GetLengthSid(sid)));
+}
+QString selectedFinalPath(HANDLE file) {
+    wchar_t path[4097]{};
+    const auto length = GetFinalPathNameByHandleW(file, path, 4097, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    if (!length || length >= 4097) return {};
+    auto value = QString::fromWCharArray(path, int(length));
+    if (!value.startsWith("\\\\?\\") || value.startsWith("\\\\?\\UNC\\", Qt::CaseInsensitive)) return {};
+    return value.mid(4);
+}
+bool selectedPathShape(const QString &path) {
+    if (path.size() < 4 || path.size() > 4096 || path[0].unicode() > 127 || !path[0].isLetter() ||
+        path[1] != ':' || path[2] != '\\' || path.contains('/') || path.mid(2).contains(':') ||
+        GetDriveTypeW(path.left(3).toStdWString().c_str()) != DRIVE_FIXED) return false;
+    for (const auto ch : path) if (ch.unicode() < 32 || ch.unicode() == 127 ||
+        (ch.unicode() >= 0x202a && ch.unicode() <= 0x202e) || (ch.unicode() >= 0x2066 && ch.unicode() <= 0x2069)) return false;
+    const auto parts = path.mid(3).split('\\');
+    if (parts.size() > 64) return false;
+    for (const auto &part : parts) if (part.isEmpty() || part == "." || part == ".." || part.endsWith('.') ||
+        part.endsWith(' ') || part.contains('*') || part.contains('?')) return false;
+    return true;
+}
+#endif
+}
+struct SelectedApplicationFile::Owner {
+    std::mutex mutex;
+#ifdef Q_OS_WIN
+    HANDLE process = nullptr, token = nullptr, file = INVALID_HANDLE_VALUE;
+    mutable HANDLE failedFreshToken = nullptr;
+    std::vector<HANDLE> directories;
+    TOKEN_STATISTICS statistics{};
+    QByteArray account;
+    quint64 processCreated = 0;
+    BY_HANDLE_FILE_INFORMATION information{};
+    bool close() {
+        bool ok = true;
+        if (file != INVALID_HANDLE_VALUE) { if (CloseHandle(file)) file = INVALID_HANDLE_VALUE; else ok = false; }
+        for (auto &h : directories) if (h) { if (CloseHandle(h)) h = nullptr; else ok = false; }
+        if (token) { if (CloseHandle(token)) token = nullptr; else ok = false; }
+        if (process) { if (CloseHandle(process)) process = nullptr; else ok = false; }
+        if (failedFreshToken) { if (CloseHandle(failedFreshToken)) failedFreshToken = nullptr; else ok = false; }
+        return ok;
+    }
+    bool current(const SelectedFileFacts &facts) const {
+        if (failedFreshToken || !process || !token || file == INVALID_HANDLE_VALUE || WaitForSingleObject(process, 0) != WAIT_TIMEOUT) return false;
+        FILETIME created{}, exited{}, kernel{}, user{};
+        if (!GetProcessTimes(process, &created, &exited, &kernel, &user) || selectedFileTime(created) != processCreated) return false;
+        using Compare = BOOL (WINAPI *)(HANDLE,HANDLE);
+        const auto module = GetModuleHandleW(L"kernelbase.dll");
+        const auto compare = module ? reinterpret_cast<Compare>(GetProcAddress(module, "CompareObjectHandles")) : nullptr;
+        const auto sameToken = [&] {
+        HANDLE threadToken = nullptr;
+        if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &threadToken)) {
+            if (!CloseHandle(threadToken)) failedFreshToken = threadToken; return false;
+        }
+        if (GetLastError() != ERROR_NO_TOKEN) return false;
+        HANDLE fresh = nullptr;
+        if (!compare || !OpenProcessToken(process, TOKEN_QUERY, &fresh)) return false;
+        TOKEN_STATISTICS now{}; DWORD size = 0;
+        const bool same = compare(token, fresh) && GetTokenInformation(fresh, TokenStatistics, &now, sizeof(now), &size) &&
+            now.TokenType == TokenPrimary && now.TokenId.LowPart == statistics.TokenId.LowPart &&
+            now.TokenId.HighPart == statistics.TokenId.HighPart && now.AuthenticationId.LowPart == statistics.AuthenticationId.LowPart &&
+            now.AuthenticationId.HighPart == statistics.AuthenticationId.HighPart && now.ModifiedId.LowPart == statistics.ModifiedId.LowPart &&
+            now.ModifiedId.HighPart == statistics.ModifiedId.HighPart && selectedAccount(fresh) == account;
+        if (!CloseHandle(fresh)) { failedFreshToken = fresh; return false; }
+        return same;
+        };
+        if (!sameToken()) return false;
+        for (auto h : directories) {
+            BY_HANDLE_FILE_INFORMATION info{};
+            if (!GetFileInformationByHandle(h, &info) || !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
+                (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+        }
+        BY_HANDLE_FILE_INFORMATION nowFile{};
+        const bool fileMatches = GetFileInformationByHandle(file, &nowFile) && !(nowFile.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) &&
+            nowFile.dwVolumeSerialNumber == information.dwVolumeSerialNumber && nowFile.nFileIndexHigh == information.nFileIndexHigh &&
+            nowFile.nFileIndexLow == information.nFileIndexLow && nowFile.nFileSizeHigh == information.nFileSizeHigh &&
+            nowFile.nFileSizeLow == information.nFileSizeLow && nowFile.dwFileAttributes == information.dwFileAttributes &&
+            selectedFileTime(nowFile.ftLastWriteTime) == selectedFileTime(information.ftLastWriteTime) &&
+            selectedFinalPath(file) == facts.image;
+        if (!fileMatches) return false;
+        FWP_BYTE_BLOB *blob = nullptr;
+        const auto appStatus = FwpmGetAppIdFromFileName0(facts.image.toStdWString().c_str(), &blob);
+        const bool appMatches = appStatus == ERROR_SUCCESS && blob && blob->data && blob->size == DWORD(facts.appId.size()) &&
+            QByteArray(reinterpret_cast<const char *>(blob->data), int(blob->size)) == facts.appId;
+        if (blob) FwpmFreeMemory0(reinterpret_cast<void **>(&blob));
+        BY_HANDLE_FILE_INFORMATION after{};
+        return appMatches && GetFileInformationByHandle(file,&after) && after.dwVolumeSerialNumber == information.dwVolumeSerialNumber &&
+            after.nFileIndexHigh == information.nFileIndexHigh && after.nFileIndexLow == information.nFileIndexLow &&
+            after.nFileSizeHigh == information.nFileSizeHigh && after.nFileSizeLow == information.nFileSizeLow &&
+            after.dwFileAttributes == information.dwFileAttributes && selectedFileTime(after.ftLastWriteTime) == selectedFileTime(information.ftLastWriteTime) &&
+            sameToken() && WaitForSingleObject(process, 0) == WAIT_TIMEOUT;
+    }
+#endif
+};
+SelectedApplicationFile::SelectedApplicationFile() = default;
+SelectedApplicationFile::~SelectedApplicationFile() = default;
+unsigned SelectedApplicationFile::physicalJobs() { return selectedFileOwners.load(); }
+bool SelectedApplicationFile::current() const {
+    if (!selectedFileWorker() || !owner_) return false;
+    std::lock_guard<std::mutex> lock(owner_->mutex);
+#ifdef Q_OS_WIN
+    return owner_->current(facts_);
+#else
+    return false;
+#endif
+}
+std::shared_ptr<SelectedApplicationFile> SelectedApplicationFile::acquire(const QString &path, QString &error) {
+    error = "The selected file could not be retained under the original account.";
+    if (!selectedFileWorker()) return {};
+#ifdef Q_OS_WIN
+    unsigned empty = 0;
+    if (!selectedPathShape(path) || !selectedFileOwners.compare_exchange_strong(empty, 1)) return {};
+    // La plaza física sólo se devuelve después de cerrar todos los HANDLE, incluso al cancelar.
+    const auto close = [](Owner *owned) {
+        static std::atomic<Owner *> quarantine{nullptr};
+        try { std::thread([owned] {
+            if (owned->close()) { delete owned; selectedFileOwners.fetch_sub(1); }
+            else quarantine.store(owned);
+        }).detach(); }
+        catch (...) {
+            // Conserva el único dueño y su plaza si no puede iniciarse el cierre; no finge drain.
+            quarantine.store(owned);
+        }
+    };
+    Owner *raw = nullptr;
+    try { raw = new Owner; } catch (...) { selectedFileOwners.fetch_sub(1); return {}; }
+    std::shared_ptr<Owner> owned;
+    try { owned = std::shared_ptr<Owner>(raw, close); } catch (...) { return {}; }
+    auto result = std::shared_ptr<SelectedApplicationFile>(new SelectedApplicationFile);
+    result->owner_ = owned;
+    owned->directories.reserve(64);
+    HANDLE threadToken = nullptr;
+    if (OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,TRUE,&threadToken)) {
+        if (!CloseHandle(threadToken)) owned->failedFreshToken = threadToken; return {};
+    }
+    if (GetLastError() != ERROR_NO_TOKEN) return {};
+    owned->process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, GetCurrentProcessId());
+    FILETIME created{}, exited{}, kernel{}, user{}; DWORD size = 0;
+    if (!owned->process || !GetProcessTimes(owned->process, &created, &exited, &kernel, &user) ||
+        !OpenProcessToken(owned->process, TOKEN_QUERY, &owned->token) ||
+        !GetTokenInformation(owned->token, TokenStatistics, &owned->statistics, sizeof(owned->statistics), &size) ||
+        owned->statistics.TokenType != TokenPrimary || (owned->account = selectedAccount(owned->token)).isEmpty()) return {};
+    owned->processCreated = selectedFileTime(created);
+    QString prefix = path.left(3);
+    const auto openDirectory = [&](const QString &directory) {
+        const auto h = CreateFileW(directory.toStdWString().c_str(), FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (h == INVALID_HANDLE_VALUE) return false;
+        owned->directories.push_back(h); BY_HANDLE_FILE_INFORMATION info{};
+        return GetFileInformationByHandle(h, &info) && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+            !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+    };
+    if (!openDirectory(prefix)) return {};
+    const auto parts = path.mid(3).split('\\');
+    for (int index = 0; index + 1 < parts.size(); ++index) {
+        if (!prefix.endsWith('\\')) prefix += '\\'; prefix += parts[index];
+        if (!openDirectory(prefix)) return {};
+    }
+    owned->file = CreateFileW(path.toStdWString().c_str(), FILE_READ_DATA | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+    if (owned->file == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(owned->file, &owned->information) ||
+        (owned->information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) return {};
+    auto &facts = result->facts_;
+    facts.image = selectedFinalPath(owned->file);
+    if (!selectedPathShape(facts.image)) return {};
+    FWP_BYTE_BLOB *blob = nullptr;
+    const auto status = FwpmGetAppIdFromFileName0(facts.image.toStdWString().c_str(), &blob);
+    if (status == ERROR_SUCCESS && blob && blob->data && blob->size >= 4 && blob->size <= 8192 && !(blob->size & 1) &&
+        !blob->data[blob->size-1] && !blob->data[blob->size-2]) facts.appId = QByteArray(reinterpret_cast<const char *>(blob->data), int(blob->size));
+    if (blob) FwpmFreeMemory0(reinterpret_cast<void **>(&blob));
+    facts.accountSid = owned->account;
+    facts.volumeSerial = owned->information.dwVolumeSerialNumber; facts.fileIndexHigh = owned->information.nFileIndexHigh;
+    facts.fileIndexLow = owned->information.nFileIndexLow; facts.fileSizeHigh = owned->information.nFileSizeHigh;
+    facts.fileSizeLow = owned->information.nFileSizeLow; facts.attributes = owned->information.dwFileAttributes;
+    facts.lastWrite = selectedFileTime(owned->information.ftLastWriteTime);
+    if (facts.appId.isEmpty() || !result->current()) return {};
+    error.clear(); return result;
+#else
+    Q_UNUSED(path); return {};
+#endif
+}
 std::optional<QByteArray> canonicalLocalApplicationId(const QString &path) {
 #ifdef Q_OS_WIN
     // Evita rutas relativas, UNC/mapped network y sintaxis alternativas que exigirían

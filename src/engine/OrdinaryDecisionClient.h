@@ -3,9 +3,11 @@
 #include "../../controller/ordinary_qt.h"
 #include <QElapsedTimer>
 #include <QTimer>
+#include <QByteArray>
 #include <set>
 #include <map>
 #include <tuple>
+#include "../platform/ProcessCatalog.h"
 namespace Gate {
 class OrdinaryDecisionClient final : public QObject {
     Q_OBJECT
@@ -28,6 +30,12 @@ class OrdinaryDecisionClient final : public QObject {
     explicit OrdinaryDecisionClient(bool isolatedQa, QObject *parent = nullptr,
                                     std::unique_ptr<gb::ipc::ii::SessionChannel> channel = {});
     bool refresh();
+    bool refreshRules();
+    // La selección procede de la página original vigente; el archivo no admite la operación.
+    bool revokeRule(const gb::wire::Id &rule, quint64 selection, bool consent);
+    bool rulesCurrent() const { return rulesCurrent_; }
+    const auto &rules() const { return rules_; }
+    std::optional<QByteArray> selectedRuleBackup(const std::vector<gb::wire::Id> &, quint64 selection) const;
     void startAutomatic();
     bool select(const gb::wire::Id &observed);
     bool direction(int direction);
@@ -49,6 +57,7 @@ class OrdinaryDecisionClient final : public QObject {
     const auto &observations() const { return rows_; }
     const auto &observed() const { return observed_; }
     const auto &draft() const { return draft_; }
+    const auto &fileDraft() const { return fileDraft_; }
     const SubmittedPresentation *submitted() const {
         return submitted_ && submitted_->command.correlation == command_ ? &*submitted_ : nullptr;
     }
@@ -56,11 +65,20 @@ class OrdinaryDecisionClient final : public QObject {
   signals:
     void changed();
   private:
+    friend class ProductController;
+    bool prepareFile(std::shared_ptr<Data::SelectedApplicationFile>, int direction,
+                     const gb::wire::Bytes &expectedTarget, const std::optional<gb::wire::Id> &editing,
+                     quint64 selection);
+    bool decideFile(bool allow, bool consent, quint64 selection);
+    bool commitDraft(bool allow, bool consent, quint64 selection);
+    void submitFilePreparation();
     void opened(bool ok, gb::wire::Frame hello);
     void received(bool ok, gb::wire::Frame reply, gb::wire::Id correlation, quint64 generation);
     bool status(const gb::wire::Frame &, bool same);
     bool send(gb::wire::Type, std::vector<gb::wire::Field> fields = {});
     void page();
+    void rulePage();
+    void submitRevocation();
     void prepare();
     void outcome(const gb::wire::Frame &);
     void fail(const QString &, bool uncertain = false);
@@ -69,17 +87,26 @@ class OrdinaryDecisionClient final : public QObject {
     State state_ = State::Closed;
     bool stopping_ = false, connected_ = false, current_ = false, visible_ = false;
     bool finalStatus_ = false, checkOnly_ = false;
+    bool readingRules_ = false, rulesCurrent_ = false;
     quint64 generation_ = 1, desired_ = 0, profile_ = 0, bindingGeneration_ = 0, pageRevision_ = 0;
     quint64 observedGeneration_ = 0;
     int direction_ = 1;
     int scope_ = 2;
     quint32 cursor_ = 0;
+    std::size_t rulePageBytes_ = 0;
     gb::wire::Id epoch_{}, boot_{}, source_{}, connection_{}, snapshot_{}, expected_{}, command_{};
     gb::wire::Type expectedType_ = gb::wire::Type::GetStatus;
     std::vector<gb::wire::iv::ObservedRecord> rows_, pageRows_;
+    std::vector<gb::wire::iv::PrincipalRuleRecord> rules_, rulePageRows_;
+    std::optional<gb::wire::iv::PrincipalRuleRecord> revocation_;
     std::set<gb::wire::Id> ids_;
     std::optional<gb::wire::iv::ObservedRecord> observed_;
     std::optional<gb::wire::iv::FutureDraftRecord> draft_;
+    std::optional<gb::wire::iv::FileFutureDraftRecord> fileDraft_;
+    std::optional<gb::wire::iv::PrincipalRuleRecord> editing_;
+    std::shared_ptr<Data::SelectedApplicationFile> fileOwner_;
+    gb::wire::Bytes expectedFileTarget_;
+    quint64 capabilities_ = 0;
     std::optional<SubmittedPresentation> submitted_;
     QElapsedTimer pageAge_, draftAge_;
     QTimer draftExpiry_;

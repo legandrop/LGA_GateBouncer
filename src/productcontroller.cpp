@@ -1,6 +1,7 @@
 #include "productcontroller.h"
 #include "data/netlimiterimport.h"
 #include <QFile>
+#include <QFileInfo>
 #include <QDir>
 #include <QStandardPaths>
 #include <QMetaObject>
@@ -63,6 +64,18 @@ struct ProductController::ImportedActivation {
     bool compared = false, selecting = false;
     QElapsedTimer age;
 };
+struct ProductController::FileActivation {
+    enum Phase { Capture, Prepare, CheckReady, Ready, CheckCommit, Sending };
+    Phase phase = Capture;
+    std::shared_ptr<Data::SelectedApplicationFile> owner;
+    Data::Action action = Data::Action::Block;
+    Data::Direction direction = Data::Direction::Out;
+    gb::wire::Bytes expectedTarget, admittedDraft;
+    std::optional<gb::wire::Id> editing;
+    quint64 ruleSelection = 0, selection = 0, generation = 0, importGeneration = 0;
+    QString candidate, digest;
+    QElapsedTimer age;
+};
 struct ProductController::NativeProcessJob {
     enum Phase { StatusBefore, Acquire, ReadBefore, Validate, ReadAfter, StatusAfter, Finish };
     Phase phase = StatusBefore;
@@ -79,7 +92,12 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
                                      std::unique_ptr<gb::ipc::ii::SessionChannel> ordinaryChannel)
     : QObject(parent), isolatedQa_(isolatedQa), engine_(isolatedQa, this), records_(isolatedQa, this, std::move(decisionChannel)),
       ordinary_(isolatedQa, this, std::move(ordinaryChannel)) {
-    connect(&ordinary_, &OrdinaryDecisionClient::changed, this, [this] { advanceImportedRule(); emit changed(); });
+    connect(&ordinary_, &OrdinaryDecisionClient::changed, this, [this] { advanceImportedRule(); advanceApplicationFile(); emit changed(); });
+    fileDrain_.setInterval(100);
+    connect(&fileDrain_,&QTimer::timeout,this,[this] {
+        if (Data::SelectedApplicationFile::physicalJobs()) return;
+        fileDrain_.stop(); emit changed();
+    });
     if (!isolatedQa_) QTimer::singleShot(0, this, [this] { if (!simulation() && !stopped_) ordinary_.startAutomatic(); });
     if (isolatedQa && (qaRoot.isEmpty() || !QDir::isAbsolutePath(qaRoot)))
         reviewError_ = "Isolated QA requires an explicit review root";
@@ -188,6 +206,8 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
 ProductController::~ProductController() {
     // La destrucción de miembros no emite hacia una ventana parcialmente destruida.
     stopped_ = true; cancelNativeProcesses(); cancelImport(); semanticJob_ = QUuid{};
+    fileActivation_.reset();
+    if (fileWorker_) { fileWorker_->wait(); delete fileWorker_; }
     if (worker_) { worker_->wait(); delete worker_; }
     if (semanticWorker_) { semanticWorker_->wait(); delete semanticWorker_; }
     if (importWorker_) { importWorker_->wait(); delete importWorker_; }
@@ -207,14 +227,37 @@ bool ProductController::flushHistory() {
     storeWriteRequested_=true; startReviewWrite(); return true;
 }
 void ProductController::queueReview(Data::ReviewDocument document,const QString &notification) {
-    cancelImportedRule();
+    cancelApplicationFile(); cancelImportedRule();
     pendingReview_=std::move(document); writeNotification_=notification;
     storeWriteRequested_=true; startReviewWrite(); emit changed();
 }
 void ProductController::startReviewWrite() {
     // Único escritor físico: la revisión se toma al despachar, nunca de una captura vieja.
     if (storeLoading_ || storeWorker_ || !store_ || !reviewWritable_ ||
-        (!storeWriteRequested_ && !historyDirty_)) return;
+        (!storeWriteRequested_ && !historyDirty_ && !pendingRuleBackup_)) return;
+    if (pendingRuleBackup_) {
+        const auto bytes = *pendingRuleBackup_; const auto id = pendingRuleBackupId_;
+        pendingRuleBackup_.reset(); pendingRuleBackupId_ = {}; savingRuleBackup_ = true;
+        auto *store = store_.get();
+        storeWorker_ = QThread::create([this,store,bytes,id] {
+            Data::StoreResult saved;
+            try { saved = store->saveRuleBackup(bytes,id); }
+            catch (...) { saved = {Data::StoreStatus::IoError,"Selected rule backup failed; no rule was changed",{}}; }
+            QMetaObject::invokeMethod(this,[this,saved,id] {
+                savingRuleBackup_ = false;
+                if (saved.ok()) emit reviewSaved("Selected rules saved as inactive backup: rules-" +
+                    id.toString(QUuid::WithoutBraces) + ".json. No rule was changed.");
+                else reviewError_ = saved.error;
+                emit changed();
+            },Qt::QueuedConnection);
+        });
+        auto *thread = storeWorker_;
+        connect(thread,&QThread::finished,this,[this,thread] {
+            if (storeWorker_ == thread) storeWorker_ = nullptr;
+            thread->deleteLater(); startReviewWrite(); emit changed();
+        });
+        thread->start(); return;
+    }
     auto next=pendingReview_ ? *pendingReview_ : review_;
     next.revision=review_.revision; next.history=history_.state();
     pendingReview_.reset(); inFlightReview_=next; storeWriteRequested_=false; flushingHistory_=true;
@@ -228,6 +271,7 @@ void ProductController::startReviewWrite() {
             flushingHistory_=false; inFlightReview_.reset();
             if (!saved.ok() || !saved.document) {
                 history_.storageFailed(); ++historyVersion_; reviewWritable_=false;
+                pendingRuleBackup_.reset(); pendingRuleBackupId_ = {};
                 pendingReview_.reset(); storeWriteRequested_=false; writeNotification_.clear();
                 reviewError_="Review was not saved: "+saved.error; historyError_=reviewError_; emit changed(); return;
             }
@@ -249,7 +293,7 @@ void ProductController::startReviewWrite() {
 }
 void ProductController::stop() {
     if (stopped_) return;
-    stopped_ = true; cancelImportedRule(); cancelNativeProcesses(); historyFlush_.stop(); ++generation_; cancelImport();
+    stopped_ = true; cancelApplicationFile(); cancelImportedRule(); cancelNativeProcesses(); historyFlush_.stop(); ++generation_; cancelImport();
     semanticJob_ = QUuid{}; draftView_ = {}; reviewView_ = {};
     engine_.invalidate(); records_.stop(); ordinary_.stop();
     flushHistory();
@@ -344,6 +388,7 @@ const Data::QNameCandidateFacts *ProductController::derivedQNameCandidate(bool d
     return found == view.candidates.cend() ? nullptr : &view.qname->candidates[*found];
 }
 void ProductController::setMode(UiMode mode) {
+    cancelApplicationFile();
     if (stopped_ || mode_ == mode) return;
     cancelNativeProcesses(); mode_ = mode; ++generation_; emit invalidated();
     cancelImport();
@@ -388,6 +433,14 @@ bool ProductController::selectDecisionRecords() {
         ++generation_; emit invalidated(); emit changed();
     }
     return records_.refresh();
+}
+bool ProductController::backupSelectedRules(const std::vector<gb::wire::Id> &rules,quint64 selection,bool consent) {
+    if (stopped_ || simulation() || !consent || !store_ || !reviewWritable_ || storeLoading_ || ruleBackupBusy()) return false;
+    const auto bytes = ordinary_.selectedRuleBackup(rules,selection);
+    if (!bytes) { reviewError_ = "A current selection with complete original AppId and account targets is required for backup.";
+        emit changed(); return false; }
+    pendingRuleBackup_ = *bytes; pendingRuleBackupId_ = QUuid::createUuid();
+    startReviewWrite(); emit changed(); return true;
 }
 void ProductController::selectStatusOnly() {
     if (stopped_ || !recordsSelected_) return;
@@ -760,5 +813,199 @@ bool ProductController::confirmImportedRule(quint64 token, bool consent) {
     activationView_.message = sent ? "Decision submitted to the original service; the imported archive remains inactive. Check the same command if its outcome is unknown."
                                    : "Inactive: the original selector expired before confirmation";
     emit changed(); return sent;
+}
+void ProductController::cancelApplicationFile() {
+    ++fileRuleToken_; fileRuleView_.token = fileRuleToken_;
+    fileRuleView_.ready = fileRuleView_.busy = false;
+    fileActivation_.reset();
+    if (ordinary_.fileOwner_ && ordinary_.state() != OrdinaryDecisionClient::State::Sending &&
+        ordinary_.state() != OrdinaryDecisionClient::State::Uncertain) ordinary_.closeNotice();
+    if (Data::SelectedApplicationFile::physicalJobs()) fileDrain_.start();
+}
+bool ProductController::prepareApplicationFile(const QString &path, Data::Action action, Data::Direction direction,
+    const std::optional<gb::wire::Id> &editing, quint64 selection, const QString &candidate, int backupIndex) {
+    if (stopped_ || simulation() || isolatedQa_ || fileWorker_ || Data::SelectedApplicationFile::physicalJobs() ||
+        fileActivation_ || activation_ || ordinary_.visible() || !ordinary_.idle() ||
+        ordinary_.state() == OrdinaryDecisionClient::State::Sending || ordinary_.state() == OrdinaryDecisionClient::State::Uncertain ||
+        (action != Data::Action::Allow && action != Data::Action::Block) ||
+        (direction != Data::Direction::Out && direction != Data::Direction::In && direction != Data::Direction::Both)) return false;
+    std::optional<Data::QNameProfileView> profile; int index = -1;
+    if (!candidate.isEmpty()) {
+        if (!reviewView_.current || !reviewView_.qname || pendingReview_ || reviewBusy()) return false;
+        const auto found = reviewView_.candidates.find(candidate);
+        if (found == reviewView_.candidates.end()) return false;
+        index = found.value(); profile = reviewView_.qname;
+        for (const auto &r : review_.report.candidates) if (r.id == candidate && r.reviewAction && *r.reviewAction != action) {
+            fileRuleView_.message = "Inactive: the local review choice differs from the original source policy."; emit changed(); return false;
+        }
+    }
+    gb::wire::Bytes expectedTarget;
+    if (backupIndex >= 0) {
+        if (!candidate.isEmpty() || editing || std::size_t(backupIndex) >= inactiveRuleBackup_.size()) return false;
+        const auto &r = inactiveRuleBackup_[std::size_t(backupIndex)];
+        if (r.package != 1 || r.action != (action == Data::Action::Allow ? 2 : 1) ||
+            r.direction != (direction == Data::Direction::Out ? 1 : direction == Data::Direction::In ? 2 : 3)) {
+            fileRuleView_.message = "Inactive: this backup scope cannot be restored by the application and account route."; emit changed(); return false;
+        }
+        expectedTarget = r.originalTarget;
+    }
+    auto request = std::make_unique<FileActivation>();
+    request->action = action; request->direction = direction; request->editing = editing; request->ruleSelection = selection;
+    request->expectedTarget = expectedTarget; request->candidate = candidate; request->generation = generation_;
+    request->importGeneration = importGeneration_; request->digest = review_.report.digest; request->age.start();
+    fileActivation_ = std::move(request); fileRuleView_ = {"Retaining the selected executable under your original account…",++fileRuleToken_,true,false};
+    const auto token = fileRuleToken_;
+    struct Capture { std::shared_ptr<Data::SelectedApplicationFile> owner; QString error; Data::QNameApplicationComparison comparison; };
+    auto result = std::make_shared<Capture>();
+    auto *worker = QThread::create([path,profile,index,result] {
+        try {
+            result->owner = Data::SelectedApplicationFile::acquire(path,result->error);
+            if (!result->owner) return;
+            if (profile) {
+                QMap<int,QByteArray> canonical;
+                const auto &facts = result->owner->facts();
+                // Sólo el archivo retenido permite el match positivo. Competidores no resueltos siguen bloqueando.
+                for (const auto &filter : profile->filters) for (const auto &predicate : filter.predicates)
+                    for (const auto &application : predicate.applications) if (application.path.known() && application.path.value == facts.image)
+                        canonical.insert(application.node,facts.appId);
+                result->comparison = Data::compareQNameApplicationScope(*profile,index,facts.appId,facts.accountSid,facts.image,canonical);
+            }
+            if (!result->owner->current()) { result->owner.reset(); result->error = "The original executable or account changed."; }
+        } catch (...) { result->owner.reset(); result->error = "The original file inspection did not complete."; }
+    });
+    fileWorker_ = worker;
+    connect(worker,&QThread::finished,this,[this,worker,result,token,profile] {
+        if (fileWorker_ == worker) fileWorker_ = nullptr;
+        worker->deleteLater();
+        if (!fileActivation_ || stopped_ || token != fileRuleToken_) {
+            if (Data::SelectedApplicationFile::physicalJobs()) fileDrain_.start(); return;
+        }
+        auto &request = *fileActivation_;
+        const bool sourceMatches = !profile || (result->comparison.representable && result->comparison.direction == request.direction &&
+            result->comparison.action.known() && result->comparison.action.value ==
+                (request.action == Data::Action::Allow ? Data::SourceFwAction::Allow : Data::SourceFwAction::Deny));
+        if (!result->owner || !sourceMatches || generation_ != request.generation ||
+            (!request.candidate.isEmpty() && (importGeneration_ != request.importGeneration || review_.report.digest != request.digest || !reviewView_.current))) {
+            fileRuleView_.message = "Inactive: " + (!result->error.isEmpty() ? result->error : result->comparison.reason.isEmpty()
+                ? "the original source scope, account or precedence cannot be represented" : result->comparison.reason);
+            cancelApplicationFile(); emit changed(); return;
+        }
+        request.owner = result->owner; request.phase = FileActivation::Prepare;
+        const int direction = request.direction == Data::Direction::Out ? 1 : request.direction == Data::Direction::In ? 2 : 3;
+        if (!ordinary_.prepareFile(request.owner,direction,request.expectedTarget,request.editing,request.ruleSelection)) {
+            fileRuleView_.message = "Inactive: the original service cannot prepare this file rule."; cancelApplicationFile(); emit changed(); return;
+        }
+        advanceApplicationFile(); emit changed();
+    });
+    worker->start(); emit changed(); return true;
+}
+void ProductController::advanceApplicationFile() {
+    if (!fileActivation_) return;
+    auto &request = *fileActivation_;
+    if (request.phase == FileActivation::Capture || request.phase == FileActivation::CheckReady || request.phase == FileActivation::CheckCommit) return;
+    if (stopped_ || simulation() || request.generation != generation_ || request.age.elapsed() >= 120000 ||
+        (!request.candidate.isEmpty() && (request.importGeneration != importGeneration_ || request.digest != review_.report.digest || !reviewView_.current || pendingReview_))) {
+        fileRuleView_.message = "Inactive: the original file review or imported source expired."; cancelApplicationFile(); return;
+    }
+    const auto state = ordinary_.state();
+    if (state == OrdinaryDecisionClient::State::Failed || state == OrdinaryDecisionClient::State::Recorded || state == OrdinaryDecisionClient::State::Uncertain) {
+        fileRuleView_.message = ordinary_.message(); cancelApplicationFile(); return;
+    }
+    if (!ordinary_.ready() || !ordinary_.fileDraft()) return;
+    if (!ordinary_.idle()) { QTimer::singleShot(50,this,[this] { advanceApplicationFile(); }); return; }
+    gb::wire::Bytes packed;
+    if (gb::wire::iv::pack(std::vector<gb::wire::iv::FileFutureDraftRecord>{*ordinary_.fileDraft()},packed) != gb::wire::Error::Ok) {
+        fileRuleView_.message = "Inactive: the original draft could not be retained."; cancelApplicationFile(); return;
+    }
+    if (request.phase == FileActivation::Ready) {
+        if (request.selection != ordinary_.selection() || request.admittedDraft != packed) {
+            fileRuleView_.message = "Inactive: the original draft or consent challenge changed."; cancelApplicationFile();
+        }
+        return;
+    }
+    if (request.phase == FileActivation::Prepare) {
+        request.selection = ordinary_.selection(); request.admittedDraft = std::move(packed); checkApplicationFile(false);
+    }
+}
+void ProductController::checkApplicationFile(bool committing) {
+    if (!fileActivation_ || fileWorker_) return;
+    auto &request = *fileActivation_;
+    request.phase = committing ? FileActivation::CheckCommit : FileActivation::CheckReady;
+    fileRuleView_.ready = false; fileRuleView_.busy = true;
+    const auto owner = request.owner; const auto token = fileRuleToken_;
+    auto result = std::make_shared<bool>(false);
+    auto *worker = QThread::create([owner,result] { try { *result = owner && owner->current(); } catch (...) {} });
+    fileWorker_ = worker;
+    connect(worker,&QThread::finished,this,[this,worker,result,token,committing] {
+        if (fileWorker_ == worker) fileWorker_ = nullptr; worker->deleteLater();
+        if (!fileActivation_ || stopped_ || token != fileRuleToken_) return;
+        auto &request = *fileActivation_; gb::wire::Bytes packed;
+        const bool same = *result && ordinary_.ready() && ordinary_.idle() && ordinary_.selection() == request.selection && ordinary_.fileDraft() &&
+            gb::wire::iv::pack(std::vector<gb::wire::iv::FileFutureDraftRecord>{*ordinary_.fileDraft()},packed) == gb::wire::Error::Ok &&
+            packed == request.admittedDraft && request.generation == generation_ && request.age.elapsed() < 120000 &&
+            (request.candidate.isEmpty() || (request.importGeneration == importGeneration_ && request.digest == review_.report.digest && reviewView_.current && !pendingReview_));
+        if (!same) {
+            fileRuleView_.message = "Inactive: the retained file, original account, service or reviewed draft changed.";
+            cancelApplicationFile(); emit changed(); return;
+        }
+        fileRuleView_.busy = false;
+        if (committing) {
+            request.phase = FileActivation::Sending;
+            const bool sent = ordinary_.decideFile(request.action == Data::Action::Allow,true,request.selection);
+            fileRuleView_.message = sent ? "Rule submitted to the original service. If its outcome is unknown, check the same command; do not repeat it."
+                                        : "Inactive: the original draft expired before submission.";
+            if (!sent) cancelApplicationFile(); emit changed(); return;
+        }
+        request.phase = FileActivation::Ready; fileRuleView_.ready = true;
+        const auto &facts = request.owner->facts();
+        const auto &draft = ordinary_.fileDraft()->draft;
+        const auto scope = Data::applicationRuleScopeText(draft.package,request.direction,request.action,false);
+        fileRuleView_.message = QString("Ready to confirm %1.\nApplication: %2\nAccount: %3\nDirection: %4\nPackage: %5\nWill apply to: %6\nWill cover: %7\n%8\nNo existing connection or request is changed. Imported documents and backups remain inactive.")
+            .arg(request.editing ? "an atomic rule replacement" : "a new rule for future connections",facts.image,importedAccount(facts.accountSid),
+                Data::directionName(request.direction),scope.package,scope.scope,scope.connections,scope.coverage);
+        fileRuleView_.message.prepend(QString("Decision: %1\n").arg(request.action == Data::Action::Allow ? "Allow" : "Block"));
+        if (ordinary_.editing_) {
+            const auto &old = *ordinary_.editing_;
+            fileRuleView_.message.prepend(QString("Replacing selected rule: %1 · %2 · %3\n")
+                .arg(QString::fromUtf8(reinterpret_cast<const char *>(old.display.name.data()),qsizetype(old.display.name.size())),
+                     old.action == 2 ? "Allow" : "Block",Data::directionName(old.direction == 1 ? Data::Direction::Out : old.direction == 2 ? Data::Direction::In : Data::Direction::Both)));
+        }
+        emit changed();
+    });
+    worker->start();
+}
+bool ProductController::confirmApplicationFile(quint64 token, bool consent) {
+    advanceApplicationFile();
+    if (!consent || !fileActivation_ || !fileRuleView_.ready || token != fileRuleToken_ || fileWorker_ ||
+        fileActivation_->phase != FileActivation::Ready) return false;
+    checkApplicationFile(true); emit changed(); return true;
+}
+bool ProductController::loadSelectedRuleBackup(const QString &path) {
+    if (stopped_ || simulation() || fileWorker_ || fileActivation_ || ordinary_.state() == OrdinaryDecisionClient::State::Sending ||
+        ordinary_.state() == OrdinaryDecisionClient::State::Uncertain) return false;
+    inactiveRuleBackup_.clear();
+    fileRuleView_ = {"Opening an inactive selected rule backup…",++fileRuleToken_,true,false};
+    const auto token = fileRuleToken_;
+    struct Read { Data::StoreResult result; std::vector<gb::wire::iv::PrincipalRuleRecord> records; };
+    auto result = std::make_shared<Read>();
+    auto *worker = QThread::create([path,result] {
+        try { result->result = Data::ReviewStore::loadRuleBackup(path,result->records); }
+        catch (...) { result->result = {Data::StoreStatus::IoError,"Inactive backup read did not complete",{}}; }
+    });
+    fileWorker_ = worker;
+    connect(worker,&QThread::finished,this,[this,worker,result,token] {
+        if (fileWorker_ == worker) fileWorker_ = nullptr; worker->deleteLater();
+        if (stopped_ || token != fileRuleToken_) return;
+        fileRuleView_.busy = false;
+        if (result->result.ok()) {
+            inactiveRuleBackup_ = std::move(result->records);
+            fileRuleView_.message = "Inactive backup opened. Each selected executable and original account must match again before confirmation.";
+        } else fileRuleView_.message = result->result.error;
+        emit changed();
+    });
+    worker->start(); emit changed(); return true;
+}
+QString ProductController::ruleBackupDirectory() const {
+    return store_ ? QFileInfo(store_->filePath()).absolutePath() : QString{};
 }
 } // namespace Gate

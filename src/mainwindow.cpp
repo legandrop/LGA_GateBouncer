@@ -697,7 +697,8 @@ void MainWindow::buildShell() {
     sideStatus_ = label("Synthetic model available\nNo protection is active", "muted", true);
     sideStatus_->setContentsMargins(10, 10, 10, 7);
     side->addWidget(sideStatus_);
-    auto *help = button("ⓘ    Help & about", "help-about", "ghost");
+    auto *help = button("ⓘ    Help && About", "help-about", "ghost");
+    help->setAccessibleName("Help & About");
     side->addWidget(help);
     connect(help, &QPushButton::clicked, this, &MainWindow::about);
     shellLayout->addWidget(sidebar_);
@@ -1141,6 +1142,15 @@ void MainWindow::refreshTable(bool newPage) {
                 {p.identityEvidence.isEmpty() ? status : "Origin paired · snapshot", {}, {}}}});
         }
         else if (view_ == "import" || view_ == "rules") {
+            if (view_ == "rules" && product_.ordinary()->rulesCurrent())
+                for (const auto &r : product_.ordinary()->rules()) {
+                    result.push_back({"principal-rule:" + QString::fromStdString(gb::wire::hex(r.rule)),
+                        {{recordText(r.display.name,"Application unknown"),"strong",{}},
+                         {r.action == 2 ? "Allow rule" : "Block rule",{},{}},
+                         {r.direction == 1 ? (r.action == 2 ? "Outbound unicast" : "Outbound")
+                             : r.direction == 2 ? "Inbound" : r.action == 2 ? "Both · includes non-unicast" : "Both",{},{}},
+                         {"Unknown",{},{}},{"App and account · coverage unvalidated",{},{}},{"Review removal", "action",{}}}});
+                }
             if (view_ == "rules" && product_.recordsSelected() && product_.records()->recordsCurrent())
                 for (const auto &r : product_.records()->rules()) {
                     const auto name = recordText(r.name, "Selector " + QString::fromStdString(gb::wire::hex(r.selector)));
@@ -1358,6 +1368,7 @@ void MainWindow::tableAction(const QModelIndex &index) {
     if (!product_.simulation()) {
         if (view_ == "processes") renderLiveDetail(id);
         else if (view_ == "pending") openEngineRequest(id);
+        else if (view_ == "rules" && id.startsWith("principal-rule:")) cleanupLiveRule();
         else if (view_ == "rules" || view_ == "import") reviewCandidate(id, view_ == "import");
         return;
     }
@@ -2042,11 +2053,40 @@ void MainWindow::renderLive() {
         pageLayout_->addWidget(label("History starts when monitoring connects and retains 4,096 detail events. Connection requests, decisions and traffic are recorded separately. Decision time can be unknown; traffic and application identity remain unknown until their original sources are available. No recorded events does not mean an application was inactive.", "faint", true));
         if (!product_.historyError().isEmpty()) pageLayout_->addWidget(note(product_.historyError()));
     } else if (view_ == "rules") {
+        auto *bar = line(pageLayout_);
+        auto *refresh = button("Refresh my rules","refresh-principal-rules");
+        refresh->setEnabled(product_.ordinary()->idle() && !product_.ordinary()->visible() &&
+            product_.ordinary()->state() != OrdinaryDecisionClient::State::Uncertain);
+        bar->addWidget(refresh);
+        connect(refresh,&QPushButton::clicked,product_.ordinary(),&OrdinaryDecisionClient::refreshRules);
+        auto *remove = button("Review rule removal","cleanup-live-rules","ghost");
+        remove->setEnabled(product_.ordinary()->rulesCurrent()); bar->addWidget(remove);
+        connect(remove,&QPushButton::clicked,this,&MainWindow::cleanup);
+        auto *files = line(pageLayout_);
+        auto *create = button("New app rule…","new-file-rule","ghost"); files->addWidget(create);
+        connect(create,&QPushButton::clicked,this,[this] { prepareFileRules(); });
+        auto *edit = button("Edit selected…","edit-file-rule","ghost"); files->addWidget(edit);
+        edit->setEnabled(product_.ordinary()->rulesCurrent()); connect(edit,&QPushButton::clicked,this,&MainWindow::editSelectedFileRule);
+        auto *backup = button("Back up selected…","backup-file-rules","ghost"); files->addWidget(backup);
+        backup->setEnabled(product_.ordinary()->rulesCurrent()); connect(backup,&QPushButton::clicked,this,&MainWindow::backupSelectedFileRules);
+        auto *restore = button("Open inactive backup…","open-rule-backup","ghost"); files->addWidget(restore); files->addStretch();
+        connect(restore,&QPushButton::clicked,this,&MainWindow::openRuleBackup);
+        if (product_.ordinary()->state() == OrdinaryDecisionClient::State::Uncertain) {
+            auto *recover = button("Check same command","rule-recover","ghost");
+            recover->setEnabled(product_.ordinary()->idle()); bar->addWidget(recover);
+            connect(recover,&QPushButton::clicked,product_.ordinary(),&OrdinaryDecisionClient::recover);
+        }
+        bar->addStretch();
+        pageLayout_->addWidget(label(product_.ordinary()->message(),"muted",true));
+        pageLayout_->addWidget(label("Rules for your account: " + (product_.ordinary()->rulesCurrent()
+            ? QString::number(product_.ordinary()->rules().size()) : "Unavailable") +
+            " · no recorded activity does not mean inactive", "faint",true));
         pageLayout_->addWidget(label("Engine rules: " + (product_.recordsSelected() && product_.records()->recordsCurrent()
             ? QString::number(product_.records()->rules().size()) + " read only" : "Unavailable") +
             " · local candidates: " + QString::number(product_.review().report.candidates.size()) + " inactive", "muted", true));
         if (!product_.reviewError().isEmpty()) pageLayout_->addWidget(note(product_.reviewError()));
         makeTable({"Source target", "State", "Direction", "Last request", "Mapping", "Candidate"}, {24, 15, 20, 20, 12, 9});
+        table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
         auto *review = button("Review selected candidate", "review-candidate"); pageLayout_->addWidget(review, 0, Qt::AlignRight);
         connect(review, &QPushButton::clicked, this, [this] { if (table_) reviewCandidate(table_->currentIndex().data(IdRole).toString()); });
     } else if (view_ == "import") {
@@ -2072,6 +2112,11 @@ void MainWindow::renderLive() {
         if (!product_.importError().isEmpty()) pageLayout_->addWidget(note("Preview preserved · " + product_.importError()));
         if (!product_.reviewError().isEmpty()) pageLayout_->addWidget(note(product_.reviewError()));
         makeTable({"Source target", "Original policy", "Mapping", "Review reason"}, {27, 17, 18, 38}, 38);
+        table_->setSelectionMode(QAbstractItemView::ExtendedSelection);
+        auto *selectedFiles = button("Review selected saved rules…","prepare-source-files","ghost");
+        selectedFiles->setEnabled(product_.importedView(false).current && product_.importedView(false).qname.has_value());
+        pageLayout_->addWidget(selectedFiles,0,Qt::AlignLeft);
+        connect(selectedFiles,&QPushButton::clicked,this,&MainWindow::prepareSelectedSourceFiles);
         auto *foot = line(pageLayout_);
         foot->addWidget(label(QString::number(product_.draft().candidates.size()) + " inactive rows · compatibility: not validated", "faint"), 1);
         auto *save = button("Save all inactive candidates", "save-candidates", "primary");
@@ -2258,6 +2303,8 @@ void MainWindow::reviewCandidate(const QString &rowId, bool draft) {
             if (product_.updateCandidate(id, action)) { closeModal(); message("Saving local review in the background…"); }
         });
         if (!draft && product_.derivedQNameCandidate(false, c.id)) {
+            auto *file = button("Choose original executable…","prepare-inactive-file","ghost"); l->addWidget(file,0,Qt::AlignRight);
+            connect(file,&QPushButton::clicked,this,[this,id=c.id] { prepareFileRules({id}); });
             auto *prepare = button("Prepare matching source rule…", "prepare-imported-rule", "ghost");
             l->addWidget(prepare, 0, Qt::AlignRight);
             connect(prepare, &QPushButton::clicked, this, [this,id=c.id] { prepareImportedRule(id); });
@@ -2365,12 +2412,15 @@ void MainWindow::closeStaleModal() {
          (!draft && modalRevision_ != product_.review().revision))) ||
         (modalOwner_ == ModalOwner::Simulation && (!product_.simulation() || !model_.available())) ||
         (modalOwner_ == ModalOwner::ImportedActivation && (product_.simulation() || product_.generation() != modalGeneration_)) ||
+        ((modalOwner_ == ModalOwner::FileRule || modalOwner_ == ModalOwner::FileBackup) &&
+         (product_.simulation() || product_.generation() != modalGeneration_)) ||
         (modalOwner_ == ModalOwner::Live && (product_.simulation() || product_.generation() != modalGeneration_ || !product_.engine().current))) closeModal();
 }
 void MainWindow::closeModal() {
     const auto owner = modalOwner_; modalOwner_ = ModalOwner::General;
     if(owner==ModalOwner::Live&&assistance_)assistance_->cancel();
     if (owner == ModalOwner::ImportedActivation) product_.cancelImportedRule();
+    if (owner == ModalOwner::FileRule || owner == ModalOwner::FileBackup) product_.cancelApplicationFile();
     if (modalOverlay_) {
         dispose(modalOverlay_);
         modalOverlay_.clear();
@@ -2445,6 +2495,7 @@ void MainWindow::edit(const QString &id, bool candidate) {
     cancel->setFocus();
 }
 void MainWindow::cleanup() {
+    if (!product_.simulation()) { cleanupLiveRule(); return; }
     if (!model_.available())
         return;
     const auto epoch = model_.epoch();
@@ -2517,6 +2568,184 @@ void MainWindow::cleanup() {
         }
     });
     cancel->setFocus();
+}
+void MainWindow::cleanupLiveRule() {
+    if (product_.simulation() || !table_ || !product_.ordinary()->rulesCurrent()) return;
+    const auto selected = table_->currentIndex().data(IdRole).toString();
+    const auto &rules = product_.ordinary()->rules();
+    const auto found = std::find_if(rules.begin(),rules.end(),[&](const auto &r) {
+        return selected == "principal-rule:" + QString::fromStdString(gb::wire::hex(r.rule));
+    });
+    if (found == rules.end()) { message("Select a rule for your account before reviewing removal."); return; }
+    const auto rule = *found; const auto selection = product_.ordinary()->selection();
+    auto *layout = modal("Review rule removal",ModalOwner::FileRule);
+    layout->addWidget(label(recordText(rule.display.name,"Application unknown"),"heading",true));
+    definition(layout,"Account",recordText(rule.display.principal,"Account display unavailable"));
+    const auto direction = rule.direction == 1 ? Data::Direction::Out : rule.direction == 2 ? Data::Direction::In : Data::Direction::Both;
+    const auto scope = Data::applicationRuleScopeText(rule.package,direction,
+        rule.action == 2 ? Data::Action::Allow : Data::Action::Block,false);
+    definition(layout,"Rule",(rule.action == 2 ? QString("Allow") : QString("Block")) + " · " + scope.connections);
+    layout->addWidget(note("Removing this rule changes future policy for this application and account. Other rules still apply. No recorded requests does not prove inactivity. Protection coverage has not been validated.",true));
+    layout->addWidget(label("An inactive backup preserves the original application and account target. Restoring it requires the selected file to match again; it does not restore permissions automatically.","faint",true));
+    auto *backupConsent = new QCheckBox("Save this selected rule as an inactive backup");
+    backupConsent->setObjectName("consent-rule-backup"); layout->addWidget(backupConsent);
+    auto *backup = button("Save selected backup","save-selected-rule-backup","ghost");
+    backup->setEnabled(false); layout->addWidget(backup,0,Qt::AlignLeft);
+    connect(backupConsent,&QCheckBox::toggled,backup,[this,backup](bool checked) {
+        backup->setEnabled(checked && !product_.ruleBackupBusy() && product_.reviewWritable());
+    });
+    connect(backup,&QPushButton::clicked,this,[this,rule,selection,backupConsent] {
+        const bool saved = product_.backupSelectedRules({rule.rule},selection,backupConsent->isChecked());
+        closeModal(); message(saved ? "Saving the selected inactive rule backup in the background. No rule was changed."
+            : "Backup was not queued. Refresh your rules and check the stored review status.");
+    });
+    auto *consent = new QCheckBox("Remove this selected application and account rule");
+    consent->setObjectName("consent-rule-removal"); layout->addWidget(consent);
+    auto *actions = line(layout); auto *cancel = button("Cancel","cancel-rule-removal","ghost");
+    actions->addWidget(cancel); actions->addStretch();
+    auto *remove = button("Remove selected rule","confirm-rule-removal","danger");
+    remove->setEnabled(false); actions->addWidget(remove);
+    connect(consent,&QCheckBox::toggled,remove,&QPushButton::setEnabled);
+    connect(cancel,&QPushButton::clicked,this,&MainWindow::closeModal);
+    connect(remove,&QPushButton::clicked,this,[this,rule,selection,consent] {
+        if (!product_.ordinary()->revokeRule(rule.rule,selection,consent->isChecked())) {
+            closeModal(); message("Rule selection changed. Refresh your rules before reviewing removal."); return;
+        }
+        closeModal();
+    });
+    cancel->setFocus();
+}
+void MainWindow::editSelectedFileRule() {
+    if (!table_ || !product_.ordinary()->rulesCurrent()) return;
+    const auto id = table_->currentIndex().data(IdRole).toString();
+    for (const auto &rule : product_.ordinary()->rules()) if (id == "principal-rule:" + QString::fromStdString(gb::wire::hex(rule.rule))) {
+        if (rule.package != 1) { message("This package scope stays unchanged; the file route cannot represent it."); return; }
+        prepareFileRules({},rule.rule); return;
+    }
+    message("Select a current rule for your account before editing.");
+}
+void MainWindow::backupSelectedFileRules() {
+    if (!table_ || !product_.ordinary()->rulesCurrent()) return;
+    std::vector<gb::wire::Id> selected;
+    for (const auto &index : table_->selectionModel()->selectedRows()) {
+        const auto id = index.data(IdRole).toString();
+        const auto &rules = product_.ordinary()->rules();
+        const auto found = std::find_if(rules.begin(),rules.end(),[&](const auto &r) { return id == "principal-rule:" + QString::fromStdString(gb::wire::hex(r.rule)); });
+        if (found == rules.end()) { message("Select only current rules for your account for this backup."); return; }
+        selected.push_back(found->rule);
+    }
+    if (selected.empty() || selected.size() > 128) { message("Select between 1 and 128 current rules for your account."); return; }
+    const auto selection = product_.ordinary()->selection();
+    auto *layout = modal("Back up selected rules",ModalOwner::FileRule);
+    layout->addWidget(note(QString("Save %1 selected rules, including their original application and account targets, as an inactive backup. No rule will be changed. A backup cannot restore permissions automatically.").arg(selected.size()),true));
+    auto *consent = new QCheckBox("Save these selected rules as an inactive backup"); layout->addWidget(consent);
+    auto *save = button("Save inactive backup","save-rule-backup","primary"); save->setEnabled(false); layout->addWidget(save);
+    connect(consent,&QCheckBox::toggled,save,&QPushButton::setEnabled);
+    connect(save,&QPushButton::clicked,this,[this,selected,selection,consent] {
+        if (!product_.backupSelectedRules(selected,selection,consent->isChecked())) { message("The original selection changed or a stored review write is unavailable."); return; }
+        closeModal(); message("Saving selected inactive rules in the background. No rule was changed.");
+    });
+}
+void MainWindow::prepareSelectedSourceFiles() {
+    if (!table_ || !product_.importedView(false).current || !product_.importedView(false).qname) return;
+    QStringList selected;
+    const auto prefix = "candidate:" + product_.review().report.digest + ":";
+    for (const auto &index : table_->selectionModel()->selectedRows()) {
+        const auto id = index.data(IdRole).toString();
+        if (!id.startsWith(prefix)) { message("Save the source preview first, then select saved inactive rules."); return; }
+        selected.push_back(id.mid(prefix.size()));
+    }
+    if (selected.isEmpty() || selected.size() > 128) { message("Select between 1 and 128 saved inactive source rules."); return; }
+    prepareFileRules(selected);
+}
+void MainWindow::openRuleBackup() {
+    if (product_.simulation()) return;
+    const auto path = QFileDialog::getOpenFileName(this,"Open inactive selected rule backup",product_.ruleBackupDirectory(),"Rule backups (*.json)");
+    if (path.isEmpty()) return;
+    auto *layout = modal("Open inactive selected rule backup",ModalOwner::FileBackup);
+    layout->addWidget(note("A backup is historical data. No stored permission becomes active. Each restore requires the original executable, your original account and explicit confirmation of a new rule.",true));
+    auto *status = label({},"muted",true); layout->addWidget(status);
+    auto *rules = combo({},"inactive-backup-selection"); layout->addWidget(rules);
+    auto *restore = button("Choose executable to restore…","restore-rule-backup","primary"); layout->addWidget(restore);
+    auto token = std::make_shared<quint64>(0);
+    auto update = [this,status,rules,restore,token] {
+        const QSignalBlocker blocked(rules);
+        const auto &view = product_.fileRuleView(); status->setText(view.message);
+        if (view.token != *token) {
+            *token = view.token; rules->clear();
+            for (const auto &r : product_.inactiveRuleBackup()) rules->addItem(recordText(r.display.name,"Application unknown") +
+                " · " + (r.action == 2 ? "Allow" : "Block") + " · " + recordText(r.display.principal,"Account unknown"));
+        } else if (!view.busy && rules->count() != int(product_.inactiveRuleBackup().size())) {
+            rules->clear(); for (const auto &r : product_.inactiveRuleBackup()) rules->addItem(recordText(r.display.name,"Application unknown") + " · " + (r.action == 2 ? "Allow" : "Block"));
+        }
+        const auto index = rules->currentIndex();
+        restore->setEnabled(!view.busy && index >= 0 && std::size_t(index) < product_.inactiveRuleBackup().size() && product_.inactiveRuleBackup()[std::size_t(index)].package == 1);
+    };
+    connect(&product_,&ProductController::changed,status,update);
+    connect(rules,&QComboBox::currentIndexChanged,status,[update](int) { update(); });
+    connect(restore,&QPushButton::clicked,this,[this,rules] { const auto index = rules->currentIndex(); if (index >= 0) prepareFileRules({}, {},index); });
+    if (!product_.loadSelectedRuleBackup(path)) message("A rule operation is already in progress; the backup was not opened.");
+    update();
+}
+void MainWindow::prepareFileRules(const QStringList &candidates, const std::optional<gb::wire::Id> &editing, int backupIndex) {
+    if (product_.simulation() || candidates.size() > 128) return;
+    const auto selection = product_.ordinary()->selection();
+    const auto digest = product_.review().report.digest; const auto revision = product_.review().revision;
+    auto *layout = modal(editing ? "Edit selected application rule" : candidates.isEmpty() && backupIndex < 0 ? "New application rule" : "Review selected inactive rules",ModalOwner::FileRule);
+    layout->addWidget(note("This route covers your connected account only. SYSTEM, NetworkService and other accounts require their original administrator route. Source conditions, priorities or package scopes that cannot be represented stay inactive. Protection coverage has not been validated.",true));
+    auto *sources = combo({},"file-source-selection");
+    if (candidates.isEmpty()) sources->addItem(backupIndex >= 0 ? "Selected inactive backup" : editing ? "Selected current rule" : "New application and account rule",QString{});
+    else for (const auto &id : candidates) sources->addItem(id,id);
+    layout->addWidget(sources);
+    auto *path = new QLineEdit; path->setReadOnly(true); path->setObjectName("selected-rule-executable"); path->setPlaceholderText("Choose the original executable; it may be closed.");
+    auto *fileLine = line(layout); fileLine->addWidget(path,1); auto *choose = button("Choose…","choose-rule-executable","ghost"); fileLine->addWidget(choose);
+    auto *policyLine = line(layout);
+    auto *policy = combo({"Block","Allow"},"file-rule-policy"); auto *direction = combo({"Outbound","Inbound","Both"},"file-rule-direction");
+    policyLine->addWidget(policy); policyLine->addWidget(direction);
+    if (editing) for (const auto &r : product_.ordinary()->rules()) if (r.rule == *editing) { policy->setCurrentIndex(r.action == 2 ? 1 : 0); direction->setCurrentIndex(r.direction == 1 ? 0 : r.direction == 2 ? 1 : 2); }
+    if (backupIndex >= 0 && std::size_t(backupIndex) < product_.inactiveRuleBackup().size()) {
+        const auto &r = product_.inactiveRuleBackup()[std::size_t(backupIndex)]; policy->setCurrentIndex(r.action == 2 ? 1 : 0); direction->setCurrentIndex(r.direction == 1 ? 0 : r.direction == 2 ? 1 : 2);
+    }
+    auto *status = label("Choose an executable. It will be retained under your original account while the service prepares its own draft.","muted",true);
+    status->setObjectName("file-rule-scope"); auto *content = new QWidget; auto *body = new QVBoxLayout(content); body->setContentsMargins(0,0,0,0); body->addWidget(status);
+    auto *scroll = scrollArea(content); scroll->setMinimumHeight(120); scroll->setMaximumHeight(240); layout->addWidget(scroll);
+    auto *consent = new QCheckBox("I accept this exact decision and the scope shown above."); consent->setObjectName("file-rule-consent"); consent->setEnabled(false); layout->addWidget(consent);
+    auto *actions = line(layout); auto *prepare = button("Check original file and draft","prepare-file-rule","ghost"); actions->addWidget(prepare);
+    auto *confirm = button(editing ? "Replace selected rule" : "Create reviewed rule","confirm-file-rule","primary"); confirm->setEnabled(false); actions->addWidget(confirm);
+    auto token = std::make_shared<quint64>(0); auto consentToken = std::make_shared<quint64>(0);
+    auto update = [this,sources,path,choose,policy,direction,status,consent,prepare,confirm,token,consentToken,candidates,backupIndex,digest,revision] {
+        const auto &view = product_.fileRuleView();
+        if (view.token != *token) { *token = view.token; *consentToken = 0; consent->setChecked(false); }
+        if (!view.message.isEmpty()) status->setText(view.message);
+        const auto state = product_.ordinary()->state();
+        const bool inFlight = view.busy || view.ready || state == OrdinaryDecisionClient::State::Sending || state == OrdinaryDecisionClient::State::Uncertain;
+        sources->setEnabled(!inFlight); choose->setEnabled(!inFlight); policy->setEnabled(!inFlight && candidates.isEmpty() && backupIndex < 0);
+        direction->setEnabled(!inFlight && candidates.isEmpty() && backupIndex < 0);
+        bool sourceKnown = true;
+        if (!candidates.isEmpty()) {
+            const auto *source = product_.derivedQNameCandidate(false,sources->currentData().toString());
+            sourceKnown = source && source->action.known() && (source->action.value == Data::SourceFwAction::Allow || source->action.value == Data::SourceFwAction::Deny) && source->direction.known() && source->direction.value != Data::Direction::Unknown && product_.review().report.digest == digest && product_.review().revision == revision;
+            if (sourceKnown) { policy->setCurrentIndex(source->action.value == Data::SourceFwAction::Allow ? 1 : 0); direction->setCurrentIndex(source->direction.value == Data::Direction::Out ? 0 : source->direction.value == Data::Direction::In ? 1 : 2); }
+        }
+        prepare->setEnabled(!inFlight && !Data::SelectedApplicationFile::physicalJobs() && !path->text().isEmpty() && sourceKnown);
+        consent->setEnabled(view.ready);
+        if (!view.ready) { *consentToken = 0; consent->setChecked(false); }
+        confirm->setEnabled(view.ready && consent->isChecked() && *consentToken == view.token);
+    };
+    const auto reset = [this,consent,consentToken] { *consentToken = 0; consent->setChecked(false); product_.cancelApplicationFile(); };
+    connect(choose,&QPushButton::clicked,status,[this,path,reset,update] { const auto selected = QFileDialog::getOpenFileName(this,"Choose original executable",{},"Executables (*.exe);;All files (*)"); if (!selected.isEmpty()) { reset(); path->setText(selected); update(); } });
+    connect(sources,&QComboBox::currentIndexChanged,status,[path,reset,update](int) { reset(); path->clear(); update(); });
+    connect(policy,&QComboBox::activated,status,[reset,update](int) { reset(); update(); });
+    connect(direction,&QComboBox::activated,status,[reset,update](int) { reset(); update(); });
+    connect(&product_,&ProductController::changed,status,update);
+    connect(prepare,&QPushButton::clicked,status,[this,path,policy,direction,sources,editing,selection,backupIndex,update] {
+        const auto action = policy->currentIndex() == 1 ? Data::Action::Allow : Data::Action::Block;
+        const auto scope = direction->currentIndex() == 0 ? Data::Direction::Out : direction->currentIndex() == 1 ? Data::Direction::In : Data::Direction::Both;
+        if (!product_.prepareApplicationFile(path->text(),action,scope,editing,selection,sources->currentData().toString(),backupIndex)) message("The original file review could not start. Check the current selection and wait for any previous operation to finish."); update();
+    });
+    connect(consent,&QCheckBox::toggled,status,[this,consentToken,confirm](bool checked) { const auto &view = product_.fileRuleView(); *consentToken = checked && view.ready ? view.token : 0; confirm->setEnabled(checked && view.ready && *consentToken == view.token); });
+    connect(confirm,&QPushButton::clicked,status,[this,consent,consentToken,update] { product_.confirmApplicationFile(*consentToken,consent->isChecked()); update(); });
+    update();
 }
 void MainWindow::about() {
     auto *l = modal("About LGA GateBouncer");
