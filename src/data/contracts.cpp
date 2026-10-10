@@ -42,4 +42,26 @@ Direction readDirection(const QString &text) {
     if (text == "Both") return Direction::Both;
     return Direction::Unknown;
 }
+ApplicationRuleScopeText applicationRuleScopeText(quint8 package, Direction direction, Action action, bool held) {
+    ApplicationRuleScopeText text;
+    text.package = package == 1 ? "Unrestricted · any package" : package == 2
+        ? "The displayed package" : "Package restriction is unknown";
+    text.scope = "This application and account, including other matching instances and sessions. "
+        + QString(package == 1 ? "Any package is included. " : package == 2
+            ? "The displayed package is included. " : "Package restriction is unknown. ")
+        + "The rule applies only to future connections; it does not resume this attempt. ";
+    text.connections = direction == Direction::Out
+        ? action == Action::Block ? "Outbound · all destinations and protocols"
+                                  : "Outbound · Allow covers unicast destinations only"
+        : direction == Direction::In ? "Inbound · all destinations and protocols"
+        : direction == Direction::Both
+            ? action == Action::Block ? "Both · inbound and outbound; all destinations and protocols"
+                                      : "Both · inbound and outbound; Allow includes non-unicast destinations"
+        : "Network direction unknown; decisions are not ready";
+    text.originalAttempt = held
+        ? "Saving an Always rule will cancel this request and keep its original connection blocked."
+        : "The original attempt stays blocked; no connection is waiting.";
+    text.coverage = "Protection coverage has not been validated.";
+    return text;
+}
 } // namespace Gate::Data

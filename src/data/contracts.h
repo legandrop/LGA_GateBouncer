@@ -163,4 +163,9 @@ QString actionName(Action action);
 std::optional<Action> readAction(const QString &text);
 QString directionName(Direction direction);
 Direction readDirection(const QString &text);
+// Presentación del ámbito futuro; no acredita identidad ni autoriza decisiones.
+struct ApplicationRuleScopeText {
+    QString package, scope, connections, originalAttempt, coverage;
+};
+ApplicationRuleScopeText applicationRuleScopeText(quint8 package, Direction direction, Action action, bool held);
 } // namespace Gate::Data

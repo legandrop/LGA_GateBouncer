@@ -1459,6 +1459,11 @@ void MainWindow::renderOrdinaryNotice() {
     const auto selection = client->selection();
     const bool held = row.temporal == 2;
     const auto scopeValue = submitted ? int(gb::wire::get(submitted->command, gb::wire::Tag::ScopeKind)) : client->selectedScope();
+    const auto futureScope = Data::applicationRuleScopeText(quint8(package),
+        directionValue == 1 ? Data::Direction::Out : directionValue == 2 ? Data::Direction::In :
+        directionValue == 3 ? Data::Direction::Both : Data::Direction::Unknown,
+        submitted ? gb::wire::get(submitted->command, gb::wire::Tag::Decision) == 2 ? Data::Action::Allow : Data::Action::Block
+                  : Data::Action::Ask, held);
     notice_ = new QFrame(root_); notice_->setObjectName("access-notice");
     notice_->setAccessibleName("Application access request");
     auto *l = new QVBoxLayout(notice_); l->setContentsMargins(15, 12, 15, 12); l->setSpacing(9);
@@ -1500,7 +1505,7 @@ void MainWindow::renderOrdinaryNotice() {
     body->addWidget(ordinaryExplanation_);
     definition(body, "Application", recordText(display.name, "Unknown"));
     definition(body, "Account", recordText(display.principal, "Unknown"));
-    definition(body, "Package", scopeValue >= 3 ? "Non-AppContainer process" : package == 1 ? "Unrestricted · any package" : recordText(display.package, "Unknown"));
+    definition(body, "Package", scopeValue >= 3 ? "Non-AppContainer process" : package == 1 ? futureScope.package : recordText(display.package, "Unknown"));
     if (!display.path.empty()) {
         auto *path = new QPlainTextEdit(recordText(display.path, "Unknown")); path->setReadOnly(true);
         path->setObjectName("ordinary-path"); path->setWordWrapMode(QTextOption::WrapAnywhere);
@@ -1508,12 +1513,9 @@ void MainWindow::renderOrdinaryNotice() {
     }
     const QString scopeDescription = scopeValue == 3 ? "this exact network flow, once. " : scopeValue == 4
         ? "only this app instance, until it exits. " : scopeValue == 5 ? "only this app instance, for up to 15 minutes or until it exits. " :
-        "this application and account, including other matching instances. "
-        + QString(package == 1 ? "Any package is included. " : package == 2
-            ? "The displayed package is included. " : "Package restriction is unknown. ") +
-        "The rule applies only to future connections; it does not resume this attempt. ";
+        futureScope.scope;
     body->addWidget(label(QString(client->state() == OrdinaryDecisionClient::State::Recorded ? "Recorded scope: " : submitted ? "Submitted scope: " : "Will apply to: ") + scopeDescription +
-        "Protection coverage has not been validated.", "muted", true));
+        futureScope.coverage, "muted", true));
     l->addWidget(scrollArea(content), 1);
     auto *fields = new QHBoxLayout; fields->setSpacing(9);
     auto *sl = new QVBoxLayout; sl->setSpacing(5); sl->addWidget(label("Apply to", "faint"));
@@ -1535,7 +1537,7 @@ void MainWindow::renderOrdinaryNotice() {
         ? client->state() == OrdinaryDecisionClient::State::Recorded
             ? "The Always rule was saved. This request was cancelled and its original connection stays blocked."
             : submitted ? "The submitted Always rule would cover only future connections. Its result is shown above."
-                : "Saving an Always rule will cancel this request and keep its original connection blocked."
+                : futureScope.originalAttempt
         : "This decision applies only to the selected connection or app instance.", "faint", true));
     auto *direction = combo({"Outbound", "Inbound", "Both"}, "ordinary-direction");
     direction->setCurrentIndex(directionValue - 1);
@@ -1550,8 +1552,7 @@ void MainWindow::renderOrdinaryNotice() {
             : directionValue == 2 ? "Network flows accepted by this app, with packets in both directions. "
             : "Network flow direction unavailable; decisions are not ready. ") +
         "UDP, QUIC, ICMP and startup coverage have not been validated."
-        : directionValue == 1 ? "Outbound · Allow covers unicast destinations only"
-        : directionValue == 2 ? "Inbound · all destinations and protocols" : "Both · inbound and outbound; Allow includes non-unicast destinations";
+        : futureScope.connections;
     l->addWidget(label(QString(client->state() == OrdinaryDecisionClient::State::Recorded ? "Recorded connections: " : submitted ? "Submitted connections: " : "Will cover: ") + network, "muted", true));
     auto *consent = new QCheckBox("I accept the effective scope shown above.");
     consent->setObjectName("ordinary-consent"); consent->setEnabled(client->ready());

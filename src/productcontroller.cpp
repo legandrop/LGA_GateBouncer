@@ -739,10 +739,15 @@ void ProductController::advanceImportedRule() {
     }
     activation_->selection = ordinary_.selection(); activation_->draft = draft;
     activationView_.ready = true; activationView_.busy = false;
-    activationView_.message = QString("Ready to confirm a new %1 rule.\nApplication: %2\nAccount: %3\nDirection: %4\nAll app instances and sessions; future connections only. The original attempt stays blocked. Source candidates stay inactive.")
+    const auto scopeText = Data::applicationRuleScopeText(draft->package,
+        draft->direction == 1 ? Data::Direction::Out : draft->direction == 2 ? Data::Direction::In : Data::Direction::Both,
+        activation_->comparison.action.value == Data::SourceFwAction::Allow ? Data::Action::Allow : Data::Action::Block,
+        observed->temporal == 2);
+    activationView_.message = QString("Ready to confirm a new %1 rule.\nApplication: %2\nAccount: %3\nDirection: %4\nPackage: %5\nWill apply to: %6\nWill cover: %7\n%8\n%9\nSource candidates stay inactive.")
         .arg(activation_->comparison.action.value == Data::SourceFwAction::Allow ? "Allow" : "Block",
              activation_->attempt.native->process->image, importedAccount(activation_->attempt.native->process->accountSid),
-             Data::directionName(activation_->comparison.direction));
+             Data::directionName(activation_->comparison.direction), scopeText.package, scopeText.scope,
+             scopeText.connections, scopeText.coverage, scopeText.originalAttempt);
 }
 bool ProductController::confirmImportedRule(quint64 token, bool consent) {
     advanceImportedRule();
