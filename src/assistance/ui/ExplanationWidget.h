@@ -13,6 +13,7 @@ private:
     void refresh();
     QPointer<GeneralSession> session_;
     Binding binding_;
+    QString observedName_; // Sólo presentación; nunca inicia ni aprueba la consulta.
     QLineEdit *product_,*publisher_;
     QLabel *text_,*state_;
     QPushButton *approve_,*start_,*cancel_;

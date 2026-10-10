@@ -85,18 +85,23 @@ QByteArray configurationBinding(const ProviderConfig &config)
     if (!validConfiguration(config)) return {};
     const QByteArray material = QByteArray::number(int(config.provider)) + '\n'
         + config.endpoint.toEncoded() + '\n' + config.revision.toUtf8() + '\n'
-        + QByteArrayLiteral("web-disclosure-v1");
+        + QByteArrayLiteral("web-disclosure-v2");
     return QCryptographicHash::hash(material, QCryptographicHash::Sha256).toHex();
 }
 QString disclosure(const ProviderConfig &config)
 {
     if (config.provider == Provider::MwmblV2)
-        return QStringLiteral("Web search sends only public application names to Mwmbl. "
+        return QStringLiteral("Automatic explanations send the executable name observed for each current request to Mwmbl. "
+            "The name can reveal which app you use; it does not verify the file's identity. Publisher is included only if you review it manually. "
+            "Names and public search snippets are used for NVIDIA explanations under the separate model notice. Paths, file hashes, file contents and local signature details are not sent. "
             "Standard searches may be shared with external sources and TypeSafe AI; "
             "pages and query keywords may enter a public index. Your connection IP is processed. "
             "Coverage is limited. Results do not certify the safety of this executable. "
             "You can revoke this consent. Mwmbl terms and privacy policy apply.");
-    return QStringLiteral("Web search sends only public application names to your configured "
+    return QStringLiteral("Automatic explanations send the executable name observed for each current request to your configured "
+        "SearXNG server. The name can reveal which app you use; it does not verify the file's identity. Publisher is included only if you review it manually. "
+        "Names and public search snippets are used for NVIDIA explanations under the separate model notice. Paths, file hashes, file contents and local signature details are not sent. "
+        "Searches use the configured "
         "SearXNG server and its search engines. The server operator can observe queries; "
         "upstream providers apply their own privacy policies and terms. Results do not "
         "certify the safety of this executable. You can revoke this consent.");

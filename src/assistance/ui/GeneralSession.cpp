@@ -1,4 +1,5 @@
 #include "GeneralSession.h"
+#include "ObservationSelection.h"
 #include <cstring>
 #include <QTimer>
 namespace Gate::Assistance::Ui {
@@ -205,6 +206,22 @@ bool GeneralSession::clearPublicReview(){
     pendingPresentation_=pending;pendingBinding_=binding;state_=G::State::Insufficient;emit changed();
     return self&&unchanged(expected)&&self->pendingBinding_==binding&&self->pendingPresentation_&&
         G::pendingPresentationBytes(*self->pendingPresentation_)==bytes;
+}
+bool GeneralSession::reviewLocalApplication(const OrdinaryDecisionClient& source){
+    QPointer<GeneralSession> self(this);QPointer<const OrdinaryDecisionClient> original(&source);
+    const auto observed=currentObservation(original.data());const auto binding=pendingBinding();
+    if(!self||!original||!observed||!binding||!pendingPresentation_||
+        !(pendingPresentation_->service()==observed->service)||!observed->matches(*binding))return false;
+    // Sólo basename entregado por el productor actual; no es ProductName ni publisher verificado.
+    const auto& name=observed->record.display.name;
+    G::PublicFields fields{std::string(name.begin(),name.end()),{},std::string(name.begin(),name.end())};
+    const auto after=currentObservation(original.data());
+    if(!G::validPublicFields(fields)||!after||!(*after==*observed))return false;
+    const bool reviewed=reviewPublicFields(std::move(fields));
+    if(!self||!original)return false;
+    const auto current=currentObservation(original.data());
+    if(!current||!(*current==*observed)){cancel();return false;}
+    return reviewed;
 }
 bool GeneralSession::reviewPublicFields(G::PublicFields fields){
     if(busy_||!pendingPresentation_||!G::validPublicFields(fields))return false;

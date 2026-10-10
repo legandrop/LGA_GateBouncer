@@ -4,6 +4,7 @@
 #include "../configuration/ProviderEntitlementVerifier.h"
 #include <QPointer>
 
+namespace Gate { class OrdinaryDecisionClient; }
 namespace Gate::Assistance::Ui {
 // Estado de presentación owned: no acuña solicitudes, permisos ni recibos.
 class GeneralSession final : public QObject {
@@ -23,6 +24,7 @@ public:
     bool selectPending(const General::Id128&,General::PendingServiceContext);
     std::optional<General::FullBinding> pendingBinding() const;
     bool reviewPublicFields(General::PublicFields);
+    bool reviewLocalApplication(const OrdinaryDecisionClient&);
     bool clearPublicReview();
     bool publicReviewCurrent() const;
     bool explainReviewed();

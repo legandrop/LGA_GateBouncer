@@ -15,6 +15,7 @@ struct GeneralConnection::SettingsView {
     bool retired=false;
     std::optional<ObservationSelection> selected,attempted;
     std::uint64_t attemptedConfiguration=0;
+    bool publicAttempted=false;
     bool current(const Broker::Id& captured,std::uint64_t revision) const {
         const auto live=channel.lock();
         return !retired&&window&&Broker::nonzero(nonce)&&nonce==captured&&generation==revision&&
@@ -99,8 +100,16 @@ void GeneralConnection::synchronizePending(){
     if(session->busy()||!session->available()||!session->configuration())return;
     const auto revision=session->configuration()->local.revision;
     // Un error o Cancel no reintenta la misma selección/configuración automáticamente.
-    if(owner->attempted&&*owner->attempted==*selected&&owner->attemptedConfiguration==revision)return;
+    if(owner->attempted&&*owner->attempted==*selected&&owner->attemptedConfiguration==revision){
+        if(!owner->publicAttempted&&owner->selected&&*owner->selected==*selected&&session->pendingBinding()){
+            // Marcar antes de changed: ni reentrada ni Cancel/error repiten este intento.
+            owner->publicAttempted=true;
+            session->reviewLocalApplication(*window_->product()->ordinary());
+        }
+        return;
+    }
     owner->selected=selected;owner->attempted=selected;owner->attemptedConfiguration=revision;
+    owner->publicAttempted=false;
     session->selectPending(selected->record.observed,selected->service);
 }
 }

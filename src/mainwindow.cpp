@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "assistance/ui/SettingsWidget.h"
 #include "assistance/ui/ExplanationWidget.h"
+#include "assistance/ui/ObservationSelection.h"
 #include <QAbstractTableModel>
 #include <QApplication>
 #include <QButtonGroup>
@@ -1427,12 +1428,18 @@ void MainWindow::renderOrdinaryNotice() {
         : client->state() == OrdinaryDecisionClient::State::Sending
             ? "Decision sent · waiting for the recorded result"
         : held ? "TCP connection waiting · closing keeps the request blocked and pending" : "Blocked attempt recorded · no connection is waiting");
+    QString observedApplication;
+    if(const auto source=Assistance::Ui::currentObservation(client)){
+        const auto& name=source->record.display.name;
+        const std::string text(name.begin(),name.end());
+        if(Assistance::General::validPublicFields({text,{},text}))observedApplication=QString::fromUtf8(text);
+    }
     ordinaryExplanation_=new Assistance::Ui::ExplanationWidget(assistance_.get(),[this,selection]{
         const auto* current=product_.ordinary();
         QPointer<Assistance::Ui::GeneralSession> explanation=assistance_.get();
         if(!explanation||!current->visible()||!current->current()||current->selection()!=selection)return std::optional<Assistance::General::FullBinding>{};
         return explanation->pendingBinding();
-    },QString{},content);
+    },observedApplication,content);
     body->addWidget(ordinaryExplanation_);
     definition(body, "Application", recordText(display.name, "Unknown"));
     definition(body, "Account", recordText(display.principal, "Unknown"));

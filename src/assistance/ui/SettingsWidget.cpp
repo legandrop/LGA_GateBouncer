@@ -57,7 +57,7 @@ SettingsWidget::SettingsWidget(GeneralSession* session,QWidget* parent):QFrame(p
     addText("Saving a key does not verify it with NVIDIA or establish permission to use the service.","faint");
     addText("When to explain","heading");
     mode_=new QComboBox(this);mode_->setObjectName("assistance-mode");mode_->addItems({"Not selected","Automatic","Manual"});layout->addWidget(mode_);
-    addText("Automatic starts when reviewed public information and current permissions are available. Manual waits for you to start the explanation.","faint");
+    addText("Automatic is the default after setup and consent. It explains each new request using the executable name observed by the service when current permissions are available. The name can reveal which app you use. Manual waits for Explain.","faint");
     selectSearch_=addButton("Set up web search","select-assistance-search");
     auto* permissions=new QGroupBox("Permissions · read each notice before agreeing",this);
     permissions->setObjectName("assistance-permissions");
