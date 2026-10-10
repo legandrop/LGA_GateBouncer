@@ -15,6 +15,7 @@
 #define GB_PENDING_TICKS (120000ull*10000ull)
 #define GB_CALLOUT_COUNT 18u
 #define GB_PACKET_BYTES 65535u
+#define GB_PACKET_CONTROL_BYTES 1024u
 C_ASSERT(sizeof(GB_ACTIVITY_SNAPSHOT)==168);
 C_ASSERT(sizeof(GB_SCOPE_DECISION)==64);
 C_ASSERT(sizeof(GB_SCOPE_RECEIPT)==104);
@@ -82,6 +83,10 @@ typedef struct GB_ENTRY {
     NET_BUFFER_LIST *packet;
     MDL *packetMdl;
     UCHAR *packetBytes;
+    BOOLEAN packetOutbound, packetObserved, packetCharged;
+    UCHAR packetRemote[16];
+    WSACMSGHDR *packetControl;
+    FWPS_TRANSPORT_SEND_PARAMS0 packetSend;
     UINT32 interfaceIndex, subInterfaceIndex;
 } GB_ENTRY;
 typedef struct GB_TUPLE {
@@ -91,6 +96,7 @@ typedef struct GB_TUPLE {
 } GB_TUPLE;
 static EX_PUSH_LOCK gbControl;
 static KSPIN_LOCK gbLock;
+static ULONG gbPacketOwned;
 static GB_ENTRY *gbEntries[GB_CLASSIFIER_CAPACITY];
 static UINT32 gbCalloutIds[GB_CALLOUT_COUNT];
 static UINT64 gbSession, gbSequence, gbLoss;
@@ -111,6 +117,16 @@ static NDIS_HANDLE gbPacketPool;
 static UNICODE_STRING gbLink=RTL_CONSTANT_STRING(L"\\DosDevices\\LgaGateBouncerClassifier");
 static NTSTATUS startClassifier(void);
 static void queueInbound(GB_ENTRY *e,HANDLE completion);
+static void discardOwnedPacket(GB_ENTRY *e,BOOLEAN locked);
+static BOOLEAN reservePacketLocked(GB_ENTRY *e) {
+    if(e->packetCharged || gbPacketOwned>=GB_CLASSIFIER_CAPACITY)return FALSE;
+    ++gbPacketOwned;e->packetCharged=TRUE;return TRUE;
+}
+static void unchargePacket(GB_ENTRY *e,BOOLEAN locked) {
+    KIRQL irql;if(!locked)KeAcquireSpinLock(&gbLock,&irql);
+    if(e->packetCharged){e->packetCharged=FALSE;--gbPacketOwned;}
+    if(!locked)KeReleaseSpinLock(&gbLock,irql);
+}
 static BOOLEAN inboundLayer(UINT16 layer) {
     return layer==FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 || layer==FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6;
 }
@@ -643,8 +659,12 @@ static void NTAPI datagramClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INC
         }
         else {
             permit(out);
-            if(data && out->actionType==FWP_ACTION_PERMIT)
-                accumulateActivity(e,v->incomingValue[direction].value.uint32,packet,TRUE);
+            if(data && out->actionType==FWP_ACTION_PERMIT) {
+                if(!(e->packetOutbound && e->packet==data && e->packetObserved))
+                    accumulateActivity(e,v->incomingValue[direction].value.uint32,packet,TRUE);
+                if(e->packetOutbound && e->packet==data && packet.complete &&
+                   v->incomingValue[direction].value.uint32==FWP_DIRECTION_OUTBOUND)e->packetObserved=TRUE;
+            }
         }
     } else if(e || ambiguous)block(out);
     // Sin scope temporal: continuar hacia la autorización permanente vigente, no fabricar Permit.
@@ -850,6 +870,18 @@ static BOOLEAN injectionMatches(GB_ENTRY *e,void *packet,const GB_TUPLE *t,const
         (m->currentMetadataValues & FWPS_METADATA_FIELD_COMPARTMENT_ID) &&
         m->transportEndpointHandle==e->record.endpoint && m->compartmentId==e->record.compartment;
 }
+static GB_ENTRY *outboundInjectedEntry(HANDLE id) {
+    ULONG i;UINT64 cause=(UINT64)(ULONG_PTR)id;
+    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)
+        if(gbEntries[i] && gbEntries[i]->record.cause==cause && gbEntries[i]->packetOutbound &&
+           !inboundLayer(gbEntries[i]->record.layerId))return gbEntries[i];
+    return NULL;
+}
+static BOOLEAN outboundInjectionBound(GB_ENTRY *e,void *packet,const GB_TUPLE *t,
+    const FWPS_INCOMING_METADATA_VALUES0 *m,UINT64 now) {
+    return e && e->packetOutbound && e->injectActive && e->injectPins && t->protocol==IPPROTO_UDP &&
+        injectionMatches(e,packet,t,m) && live(e,now) && e->receipt.decision.action==2;
+}
 static BOOLEAN applyInboundDecision(GB_ENTRY *e,FWPS_CLASSIFY_OUT0 *out,UINT64 now) {
     if(!injectionReady(e,now) || !((out->rights & FWPS_RIGHT_ACTION_WRITE) ||
         (e->receipt.decision.action==1 && out->actionType==FWP_ACTION_PERMIT)))return FALSE;
@@ -861,20 +893,44 @@ static BOOLEAN applyInboundDecision(GB_ENTRY *e,FWPS_CLASSIFY_OUT0 *out,UINT64 n
     return TRUE;
 }
 static void releasePacket(GB_ENTRY *e,NET_BUFFER_LIST *packet,BOOLEAN failed) {
-    KIRQL irql; MDL *mdl; UCHAR *bytes;
+    KIRQL irql; MDL *mdl; UCHAR *bytes; WSACMSGHDR *control;
     KeAcquireSpinLock(&gbLock,&irql);
-    mdl=e->packetMdl; bytes=e->packetBytes; e->packet=NULL; e->packetMdl=NULL; e->packetBytes=NULL;
-    if(failed) revoke(e);
+    mdl=e->packetMdl; bytes=e->packetBytes; control=e->packetControl;
+    e->packet=NULL; e->packetMdl=NULL; e->packetBytes=NULL;e->packetControl=NULL;
+    e->packetSend.controlData=NULL;e->packetSend.controlDataLength=0;
+    if(failed) {if(e->packetOutbound)e->activity.flags|=GB_ACTIVITY_INCOMPLETE;revoke(e);}
     if(e->completing) { revoke(e); e->completing=FALSE; e->consumed=TRUE; }
     KeReleaseSpinLock(&gbLock,irql);
     FwpsFreeNetBufferList0(packet); IoFreeMdl(mdl); ExFreePoolWithTag(bytes,GB_TAG);
+    if(control)ExFreePoolWithTag(control,GB_TAG);
+    unchargePacket(e,FALSE); // Cuenta hasta el último free físico, no sólo hasta detach.
     KeAcquireSpinLock(&gbLock,&irql); e->injectActive=FALSE; e->injectQueued=FALSE; --e->injectPins;
     KeReleaseSpinLock(&gbLock,irql);
 }
 static void NTAPI injectionComplete(void *context,NET_BUFFER_LIST *packet,BOOLEAN dispatchLevel) {
-    GB_ENTRY *e=context; UNREFERENCED_PARAMETER(dispatchLevel);
+    GB_ENTRY *e=context;KIRQL irql; UNREFERENCED_PARAMETER(dispatchLevel);
     // Pin propio de completionContext, nunca dereference de injectionContext metadata.
+    KeAcquireSpinLock(&gbLock,&irql);
+    // Completion acredita la inyección, no una clasificación DATAGRAM ausente.
+    if(e->packetOutbound && (!e->packetObserved || !NT_SUCCESS(NET_BUFFER_LIST_STATUS(packet))))
+        e->activity.flags|=GB_ACTIVITY_INCOMPLETE;
+    KeReleaseSpinLock(&gbLock,irql);
     releasePacket(e,packet,!NT_SUCCESS(NET_BUFFER_LIST_STATUS(packet)));
+}
+static void NTAPI outboundDpc(KDPC *dpc,void *context,void *a,void *b) {
+    GB_ENTRY *e=context;NET_BUFFER_LIST *packet;KIRQL irql;BOOLEAN ready,blocked;NTSTATUS status;
+    UNREFERENCED_PARAMETER(dpc);UNREFERENCED_PARAMETER(a);UNREFERENCED_PARAMETER(b);
+    KeAcquireSpinLock(&gbLock,&irql);packet=e->packet;e->injectQueued=FALSE;e->injectActive=TRUE;
+    ready=e->packetOutbound && packet && e->injectPins && !e->completing && live(e,KeQueryInterruptTime());
+    blocked=ready && e->receipt.decision.action==1;
+    ready=ready && e->receipt.decision.action==2;
+    KeReleaseSpinLock(&gbLock,irql);
+    if(!ready){releasePacket(e,packet,!blocked);return;}
+    status=FwpsInjectTransportSendAsync0(gbInjection[e->record.family==4 ? 0 : 1],
+        (HANDLE)(ULONG_PTR)e->record.cause,e->record.endpoint,0,&e->packetSend,
+        e->record.family==4 ? AF_INET : AF_INET6,e->record.compartment,packet,injectionComplete,e);
+    // SUCCESS transfiere el pin al callback; éste puede preceder al retorno.
+    if(!NT_SUCCESS(status))releasePacket(e,packet,TRUE);
 }
 static void NTAPI inboundDpc(KDPC *dpc,void *context,void *a,void *b) {
     GB_ENTRY *e=context; NET_BUFFER_LIST *packet; KIRQL irql; BOOLEAN ready; NTSTATUS status;
@@ -892,7 +948,7 @@ static void queueInbound(GB_ENTRY *e,HANDLE completion) {
     KIRQL irql; NET_BUFFER_LIST *packet;
     KeAcquireSpinLock(&gbLock,&irql); packet=e->packet;
     KeReleaseSpinLock(&gbLock,irql);
-    FwpsCompleteOperation0(completion,packet);
+    FwpsCompleteOperation0(completion,e->packetOutbound ? NULL : packet);
     if(!KeInsertQueueDpc(&e->injectDpc,NULL,NULL)) releasePacket(e,packet,TRUE);
 }
 static BOOLEAN packetSpan(UCHAR family,ULONG ipSize,ULONG tcpSize,ULONG offset,ULONG length) {
@@ -953,7 +1009,9 @@ static BOOLEAN copyInboundPacket(GB_ENTRY *e,NET_BUFFER_LIST *original,const FWP
     sfield=e->record.family==4 ? FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_SUB_INTERFACE_INDEX : FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_SUB_INTERFACE_INDEX;
     if(v->valueCount<=sfield || v->incomingValue[ifield].value.type!=FWP_UINT32 || v->incomingValue[sfield].value.type!=FWP_UINT32)return FALSE;
     e->interfaceIndex=v->incomingValue[ifield].value.uint32; e->subInterfaceIndex=v->incomingValue[sfield].value.uint32;
-    if(!NT_SUCCESS(FwpsAllocateCloneNetBufferList0(original,NULL,NULL,0,&clone)))return FALSE;
+    {KIRQL irql;BOOLEAN reserved;KeAcquireSpinLock(&gbLock,&irql);reserved=reservePacketLocked(e);KeReleaseSpinLock(&gbLock,irql);
+        if(!reserved)return FALSE;}
+    if(!NT_SUCCESS(FwpsAllocateCloneNetBufferList0(original,NULL,NULL,0,&clone))){unchargePacket(e,FALSE);return FALSE;}
     nb=NET_BUFFER_LIST_FIRST_NB(clone);
     if(!(e->record.protocol==IPPROTO_UDP ? udpSpan(e->record.family,ipSize,tcpSize,NET_BUFFER_DATA_OFFSET(nb),NET_BUFFER_DATA_LENGTH(nb)) :
         packetSpan(e->record.family,ipSize,tcpSize,NET_BUFFER_DATA_OFFSET(nb),NET_BUFFER_DATA_LENGTH(nb))))goto done;
@@ -978,12 +1036,7 @@ static BOOLEAN copyInboundPacket(GB_ENTRY *e,NET_BUFFER_LIST *original,const FWP
 done:
     if(retreated)NdisAdvanceNetBufferDataStart(NET_BUFFER_LIST_FIRST_NB(clone),retreat,FALSE,NULL);
     FwpsFreeCloneNetBufferList0(clone,0); // Ningún parent/MDL de original sobrevive al aviso.
-    if(!ok) {
-        if(e->packet)FwpsFreeNetBufferList0(e->packet);
-        if(e->packetMdl)IoFreeMdl(e->packetMdl);
-        if(e->packetBytes)ExFreePoolWithTag(e->packetBytes,GB_TAG);
-        e->packet=NULL;e->packetMdl=NULL;e->packetBytes=NULL;
-    }
+    if(!ok)discardOwnedPacket(e,FALSE);
     return ok;
 }
 static void NTAPI inboundClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA_VALUES0 *m,
@@ -1040,7 +1093,7 @@ static void NTAPI inboundClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCO
     KeReleaseSpinLock(&gbLock,irql);
     if(!copyInboundPacket(e,data,v,m)){freeEntry(e);block(out);return;}
     if(!currentEntry(e)) {
-        FwpsFreeNetBufferList0(e->packet);IoFreeMdl(e->packetMdl);ExFreePoolWithTag(e->packetBytes,GB_TAG);
+        discardOwnedPacket(e,FALSE);
         freeEntry(e);block(out);return;
     }
     KeAcquireSpinLock(&gbLock,&irql);
@@ -1050,7 +1103,7 @@ static void NTAPI inboundClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCO
     e->completion=completion;e->receipt.state=GB_SCOPE_PENDING;gbEntries[empty]=e;
     block(out);out->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;KeReleaseSpinLock(&gbLock,irql);return;
 rejectPacket:
-    KeReleaseSpinLock(&gbLock,irql);FwpsFreeNetBufferList0(e->packet);IoFreeMdl(e->packetMdl);ExFreePoolWithTag(e->packetBytes,GB_TAG);
+    KeReleaseSpinLock(&gbLock,irql);discardOwnedPacket(e,FALSE);
     freeEntry(e);block(out);return;
 reject:
     KeReleaseSpinLock(&gbLock,irql);freeEntry(e);block(out);
@@ -1102,12 +1155,73 @@ static void NTAPI listenerClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INC
     }
     KeReleaseSpinLock(&gbLock,irql);if(e)freeEntry(e);
 }
+static void discardOwnedPacket(GB_ENTRY *e,BOOLEAN locked) {
+    if(e->packet)FwpsFreeNetBufferList0(e->packet);
+    if(e->packetMdl)IoFreeMdl(e->packetMdl);
+    if(e->packetBytes)ExFreePoolWithTag(e->packetBytes,GB_TAG);
+    if(e->packetControl)ExFreePoolWithTag(e->packetControl,GB_TAG);
+    e->packet=NULL;e->packetMdl=NULL;e->packetBytes=NULL;e->packetControl=NULL;
+    e->packetSend.controlData=NULL;e->packetSend.controlDataLength=0;
+    unchargePacket(e,locked);
+}
+// Bajo gbLock, tras reservar capacidad: una sola copia profunda por slot físico.
+static BOOLEAN copyOutboundUdp(GB_ENTRY *e,NET_BUFFER_LIST *original,const FWPS_INCOMING_METADATA_VALUES0 *m) {
+    NET_BUFFER *nb;UCHAR *data;ULONG total;UINT32 address;
+    NDIS_TCP_IP_CHECKSUM_NET_BUFFER_LIST_INFO checksum,transmit={0};
+    if(!original || NET_BUFFER_LIST_NEXT_NBL(original) || !(nb=NET_BUFFER_LIST_FIRST_NB(original)) ||
+       NET_BUFFER_NEXT_NB(nb) || e->record.protocol!=IPPROTO_UDP ||
+       (m->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_HEADER_INCLUDE_HEADER) ||
+       ((m->currentMetadataValues & FWPS_METADATA_FIELD_IP_HEADER_SIZE) && m->ipHeaderSize) ||
+       (e->record.family==6 && !(m->currentMetadataValues & FWPS_METADATA_FIELD_REMOTE_SCOPE_ID)))return FALSE;
+    total=NET_BUFFER_DATA_LENGTH(nb);if(total<8 || total>GB_PACKET_BYTES)return FALSE;
+    if((m->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA) &&
+       ((m->controlData==NULL)!=(m->controlDataLength==0) || m->controlDataLength>GB_PACKET_CONTROL_BYTES ||
+        (m->controlDataLength && m->controlDataLength<sizeof(WSACMSGHDR))))return FALSE;
+    if(!reservePacketLocked(e))return FALSE;
+    if((m->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_CONTROL_DATA) && m->controlDataLength) {
+        e->packetControl=ExAllocatePool2(POOL_FLAG_NON_PAGED,m->controlDataLength,GB_TAG);
+        if(!e->packetControl)goto fail;
+        RtlCopyMemory(e->packetControl,m->controlData,m->controlDataLength);
+        e->packetSend.controlData=e->packetControl;e->packetSend.controlDataLength=m->controlDataLength;
+    }
+    e->packetBytes=ExAllocatePool2(POOL_FLAG_NON_PAGED,total,GB_TAG);if(!e->packetBytes)goto fail;
+    data=NdisGetDataBuffer(nb,total,e->packetBytes,1,0);if(!data)goto fail;
+    if(data!=e->packetBytes)RtlCopyMemory(e->packetBytes,data,total);
+    data=e->packetBytes;
+    if(((ULONG)data[4]*256+data[5])!=total ||
+       ((UINT16)data[0]*256+data[1])!=e->record.localPort ||
+       ((UINT16)data[2]*256+data[3])!=e->record.remotePort)goto fail;
+    // USO comparte el slot TcpRecvSegCoalesceInfo; el alias nuevo exige NDIS683.
+    if(NET_BUFFER_LIST_INFO(original,TcpRecvSegCoalesceInfo) ||
+       NET_BUFFER_LIST_INFO(original,TcpLargeSendNetBufferListInfo))goto fail;
+    checksum.Value=NET_BUFFER_LIST_INFO(original,TcpIpChecksumNetBufferListInfo);
+    transmit.Transmit.IsIPv4=checksum.Transmit.IsIPv4;
+    transmit.Transmit.IsIPv6=checksum.Transmit.IsIPv6;
+    transmit.Transmit.UdpChecksum=checksum.Transmit.UdpChecksum;
+    if(checksum.Value!=transmit.Value || (checksum.Value &&
+       (checksum.Transmit.IsIPv4!=(e->record.family==4) || checksum.Transmit.IsIPv6!=(e->record.family==6))))goto fail;
+    if(e->record.family==6 && !data[6] && !data[7] && !checksum.Transmit.UdpChecksum)goto fail;
+    RtlCopyMemory(e->packetRemote,e->record.remoteAddress,16);
+    if(e->record.family==4) {
+        RtlCopyMemory(&address,e->packetRemote,4);address=RtlUlongByteSwap(address);
+        RtlCopyMemory(e->packetRemote,&address,4);
+    }
+    e->packetSend.remoteAddress=e->packetRemote;
+    if(m->currentMetadataValues & FWPS_METADATA_FIELD_REMOTE_SCOPE_ID)e->packetSend.remoteScopeId=m->remoteScopeId;
+    e->packetMdl=IoAllocateMdl(e->packetBytes,total,FALSE,FALSE,NULL);if(!e->packetMdl)goto fail;
+    MmBuildMdlForNonPagedPool(e->packetMdl);
+    if(!NT_SUCCESS(FwpsAllocateNetBufferAndNetBufferList0(gbPacketPool,0,0,e->packetMdl,0,total,&e->packet)))goto fail;
+    NET_BUFFER_LIST_INFO(e->packet,TcpIpChecksumNetBufferListInfo)=transmit.Value;
+    e->packetOutbound=TRUE;KeInitializeDpc(&e->injectDpc,outboundDpc,e);return TRUE;
+fail:
+    discardOwnedPacket(e,TRUE);return FALSE;
+}
 static void NTAPI classify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA_VALUES0 *m,
     void *data,const void *context,const FWPS_FILTER3 *filter,UINT64 flow,FWPS_CLASSIFY_OUT0 *out) {
     ULONG protocolField,flagsField,appField,reasonField,empty=GB_CLASSIFIER_CAPACITY;
     GB_TUPLE t; GB_ENTRY *e,*grant=NULL; BOOLEAN ambiguous; KIRQL irql; UINT64 now=KeQueryInterruptTime();
-    NTSTATUS status; HANDLE completion=NULL;
-    UNREFERENCED_PARAMETER(data); UNREFERENCED_PARAMETER(context); UNREFERENCED_PARAMETER(flow);
+    NTSTATUS status; HANDLE completion=NULL,id=NULL;FWPS_PACKET_INJECTION_STATE injection;
+    UNREFERENCED_PARAMETER(context); UNREFERENCED_PARAMETER(flow);
     if(!v || !m || !filter) { block(out); return; }
     if(v->layerId==FWPS_LAYER_ALE_AUTH_CONNECT_V4) {
         protocolField=FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_PROTOCOL; flagsField=FWPS_FIELD_ALE_AUTH_CONNECT_V4_FLAGS;
@@ -1124,8 +1238,16 @@ static void NTAPI classify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_ME
     if(v->incomingValue[flagsField].value.type!=FWP_UINT32 || !tuple(v,m,&t) ||
        !(m->currentMetadataValues & FWPS_METADATA_FIELD_COMPARTMENT_ID) || m->compartmentId!=t.compartment ||
        (v->incomingValue[flagsField].value.uint32 & FWP_CONDITION_FLAG_IS_RAW_ENDPOINT)) { block(out); return; }
+    if(t.protocol==IPPROTO_UDP && data) {
+        injection=FwpsQueryPacketInjectionState0(gbInjection[t.family==4 ? 0 : 1],data,&id);
+        if(injection==FWPS_PACKET_INJECTED_BY_SELF || injection==FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF) {
+            KeAcquireSpinLock(&gbLock,&irql);e=outboundInjectedEntry(id);
+            if(outboundInjectionBound(e,data,&t,m,KeQueryInterruptTime()))permit(out);else block(out);
+            KeReleaseSpinLock(&gbLock,irql);return;
+        }
+    }
     if(v->incomingValue[flagsField].value.uint32 & FWP_CONDITION_FLAG_IS_REAUTHORIZE) {
-        KeAcquireSpinLock(&gbLock,&irql); e=endpoint(m,&t,FALSE,FALSE,&ambiguous);
+        KeAcquireSpinLock(&gbLock,&irql); e=endpoint(m,&t,FALSE,FALSE,&ambiguous);now=KeQueryInterruptTime();
         if(e && !ambiguous && e->completing && v->valueCount>reasonField &&
            v->incomingValue[reasonField].value.type==FWP_UINT32 &&
            v->incomingValue[reasonField].value.uint32==FWP_CONDITION_REAUTHORIZE_REASON_CLASSIFY_COMPLETION) {
@@ -1150,7 +1272,7 @@ static void NTAPI classify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_ME
         if(t.protocol!=IPPROTO_UDP){KeAcquireSpinLock(&gbLock,&irql);if(gbFile)loss();KeReleaseSpinLock(&gbLock,irql);}
         block(out);return;
     }
-    KeAcquireSpinLock(&gbLock,&irql);
+    KeAcquireSpinLock(&gbLock,&irql);now=KeQueryInterruptTime();
     if(!gbFile || gbFault || gbLoss==GB_MAX64 || gbSequence==GB_MAX64) goto deny;
     empty=slotFor(e,&t,&ambiguous);
     if(ambiguous)goto deny;
@@ -1167,6 +1289,11 @@ static void NTAPI classify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_ME
         if(e->receipt.decision.action==2) permit(out); else block(out);
         KeReleaseSpinLock(&gbLock,irql); return;
     }
+    if(t.protocol==IPPROTO_UDP &&
+       ((v->incomingValue[flagsField].value.uint32 & (FWP_CONDITION_FLAG_IS_IPSEC_SECURED |
+           FWP_CONDITION_FLAG_IS_FRAGMENT | FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP |
+           FWP_CONDITION_FLAG_IS_IPSEC_NATT_RECLASSIFY | FWP_CONDITION_FLAG_IS_OUTBOUND_PASS_THRU)) ||
+        !copyOutboundUdp(e,data,m)))goto deny;
     // El contexto se publica bajo lock antes de que ordinary pueda entregar su decisión.
     status=FwpsPendOperation0(m->completionHandle,&completion);
     if(!NT_SUCCESS(status) || !completion) goto deny;
@@ -1174,13 +1301,13 @@ static void NTAPI classify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_ME
     block(out); out->flags |= FWPS_CLASSIFY_OUT_FLAG_ABSORB;
     KeReleaseSpinLock(&gbLock,irql); return;
 deny:
-    KeReleaseSpinLock(&gbLock,irql); freeEntry(e); block(out);
+    KeReleaseSpinLock(&gbLock,irql); discardOwnedPacket(e,FALSE);freeEntry(e); block(out);
 }
 static void NTAPI heldGuardClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA_VALUES0 *m,
     void *data,const void *context,const FWPS_FILTER3 *filter,UINT64 flow,FWPS_CLASSIFY_OUT0 *out) {
     ULONG protocol,flags,reason; GB_TUPLE t; GB_ENTRY *e; BOOLEAN ambiguous,completion; KIRQL irql;
-    UINT64 now=KeQueryInterruptTime();
-    UNREFERENCED_PARAMETER(data); UNREFERENCED_PARAMETER(context); UNREFERENCED_PARAMETER(filter); UNREFERENCED_PARAMETER(flow);
+    UINT64 now;HANDLE id=NULL;FWPS_PACKET_INJECTION_STATE injection;
+    UNREFERENCED_PARAMETER(context); UNREFERENCED_PARAMETER(filter); UNREFERENCED_PARAMETER(flow);
     if(out->rights & FWPS_RIGHT_ACTION_WRITE) out->actionType=FWP_ACTION_CONTINUE;
     if(!v || !m) { block(out); return; }
     protocol=v->layerId==FWPS_LAYER_ALE_AUTH_CONNECT_V4 ? FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_PROTOCOL : FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_PROTOCOL;
@@ -1189,9 +1316,18 @@ static void NTAPI heldGuardClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_IN
     if(v->valueCount<=flags || v->incomingValue[protocol].value.type!=FWP_UINT8 ||
         (v->incomingValue[protocol].value.uint8!=IPPROTO_TCP && v->incomingValue[protocol].value.uint8!=IPPROTO_UDP)) return;
     if(!tuple(v,m,&t) || v->incomingValue[flags].value.type!=FWP_UINT32) { block(out); return; }
+    if(t.protocol==IPPROTO_UDP && data) {
+        injection=FwpsQueryPacketInjectionState0(gbInjection[t.family==4 ? 0 : 1],data,&id);
+        if(injection==FWPS_PACKET_INJECTED_BY_SELF || injection==FWPS_PACKET_PREVIOUSLY_INJECTED_BY_SELF) {
+            KeAcquireSpinLock(&gbLock,&irql);e=outboundInjectedEntry(id);
+            // Sólo el scope inferior puede decidir; el guard nunca fabrica Permit.
+            if(!outboundInjectionBound(e,data,&t,m,KeQueryInterruptTime()))block(out);
+            KeReleaseSpinLock(&gbLock,irql);return;
+        }
+    }
     completion=(v->incomingValue[flags].value.uint32 & FWP_CONDITION_FLAG_IS_REAUTHORIZE) && v->valueCount>reason &&
         v->incomingValue[reason].value.type==FWP_UINT32 && v->incomingValue[reason].value.uint32==FWP_CONDITION_REAUTHORIZE_REASON_CLASSIFY_COMPLETION;
-    KeAcquireSpinLock(&gbLock,&irql); e=endpoint(m,&t,FALSE,TRUE,&ambiguous);
+    KeAcquireSpinLock(&gbLock,&irql); e=endpoint(m,&t,FALSE,TRUE,&ambiguous);now=KeQueryInterruptTime();
     if(ambiguous) block(out);
     else if(e) {
         if(e->cancel.guarded) {
