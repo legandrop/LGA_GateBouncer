@@ -9,10 +9,13 @@ inline constexpr wchar_t OrdinaryPipe[] = L"\\\\.\\pipe\\LGA.GateBouncer.Ordinar
 // procesos locales, protección ni efecto actual. El servidor adquiere el actor.
 class OrdinaryClient final : public ii::SessionChannel {
 public:
+    enum class IntentRole : std::uint8_t { OwnAccount = 1, Administrative = 2 };
+    explicit OrdinaryClient(IntentRole role = IntentRole::OwnAccount) : role_(role) {}
     ~OrdinaryClient() override { close(); }
     bool open(bool control, const std::filesystem::path &serviceImage) override {
         close();
-        if (control || !native::fixedPath(serviceImage)) return false;
+        if (control || (role_ != IntentRole::OwnAccount && role_ != IntentRole::Administrative) ||
+            !native::fixedPath(serviceImage)) return false;
         image_ = serviceImage;
         deployment_ = std::make_unique<controller::Deployment>(image_.parent_path());
         if (!deployment_->verify(image_,controller::DeploymentRole::Service) || !deployment_->current()) {
@@ -23,12 +26,14 @@ public:
         if (!pipe_ || !authenticated()) { close(); return false; }
         wire::Frame request; request.minor = 3; request.type = wire::Type::Hello;
         request.correlation = native::randomIdentity();
-        request.fields = {wire::value(wire::Tag::ClientRole, 1, 1)};
+        request.fields = {wire::value(wire::Tag::ClientRole, unsigned(role_), 1)};
         wire::Frame response;
         if (!ii::send(pipe_.value, request, nullptr) || !ii::receive(pipe_.value, response, nullptr) ||
             response.minor != 3 || response.type != wire::Type::HelloAck || response.sequence != 1 ||
             response.correlation != request.correlation || wire::zero(response.connection) ||
-            !statusContext(response) || !authenticated()) { close(); return false; }
+            !statusContext(response) || !authenticated() ||
+            (role_ == IntentRole::Administrative &&
+             !(wire::get(response, wire::Tag::Capabilities) & wire::iv::AdministrativePrincipalControl))) { close(); return false; }
         connection_ = response.connection; hello_ = std::move(response); tx_ = rx_ = 2;
         return true;
     }
@@ -62,6 +67,7 @@ public:
         return bool(pipe_) && !wire::zero(connection_);
     }
 private:
+    const IntentRole role_;
     bool authenticated() {
         native::ProcessEvidence acquired;
         if (!pipe_ || !deployment_ || !deployment_->current() || !ii::readableServerEvidence(pipe_.value, image_, acquired)) return false;

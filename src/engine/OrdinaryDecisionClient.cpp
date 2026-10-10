@@ -23,14 +23,15 @@ bool originalTargetDigest(const Bytes &target, const Digest &expected) {
     const auto hash = QCryptographicHash::hash(QByteArray(reinterpret_cast<const char *>(input.data()),qsizetype(input.size())),QCryptographicHash::Sha256);
     return std::equal(expected.begin(),expected.end(),reinterpret_cast<const unsigned char *>(hash.constData()));
 }
-std::unique_ptr<gb::ipc::ii::SessionChannel> channelFor(bool qa, std::unique_ptr<gb::ipc::ii::SessionChannel> channel) {
+std::unique_ptr<gb::ipc::ii::SessionChannel> channelFor(bool qa, std::unique_ptr<gb::ipc::ii::SessionChannel> channel, bool administrative) {
     if (channel || qa) return channel;
-    return std::make_unique<gb::ipc::iii::OrdinaryClient>();
+    using Role = gb::ipc::iii::OrdinaryClient::IntentRole;
+    return std::make_unique<gb::ipc::iii::OrdinaryClient>(administrative ? Role::Administrative : Role::OwnAccount);
 }
 }
 OrdinaryDecisionClient::OrdinaryDecisionClient(bool isolatedQa, QObject *parent,
-                                             std::unique_ptr<gb::ipc::ii::SessionChannel> channel)
-    : QObject(parent), session_(this, channelFor(isolatedQa, std::move(channel))) {
+                                             std::unique_ptr<gb::ipc::ii::SessionChannel> channel, bool administrative)
+    : QObject(parent), session_(this, channelFor(isolatedQa, std::move(channel), administrative)), administrative_(administrative) {
     connect(&session_, &gb::controller::OrdinarySession::opened, this, &OrdinaryDecisionClient::opened);
     connect(&session_, &gb::controller::OrdinarySession::received, this, &OrdinaryDecisionClient::received);
     draftExpiry_.setSingleShot(true);
@@ -70,6 +71,7 @@ void OrdinaryDecisionClient::startAutomatic() {
     automatic_ = true; quietPollMs_ = 2000; poll_.start(quietPollMs_);
     if (!visible_ && state_ != State::Sending && state_ != State::Uncertain) refresh();
 }
+void OrdinaryDecisionClient::pauseAutomatic() { automatic_ = false; poll_.stop(); }
 void OrdinaryDecisionClient::showNext() {
     if (!automatic_ || !current_ || visible_ || !session_.idle() || state_ == State::Sending || state_ == State::Uncertain) return;
     for (const auto &row : rows_) {
@@ -97,7 +99,7 @@ bool OrdinaryDecisionClient::refreshRules() {
     backgroundRead_ = false;
     closeNotice(); current_ = false; rulesCurrent_ = false; readingRules_ = true;
     revocation_.reset(); rulePageRows_.clear(); rulePageBytes_ = 0; ids_.clear();
-    state_ = State::Loading; message_ = "Reading rules for your account…";
+    state_ = State::Loading; message_ = administrative_ ? "Reading the administrative rule catalog…" : "Reading rules for your account…";
     finalStatus_ = false; checkOnly_ = false; emit changed();
     if (!connected_) {
         const auto image = QDir(QCoreApplication::applicationDirPath()).filePath("GateBouncerService.exe");
@@ -111,7 +113,11 @@ bool OrdinaryDecisionClient::revokeRule(const Id &rule, quint64 selection, bool 
         !session_.idle() || state_ == State::Sending || state_ == State::Uncertain) return false;
     const auto found = std::find_if(rules_.begin(),rules_.end(),[&](const auto &r) { return r.rule == rule; });
     if (found == rules_.end() || found->targetKind != 1 || found->scope != 2 || found->desired != desired_) return false;
-    revocation_ = *found; current_ = false; rulesCurrent_ = false;
+    iv::OriginalTarget target;
+    if (administrative_ && iv::unpackOriginalTarget(found->originalTarget,target) != Error::Ok) return false;
+    revocation_ = *found; selectedSid_ = administrative_ ? target.accountSid : Bytes{};
+    selectedTarget_ = administrative_ ? found->originalTarget : Bytes{};
+    current_ = false; rulesCurrent_ = false;
     state_ = State::Preparing; message_ = "Rechecking the selected rule before removal…"; emit changed();
     return send(Type::GetStatus);
 }
@@ -159,7 +165,11 @@ bool OrdinaryDecisionClient::prepareFile(std::shared_ptr<Data::SelectedApplicati
             r->revision == UINT64_MAX || r->targetRevision == UINT64_MAX || r->originalTarget.empty()) return false;
         selected = *r;
     }
+    iv::OriginalTarget original;
+    if (administrative_ && selected && iv::unpackOriginalTarget(selected->originalTarget,original) != Error::Ok) return false;
     closeNotice(); fileOwner_ = std::move(owner); expectedFileTarget_ = expectedTarget; editing_ = selected;
+    selectedSid_ = administrative_ && selected ? original.accountSid : Bytes{};
+    selectedTarget_ = administrative_ && selected ? selected->originalTarget : Bytes{};
     current_ = false; rulesCurrent_ = false; readingRules_ = false; direction_ = direction; scope_ = 2;
     visible_ = true; finalStatus_ = false; checkOnly_ = false;
     state_ = State::Loading; message_ = "Checking the selected executable and your account…"; emit changed();
@@ -187,6 +197,7 @@ bool OrdinaryDecisionClient::status(const Frame &f, bool same) {
     if (f.minor != 3 || iv::validate(f) != Error::Ok ||
         (f.type != Type::HelloAck && f.type != Type::Status) || get(f, Tag::IVProfile) != 1 ||
         (get(f, Tag::Capabilities) & (ObservedRead | FuturePolicyControl)) != (ObservedRead | FuturePolicyControl) ||
+        (administrative_ && !(get(f,Tag::Capabilities) & iv::AdministrativePrincipalControl)) ||
         zero(idValue(f, Tag::SourceEpoch)) || !get(f, Tag::ProfileGeneration) ||
         get(f, Tag::EffectiveKnown) || get(f, Tag::EffectiveRev)) return false;
     const auto *context = find(f, Tag::ServiceContext);
@@ -204,7 +215,8 @@ void OrdinaryDecisionClient::opened(bool ok, Frame f) {
     if (state_ == State::Uncertain) {
         if (!ok || f.type != Type::HelloAck || iv::validate(f) != Error::Ok ||
             idValue(f, Tag::ServiceEpoch) != epoch_ || idValue(f, Tag::BootId) != boot_ ||
-            get(f, Tag::ProfileGeneration) != profile_ || get(f, Tag::EffectiveKnown) || get(f, Tag::EffectiveRev) || zero(f.connection)) {
+            get(f, Tag::ProfileGeneration) != profile_ || get(f, Tag::EffectiveKnown) || get(f, Tag::EffectiveRev) || zero(f.connection) ||
+            (administrative_ && !(get(f,Tag::Capabilities) & iv::AdministrativePrincipalControl))) {
             connected_ = false; fail("The service that received this decision is unavailable. Its result remains unknown.", true); return;
         }
         connected_ = true; connection_ = f.connection;
@@ -217,6 +229,16 @@ void OrdinaryDecisionClient::opened(bool ok, Frame f) {
 bool OrdinaryDecisionClient::send(Type type, std::vector<Field> fields) {
     Frame f; f.minor = 3; f.type = type; f.connection = connection_; f.correlation = freshId();
     if (type != Type::GetStatus) fields.push_back(value(Tag::ServiceEpoch, epoch_));
+    // La intención selecciona el recorrido; sólo el peer original y la respuesta
+    // auténtica admiten el modo. El SID nunca procede de un campo editable.
+    if (administrative_) {
+        const bool inventory = type == Type::ListObserved || type == Type::ListPrincipalRules || type == Type::GetObservedRecord;
+        const bool selected = type == Type::PrepareFuturePolicy || type == Type::GetFutureDraft ||
+            type == Type::CommitFuturePolicy || type == Type::RevokePrincipalRule ||
+            type == Type::PrepareFileFuturePolicy || type == Type::ReplacePrincipalRule;
+        if (inventory || (selected && !selectedSid_.empty())) fields.push_back(value(Tag::AdministrativeMode,1,1));
+        if (selected && !selectedSid_.empty()) fields.push_back({Tag::SelectedPrincipalSid,true,selectedSid_});
+    }
     std::sort(fields.begin(), fields.end(), [](const auto &a, const auto &b) { return a.tag < b.tag; });
     f.fields = std::move(fields); expected_ = f.correlation; expectedType_ = type;
     if (type == Type::CommitFuturePolicy || type == Type::RevokePrincipalRule || type == Type::ReplacePrincipalRule) {
@@ -241,7 +263,9 @@ bool OrdinaryDecisionClient::select(const Id &id) {
     if (!current_ || !session_.idle() || state_ == State::Sending || state_ == State::Uncertain) return false;
     auto row = std::find_if(rows_.begin(), rows_.end(), [&](const auto &r) { return r.observed == id && r.state == 1; });
     if (row == rows_.end()) return false;
-    closeNotice(); observed_ = *row; visible_ = true; direction_ = row->temporal == 2 ? 0 : 1; scope_ = row->temporal == 2 ? 3 : 2;
+    closeNotice(); observed_ = *row; visible_ = true;
+    direction_ = !administrative_ && row->temporal == 2 ? 0 : 1;
+    scope_ = !administrative_ && row->temporal == 2 ? 3 : 2;
     shown_[row->observed] = ShownKey{epoch_, boot_, source_, profile_, row->revision};
     state_ = State::Preparing; message_ = "Rechecking this request…"; emit changed();
     return send(Type::GetObservedRecord, {value(Tag::ObservedId, row->observed),
@@ -255,6 +279,7 @@ bool OrdinaryDecisionClient::direction(int direction) {
     state_ = State::Preparing; message_ = "Checking which connections this rule will cover…"; emit changed(); prepare(); return true;
 }
 bool OrdinaryDecisionClient::scope(int scope) {
+    if (administrative_ && scope >= 3) return false;
     if (!ready() || !session_.idle() || !observed_ || scope < 2 || scope > 5 ||
         (observed_->temporal != 2 && scope != 2)) return false;
     ++generation_; draftExpiry_.stop(); draft_.reset(); scope_ = scope;
@@ -279,7 +304,8 @@ void OrdinaryDecisionClient::closeNotice() {
     backgroundRead_ = false; checkingObservation_ = false; checkingObservationAfter_ = false; checkOnly_ = false;
     visible_ = false; draftExpiry_.stop();
     if (state_ != State::Sending && state_ != State::Uncertain) {
-        ++generation_; draft_.reset(); fileDraft_.reset(); fileOwner_.reset(); expectedFileTarget_.clear(); editing_.reset(); observed_.reset(); submitted_.reset(); state_ = State::Closed;
+        ++generation_; draft_.reset(); fileDraft_.reset(); fileOwner_.reset(); expectedFileTarget_.clear(); editing_.reset(); observed_.reset(); submitted_.reset();
+        selectedSid_.clear(); selectedTarget_.clear(); state_ = State::Closed;
     }
     emit changed();
     if (automatic_) QTimer::singleShot(0, this, &OrdinaryDecisionClient::showNext);
@@ -288,6 +314,8 @@ bool OrdinaryDecisionClient::ready() const {
     return current_ && visible_ && state_ == State::Ready && draft_ && draftAge_.isValid() && draftAge_.elapsed() < draft_->ttl;
 }
 std::optional<OrdinaryDecisionClient::ObservationContext> OrdinaryDecisionClient::observationContext() const {
+    // El ring y el catálogo de procesos propios no contienen causas foreign.
+    if (administrative_) return {};
     if (stopping_ || !connected_ || !current_ || !visible_ || !observed_ || observedGeneration_ != generation_ ||
         (state_ != State::Preparing && state_ != State::Ready) || !profile_ || !bindingGeneration_ ||
         zero(epoch_) || zero(boot_) || zero(source_) || zero(connection_) ||
@@ -382,7 +410,20 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
     if (f.type == Type::ProtocolError) {
         const auto error = get(f, Tag::ErrorCode);
         fail(error == unsigned(Error::StoreFailure) || error == unsigned(Error::RecoveryRequired)
-            ? commandRecoveryMessage : "The service rejected this review.", mutation); return;
+            ? commandRecoveryMessage : error == unsigned(Error::ScopeUnsupported)
+            ? "Unsupported: this account has no original connection or app-instance decision bridge."
+            : "The service rejected this review.", mutation); return;
+    }
+    const bool inventoryReply = expectedType_ == Type::ListObserved || expectedType_ == Type::ListPrincipalRules;
+    const bool causeReply = expectedType_ == Type::GetObservedRecord;
+    const bool draftReply = expectedType_ == Type::PrepareFuturePolicy || expectedType_ == Type::PrepareFileFuturePolicy || expectedType_ == Type::GetFutureDraft;
+    if (inventoryReply || causeReply || draftReply) {
+        const bool grouped = administrative_ && (inventoryReply || causeReply || !selectedSid_.empty());
+        if (bool(find(f,Tag::AdministrativeMode)) != grouped ||
+            (grouped && get(f,Tag::AdministrativeMode) != 1) ||
+            (grouped && draftReply && (!find(f,Tag::SelectedPrincipalSid) || find(f,Tag::SelectedPrincipalSid)->bytes != selectedSid_))) {
+            fail("Administrative selection or response mode changed."); return;
+        }
     }
     if (expectedType_ == Type::GetStatus) {
         if (fileOwner_ && !checkOnly_) {
@@ -414,7 +455,8 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         if (finalStatus_ && readingRules_) {
             if (pageAge_.elapsed() >= 5000) { fail("Rule review snapshot expired."); return; }
             rules_ = std::move(rulePageRows_); rulesCurrent_ = true; current_ = false; state_ = State::Closed;
-            message_ = "Rules for your account ready to review · protection coverage unvalidated"; emit changed();
+            message_ = administrative_ ? "Administrative rule catalog ready · protection coverage unvalidated"
+                : "Rules for your account ready to review · protection coverage unvalidated"; emit changed();
             if (automatic_ && !stopping_) poll_.start(quietPollMs_); return;
         }
         if (finalStatus_) {
@@ -490,6 +532,16 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         if (f.type != Type::ObservedRecord || iv::unpack(find(f, Tag::Records)->bytes, 1, rows) != Error::Ok ||
             rows[0].observed != observed_->observed || rows[0].revision != observed_->revision || rows[0].source != source_ ||
             rows[0].binding != observed_->binding || rows[0].state != 1) { fail("This request is no longer current."); return; }
+        if (administrative_) {
+            const auto *sid = find(f,Tag::SelectedPrincipalSid); const auto *target = find(f,Tag::OriginalTarget);
+            iv::OriginalTarget parsed;
+            if (!sid || !target || iv::unpackOriginalTarget(target->bytes,parsed) != Error::Ok || parsed.accountSid != sid->bytes ||
+                parsed.packageMode != rows[0].package ||
+                (checkingObservation_ && (selectedSid_ != sid->bytes || selectedTarget_ != target->bytes))) {
+                fail("The original request account or application target changed."); return;
+            }
+            selectedSid_ = sid->bytes; selectedTarget_ = target->bytes;
+        }
         if (checkingObservation_) {
             checkingObservation_ = false;
             Bytes before, after;
@@ -526,7 +578,8 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
             d.scope != 2 || d.package != 1 || d.accepted != 3 || !zero(d.observed) || d.observedRevision ||
             std::any_of(d.migration.begin(),d.migration.end(),[](auto b) { return b != 0; }) ||
             iv::unpackOriginalTarget(row.originalTarget,target) != Error::Ok || target.packageMode != 1 ||
-            target.appId != ownBytes(own.appId) || target.accountSid != ownBytes(own.accountSid) || !target.packageSid.empty() ||
+            target.appId != ownBytes(own.appId) || target.accountSid !=
+                (administrative_ && editing_ ? selectedSid_ : ownBytes(own.accountSid)) || !target.packageSid.empty() ||
             !originalTargetDigest(row.originalTarget,d.target) || (!expectedFileTarget_.empty() && row.originalTarget != expectedFileTarget_) ||
             identity.volumeSerial != own.volumeSerial || identity.fileIndexHigh != own.fileIndexHigh || identity.fileIndexLow != own.fileIndexLow ||
             identity.fileSizeHigh != own.fileSizeHigh || identity.fileSizeLow != own.fileSizeLow || identity.attributes != own.attributes ||
@@ -563,6 +616,10 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
              rows[0].targetRevision != draft_->targetRevision || rows[0].accepted != draft_->accepted ||
              rows[0].package != draft_->package || rows[0].scope != draft_->scope))) {
             fail("Future review binding changed."); return;
+        }
+        if (administrative_ && (!find(f,Tag::OriginalTarget) || find(f,Tag::OriginalTarget)->bytes != selectedTarget_ ||
+            !originalTargetDigest(selectedTarget_,rows[0].target) || rows[0].scope != 2)) {
+            fail("The draft differs from the original selected application and account."); return;
         }
         draft_ = rows[0];
         if (draft_->state != 3 || draft_->proof != iv::Proof::CurrentShapeUnproven) { fail("The service cannot prepare this decision."); return; }

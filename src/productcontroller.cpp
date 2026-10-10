@@ -91,8 +91,9 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
                                      std::unique_ptr<gb::ipc::ii::SessionChannel> decisionChannel,
                                      std::unique_ptr<gb::ipc::ii::SessionChannel> ordinaryChannel)
     : QObject(parent), isolatedQa_(isolatedQa), engine_(isolatedQa, this), records_(isolatedQa, this, std::move(decisionChannel)),
-      ordinary_(isolatedQa, this, std::move(ordinaryChannel)) {
+      ordinary_(isolatedQa, this, std::move(ordinaryChannel)), administrative_(isolatedQa, this, {}, true) {
     connect(&ordinary_, &OrdinaryDecisionClient::changed, this, [this] { advanceImportedRule(); advanceApplicationFile(); emit changed(); });
+    connect(&administrative_, &OrdinaryDecisionClient::changed, this, [this] { advanceApplicationFile(); emit changed(); });
     fileDrain_.setInterval(100);
     connect(&fileDrain_,&QTimer::timeout,this,[this] {
         if (Data::SelectedApplicationFile::physicalJobs()) return;
@@ -296,7 +297,7 @@ void ProductController::stop() {
     if (stopped_) return;
     stopped_ = true; cancelApplicationFile(); cancelImportedRule(); cancelNativeProcesses(); historyFlush_.stop(); ++generation_; cancelImport();
     semanticJob_ = QUuid{}; draftView_ = {}; reviewView_ = {};
-    engine_.invalidate(); records_.stop(); ordinary_.stop();
+    engine_.invalidate(); records_.stop(); ordinary_.stop(); administrative_.stop();
     flushHistory();
 }
 void ProductController::loadReview(const QString &root) {
@@ -388,6 +389,24 @@ const Data::QNameCandidateFacts *ProductController::derivedQNameCandidate(bool d
     const auto found = view.candidates.constFind(id);
     return found == view.candidates.cend() ? nullptr : &view.qname->candidates[*found];
 }
+bool ProductController::selectAdministrative(bool enabled) {
+    if (stopped_ || simulation()) return false;
+    if (enabled == administrativeSelected_) return true;
+    const auto available = [](const OrdinaryDecisionClient &client) {
+        return client.idle() && client.state() != OrdinaryDecisionClient::State::Sending &&
+            client.state() != OrdinaryDecisionClient::State::Uncertain;
+    };
+    if (fileWorker_ || fileActivation_ || Data::SelectedApplicationFile::physicalJobs() || activation_ ||
+        !available(ordinary_) || !available(administrative_)) return false;
+    ordinary()->pauseAutomatic(); ordinary()->closeNotice();
+    administrativeSelected_ = enabled; ++generation_;
+    ordinary()->invalidate();
+    emit invalidated(); emit changed();
+    // El constructor aislado nunca abre un canal real. La intención tampoco
+    // provoca elevación: el servicio rechaza un primary token no admitido.
+    if (!isolatedQa_) ordinary()->startAutomatic();
+    return true;
+}
 void ProductController::setMode(UiMode mode) {
     cancelApplicationFile();
     if (stopped_ || mode_ == mode) return;
@@ -395,8 +414,8 @@ void ProductController::setMode(UiMode mode) {
     cancelImport();
     engine_.invalidate();
     records_.invalidate();
-    ordinary_.invalidate();
-    if (!simulation() && !isolatedQa_) ordinary_.startAutomatic();
+    ordinary_.invalidate(); administrative_.invalidate();
+    if (!simulation() && !isolatedQa_) ordinary()->startAutomatic();
     deriveImportedViews();
     if (!simulation()) refreshProcesses();
     emit changed();
@@ -437,7 +456,7 @@ bool ProductController::selectDecisionRecords() {
 }
 bool ProductController::backupSelectedRules(const std::vector<gb::wire::Id> &rules,quint64 selection,bool consent) {
     if (stopped_ || simulation() || !consent || !store_ || !reviewWritable_ || storeLoading_ || ruleBackupBusy()) return false;
-    const auto bytes = ordinary_.selectedRuleBackup(rules,selection);
+    const auto bytes = ordinary()->selectedRuleBackup(rules,selection);
     if (!bytes) { reviewError_ = "A current selection with complete original AppId and account targets is required for backup.";
         emit changed(); return false; }
     pendingRuleBackup_ = *bytes; pendingRuleBackupId_ = QUuid::createUuid();
@@ -679,6 +698,7 @@ void ProductController::cancelImportedRule() {
         ordinary_.state() != OrdinaryDecisionClient::State::Uncertain) ordinary_.closeNotice();
 }
 bool ProductController::prepareImportedRule(const QString &candidate, const QString &processIdValue) {
+    if (administrativeSelected_) return false; // El puente causal de procesos foreign sigue pendiente.
     cancelImportedRule(); activationView_ = {}; activationView_.candidate = candidate; activationView_.process = processIdValue;
     activationView_.message = "Inactive: current original process and request evidence are required";
     const auto *p = process(processIdValue);
@@ -819,19 +839,23 @@ void ProductController::cancelApplicationFile() {
     ++fileRuleToken_; fileRuleView_.token = fileRuleToken_;
     fileRuleView_.ready = fileRuleView_.busy = false;
     fileActivation_.reset();
-    if (ordinary_.fileOwner_ && ordinary_.state() != OrdinaryDecisionClient::State::Sending &&
-        ordinary_.state() != OrdinaryDecisionClient::State::Uncertain) ordinary_.closeNotice();
+    if (ordinary()->fileOwner_ && ordinary()->state() != OrdinaryDecisionClient::State::Sending &&
+        ordinary()->state() != OrdinaryDecisionClient::State::Uncertain) ordinary()->closeNotice();
     if (Data::SelectedApplicationFile::physicalJobs()) fileDrain_.start();
 }
 bool ProductController::prepareApplicationFile(const QString &path, Data::Action action, Data::Direction direction,
     const std::optional<gb::wire::Id> &editing, quint64 selection, const QString &candidate, int backupIndex) {
     if (stopped_ || simulation() || isolatedQa_ || fileWorker_ || Data::SelectedApplicationFile::physicalJobs() ||
-        fileActivation_ || activation_ || ordinary_.visible() || !ordinary_.idle() ||
-        ordinary_.state() == OrdinaryDecisionClient::State::Sending || ordinary_.state() == OrdinaryDecisionClient::State::Uncertain ||
+        fileActivation_ || activation_ || ordinary()->visible() || !ordinary()->idle() ||
+        ordinary()->state() == OrdinaryDecisionClient::State::Sending || ordinary()->state() == OrdinaryDecisionClient::State::Uncertain ||
         (action != Data::Action::Allow && action != Data::Action::Block) ||
         (direction != Data::Direction::Out && direction != Data::Direction::In && direction != Data::Direction::Both)) return false;
     std::optional<Data::QNameProfileView> profile; int index = -1;
     if (!candidate.isEmpty()) {
+        if (administrativeSelected_) {
+            fileRuleView_.message = "Inactive: imported account and predicate migration requires its original cross-account bridge.";
+            emit changed(); return false;
+        }
         if (!reviewView_.current || !reviewView_.qname || pendingReview_ || reviewBusy()) return false;
         const auto found = reviewView_.candidates.find(candidate);
         if (found == reviewView_.candidates.end()) return false;
@@ -893,7 +917,7 @@ bool ProductController::prepareApplicationFile(const QString &path, Data::Action
         }
         request.owner = result->owner; request.phase = FileActivation::Prepare;
         const int direction = request.direction == Data::Direction::Out ? 1 : request.direction == Data::Direction::In ? 2 : 3;
-        if (!ordinary_.prepareFile(request.owner,direction,request.expectedTarget,request.editing,request.ruleSelection)) {
+        if (!ordinary()->prepareFile(request.owner,direction,request.expectedTarget,request.editing,request.ruleSelection)) {
             fileRuleView_.message = "Inactive: the original service cannot prepare this file rule."; cancelApplicationFile(); emit changed(); return;
         }
         advanceApplicationFile(); emit changed();
@@ -908,24 +932,24 @@ void ProductController::advanceApplicationFile() {
         (!request.candidate.isEmpty() && (request.importGeneration != importGeneration_ || request.digest != review_.report.digest || !reviewView_.current || pendingReview_))) {
         fileRuleView_.message = "Inactive: the original file review or imported source expired."; cancelApplicationFile(); return;
     }
-    const auto state = ordinary_.state();
+    const auto state = ordinary()->state();
     if (state == OrdinaryDecisionClient::State::Failed || state == OrdinaryDecisionClient::State::Recorded || state == OrdinaryDecisionClient::State::Uncertain) {
-        fileRuleView_.message = ordinary_.message(); cancelApplicationFile(); return;
+        fileRuleView_.message = ordinary()->message(); cancelApplicationFile(); return;
     }
-    if (!ordinary_.ready() || !ordinary_.fileDraft()) return;
-    if (!ordinary_.idle()) { QTimer::singleShot(50,this,[this] { advanceApplicationFile(); }); return; }
+    if (!ordinary()->ready() || !ordinary()->fileDraft()) return;
+    if (!ordinary()->idle()) { QTimer::singleShot(50,this,[this] { advanceApplicationFile(); }); return; }
     gb::wire::Bytes packed;
-    if (gb::wire::iv::pack(std::vector<gb::wire::iv::FileFutureDraftRecord>{*ordinary_.fileDraft()},packed) != gb::wire::Error::Ok) {
+    if (gb::wire::iv::pack(std::vector<gb::wire::iv::FileFutureDraftRecord>{*ordinary()->fileDraft()},packed) != gb::wire::Error::Ok) {
         fileRuleView_.message = "Inactive: the original draft could not be retained."; cancelApplicationFile(); return;
     }
     if (request.phase == FileActivation::Ready) {
-        if (request.selection != ordinary_.selection() || request.admittedDraft != packed) {
+        if (request.selection != ordinary()->selection() || request.admittedDraft != packed) {
             fileRuleView_.message = "Inactive: the original draft or consent challenge changed."; cancelApplicationFile();
         }
         return;
     }
     if (request.phase == FileActivation::Prepare) {
-        request.selection = ordinary_.selection(); request.admittedDraft = std::move(packed); checkApplicationFile(false);
+        request.selection = ordinary()->selection(); request.admittedDraft = std::move(packed); checkApplicationFile(false);
     }
 }
 void ProductController::checkApplicationFile(bool committing) {
@@ -941,8 +965,8 @@ void ProductController::checkApplicationFile(bool committing) {
         if (fileWorker_ == worker) fileWorker_ = nullptr; worker->deleteLater();
         if (!fileActivation_ || stopped_ || token != fileRuleToken_) return;
         auto &request = *fileActivation_; gb::wire::Bytes packed;
-        const bool same = *result && ordinary_.ready() && ordinary_.idle() && ordinary_.selection() == request.selection && ordinary_.fileDraft() &&
-            gb::wire::iv::pack(std::vector<gb::wire::iv::FileFutureDraftRecord>{*ordinary_.fileDraft()},packed) == gb::wire::Error::Ok &&
+        const bool same = *result && ordinary()->ready() && ordinary()->idle() && ordinary()->selection() == request.selection && ordinary()->fileDraft() &&
+            gb::wire::iv::pack(std::vector<gb::wire::iv::FileFutureDraftRecord>{*ordinary()->fileDraft()},packed) == gb::wire::Error::Ok &&
             packed == request.admittedDraft && request.generation == generation_ && request.age.elapsed() < 120000 &&
             (request.candidate.isEmpty() || (request.importGeneration == importGeneration_ && request.digest == review_.report.digest && reviewView_.current && !pendingReview_));
         if (!same) {
@@ -952,21 +976,28 @@ void ProductController::checkApplicationFile(bool committing) {
         fileRuleView_.busy = false;
         if (committing) {
             request.phase = FileActivation::Sending;
-            const bool sent = ordinary_.decideFile(request.action == Data::Action::Allow,true,request.selection);
+            const bool sent = ordinary()->decideFile(request.action == Data::Action::Allow,true,request.selection);
             fileRuleView_.message = sent ? "Rule submitted to the original service. If its outcome is unknown, check the same command; do not repeat it."
                                         : "Inactive: the original draft expired before submission.";
             if (!sent) cancelApplicationFile(); emit changed(); return;
         }
         request.phase = FileActivation::Ready; fileRuleView_.ready = true;
         const auto &facts = request.owner->facts();
-        const auto &draft = ordinary_.fileDraft()->draft;
+        const auto &fileDraft = *ordinary()->fileDraft(); const auto &draft = fileDraft.draft;
+        gb::wire::iv::OriginalTarget target;
+        if (gb::wire::iv::unpackOriginalTarget(fileDraft.originalTarget,target) != gb::wire::Error::Ok) {
+            fileRuleView_.message = "Inactive: the original target account is unavailable."; cancelApplicationFile(); return;
+        }
+        const QByteArray targetSid(reinterpret_cast<const char *>(target.accountSid.data()),qsizetype(target.accountSid.size()));
         const auto scope = Data::applicationRuleScopeText(draft.package,request.direction,request.action,false);
         fileRuleView_.message = QString("Ready to confirm %1.\nApplication: %2\nAccount: %3\nDirection: %4\nPackage: %5\nWill apply to: %6\nWill cover: %7\n%8\nNo existing connection or request is changed. Imported documents and backups remain inactive.")
-            .arg(request.editing ? "an atomic rule replacement" : "a new rule for future connections",facts.image,importedAccount(facts.accountSid),
+            .arg(request.editing ? "an atomic rule replacement" : "a new rule for future connections",facts.image,importedAccount(targetSid),
                 Data::directionName(request.direction),scope.package,scope.scope,scope.connections,scope.coverage);
         fileRuleView_.message.prepend(QString("Decision: %1\n").arg(request.action == Data::Action::Allow ? "Allow" : "Block"));
-        if (ordinary_.editing_) {
-            const auto &old = *ordinary_.editing_;
+        if (administrativeSelected_) fileRuleView_.message.prepend("Acting account: " + importedAccount(facts.accountSid) +
+            " · original authenticated administrative session\n");
+        if (ordinary()->editing_) {
+            const auto &old = *ordinary()->editing_;
             fileRuleView_.message.prepend(QString("Replacing selected rule: %1 · %2 · %3\n")
                 .arg(QString::fromUtf8(reinterpret_cast<const char *>(old.display.name.data()),qsizetype(old.display.name.size())),
                      old.action == 2 ? "Allow" : "Block",Data::directionName(old.direction == 1 ? Data::Direction::Out : old.direction == 2 ? Data::Direction::In : Data::Direction::Both)));
@@ -982,8 +1013,8 @@ bool ProductController::confirmApplicationFile(quint64 token, bool consent) {
     checkApplicationFile(true); emit changed(); return true;
 }
 bool ProductController::loadSelectedRuleBackup(const QString &path) {
-    if (stopped_ || simulation() || fileWorker_ || fileActivation_ || ordinary_.state() == OrdinaryDecisionClient::State::Sending ||
-        ordinary_.state() == OrdinaryDecisionClient::State::Uncertain) return false;
+    if (stopped_ || simulation() || fileWorker_ || fileActivation_ || ordinary()->state() == OrdinaryDecisionClient::State::Sending ||
+        ordinary()->state() == OrdinaryDecisionClient::State::Uncertain) return false;
     inactiveRuleBackup_.clear();
     fileRuleView_ = {"Opening an inactive selected rule backup…",++fileRuleToken_,true,false};
     const auto token = fileRuleToken_;

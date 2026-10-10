@@ -28,7 +28,11 @@ class OrdinaryDecisionClient final : public QObject {
     };
     std::optional<ObservationContext> observationContext() const;
     explicit OrdinaryDecisionClient(bool isolatedQa, QObject *parent = nullptr,
-                                    std::unique_ptr<gb::ipc::ii::SessionChannel> channel = {});
+                                    std::unique_ptr<gb::ipc::ii::SessionChannel> channel = {}, bool administrative = false);
+    bool administrative() const { return administrative_; }
+    const auto &selectedPrincipalSid() const { return selectedSid_; }
+    const auto &selectedOriginalTarget() const { return selectedTarget_; }
+    void pauseAutomatic();
     bool refresh();
     bool refreshRules();
     // La selección procede de la página original vigente; el archivo no admite la operación.
@@ -87,6 +91,8 @@ class OrdinaryDecisionClient final : public QObject {
     void showNext();
     void automaticRead();
     gb::controller::OrdinarySession session_;
+    const bool administrative_;
+    gb::wire::Bytes selectedSid_, selectedTarget_;
     State state_ = State::Closed;
     bool stopping_ = false, connected_ = false, current_ = false, visible_ = false;
     bool finalStatus_ = false, checkOnly_ = false;

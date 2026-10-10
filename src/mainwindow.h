@@ -67,6 +67,7 @@ class MainWindow final : public QMainWindow {
     void renderImport();
     void renderSettings();
     void renderLive();
+    void reviewSourceSelector();
     void renderLiveDetail(const QString &id);
     void reviewCandidate(const QString &id, bool draft = false);
     void prepareImportedRule(const QString &id);

@@ -43,6 +43,23 @@ namespace {
 QString recordText(const gb::wire::Bytes &bytes, const QString &fallback) {
     return bytes.empty() ? fallback : QString::fromUtf8(reinterpret_cast<const char *>(bytes.data()), qsizetype(bytes.size()));
 }
+QString accountText(const gb::wire::Bytes &sid) {
+    if (sid.size() < 8 || sid[0] != 1 || sid.size() != 8u + 4u * sid[1]) return "Unknown";
+    quint64 authority = 0;
+    for (int i = 2; i < 8; ++i) authority = (authority << 8) | sid[i];
+    QString text = "S-1-" + QString::number(authority);
+    for (std::size_t i = 8; i < sid.size(); i += 4) {
+        quint32 value = 0;
+        for (int b = 0; b < 4; ++b) value |= quint32(sid[i+b]) << (8*b);
+        text += '-' + QString::number(value);
+    }
+    return text;
+}
+QString targetAccountText(const gb::wire::iv::PrincipalRuleRecord &rule) {
+    gb::wire::iv::OriginalTarget target;
+    return gb::wire::iv::unpackOriginalTarget(rule.originalTarget,target) == gb::wire::Error::Ok
+        ? accountText(target.accountSid) : QString("Unknown");
+}
 QString reconstructionText(const Data::SemanticCandidate *candidate) {
     if (!candidate) return "Analysis pending";
     switch (candidate->reconstruction) {
@@ -581,7 +598,7 @@ MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
     connect(&product_, &ProductController::changed, this, &MainWindow::refresh);
     connect(&product_, &ProductController::changed, this, &MainWindow::updateLifecycle);
     connect(&product_, &ProductController::reviewSaved, this, [this](const QString &text) { if (!closing_) message(text); });
-    connect(product_.ordinary(), &OrdinaryDecisionClient::changed, this, &MainWindow::renderOrdinaryNotice);
+    connect(&product_, &ProductController::changed, this, &MainWindow::renderOrdinaryNotice);
     connect(&product_, &ProductController::importedViewsInvalidated, this, &MainWindow::closeStaleModal);
     connect(&model_, &Simulation::changed, this, &MainWindow::updateLifecycle);
     connect(&reviewer_, &ReviewGateway::changed, this, [this] {
@@ -636,7 +653,7 @@ void MainWindow::updateLifecycle() {
         ? Lifecycle::EngineState::Degraded : Lifecycle::EngineState::Unavailable;
     if (!snapshot.simulation && product_.ordinary()->current())
         snapshot.pendingCount = product_.ordinary()->observations().size();
-    else if (!snapshot.simulation && product_.recordsSelected() && product_.records()->recordsCurrent())
+    else if (!snapshot.simulation && !product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent())
         snapshot.pendingCount = product_.records()->pending().size();
     lifecycle_->applyEngineSnapshot(snapshot);
 }
@@ -897,7 +914,7 @@ void MainWindow::updatePageState() {
         it.value()->setChecked(it.key() == view_);
     pendingCount_->setText(product_.simulation() ? QString::number(model_.state().pending.size())
         : product_.ordinary()->current() ? QString::number(product_.ordinary()->observations().size())
-        : product_.recordsSelected() && product_.records()->recordsCurrent()
+        : !product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent()
             ? QString::number(product_.records()->pending().size()) : "—");
     pendingCount_->setVisible(!product_.simulation() || !model_.state().pending.isEmpty());
     sideStatus_->setText(model_.available()
@@ -950,6 +967,11 @@ void MainWindow::updatePageState() {
             footer_->setText("Pending requests · review each connection or save a rule for this application and account");
         }
         const auto *client = product_.ordinary();
+        if (product_.administrativeSelected()) {
+            status_->setText((client->current() || client->rulesCurrent()
+                ? QString("Administrative review connected") : QString("Administrative review unavailable")) + "\nCoverage not validated");
+            footer_->setText("Original target accounts · future application rules only · current traffic remains unknown");
+        }
         const bool ordinaryIdle = client->idle() && client->state() != OrdinaryDecisionClient::State::Uncertain;
         const auto enable = [this](const char *name, bool enabled) {
             if (auto *b = pageControl<QPushButton>(page_,name)) b->setEnabled(enabled);
@@ -977,8 +999,10 @@ void MainWindow::updatePageState() {
         if (auto *panel = pageControl<QFrame>(page_,"pending-context-note")) {
             const auto labels = panel->findChildren<QLabel *>();
             if (labels.size() == 2) labels.last()->setText(client->current()
-                ? "Review each request to choose Allow or Block and how long it applies. Always rules cover future connections for this application and account. Protection coverage has not been validated."
-                : product_.recordsSelected() && product_.records()->recordsCurrent()
+                ? client->administrative()
+                    ? "Review original target applications and accounts. Always rules cover future connections; Once, app-instance and timed decisions are Unsupported. Protection coverage has not been validated."
+                    : "Review each request to choose Allow or Block and how long it applies. Always rules cover future connections for this application and account. Protection coverage has not been validated."
+                : !product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent()
                     ? "View request snapshot · read only. These requests use the separate administrator reviewer; coverage remains unvalidated."
                     : "No current request list. Refresh requests to check the connection; a running process is not an access request.");
         }
@@ -995,7 +1019,7 @@ void MainWindow::updatePageState() {
                 .arg(live ? "Partial available history" : "Monitoring unavailable; saved history retained").arg(sources).arg(gaps)
                 : "Monitoring unavailable · a service heartbeat does not report traffic.");
         }
-        if (auto *text = pageControl<QLabel>(page_,"principal-page-count")) text->setText("Rules for your account: " +
+        if (auto *text = pageControl<QLabel>(page_,"principal-page-count")) text->setText(QString(client->administrative() ? "Administrative catalog rules: " : "Rules for your account: ") +
             (client->rulesCurrent() ? QString::number(client->rules().size()) : "Unavailable") + " · no recorded activity does not mean inactive");
         if (auto *text = pageControl<QLabel>(page_,"import-page-state")) {
             QStringList messages;
@@ -1291,14 +1315,17 @@ void MainWindow::refreshTable(bool newPage) {
         else if (view_ == "import" || view_ == "rules") {
             if (view_ == "rules" && product_.ordinary()->rulesCurrent())
                 for (const auto &r : product_.ordinary()->rules()) {
+                    const QString account = recordText(r.display.principal,"Account unknown") + " · " + targetAccountText(r);
+                    if (!query_.isEmpty() && !(recordText(r.display.name,{}) + " " + recordText(r.display.path,{}) + " " + account)
+                        .contains(query_,Qt::CaseInsensitive)) continue;
                     result.push_back({"principal-rule:" + QString::fromStdString(gb::wire::hex(r.rule)),
-                        {{recordText(r.display.name,"Application unknown"),"strong",{}},
+                        {{recordText(r.display.name,"Application unknown") + "\n" + account,"strong",{}},
                          {r.action == 2 ? "Allow rule" : "Block rule",{},{}},
                          {r.direction == 1 ? (r.action == 2 ? "Outbound unicast" : "Outbound")
                              : r.direction == 2 ? "Inbound" : r.action == 2 ? "Both · includes non-unicast" : "Both",{},{}},
                          {"Unknown",{},{}},{"App and account · coverage unvalidated",{},{}},{"Review removal", "action",{}}}});
                 }
-            if (view_ == "rules" && product_.recordsSelected() && product_.records()->recordsCurrent())
+            if (view_ == "rules" && !product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent())
                 for (const auto &r : product_.records()->rules()) {
                     const auto name = recordText(r.name, "Selector " + QString::fromStdString(gb::wire::hex(r.selector)));
                     result.push_back({engineRowId("rule", product_.engine().serviceEpoch, r.rule),
@@ -1309,6 +1336,7 @@ void MainWindow::refreshTable(bool newPage) {
                 }
             const auto &report = view_ == "import" ? product_.draft() : product_.review().report;
             for (const auto &c : report.candidates) {
+                if (view_ == "rules" && product_.administrativeSelected()) continue;
                 const auto *derived = product_.derivedCandidate(view_ == "import", c.id);
                 const auto *qname = product_.derivedQNameCandidate(view_ == "import", c.id);
                 const auto &derivedView = product_.importedView(view_ == "import");
@@ -1326,14 +1354,18 @@ void MainWindow::refreshTable(bool newPage) {
             }
         }
         else if (view_ == "pending" && product_.ordinary()->current()) {
-            for (const auto &p : product_.ordinary()->observations())
+            for (const auto &p : product_.ordinary()->observations()) {
+                const QString account = recordText(p.display.principal,"Account unknown");
+                if (!query_.isEmpty() && !(recordText(p.display.name,{}) + " " + recordText(p.display.path,{}) + " " + account)
+                    .contains(query_,Qt::CaseInsensitive)) continue;
                 result.push_back({"ordinary:" + QString::fromStdString(gb::wire::hex(p.observed)),
-                    {{recordText(p.display.name, "Unattributed application"), "strong", {}},
+                    {{recordText(p.display.name, "Unattributed application") + "\n" + account, "strong", {}},
                      {"Requested destination unknown", {}, {}},
                      {recordUtc(p.lastUtc, p.presence & 2), {}, qulonglong(p.lastUtc)},
                      {"Review request →", "action", {}}}});
+            }
         }
-        else if (view_ == "pending" && product_.recordsSelected() && product_.records()->recordsCurrent())
+        else if (view_ == "pending" && !product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent())
             for (const auto &p : product_.records()->pending())
                 result.push_back({engineRowId("pending", product_.engine().serviceEpoch, p.request),
                     {{recordText(p.name, "Unattributed request"), "strong", {}},
@@ -1630,6 +1662,8 @@ void MainWindow::renderOrdinaryNotice() {
     encoded.clear();
     if (client->draft()) gb::wire::iv::pack(std::vector<gb::wire::iv::FutureDraftRecord>{*client->draft()}, encoded);
     stamp << QByteArray(reinterpret_cast<const char *>(encoded.data()), encoded.size())
+          << client->administrative()
+          << QByteArray(reinterpret_cast<const char *>(client->selectedOriginalTarget().data()),client->selectedOriginalTarget().size())
           << client->selection() << int(client->state()) << client->message() << client->visible()
           << client->ready() << client->selectedDirection() << client->selectedScope()
           << product_.importedActivation().busy << product_.importedActivation().ready;
@@ -1694,12 +1728,17 @@ void MainWindow::renderOrdinaryNotice() {
     ordinaryExplanation_=new Assistance::Ui::ExplanationWidget(assistance_.get(),[this,selection]{
         const auto* current=product_.ordinary();
         QPointer<Assistance::Ui::GeneralSession> explanation=assistance_.get();
-        if(!explanation||!current->visible()||!current->current()||current->selection()!=selection)return std::optional<Assistance::General::FullBinding>{};
+        if(!explanation||current->administrative()||!current->visible()||!current->current()||current->selection()!=selection)return std::optional<Assistance::General::FullBinding>{};
         return explanation->pendingBinding();
     },observedApplication,content);
     body->addWidget(ordinaryExplanation_);
     definition(body, "Application", recordText(display.name, "Unknown"));
-    definition(body, "Account", recordText(display.principal, "Unknown"));
+    definition(body, "Target account", recordText(display.principal, "Unknown") +
+        (client->administrative() ? " · " + accountText(client->selectedPrincipalSid()) : QString{}));
+    if (client->administrative()) {
+        definition(body,"Acting account","Original authenticated administrative session · separate from the target account");
+        body->addWidget(label("Once, this app instance and timed decisions: Unsupported for administrative targets. Current traffic and protection coverage have not been validated.","warning",true));
+    }
     definition(body, "Package", scopeValue >= 3 ? "Non-AppContainer process" : package == 1 ? futureScope.package : recordText(display.package, "Unknown"));
     if (!display.path.empty()) {
         auto *path = new QPlainTextEdit(recordText(display.path, "Unknown")); path->setReadOnly(true);
@@ -1714,12 +1753,14 @@ void MainWindow::renderOrdinaryNotice() {
     l->addWidget(scrollArea(content), 1);
     auto *fields = new QHBoxLayout; fields->setSpacing(9);
     auto *sl = new QVBoxLayout; sl->setSpacing(5); sl->addWidget(label("Apply to", "faint"));
-    auto *scope = combo({"Application + account", "This app instance", "Once"}, "decision-scope");
-    if (!held) for (int i : {1, 2}) scope->setItemData(i, 0, Qt::UserRole - 1);
+    auto *scope = combo({"Application + account", client->administrative() ? "This app instance · Unsupported" : "This app instance",
+        client->administrative() ? "Once · Unsupported" : "Once"}, "decision-scope");
+    if (!held || client->administrative()) for (int i : {1, 2}) scope->setItemData(i, 0, Qt::UserRole - 1);
     scope->setCurrentIndex(scopeValue == 2 ? 0 : scopeValue == 3 ? 2 : 1);
     scope->setEnabled(client->ready()); sl->addWidget(scope); fields->addLayout(sl, 1);
     auto *dl = new QVBoxLayout; dl->setSpacing(5); dl->addWidget(label("Keep this decision", "faint"));
-    auto *duration = combo({scopeValue == 3 ? "This connection" : scopeValue == 2 ? "Always" : "Until this instance exits", "15 minutes"}, "decision-duration");
+    auto *duration = combo({scopeValue == 3 ? "This connection" : scopeValue == 2 ? "Always" : "Until this instance exits",
+        client->administrative() ? "15 minutes · Unsupported" : "15 minutes"}, "decision-duration");
     duration->setCurrentIndex(scopeValue == 5 ? 1 : 0);
     duration->setEnabled(client->ready() && scopeValue >= 4); dl->addWidget(duration); fields->addLayout(dl, 1); l->addLayout(fields);
     connect(scope, &QComboBox::currentIndexChanged, this, [client, selection](int index) {
@@ -2193,7 +2234,32 @@ void MainWindow::modeSelector(QVBoxLayout *layout) {
     connect(mode, &QComboBox::currentIndexChanged, this, [this](int i) { setMode(i ? UiMode::Simulation : UiMode::LiveReadOnly); });
     layout->addWidget(panel);
 }
+void MainWindow::reviewSourceSelector() {
+    auto *bar = line(pageLayout_);
+    bar->addWidget(label("Review source","muted"));
+    auto *source = combo({"My account", "Administrative accounts"},"principal-review-source");
+    source->setCurrentIndex(product_.administrativeSelected() ? 1 : 0); bar->addWidget(source); bar->addStretch();
+    connect(source,&QComboBox::currentIndexChanged,this,[this,source](int index) {
+        if (!product_.selectAdministrative(index == 1)) {
+            const QSignalBlocker guard(source); source->setCurrentIndex(product_.administrativeSelected() ? 1 : 0);
+            message("Finish the current review or recover the same command before changing accounts."); return;
+        }
+        // Cambiar explícitamente de origen retira sus callbacks y selecciones.
+        // Las notificaciones del mismo origen conservan la página incremental.
+        saveViewState(); closeModal(); selected_.clear(); buildPage();
+    });
+    auto *search = new QLineEdit(query_); search->setObjectName("principal-review-search");
+    search->setPlaceholderText("Search application, account or path"); search->setClearButtonEnabled(true);
+    pageLayout_->addWidget(search);
+    connect(search,&QLineEdit::textChanged,this,[this](const QString &text) { query_ = text; refreshTable(); });
+    pageLayout_->addWidget(label(product_.administrativeSelected()
+        ? "Uses an existing admitted administrative token and the original service catalog. No elevation is requested. The acting account is separate from each target account. Once, app-instance and timed decisions are Unsupported; current traffic is unavailable."
+        : "Review requests and application rules for your account. Administrative review uses a separate original session.","faint",true));
+}
 void MainWindow::renderLive() {
+    if (view_ == "pending" || view_ == "rules") reviewSourceSelector();
+    if (product_.administrativeSelected() && (view_ == "processes" || view_ == "activity"))
+        pageLayout_->addWidget(note("This page retains its existing process or history source. Administrative target traffic and history are unavailable; administrative requests do not enter the account's history stream."));
     const auto named = [](QLabel *text, const char *name) { text->setObjectName(name); return text; };
     if (view_ != "settings") pageLayout_->addWidget(note("Process and activity records are read only. Review pending access requests to choose Allow or Block. Protection coverage has not been validated.", true));
     if (view_ == "processes") {
@@ -2219,8 +2285,10 @@ void MainWindow::renderLive() {
         bar->addStretch();
         pageLayout_->addWidget(named(label(product_.ordinary()->message(), "muted", true),"ordinary-page-message"));
         auto *contextNote = note(product_.ordinary()->current()
-            ? "Review each request to choose Allow or Block and how long it applies. Always rules cover future connections for this application and account. Protection coverage has not been validated."
-            : product_.recordsSelected() && product_.records()->recordsCurrent()
+            ? product_.administrativeSelected()
+                ? "Review original target applications and accounts. Always rules cover future connections; Once, app-instance and timed decisions are Unsupported. Protection coverage has not been validated."
+                : "Review each request to choose Allow or Block and how long it applies. Always rules cover future connections for this application and account. Protection coverage has not been validated."
+            : !product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent()
                 ? "View request snapshot · read only. These requests use the separate administrator reviewer; coverage remains unvalidated."
                 : "No current request list. Refresh requests to check the connection; a running process is not an access request.");
         contextNote->setObjectName("pending-context-note"); pageLayout_->addWidget(contextNote);
@@ -2246,7 +2314,7 @@ void MainWindow::renderLive() {
         pageLayout_->addWidget(named(label(product_.historyError(),"warning",true),"history-error"));
     } else if (view_ == "rules") {
         auto *bar = line(pageLayout_);
-        auto *refresh = button("Refresh my rules","refresh-principal-rules");
+        auto *refresh = button(product_.administrativeSelected() ? "Refresh administrative rules" : "Refresh my rules","refresh-principal-rules");
         refresh->setEnabled(product_.ordinary()->idle() && !product_.ordinary()->visible() &&
             product_.ordinary()->state() != OrdinaryDecisionClient::State::Uncertain);
         bar->addWidget(refresh);
@@ -2270,7 +2338,7 @@ void MainWindow::renderLive() {
         }
         bar->addStretch();
         pageLayout_->addWidget(named(label(product_.ordinary()->message(),"muted",true),"ordinary-page-message"));
-        pageLayout_->addWidget(named(label("Rules for your account: " + (product_.ordinary()->rulesCurrent()
+        pageLayout_->addWidget(named(label(QString(product_.administrativeSelected() ? "Administrative catalog rules: " : "Rules for your account: ") + (product_.ordinary()->rulesCurrent()
             ? QString::number(product_.ordinary()->rules().size()) : "Unavailable") +
             " · no recorded activity does not mean inactive", "faint",true),"principal-page-count"));
         pageLayout_->addWidget(named(label("Engine rules: " + (product_.recordsSelected() && product_.records()->recordsCurrent()
@@ -2798,7 +2866,8 @@ void MainWindow::cleanupLiveRule() {
     const auto rule = *found; const auto selection = product_.ordinary()->selection();
     auto *layout = modal("Review rule removal",ModalOwner::FileRule);
     layout->addWidget(label(recordText(rule.display.name,"Application unknown"),"heading",true));
-    definition(layout,"Account",recordText(rule.display.principal,"Account display unavailable"));
+    definition(layout,"Target account",recordText(rule.display.principal,"Account display unavailable") + " · " + targetAccountText(rule));
+    if (product_.administrativeSelected()) definition(layout,"Acting account","Original authenticated administrative session");
     const auto direction = rule.direction == 1 ? Data::Direction::Out : rule.direction == 2 ? Data::Direction::In : Data::Direction::Both;
     const auto scope = Data::applicationRuleScopeText(rule.package,direction,
         rule.action == 2 ? Data::Action::Allow : Data::Action::Block,false);
@@ -2910,7 +2979,9 @@ void MainWindow::prepareFileRules(const QStringList &candidates, const std::opti
     const auto selection = product_.ordinary()->selection();
     const auto digest = product_.review().report.digest; const auto revision = product_.review().revision;
     auto *layout = modal(editing ? "Edit selected application rule" : candidates.isEmpty() && backupIndex < 0 ? "New application rule" : "Review selected inactive rules",ModalOwner::FileRule);
-    layout->addWidget(note("This route covers your connected account only. SYSTEM, NetworkService and other accounts require their original administrator route. Source conditions, priorities or package scopes that cannot be represented stay inactive. Protection coverage has not been validated.",true));
+    layout->addWidget(note(product_.administrativeSelected()
+        ? "An administrative replacement preserves the account from the selected original catalog rule. The executable is retained under the acting account; that actor is separate from the target account. New file rules still use your own account. A saved backup cannot select another account. Unsupported source conditions, priorities and package scopes remain inactive; protection coverage has not been validated."
+        : "This route covers your connected account only. SYSTEM, NetworkService and other accounts require their original administrator route. Source conditions, priorities or package scopes that cannot be represented stay inactive. Protection coverage has not been validated.",true));
     auto *sources = combo({},"file-source-selection");
     if (candidates.isEmpty()) sources->addItem(backupIndex >= 0 ? "Selected inactive backup" : editing ? "Selected current rule" : "New application and account rule",QString{});
     else for (const auto &id : candidates) sources->addItem(id,id);

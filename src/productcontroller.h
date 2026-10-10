@@ -91,8 +91,10 @@ class ProductController final : public QObject {
     const EngineStatus &engine() const { return recordsSelected_ ? records_.status() : engine_.status(); }
     DecisionViewClient *records() { return &records_; }
     const DecisionViewClient *records() const { return &records_; }
-    OrdinaryDecisionClient *ordinary() { return &ordinary_; }
-    const OrdinaryDecisionClient *ordinary() const { return &ordinary_; }
+    OrdinaryDecisionClient *ordinary() { return administrativeSelected_ ? &administrative_ : &ordinary_; }
+    const OrdinaryDecisionClient *ordinary() const { return administrativeSelected_ ? &administrative_ : &ordinary_; }
+    bool administrativeSelected() const { return administrativeSelected_; }
+    bool selectAdministrative(bool enabled);
     bool recordsSelected() const { return recordsSelected_; }
     bool selectDecisionRecords();
     bool backupSelectedRules(const std::vector<gb::wire::Id> &, quint64 selection, bool consent);
@@ -104,7 +106,7 @@ class ProductController final : public QObject {
     quint64 generation() const { return generation_; }
     void stop();
     bool idle() const { return (!fileWorker_ || !fileWorker_->isRunning()) && !Data::SelectedApplicationFile::physicalJobs() && (!worker_ || !worker_->isRunning()) && (!semanticWorker_ || !semanticWorker_->isRunning()) && (!importWorker_ || !importWorker_->isRunning()) && (!storeWorker_ || !storeWorker_->isRunning()) && !storeLoading_ && !flushingHistory_ &&
-        !pendingRuleBackup_ && !savingRuleBackup_ && !(reviewWritable_ && (storeWriteRequested_ || historyDirty_)) && engine_.idle() && records_.idle() && ordinary_.idle(); }
+        !pendingRuleBackup_ && !savingRuleBackup_ && !(reviewWritable_ && (storeWriteRequested_ || historyDirty_)) && engine_.idle() && records_.idle() && ordinary_.idle() && administrative_.idle(); }
   signals:
     void changed();
     void invalidated();
@@ -166,6 +168,8 @@ class ProductController final : public QObject {
     EngineViewClient engine_;
     DecisionViewClient records_;
     OrdinaryDecisionClient ordinary_;
+    OrdinaryDecisionClient administrative_;
+    bool administrativeSelected_ = false;
     bool recordsSelected_ = false, stopped_ = false;
     gb::wire::Id lastEpoch_{}, lastBoot_{};
     quint64 lastProfile_ = 0;
