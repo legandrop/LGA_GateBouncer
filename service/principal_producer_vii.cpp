@@ -797,9 +797,16 @@ bool NativeRuntime::capturePrincipalWitness(PrincipalFileCapture &file) noexcept
 }
 void NativeRuntime::drainPrincipalFiles() noexcept {
   for(;;) {
-    std::shared_ptr<PrincipalFileCapture> retired;std::size_t charge=0;
+    std::shared_ptr<PrincipalFileCapture> retired;std::size_t charge=0;bool persistent=false;
     {
       std::lock_guard<std::mutex> lock(mutex);
+      // Sólo tras Applied/readback/start del catálogo nuevo; Prepared conserva la custodia anterior.
+      if(persistentRuleCatalogCurrent()) {
+        for(auto it=persistentRuleFiles_.begin();it!=persistentRuleFiles_.end();++it)
+          if(*it && !persistentRuleFileReferenced(**it)) {
+            retired=std::move(*it);persistentRuleFiles_.erase(it);persistent=true;break;
+          }
+      }
       const auto now=GetTickCount64();
       for(auto it=principalAdmissions_.begin();it!=principalAdmissions_.end();) {
         auto &admission=*it->second;
@@ -811,12 +818,13 @@ void NativeRuntime::drainPrincipalFiles() noexcept {
           it=principalAdmissions_.erase(it);
         } else ++it;
       }
-      for(auto &slot:principalFiles_)if(slot && slot->completed && slot.use_count()==1) {
+      for(auto &slot:principalFiles_)if(!retired && slot && slot->completed && slot.use_count()==1) {
         charge=slot->charged;retired=std::move(slot);break;
       }
     }
     if(!retired)return;
     retired.reset(); // Cierre físico fuera Runtime; el cargo sigue reservado hasta aquí.
+    if(persistent)continue; // No pertenece al pool de drafts ni a sus cargos físicos.
     {
       std::lock_guard<std::mutex> lock(mutex);
       if(!principalFilePhysical_ || charge>principalFileBytes_) {principalWriteFault_=true;return;}

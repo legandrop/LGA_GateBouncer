@@ -619,9 +619,32 @@ bool NativeRuntime::bindPrincipalObservation(CatalogPlanBuilder &plan) {
 bool NativeRuntime::persistentRuleFilesCurrent() const noexcept {
     try {
         if(!deployment_ || !deployment_->serviceAdmittedCurrent() || backend_.deployment_!=deployment_)return false;
-        for(const auto &file:persistentRuleFiles_)if(!file || !principalFileMetadataCurrent(*file))return false;
+        const bool current=persistentRuleCatalogCurrent();
+        for(const auto &file:persistentRuleFiles_)
+            if(!file || ((!current || persistentRuleFileReferenced(*file)) && !principalFileMetadataCurrent(*file)))return false;
         return deployment_->serviceAdmittedCurrent();
     } catch(...) {return false;}
+}
+bool NativeRuntime::persistentRuleCatalogCurrent() const noexcept {
+    try {
+        const auto &snapshot=principalRead_.snapshot;
+        const auto &catalog=principalCatalog_;
+        const auto &source=principalSource_;
+        return principalRead_.kind==principal::StoredImage::Principal && principalStore_ && !principalStore_->uncertain() &&
+            snapshot.storedState==State::Applied && snapshot.storedKnown && snapshot.effective==snapshot.desired &&
+            snapshot.sequence==principalStore_->read_.snapshot.sequence &&
+            snapshot.encoded.data()==principalStore_->read_.snapshot.encoded.data() &&
+            snapshot.encoded.size()==principalStore_->read_.snapshot.encoded.size() &&
+            catalog && catalog->arena_ && catalog->desired_==snapshot.desired &&
+            catalog->arena_->data()==snapshot.encoded.data() && catalog->arena_->size()==snapshot.encoded.size() &&
+            source && source->stage()==allnative::Stage::Active && source->binding_==catalog->binding_ &&
+            std::atomic_load(&source->catalog_)==catalog;
+    } catch(...) {return false;}
+}
+bool NativeRuntime::persistentRuleFileReferenced(const PrincipalFileCapture &file) const noexcept {
+    // Sólo se usa con el catálogo/arena actuales comprobados; nunca join por path o PID.
+    return std::any_of(principalRead_.snapshot.rules.begin(),principalRead_.snapshot.rules.end(),
+        [&](const auto &rule){return rule.kind==1 && rule.durableWitness()==file.durableWitness;});
 }
 bool NativeRuntime::capturePersistentRuleFiles() {
     // Sólo initialize/load llama aquí, fuera Runtime::mutex y antes de exponer peers.

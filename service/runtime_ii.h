@@ -278,6 +278,8 @@ class NativeRuntime {
     bool bindPrincipalObservation(CatalogPlanBuilder &);
     bool capturePersistentRuleFiles();
     bool persistentRuleFilesCurrent() const noexcept;
+    bool persistentRuleCatalogCurrent() const noexcept;
+    bool persistentRuleFileReferenced(const PrincipalFileCapture &) const noexcept;
     std::vector<std::shared_ptr<PrincipalFileCapture>> persistentRuleFiles_;
     bool restoreAttempted_ = false;
     bool provisionPrincipalImage(CatalogPlanBuilder &);
