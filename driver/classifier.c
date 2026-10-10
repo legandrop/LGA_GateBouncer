@@ -1199,7 +1199,8 @@ static BOOLEAN copyOutboundUdp(GB_ENTRY *e,NET_BUFFER_LIST *original,const FWPS_
     transmit.Transmit.IsIPv6=checksum.Transmit.IsIPv6;
     transmit.Transmit.UdpChecksum=checksum.Transmit.UdpChecksum;
     if(checksum.Value!=transmit.Value || (checksum.Value &&
-       (checksum.Transmit.IsIPv4!=(e->record.family==4) || checksum.Transmit.IsIPv6!=(e->record.family==6))))goto fail;
+       (checksum.Transmit.IsIPv4!=(e->record.family==4 ? 1u : 0u) ||
+        checksum.Transmit.IsIPv6!=(e->record.family==6 ? 1u : 0u))))goto fail;
     if(e->record.family==6 && !data[6] && !data[7] && !checksum.Transmit.UdpChecksum)goto fail;
     RtlCopyMemory(e->packetRemote,e->record.remoteAddress,16);
     if(e->record.family==4) {
