@@ -27,8 +27,11 @@ class CatalogPlanBuilder final {
       const std::shared_ptr<const allnative::CatalogSnapshot> &before,
       VerifyBeforeWrite, void *) noexcept;
   WriteOutcome transactInitial(HANDLE, const WriteApi &, VerifyBeforeWrite, void *) noexcept;
+  WriteOutcome transactRestore(HANDLE, const WriteApi &, VerifyBeforeWrite, void *) noexcept;
   WriteOutcome transactBody(HANDLE, const WriteApi &,
-      const std::shared_ptr<const allnative::CatalogSnapshot> &, VerifyBeforeWrite, void *, bool initial) noexcept;
+      const std::shared_ptr<const allnative::CatalogSnapshot> &, VerifyBeforeWrite, void *, bool initial, bool restore = false) noexcept;
+  const principal::SnapshotStore *restoreStore_ = nullptr;
+  principal::ByteView restoreImage_;
   bool detachOutcomeArena() noexcept;
   bool attachOutcomeArena(const principal::ByteView &) noexcept;
   CatalogPlanBuilder(allnative::CatalogRegistry &, std::size_t arenaCapacity,

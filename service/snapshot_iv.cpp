@@ -427,16 +427,22 @@ bool headerRules(const ByteView &p, const ByteView &d, std::uint64_t desired,
         return false;
       auto size = std::size_t(n(p, at, 4));
       auto kind = n(p, at + 4, 2);
-      if (size < 64 || size > 64 + MaxTargetBytes || size > p.size() - at - 8 || kind < 1 ||
-          kind > 3 || n(p, at + 6, 2) != 1)
+      if (size < 64 || size > 64 + MaxTargetBytes + 8272 || size > p.size() - at - 8 || kind < 1 ||
+          kind > 3 || (n(p, at + 6, 2) != 1 && n(p, at + 6, 2) != 2))
         return false;
+      const bool witness = n(p, at + 6, 2) == 2;
       row = p.sub(at + 8, size);
       r.kind = std::uint8_t(kind);
       at += 8 + size;
-      if (!zeros(row, 50, 6) || !zeros(row, 60, 4) ||
-          n(row, 56, 4) != size - 64 || n(row, 49, 1) != (kind == 2 ? 0 : 1))
+      const auto targetSize = std::size_t(n(row, 56, 4));
+      const auto witnessSize = std::size_t(n(row, 60, 4));
+      if (!zeros(row, 50, 6) || targetSize > MaxTargetBytes ||
+          targetSize > size - 64 || witnessSize != size - 64 - targetSize ||
+          (witness ? kind != 1 || !witnessSize : witnessSize != 0) ||
+          n(row, 49, 1) != (kind == 2 ? 0 : 1))
         return false;
-      r.target = row.sub(64, size - 64);
+      r.target = row.sub(64, targetSize);
+      if (witness && !decodeRuleWitness(r,row.sub(64 + targetSize,witnessSize))) return false;
     } else {
       if (p.size() - at < 53)
         return false;
@@ -467,6 +473,23 @@ bool headerRules(const ByteView &p, const ByteView &d, std::uint64_t desired,
   return true;
 }
 } // namespace
+bool validRuleWitness(const ByteView &b) {
+  // FWI1 contiene metadata y SHA256 de un handle, nunca una prueba de imagen cargada.
+  try {
+    if (b.size() < 82 || b.size() > 8272 || !magic(b,"FWI1") ||
+        n(b,4,2) != 1 || n(b,6,2) != 80 || n(b,8,4) != b.size() ||
+        n(b,12,4) != b.size()-80 || (b.size()-80)%2 || !n(b,16,4) ||
+        (!n(b,20,4) && !n(b,24,4)) || n(b,28,4) || !n(b,32,4) ||
+        n(b,32,4) > 512ull*1024*1024 || (n(b,36,4) & (FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        !n(b,40,8) || n(b,40,8) > INT64_MAX || array<32>(b,48) == Digest{}) return false;
+    for (std::size_t at=80;at<b.size();at+=2) if (!n(b,at,2)) return false;
+    return true;
+  } catch (...) {return false;}
+}
+bool decodeRuleWitness(Rule &r,const ByteView &b) {
+  if (r.kind != 1 || !validRuleWitness(b)) return false;
+  r.durableWitness_ = b; return true;
+}
 bool sidValid(const ByteView &b) {
   return b.size() >= 8 && b.size() <= 68 && n(b, 0, 1) == 1 &&
          n(b, 1, 1) <= 15 && b.size() == 8 + 4 * n(b, 1, 1);
@@ -591,6 +614,7 @@ bool rulesValid(const std::vector<Rule> &rows) {
     for (std::size_t i = 0; i < rows.size(); ++i) {
       const auto &r = rows[i];
       Target t;
+      if (r.durableWitness().size() && (r.kind != 1 || !validRuleWitness(r.durableWitness()))) return false;
       if (zero(r.id) || zero(r.selector) || !ids.insert(r.id).second ||
           !r.revision || (r.kind == 2 && r.revision != 1) || !r.targetRevision || r.action < 1 ||
           r.action > 2 || r.direction < 1 || r.direction > 3 ||
@@ -623,9 +647,9 @@ bool sections(const std::vector<Rule> &rows, std::uint64_t desired,
     return false;
   std::size_t size = 24;
   for (const auto &r : rows) {
-    if (r.target.size() + 72 > MaxSnapshotBytes - size)
+    if (r.target.size() + r.durableWitness().size() + 72 > MaxSnapshotBytes - size)
       return false;
-    size += 72 + r.target.size();
+    size += 72 + r.target.size() + r.durableWitness().size();
   }
   std::vector<const Rule *> ordered;
   for (const auto &r : rows)
@@ -652,9 +676,9 @@ bool sections(const std::vector<Rule> &rows, std::uint64_t desired,
   put(d, 16, desired, 8);
   p.reserve(size);
   for (auto r : ordered) {
-    append(p, r->target.size() + 64, 4);
+    append(p, r->target.size() + r->durableWitness().size() + 64, 4);
     append(p, r->kind, 2);
-    append(p, 1, 2);
+    append(p, r->durableWitness().size() ? 2 : 1, 2);
     auto at = p.size();
     p.resize(at + 64);
     put(p, at, r->id);
@@ -664,7 +688,9 @@ bool sections(const std::vector<Rule> &rows, std::uint64_t desired,
     p[at + 48] = r->action;
     p[at + 49] = r->kind == 2 ? 0 : 1;
     put(p, at + 56, r->target.size(), 4);
+    put(p, at + 60, r->durableWitness().size(), 4);
     append(p, r->target);
+    append(p, r->durableWitness());
     append(d, r->id);
     append(d, r->selector);
     append(d, r->direction, 1);
@@ -1231,8 +1257,8 @@ bool ByteView::prepareOwned(const Snapshot &s, const Entry &command, ByteView &o
         !rulesValid(s.rules)) return false;
     std::size_t policySize = 24, journalSize = 96;
     for (const auto &rule : s.rules) {
-      if (rule.target.size() + 72 > MaxSnapshotBytes - policySize) return false;
-      policySize += rule.target.size() + 72;
+      if (rule.target.size() + rule.durableWitness().size() + 72 > MaxSnapshotBytes - policySize) return false;
+      policySize += rule.target.size() + rule.durableWitness().size() + 72;
     }
     for (const auto &entry : s.entries) {
       if (entry.size() > decisions::MaxJournalBytes - journalSize) return false;
@@ -1268,14 +1294,18 @@ bool ByteView::prepareOwned(const Snapshot &s, const Entry &command, ByteView &o
     std::sort(ordered.begin(), ordered.end(), [](auto a, auto b) { return a->id < b->id; });
     std::size_t at = policyAt + 24, direction = directionAt + 24;
     for (const auto *rule : ordered) {
-      put(b, at, rule->target.size() + 64, 4); put(b, at + 4, rule->kind, 2); put(b, at + 6, 1, 2);
+      put(b, at, rule->target.size() + rule->durableWitness().size() + 64, 4); put(b, at + 4, rule->kind, 2);
+      put(b, at + 6, rule->durableWitness().size() ? 2 : 1, 2);
       const auto row = at + 8;
       put(b, row, rule->id); put(b, row + 16, rule->selector);
       put(b, row + 32, rule->revision, 8); put(b, row + 40, rule->targetRevision, 8);
       b[row + 48] = rule->action; b[row + 49] = rule->kind == 2 ? 0 : 1;
       put(b, row + 56, rule->target.size(), 4);
+      put(b, row + 60, rule->durableWitness().size(), 4);
       if (rule->target.size()) std::copy_n(rule->target.data(), rule->target.size(), b.begin() + row + 64);
-      at += 72 + rule->target.size();
+      if (rule->durableWitness().size()) std::copy_n(rule->durableWitness().data(),rule->durableWitness().size(),
+          b.begin()+row+64+rule->target.size());
+      at += 72 + rule->target.size() + rule->durableWitness().size();
       put(b, direction, rule->id); put(b, direction + 16, rule->selector);
       b[direction + 32] = rule->direction; b[direction + 33] = rule->mode; direction += 40;
     }
@@ -1358,7 +1388,7 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
       return a.id == b.id && a.selector == b.selector &&
              a.revision == b.revision && a.targetRevision == b.targetRevision &&
              a.action == b.action && a.direction == b.direction &&
-             a.mode == b.mode && a.kind == b.kind && a.target == b.target;
+             a.mode == b.mode && a.kind == b.kind && a.target == b.target && a.durableWitness() == b.durableWitness();
     };
     auto sameEntry = [](const ByteView &left, const ByteView &right,
                         bool outcome) {

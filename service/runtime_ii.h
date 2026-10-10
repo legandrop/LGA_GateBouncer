@@ -93,6 +93,7 @@ class NativeRuntime {
         std::filesystem::path path;
         BY_HANDLE_FILE_INFORMATION imageId{};
         principal::ByteView target;
+        principal::ByteView durableWitness;
         Bytes targetSid;
         wire::iv::Display display;
         std::shared_ptr<PrincipalSourceCapture> originalSource;
@@ -112,6 +113,7 @@ class NativeRuntime {
         std::optional<allnative::NativeProof> proof;
         std::optional<principal::Rule> revocation;
         std::shared_ptr<PrincipalFileCapture> file;
+        std::shared_ptr<PrincipalFileCapture> persistentFile;
         std::optional<principal::Rule> replacing;
         std::uint64_t targetRevision=1;
         native::ProcessEvidence actor;
@@ -169,6 +171,9 @@ class NativeRuntime {
     Frame fileFutureRecord(const PrincipalAdmission &);
     Frame listPrincipalRules(const Frame &, const std::shared_ptr<PrincipalPeer> &);
     static bool capturePrincipalFile(PrincipalFileCapture &, const Frame &) noexcept;
+    static bool capturePrincipalFile(PrincipalFileCapture &, const Bytes &) noexcept;
+    static bool capturePrincipalWitness(PrincipalFileCapture &) noexcept;
+    Frame capturePersistentCommit(const Frame &, const std::shared_ptr<PrincipalPeer> &, HANDLE);
     static bool principalFileActorCurrent(const PrincipalFileCapture &) noexcept;
     static bool principalFileMetadataCurrent(const PrincipalFileCapture &) noexcept;
     static bool principalOriginalSourceCurrent(const PrincipalFileCapture &) noexcept;
@@ -271,6 +276,10 @@ class NativeRuntime {
     bool acquireObservationEngine();
     bool loadPrincipalImage();
     bool bindPrincipalObservation(CatalogPlanBuilder &);
+    bool capturePersistentRuleFiles();
+    bool persistentRuleFilesCurrent() const noexcept;
+    std::vector<std::shared_ptr<PrincipalFileCapture>> persistentRuleFiles_;
+    bool restoreAttempted_ = false;
     bool provisionPrincipalImage(CatalogPlanBuilder &);
     void retirePrincipalObservation() noexcept;
     std::shared_ptr<EngineResource> observationEngine_;

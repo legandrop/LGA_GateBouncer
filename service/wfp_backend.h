@@ -41,6 +41,9 @@ private:
         decisions::CatalogPlanBuilder::VerifyBeforeWrite, void *) noexcept;
     decisions::CatalogPlanBuilder::WriteOutcome applyInitialPrincipalPlan(
         decisions::CatalogPlanBuilder &, decisions::CatalogPlanBuilder::VerifyBeforeWrite, void *) noexcept;
+    bool principalInventoryAbsent(bool &) noexcept;
+    decisions::CatalogPlanBuilder::WriteOutcome restorePrincipalPlan(
+        decisions::CatalogPlanBuilder &, decisions::CatalogPlanBuilder::VerifyBeforeWrite, void *) noexcept;
     static void CALLBACK eventCallback(void* context,const FWPM_NET_EVENT1* event);
     SelectorRegistry& registry_;
     HANDLE engine_=nullptr,subscription_=nullptr;

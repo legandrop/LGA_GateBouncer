@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <bcrypt.h>
 
 namespace gb::decisions {
 namespace {
@@ -480,6 +481,7 @@ void NativeRuntime::closeOrdinaryPeer(const std::shared_ptr<PrincipalPeer> &peer
     for (auto &entry : principalAdmissions_) if (entry.second->owner == peer) {
         entry.second->cancelled = true;
         if (entry.second->file) entry.second->file->cancelled.store(true);
+        if (entry.second->persistentFile) entry.second->persistentFile->cancelled.store(true);
     }
     peer->pages.clear(); peer->rulePages.clear();
 }
@@ -602,6 +604,10 @@ bool NativeRuntime::principalOriginalSourceCurrent(const PrincipalFileCapture &f
   } catch(...) {return false;}
 }
 bool NativeRuntime::capturePrincipalFile(PrincipalFileCapture &file,const Frame &request) noexcept {
+  const auto text=find(request,Tag::Text);
+  return text && capturePrincipalFile(file,text->bytes);
+}
+bool NativeRuntime::capturePrincipalFile(PrincipalFileCapture &file,const Bytes &bytes) noexcept {
   struct Revert {
     bool active=false;
     ~Revert() {
@@ -611,7 +617,6 @@ bool NativeRuntime::capturePrincipalFile(PrincipalFileCapture &file,const Frame 
   struct Blob {FWP_BYTE_BLOB *value=nullptr;~Blob(){if(value)FwpmFreeMemory0(reinterpret_cast<void **>(&value));}} blob;
   try {
     if(!principalFileActorCurrent(file))return false;
-    const auto &bytes=find(request,Tag::Text)->bytes;
     const auto units=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,
       reinterpret_cast<const char *>(bytes.data()),int(bytes.size()),nullptr,0);
     if(units<=0 || units>4096)return false;
@@ -675,8 +680,119 @@ bool NativeRuntime::capturePrincipalFile(PrincipalFileCapture &file,const Frame 
     if(charge>FileReserveBytes)return false;
     const auto lastWrite=(std::uint64_t(file.imageId.ftLastWriteTime.dwHighDateTime)<<32)|file.imageId.ftLastWriteTime.dwLowDateTime;
     if(!lastWrite || lastWrite>INT64_MAX || !wire::iv::validFileTarget(file.target.copy()) || !principalFileMetadataCurrent(file))return false;
+    if(!capturePrincipalWitness(file))return false;
+    charge+=file.durableWitness.ownedCapacityBytes();
+    if(charge>FileReserveBytes)return false;
     file.charged=charge;
     return true;
+  } catch(...) {return false;}
+}
+Frame NativeRuntime::capturePersistentCommit(const Frame &frame,const std::shared_ptr<PrincipalPeer> &peer,HANDLE stop) {
+  std::shared_ptr<PrincipalFileCapture> file;
+  std::shared_ptr<PrincipalAdmission> admission;
+  std::shared_ptr<allnative::ClassifierCause> cause;
+  Bytes path;
+  try {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto found=principalAdmissions_.find(idValue(frame,Tag::DraftId));
+      if(found==principalAdmissions_.end())return principalError(Error::Stale);
+      admission=found->second;
+      if(!peer || admission->owner!=peer || admission->file || admission->persistentFile || admission->scope!=2 || admission->consumed ||
+         admission->cancelled || admission->source!=principalSource_ || !principalPeerCurrent(*peer) ||
+         !deployment_ || !deployment_->serviceAdmittedCurrent() || !admission->event ||
+         !(cause=admission->event->classifier_) || !cause->current() || !cause->process_.current() ||
+         GetTickCount64()>=admission->deadline || WaitForSingleObject(stop,0)!=WAIT_TIMEOUT)return principalError(Error::IdentityUnavailable);
+      if(std::any_of(principalRead_.snapshot.rules.begin(),principalRead_.snapshot.rules.end(),
+          [](const auto &r){return r.kind==3;}))return principalError(Error::Unsupported);
+      principal::Target target;
+      if(!principal::parseTarget(admission->fullTarget,target))return principalError(Error::IdentityUnavailable);
+      auto free=std::find_if(principalFiles_.begin(),principalFiles_.end(),[](const auto &slot){return !slot;});
+      if(free==principalFiles_.end() || principalFilePhysical_>=64 || principalFileBytes_>PendingBytesLimit-FileReserveBytes)
+        return principalError(Error::Capacity);
+      file=std::make_shared<PrincipalFileCapture>();file->identity=peer->identity;file->targetSid=target.user.copy();
+      file->charged=FileReserveBytes;file->deadline=admission->deadline;
+      *free=file;++principalFilePhysical_;principalFileBytes_+=FileReserveBytes;
+      HANDLE raw=nullptr;
+      if(!principalDuplicate_(GetCurrentProcess(),peer->actor.process.value,GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS)) {
+        file->completed=true;file->cancelled.store(true);return principalError(Error::IdentityUnavailable);
+      }
+      file->actor.process.reset(raw);file->actor.pid=peer->actor.pid;file->actor.created=peer->actor.created;file->actor.image=peer->actor.image;
+      if(!OpenProcessToken(file->actor.process.value,TOKEN_QUERY|TOKEN_DUPLICATE,&raw)) {
+        file->completed=true;file->cancelled.store(true);return principalError(Error::IdentityUnavailable);
+      }
+      file->primary.reset(raw);
+      if(!principalDuplicate_(GetCurrentProcess(),stop,GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS)) {
+        file->completed=true;file->cancelled.store(true);return principalError(Error::IdentityUnavailable);
+      }
+      file->stop.reset(raw);
+      path=displayText(cause->process_.image.u16string(),4096);
+      admission->persistentFile=file; // Custodia de cancelación, todavía sin witness ni permiso.
+    }
+    // El path sólo localiza: la causa original y el APP_ID custodiado deben coincidir después.
+    const bool captured=capturePrincipalFile(*file,path);
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      file->completed=true;
+      if(captured)principalFileBytes_-=FileReserveBytes-file->charged;
+      else file->charged=FileReserveBytes;
+      principal::Target expected,actual;
+      const auto found=principalAdmissions_.find(admission->request);
+      if(!captured || found==principalAdmissions_.end() || found->second!=admission || admission->persistentFile!=file || admission->cancelled ||
+         admission->consumed || admission->source!=principalSource_ || !cause->current() ||
+         !cause->process_.current() || !principalFileMetadataCurrent(*file) || !principalPeerCurrent(*peer) ||
+         !deployment_->serviceAdmittedCurrent() || !samePath(file->path,cause->process_.image) ||
+         !principal::parseTarget(admission->fullTarget,expected) || !principal::parseTarget(file->target,actual) ||
+         actual.app!=expected.app || actual.user!=expected.user) {
+        file->cancelled.store(true);return principalError(Error::IdentityUnavailable);
+      }
+      // Witness separado: jamás sustituir admission.file ni la causa/proof originales de writePrincipal.
+      admission->persistentFile=file;
+      return dispatchOrdinary(frame,peer);
+    }
+  } catch(...) {
+    if(file){std::lock_guard<std::mutex> lock(mutex);file->completed=true;file->cancelled.store(true);}
+    return principalError(Error::IdentityUnavailable);
+  }
+}
+bool NativeRuntime::capturePrincipalWitness(PrincipalFileCapture &file) noexcept {
+  BCRYPT_ALG_HANDLE algorithm=nullptr;BCRYPT_HASH_HANDLE hash=nullptr;
+  struct Release {
+    BCRYPT_ALG_HANDLE &algorithm;BCRYPT_HASH_HANDLE &hash;
+    ~Release(){if(hash)BCryptDestroyHash(hash);if(algorithm)BCryptCloseAlgorithmProvider(algorithm,0);}
+  } release{algorithm,hash};
+  try {
+    // Siempre fuera Runtime::mutex. Lectura incremental del MISMO handle original.
+    if(!principalFileMetadataCurrent(file) || file.imageId.nFileSizeHigh || !file.imageId.nFileSizeLow ||
+       file.imageId.nFileSizeLow>512u*1024*1024 || file.path.native().size()>4096 ||
+       BCryptOpenAlgorithmProvider(&algorithm,BCRYPT_SHA256_ALGORITHM,nullptr,0)<0 ||
+       BCryptCreateHash(algorithm,&hash,nullptr,0,nullptr,0,0)<0)return false;
+    LARGE_INTEGER zero{};
+    if(!SetFilePointerEx(file.image.value,zero,nullptr,FILE_BEGIN))return false;
+    const auto deadline=GetTickCount64()+30000;
+    std::array<BYTE,65536> buffer{};std::uint64_t read=0;
+    while(read<file.imageId.nFileSizeLow) {
+      DWORD count=0;
+      const auto requested=DWORD(std::min<std::uint64_t>(buffer.size(),file.imageId.nFileSizeLow-read));
+      if(GetTickCount64()>=deadline || !principalFileMetadataCurrent(file) || !ReadFile(file.image.value,buffer.data(),requested,&count,nullptr) ||
+         count!=requested || BCryptHashData(hash,buffer.data(),count,0)<0)return false;
+      read+=count;
+    }
+    Digest digest{};
+    if(GetTickCount64()>=deadline || BCryptFinishHash(hash,digest.data(),DWORD(digest.size()),0)<0 || !principalFileMetadataCurrent(file))return false;
+    const auto &path=file.path.native();Bytes witness(80+path.size()*sizeof(wchar_t));
+    auto put=[&](std::size_t at,std::uint64_t value,std::size_t width){
+      for(std::size_t i=0;i<width;++i)witness[at+i]=std::uint8_t(value>>(8*i));
+    };
+    std::copy_n("FWI1",4,witness.begin());put(4,1,2);put(6,80,2);put(8,witness.size(),4);put(12,path.size()*2,4);
+    put(16,file.imageId.dwVolumeSerialNumber,4);put(20,file.imageId.nFileIndexHigh,4);put(24,file.imageId.nFileIndexLow,4);
+    put(28,file.imageId.nFileSizeHigh,4);put(32,file.imageId.nFileSizeLow,4);put(36,file.imageId.dwFileAttributes,4);
+    put(40,(std::uint64_t(file.imageId.ftLastWriteTime.dwHighDateTime)<<32)|file.imageId.ftLastWriteTime.dwLowDateTime,8);
+    std::copy(digest.begin(),digest.end(),witness.begin()+48);
+    for(std::size_t i=0;i<path.size();++i)put(80+i*2,std::uint16_t(path[i]),2);
+    principal::ByteView captured(std::move(witness));
+    if(!principal::validRuleWitness(captured) || !principalFileMetadataCurrent(file))return false;
+    file.durableWitness=std::move(captured);return true;
   } catch(...) {return false;}
 }
 void NativeRuntime::drainPrincipalFiles() noexcept {
@@ -687,9 +803,12 @@ void NativeRuntime::drainPrincipalFiles() noexcept {
       const auto now=GetTickCount64();
       for(auto it=principalAdmissions_.begin();it!=principalAdmissions_.end();) {
         auto &admission=*it->second;
-        if(admission.file && (admission.cancelled || admission.consumed || now>=admission.deadline ||
-            admission.file->cancelled.load() || admission.owner->cancelled)) {
-          admission.file->cancelled.store(true);it=principalAdmissions_.erase(it);
+        if((admission.file || admission.persistentFile) && (admission.cancelled || admission.consumed || now>=admission.deadline ||
+            (admission.file && admission.file->cancelled.load()) ||
+            (admission.persistentFile && admission.persistentFile->cancelled.load()) || !admission.owner || admission.owner->cancelled)) {
+          if(admission.file)admission.file->cancelled.store(true);
+          if(admission.persistentFile)admission.persistentFile->cancelled.store(true);
+          it=principalAdmissions_.erase(it);
         } else ++it;
       }
       for(auto &slot:principalFiles_)if(slot && slot->completed && slot.use_count()==1) {
@@ -764,7 +883,7 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
   const bool prepare=frame.type==Type::PrepareFileFuturePolicy;
   try {
   {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(mutex);
     tick();
     if(wire::iv::validate(frame)!=Error::Ok || !peer || peer->readonly || frame.connection!=peer->connection ||
        idValue(frame,Tag::ServiceEpoch)!=epoch_ || !principalPeerCurrent(*peer) ||
@@ -776,8 +895,13 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
       return dispatchOrdinary(frame,peer);
     if(!prepare) {
       const auto found=principalAdmissions_.find(idValue(frame,Tag::DraftId));
-      if(found==principalAdmissions_.end() || !found->second->file)
-        return find(frame,Tag::OriginalSourceSelection) ? principalError(Error::Stale) : dispatchOrdinary(frame,peer);
+      if(found==principalAdmissions_.end() || !found->second->file) {
+        if(find(frame,Tag::OriginalSourceSelection))return principalError(Error::Stale);
+        if(found!=principalAdmissions_.end() && frame.type==Type::CommitFuturePolicy && found->second->scope==2) {
+          lock.unlock();return capturePersistentCommit(frame,peer,stop);
+        }
+        return dispatchOrdinary(frame,peer);
+      }
       held=found->second;
       if(held->owner!=peer || held->cancelled || held->consumed || principalNow_()>=held->deadline ||
          held->administrative!=administrative || (administrative && held->selectedSid!=find(frame,Tag::SelectedPrincipalSid)->bytes))
@@ -938,6 +1062,7 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
       if(it->second->owner==peer) {
         it->second->cancelled=true;
         if(it->second->file)it->second->file->cancelled.store(true);
+        if(it->second->persistentFile)it->second->persistentFile->cancelled.store(true);
         it=principalAdmissions_.erase(it);
       } else ++it;
     }
@@ -1110,6 +1235,7 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
         if (entry->second->owner == peer || entry->second->binding == observation.row.binding) {
             entry->second->cancelled = true;
             if (entry->second->file) entry->second->file->cancelled.store(true);
+            if (entry->second->persistentFile) entry->second->persistentFile->cancelled.store(true);
             entry = principalAdmissions_.erase(entry);
         } else ++entry;
     }
@@ -1239,6 +1365,15 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         rule.mode = rule.action == 1 || rule.direction == 2 ? 0 : rule.direction == 1 ? 1 : 2;
         rule.target = admission->fullTarget;
         if(admission->file && admission->file->originalSource)rule.kind=3;
+        if(admission->scope==2 && rule.kind==1) {
+            const auto original=admission->file ? admission->file : admission->persistentFile;
+            principal::Target expected,actual;
+            if(!original || !principalFileMetadataCurrent(*original) ||
+               !principal::parseTarget(admission->fullTarget,expected) || !principal::parseTarget(original->target,actual) ||
+               expected.app!=actual.app || expected.user!=actual.user || !principal::validRuleWitness(original->durableWitness))
+                return principalError(Error::IdentityUnavailable);
+            rule.durableWitness_=original->durableWitness;
+        }
         if (admission->scope == 2) {
             if (admission->replacing) {
                 const auto prior = std::find_if(target.rules.begin(), target.rules.end(),
@@ -1584,6 +1719,7 @@ void NativeRuntime::invalidatePrincipalObservations() noexcept {
     for (auto &entry : principalAdmissions_) {
         entry.second->cancelled = true;
         if (entry.second->file) entry.second->file->cancelled.store(true);
+        if (entry.second->persistentFile) entry.second->persistentFile->cancelled.store(true);
     }
     principalAdmissions_.clear();
     principalPendingBytes_ = 0;

@@ -276,6 +276,20 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactInitial(
     HANDLE engine,const WriteApi &api,VerifyBeforeWrite verify,void *context) noexcept {
   return transactBody(engine,api,{},verify,context,true);
 }
+CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactRestore(
+    HANDLE engine,const WriteApi &api,VerifyBeforeWrite verify,void *context) noexcept {
+  // Capacidad privada del Runtime; el snapshot aislado nunca abre esta operación.
+  principal::Snapshot original;
+  if(!restoreStore_ || !restoreImage_.size() || !principal::parse(restoreImage_,original) ||
+     original.storedState!=State::Applied || !original.storedKnown || original.effective!=original.desired ||
+     original.archive.size() || original.migrationBase ||
+     std::any_of(original.rules.begin(),original.rules.end(),[](const auto &r){return r.kind!=1 ||
+       !principal::validRuleWitness(r.durableWitness());}) || !storage_.storage_ ||
+     !storage_.storage_->arena_ || storage_.storage_->arena_->data()!=restoreImage_.data() ||
+     storage_.storage_->arena_->size()!=restoreImage_.size() || storage_.storage_->desired_!=original.desired)
+    return {};
+  return transactBody(engine,api,{},verify,context,false,true);
+}
 bool CatalogPlanBuilder::conditionalWriteCurrent(const allnative::CatalogSnapshot &after,
     const std::shared_ptr<const allnative::CatalogSnapshot> &before) const noexcept {
   try {
@@ -342,7 +356,7 @@ bool CatalogPlanBuilder::conditionalWriteCurrent(const allnative::CatalogSnapsho
 }
 CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactBody(
     HANDLE engine,const WriteApi &api,const std::shared_ptr<const allnative::CatalogSnapshot> &before,
-    VerifyBeforeWrite verify,void *context,bool initial) noexcept {
+    VerifyBeforeWrite verify,void *context,bool initial,bool restore) noexcept {
   WriteOutcome result;
   if (phase_ != Phase::Staged || !storage_.storage_ || writeAttempted_ ||
       !engine || !verify || !context || !api.begin || !api.commit ||
@@ -357,11 +371,14 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactBody(
                        [](const auto &rule) { return rule.targetKind == 3; });
   };
   const bool hasConditional=conditional(after) || (before && conditional(*before));
-  if (hasConditional && (initial || !conditionalWriteCurrent(after,before))) {
+  if (hasConditional && (initial || restore || !conditionalWriteCurrent(after,before))) {
     result.error = ERROR_NOT_SUPPORTED;
     return result;
   }
-  if (initial) {
+  if (restore) {
+    if(before || initial || !restoreStore_ || !after.arena_ ||
+       std::any_of(after.rules_.begin(),after.rules_.end(),[](const auto &rule){return rule.targetKind!=1;}))return result;
+  } else if (initial) {
     if (before || !initialCandidate_ || !after.arena_ || after.desired_ || after.generation_ != 1 ||
         !after.rules_.empty() || after.slots_.size() != 28) return result;
   } else if (!before || !before->binding_ ||
@@ -432,6 +449,7 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactBody(
     }
     if (result.error == ERROR_SUCCESS) {
       if(hasConditional && !conditionalWriteCurrent(after,before))result.error=ERROR_INVALID_STATE;
+      if(restore && !verify(context))result.error=ERROR_INVALID_STATE;
     }
     if (result.error == ERROR_SUCCESS) {
       result.error = api.commit(engine);

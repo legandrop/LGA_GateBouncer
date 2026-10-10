@@ -5,6 +5,7 @@
 #include <shlobj.h>
 #include <algorithm>
 #include <cstring>
+#include <cstddef>
 #include <iostream>
 
 namespace gb {
@@ -85,7 +86,9 @@ bool initialAbsent(HANDLE engine) {
     if (sublayer) FwpmFreeMemory0(reinterpret_cast<void **>(&sublayer));
     if (!absent) return false;
     HANDLE enumeration = nullptr;
-    if (FwpmFilterCreateEnumHandle0(engine,nullptr,&enumeration) != ERROR_SUCCESS || !enumeration) return false;
+    FWPM_FILTER_ENUM_TEMPLATE0 all{};all.enumType=FWP_FILTER_ENUM_FULLY_CONTAINED;
+    all.flags=FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME|FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED;
+    if (FwpmFilterCreateEnumHandle0(engine,&all,&enumeration) != ERROR_SUCCESS || !enumeration) return false;
     bool ok = true, ended = false; std::size_t total = 0;
     while (ok && !ended) {
         FWPM_FILTER0 **rows = nullptr; UINT32 count = 0;
@@ -98,6 +101,43 @@ bool initialAbsent(HANDLE engine) {
         if (total > 65536) ok = false;
     }
     return FwpmFilterDestroyEnumHandle0(engine,enumeration) == ERROR_SUCCESS && ok && ended;
+}
+bool principalObjectSecurity(HANDLE engine) {
+    BYTE sy[SECURITY_MAX_SID_SIZE]{},ba[SECURITY_MAX_SID_SIZE]{};DWORD sn=sizeof(sy),bn=sizeof(ba);
+    if(!CreateWellKnownSid(WinLocalSystemSid,nullptr,sy,&sn) ||
+       !CreateWellKnownSid(WinBuiltinAdministratorsSid,nullptr,ba,&bn))return false;
+    for(bool provider:{true,false}) {
+        PSECURITY_DESCRIPTOR sd=nullptr;
+        const auto query=provider ? &FwpmProviderGetSecurityInfoByKey0 : &FwpmSubLayerGetSecurityInfoByKey0;
+        const auto error=query(engine,provider ? &Provider : &Sublayer,OWNER_SECURITY_INFORMATION|DACL_SECURITY_INFORMATION,
+            nullptr,nullptr,nullptr,nullptr,&sd);
+        PSID owner=nullptr;PACL acl=nullptr;BOOL present=FALSE,def=FALSE;
+        SECURITY_DESCRIPTOR_CONTROL control=0;DWORD revision=0;
+        bool ok=error==ERROR_SUCCESS && sd && IsValidSecurityDescriptor(sd) &&
+            GetSecurityDescriptorOwner(sd,&owner,&def) && owner && IsValidSid(owner) && (EqualSid(owner,sy)||EqualSid(owner,ba)) &&
+            GetSecurityDescriptorDacl(sd,&present,&acl,&def) && present && acl && IsValidAcl(acl) &&
+            GetSecurityDescriptorControl(sd,&control,&revision) && (control&SE_DACL_PROTECTED);
+        bool fullSy=false,fullBa=false;
+        for(DWORD i=0;ok && i<acl->AceCount;++i) {
+            void *raw=nullptr;ok=GetAce(acl,i,&raw)!=FALSE;
+            if(!ok)break;
+            const auto header=static_cast<ACE_HEADER *>(raw);
+            if(header->AceType!=ACCESS_ALLOWED_ACE_TYPE || header->AceFlags ||
+               header->AceSize<offsetof(ACCESS_ALLOWED_ACE,SidStart)+8){ok=false;break;}
+            const auto ace=static_cast<ACCESS_ALLOWED_ACE *>(raw);
+            const auto sid=static_cast<const SID *>(static_cast<const void *>(&ace->SidStart));
+            ok=sid->SubAuthorityCount<=SID_MAX_SUB_AUTHORITIES &&
+                GetSidLengthRequired(sid->SubAuthorityCount)<=header->AceSize- offsetof(ACCESS_ALLOWED_ACE,SidStart) &&
+                IsValidSid(const_cast<SID *>(sid));
+            DWORD mask=ace->Mask;GENERIC_MAPPING mapping{FWPM_GENERIC_READ,FWPM_GENERIC_WRITE,FWPM_GENERIC_EXECUTE,FWPM_GENERIC_ALL};
+            if(ok && !(mask&MAXIMUM_ALLOWED))MapGenericMask(&mask,&mapping);else ok=false;
+            ok=ok && (EqualSid(&ace->SidStart,sy)||EqualSid(&ace->SidStart,ba)) && mask==FWPM_GENERIC_ALL;
+            if(ok){fullSy|=EqualSid(&ace->SidStart,sy)!=FALSE;fullBa|=EqualSid(&ace->SidStart,ba)!=FALSE;}
+        }
+        if(sd)FwpmFreeMemory0(reinterpret_cast<void **>(&sd));
+        if(!ok || !fullSy || !fullBa)return false;
+    }
+    return true;
 }
 }
 WfpBackend::~WfpBackend(){if(subscription_)FwpmNetEventUnsubscribe0(engine_,subscription_);if(engine_)FwpmEngineClose0(engine_);}
@@ -148,6 +188,37 @@ decisions::CatalogPlanBuilder::WriteOutcome WfpBackend::applyInitialPrincipalPla
         catch (...) { return false; }
     };
     return plan.transactInitial(engine_,decisions::CatalogPlanBuilder::WriteApi{},inside,&check);
+}
+bool WfpBackend::principalInventoryAbsent(bool &absent) noexcept {
+    absent=false;
+    if(!engine_ || !deployment_ || !authorized() || FwpmTransactionBegin0(engine_,FWPM_TXN_READ_ONLY)!=ERROR_SUCCESS)return false;
+    bool ok=false;
+    try {
+        absent=initialAbsent(engine_);
+        ok=authorized() && (absent || (objectIdentity(engine_,serviceName()) && principalObjectSecurity(engine_))) && authorized();
+    } catch(...) {ok=false;}
+    return FwpmTransactionAbort0(engine_)==ERROR_SUCCESS && ok && authorized();
+}
+decisions::CatalogPlanBuilder::WriteOutcome WfpBackend::restorePrincipalPlan(
+    decisions::CatalogPlanBuilder &plan,decisions::CatalogPlanBuilder::VerifyBeforeWrite verify,void *context) noexcept {
+    if(!engine_ || !deployment_ || !authorized() || !verify || !context || !plan.restoreStore_)return {};
+    struct Check {WfpBackend &backend;decisions::CatalogPlanBuilder::VerifyBeforeWrite verify;void *context;bool created=false;}
+        check{*this,verify,context};
+    const auto inside=[](void *raw) noexcept {
+        auto &c=*static_cast<Check *>(raw);
+        try {
+            if(!c.backend.authorized() || !c.verify(c.context))return false;
+            if(!c.created) {
+                // Ausencia TOTAL dentro de la transacción de escritura original. Nunca borrar/adoptar ajenos.
+                if(!initialAbsent(c.backend.engine_) || !c.verify(c.context) ||
+                   !objects(c.backend.engine_,c.backend.serviceName()))return false;
+                c.created=true;
+            }
+            return objectIdentity(c.backend.engine_,c.backend.serviceName()) && principalObjectSecurity(c.backend.engine_) &&
+                c.verify(c.context) && c.backend.authorized();
+        } catch(...) {return false;}
+    };
+    return plan.transactRestore(engine_,decisions::CatalogPlanBuilder::WriteApi{},inside,&check);
 }
 bool WfpBackend::connect(){
     if(!authorized()||engine_)return false;

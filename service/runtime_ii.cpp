@@ -412,6 +412,10 @@ ServiceContext NativeRuntime::readServiceContext() const noexcept {
         if(principalSource_)principalSource_->lose(); // Pérdida real de owner del motor, no close de un GUI.
         return unavailable;
     }
+    if(!persistentRuleFiles_.empty() && !persistentRuleFilesCurrent()) {
+        if(principalSource_)principalSource_->lose();
+        return unavailable;
+    }
     const auto source = principalSource_;
     const auto catalog = principalCatalog_;
     const auto engine = observationEngine_;
@@ -487,8 +491,8 @@ bool NativeRuntime::loadPrincipalImage() {
             if (!provisionPrincipalImage(plan)) principalWriteFault_ = true;
             return true;
         }
-        if (principalRead_.kind == principal::StoredImage::Principal)
-            bindPrincipalObservation(plan);
+        if (principalRead_.kind == principal::StoredImage::Principal && !bindPrincipalObservation(plan))
+            principalWriteFault_ = true;
         // Un archivo histórico, Missing o un fallo de lectura actual no crea
         // permisos, baseline ni replay. El servicio queda consultable sin efecto conocido.
         return true;
@@ -556,23 +560,51 @@ bool NativeRuntime::bindPrincipalObservation(CatalogPlanBuilder &plan) {
     if (principalRead_.kind != principal::StoredImage::Principal || principalSource_ ||
         inventoryRevision_ == UINT64_MAX || !acquireObservationEngine()) return false;
     try {
+        // OwnedStore físico/lease y namespace del servicio originales, no archivo histórico del usuario.
+        if(!deployment_ || !deployment_->serviceAdmittedCurrent() || backend_.deployment_!=deployment_ ||
+           !principalStore_ || principalStore_->uncertain() || !capturePersistentRuleFiles())return false;
         auto sdk = principalSdk_();
         auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
             allnative::EngineLease(observationEngine_->handle(), observationEngine_->pin()),
             allnative::BindReceipt(observationEngine_->context_, observationEngine_->generation_), sdk, principalClassifier_));
+        struct Before {NativeRuntime &runtime;principal::SnapshotStore *store;const principal::ByteView &bytes;
+            std::shared_ptr<allnative::NativeSource> source;} before{*this,principalStore_.get(),principalRead_.snapshot.encoded,source};
+        const auto current=[](void *raw) noexcept {
+            auto &b=*static_cast<Before *>(raw);
+            try {
+                bool same=false,exists=false;
+                return b.runtime.principalStore_.get()==b.store && !b.store->uncertain() &&
+                    b.runtime.deployment_->serviceAdmittedCurrent() && b.runtime.backend_.deployment_==b.runtime.deployment_ &&
+                    b.runtime.persistentRuleFilesCurrent() && b.source->prerequisites() &&
+                    b.runtime.file_.compare(b.bytes.data(),b.bytes.size(),same,exists) && same && exists;
+            } catch(...) {return false;}
+        };
+        if(!current(&before))return false;
         std::array<std::uint16_t, 8> domain{};
         std::array<allnative::recipe::SupportField, 32> support{};
         std::size_t count = 0;
         if (observationEngine_->readDomain(domain, support, count) != Reason::None ||
             plan.stage(principalRead_.snapshot.encoded, source->binding_, inventoryRevision_ + 1,
-                       domain, {support.data(), count}) != Reason::None ||
-            plan.confirmInventory(observationEngine_->handle(), sdk, &allnative::guardedRead) != Reason::None)
+                       domain, {support.data(), count}) != Reason::None)
             return false;
+        bool absent=false;
+        if(!backend_.principalInventoryAbsent(absent))return false;
+        if(absent) {
+            if(restoreAttempted_ || principalRead_.snapshot.storedState!=State::Applied ||
+               !source->prerequisites() || !persistentRuleFilesCurrent())return false;
+            restoreAttempted_=true; // Un intento incierto no se repite en esta instancia.
+            plan.restoreStore_=principalStore_.get();plan.restoreImage_=principalRead_.snapshot.encoded;
+            const auto effect=backend_.restorePrincipalPlan(plan,current,&before);
+            if(!effect.attempted || !effect.committed || effect.cleanupUnknown || !current(&before))return false;
+        }
+        if(!current(&before) ||
+           plan.confirmInventory(observationEngine_->handle(),sdk,&allnative::guardedRead)!=Reason::None ||
+           !current(&before))return false;
         auto catalog = plan.freeze();
         if (!catalog) return false;
         allnative::CatalogReceipt receipt(catalog); // Únicamente owner real, después del readback completo.
         principalSource_ = std::move(source);
-        if (principalSource_->start(receipt) != Reason::None) {
+        if (principalSource_->start(receipt) != Reason::None || !current(&before)) {
             retirePrincipalObservation();
             return false;
         }
@@ -583,6 +615,59 @@ bool NativeRuntime::bindPrincipalObservation(CatalogPlanBuilder &plan) {
         retirePrincipalObservation();
         return false;
     }
+}
+bool NativeRuntime::persistentRuleFilesCurrent() const noexcept {
+    try {
+        if(!deployment_ || !deployment_->serviceAdmittedCurrent() || backend_.deployment_!=deployment_)return false;
+        for(const auto &file:persistentRuleFiles_)if(!file || !principalFileMetadataCurrent(*file))return false;
+        return deployment_->serviceAdmittedCurrent();
+    } catch(...) {return false;}
+}
+bool NativeRuntime::capturePersistentRuleFiles() {
+    // Sólo initialize/load llama aquí, fuera Runtime::mutex y antes de exponer peers.
+    if(!persistentRuleFiles_.empty() || !principalStore_ || principalStore_->uncertain() ||
+       principalRead_.kind!=principal::StoredImage::Principal || !deployment_ ||
+       !deployment_->serviceAdmittedCurrent() || backend_.deployment_!=deployment_)return false;
+    const auto &snapshot=principalRead_.snapshot;
+    if(snapshot.archive.size() || snapshot.migrationBase)return false;
+    std::size_t charge=0;const auto deadline=GetTickCount64()+60000;
+    for(const auto &rule:snapshot.rules) {
+        principal::Target target;
+        if(rule.kind!=1 || !principal::validRuleWitness(rule.durableWitness()) ||
+           !principal::parseTarget(rule.target,target))return false; // Needs review: sin autoridad durable de archivo.
+        const auto known=std::find_if(persistentRuleFiles_.begin(),persistentRuleFiles_.end(),
+            [&](const auto &file){return file->durableWitness==rule.durableWitness();});
+        if(known!=persistentRuleFiles_.end()) {
+            principal::Target held;
+            if(!principal::parseTarget((*known)->target,held) || held.app!=target.app)return false;
+            continue;
+        }
+        if(persistentRuleFiles_.size()>=64 || GetTickCount64()>=deadline)return false;
+        auto file=std::make_shared<PrincipalFileCapture>();
+        file->deadline=std::min<ULONGLONG>(deadline,GetTickCount64()+30000);file->targetSid=target.user.copy();
+        HANDLE token=nullptr;
+        if(!file->actor.acquire(GetCurrentProcessId()) || !OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY|TOKEN_DUPLICATE,&token))return false;
+        file->primary.reset(token);
+        if(!native::tokenEvidence(token,file->identity) ||
+           !native::systemServiceToken(token,controller::deploymentService(deployment_->mode())))return false;
+        file->stop.reset(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+        if(!file->stop)return false;
+        const auto &witness=rule.durableWitness();std::wstring path;
+        for(std::size_t at=80;at<witness.size();at+=2)
+            path.push_back(wchar_t(witness.data()[at]|(unsigned(witness.data()[at+1])<<8)));
+        const auto units=WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,path.data(),int(path.size()),nullptr,0,nullptr,nullptr);
+        if(units<=0 || units>16384)return false;
+        Bytes bytes(std::size_t(units),0);
+        if(WideCharToMultiByte(CP_UTF8,WC_ERR_INVALID_CHARS,path.data(),int(path.size()),reinterpret_cast<char *>(bytes.data()),units,nullptr,nullptr)!=units ||
+           !capturePrincipalFile(*file,bytes) || file->durableWitness!=witness || !persistentRuleFilesCurrent())return false;
+        principal::Target held;
+        if(!principal::parseTarget(file->target,held) || held.app!=target.app || held.user!=target.user ||
+           file->charged>8*1024*1024-charge)return false;
+        charge+=file->charged;
+        file->deadline=UINT64_MAX;file->completed=true;
+        persistentRuleFiles_.push_back(std::move(file)); // Retener hasta retiro físico del Source/Runtime.
+    }
+    return persistentRuleFilesCurrent();
 }
 void NativeRuntime::retirePrincipalObservation() noexcept {
     principalCatalog_.reset();
@@ -633,6 +718,7 @@ void NativeRuntime::tick() {
                 !principalActorCurrent(admission)) {
                 admission.cancelled = true;
                 if (admission.file) admission.file->cancelled.store(true);
+                if (admission.persistentFile) admission.persistentFile->cancelled.store(true);
                 entry = principalAdmissions_.erase(entry);
             } else ++entry;
         }

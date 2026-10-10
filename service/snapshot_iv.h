@@ -62,7 +62,17 @@ struct Rule {
   std::uint64_t revision = 1, targetRevision = 1;
   std::uint8_t action = 1, direction = 1, mode = 0, kind = 1;
   ByteView target;
+  // Bytes físicos del archivo capturado, no identidad de una imagen cargada.
+  const ByteView &durableWitness() const { return durableWitness_; }
+private:
+  ByteView durableWitness_;
+  friend class gb::decisions::NativeRuntime;
+  friend class ByteView;
+  friend bool decodeRuleWitness(Rule &, const ByteView &);
+  friend bool sections(const std::vector<Rule> &, std::uint64_t, Bytes &, Bytes &);
 };
+// Validación de formato puro. Sólo Runtime liga estos bytes a handles originales.
+bool validRuleWitness(const ByteView &);
 struct Entry {
   decisions::CommandEntry command;
   ByteView legacyEnvelope;
