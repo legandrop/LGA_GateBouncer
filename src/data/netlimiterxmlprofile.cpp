@@ -463,6 +463,102 @@ QNamePolicyComparison compareQNamePolicy(const QNameProfileView &view, const QNa
     }
     return result;
 }
+namespace {
+bool applicationSidShape(const QByteArray &sid) {
+    return sid.size() >= 12 && sid.size() <= 68 && quint8(sid[0]) == 1 &&
+        quint8(sid[1]) >= 1 && quint8(sid[1]) <= 15 && sid.size() == 8 + 4 * quint8(sid[1]);
+}
+std::optional<QByteArray> applicationSourceSid(const ApplicationConstraint &application) {
+    if (!application.sidBytes.known()) return {};
+    const auto encoded = application.sidBytes.value.toLatin1();
+    const auto sid = QByteArray::fromBase64(encoded, QByteArray::AbortOnBase64DecodingErrors);
+    if (sid.toBase64() != encoded || !applicationSidShape(sid)) return {};
+    return sid;
+}
+QNameMatch compareApplicationPredicate(const QNamePredicate &p, const QByteArray &appId,
+    const QByteArray &accountSid, const QString &image, const QMap<int, QByteArray> &canonical) {
+    if (!p.complete || !p.match.known() || p.kind != "FFAppIdEqual" || p.applications.isEmpty()) return QNameMatch::Unknown;
+    bool any = false, unknown = false;
+    for (const auto &a : p.applications) {
+        const auto sid = applicationSourceSid(a);
+        if (!sid) { unknown = true; continue; }
+        if (*sid != accountSid) continue; // Sid.Equals original compara bytes, no nombres/cuenta inferida.
+        const auto found = canonical.constFind(a.node);
+        if (a.pathExact && a.path.known() && a.path.value == image &&
+            found != canonical.cend() && *found == appId) any = true;
+        else unknown = true;
+        // Un AppId Windows distinto no prueba String.Compare(ignoreCase:true) del motor fuente.
+        // Alias/cultura/casing requieren su puente original; no convierten Unknown en No.
+    }
+    const auto positive = any ? QNameMatch::Yes : unknown ? QNameMatch::Unknown : QNameMatch::No;
+    if (positive == QNameMatch::Unknown || p.match.value) return positive;
+    return positive == QNameMatch::Yes ? QNameMatch::No : QNameMatch::Yes;
+}
+QNameMatch compareApplicationFilter(const QNameProfileView &view, int index, const QByteArray &appId,
+    const QByteArray &accountSid, const QString &image, const QMap<int, QByteArray> &canonical) {
+    if (index < 0 || index >= view.filters.size()) return QNameMatch::Unknown;
+    const auto &filter = view.filters[index];
+    if (!filter.complete || !filter.baseFilters.isEmpty() || filter.package.node >= 0 ||
+        !filter.filterType.known() || (filter.filterType.value != "Filter" && filter.filterType.value != "Zone") ||
+        filter.predicates.isEmpty()) return QNameMatch::Unknown;
+    bool unknown = false;
+    for (const auto &p : filter.predicates) {
+        const auto match = compareApplicationPredicate(p, appId, accountSid, image, canonical);
+        if (match == QNameMatch::No) return match;
+        unknown |= match == QNameMatch::Unknown;
+    }
+    return unknown ? QNameMatch::Unknown : QNameMatch::Yes;
+}
+}
+QNameApplicationComparison compareQNameApplicationScope(const QNameProfileView &view, int index,
+    const QByteArray &appId, const QByteArray &accountSid, const QString &originalImage,
+    const QMap<int, QByteArray> &canonicalApplications) {
+    QNameApplicationComparison result;
+    result.reason = "Source scope is not representable by the original application selector";
+    if (!view.valid || !view.profileKnown || !view.diagnosticsComplete || index < 0 || index >= view.candidates.size() ||
+        !applicationSidShape(accountSid) || appId.size() < 4 || appId.size() > 8192 || (appId.size() & 1) ||
+        appId[appId.size()-1] != 0 || appId[appId.size()-2] != 0 || originalImage.isEmpty()) return result;
+    const auto &selected = view.candidates[index];
+    if (!selected.complete || selected.kind != "fwRule" || !selected.enabled.known() || !selected.enabled.value ||
+        !selected.weight.known() || !selected.action.known() ||
+        (selected.action.value != SourceFwAction::Allow && selected.action.value != SourceFwAction::Deny) ||
+        !selected.direction.known() || selected.direction.value == Direction::Unknown ||
+        selected.filterIndex < 0 || selected.filterIndex >= view.filters.size()) return result;
+    const auto &filter = view.filters[selected.filterIndex];
+    // Sólo un AppId positivo único conserva exactamente el ámbito del selector aplicación/cuenta.
+    if (!filter.complete || !filter.baseFilters.isEmpty() || filter.package.node >= 0 ||
+        !filter.filterType.known() || filter.filterType.value != "Filter" || filter.predicates.size() != 1) return result;
+    const auto &p = filter.predicates[0];
+    if (p.kind != "FFAppIdEqual" || !p.complete || !p.match.known() || !p.match.value || p.applications.size() != 1) return result;
+    const auto &application = p.applications[0];
+    if (application.packageId.node >= 0 || application.serviceName.node >= 0 ||
+        compareApplicationPredicate(p, appId, accountSid, originalImage, canonicalApplications) != QNameMatch::Yes) {
+        result.reason = "Source AppId, account SID or literal image does not match the original cause";
+        return result;
+    }
+    for (int other = 0; other < view.candidates.size(); ++other) {
+        if (other == index) continue;
+        const auto &candidate = view.candidates[other];
+        if (candidate.kind == "limitRule" || (candidate.enabled.known() && !candidate.enabled.value)) continue;
+        if (candidate.kind != "fwRule") { result.interferingCandidates.push_back(other); continue; }
+        if (candidate.direction.known() && candidate.direction.value != Direction::Unknown &&
+            selected.direction.value != Direction::Both && candidate.direction.value != Direction::Both &&
+            candidate.direction.value != selected.direction.value) continue;
+        if (candidate.weight.known() && candidate.weight.value < selected.weight.value) continue;
+        // Incluso una fila incompleta puede quedar disjunta por un SID exacto conocido.
+        // Zona/tag/rango/domain/Package/Composite no se aplanan para fabricar esa exclusión.
+        if (compareApplicationFilter(view, candidate.filterIndex, appId, accountSid, originalImage,
+                canonicalApplications) == QNameMatch::No) continue;
+        result.interferingCandidates.push_back(other);
+    }
+    if (!result.interferingCandidates.isEmpty()) {
+        result.reason = "An equal, higher or unknown source weight may interfere with this application scope";
+        return result;
+    }
+    result.representable = true; result.action = selected.action; result.direction = selected.direction.value;
+    result.reason = "Source scope comparison matches; original live selector and explicit consent are still required";
+    return result;
+}
 QNameProfileView deriveQNameProfile(const QNameEvidence &evidence, const ImportLimits &limits) {
     return Deriver{evidence, limits, {}, 0, {}, {}}.run();
 }

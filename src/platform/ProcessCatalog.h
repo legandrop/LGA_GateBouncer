@@ -11,6 +11,9 @@ struct ProcessCatalogResult {
     quint64 generation = 0;
 };
 struct NativeOwnBatch;
+// Normaliza sólo una declaración de ruta local mediante API Windows. No obtiene FileID,
+// proceso, token, imagen mapeada, lease ni autoridad; el consumidor coteja causa original.
+std::optional<QByteArray> canonicalLocalApplicationId(const QString &path);
 class ProcessCatalog final {
   public:
     ProcessCatalog();

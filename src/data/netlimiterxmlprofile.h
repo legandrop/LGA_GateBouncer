@@ -78,6 +78,17 @@ struct QNamePolicyComparison {
 };
 QNameMatch compareQNameFilter(const QNameProfileView &view, int filter, const QNameConnectionFacts &facts);
 QNamePolicyComparison compareQNamePolicy(const QNameProfileView &view, const QNameConnectionFacts &facts);
+struct QNameApplicationComparison {
+    bool representable = false;
+    SourceFact<SourceFwAction> action;
+    Direction direction = Direction::Unknown;
+    QString reason;
+    QVector<int> interferingCandidates;
+};
+// Comparación de ámbito declarativo con AppId canónicos/SID. No concede selector/consent.
+QNameApplicationComparison compareQNameApplicationScope(const QNameProfileView &view, int candidate,
+    const QByteArray &appId, const QByteArray &accountSid, const QString &originalImage,
+    const QMap<int, QByteArray> &canonicalApplications);
 struct QNameImportResult {
     ImportReport report;
     std::optional<QNameEvidence> evidence;

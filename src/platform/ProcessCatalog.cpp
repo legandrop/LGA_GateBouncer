@@ -23,6 +23,37 @@
 #endif
 
 namespace Gate::Data {
+std::optional<QByteArray> canonicalLocalApplicationId(const QString &path) {
+#ifdef Q_OS_WIN
+    // Evita rutas relativas, UNC/mapped network y sintaxis alternativas que exigirían
+    // inferir otro ámbito o acceder a un servidor. No hay fallback textual.
+    if (path.size() < 4 || path.size() > 4096 || path[0].unicode() > 127 ||
+        !path[0].isLetter() || path[1] != ':' || path[2] != '\\' ||
+        path.contains(QChar(0)) || path.contains('*') || path.contains('?') || path.contains('/') || path.mid(2).contains(':')) return {};
+    const auto root = path.left(3).toStdWString();
+    const auto drive = GetDriveTypeW(root.c_str());
+    if (drive != DRIVE_FIXED && drive != DRIVE_REMOVABLE && drive != DRIVE_RAMDISK) return {};
+    QString prefix = path.left(2);
+    for (const auto &part : path.mid(3).split('\\')) {
+        if (part.isEmpty() || part == "." || part == "..") return {};
+        prefix += '\\' + part;
+        const auto attributes = GetFileAttributesW(prefix.toStdWString().c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT)) return {};
+    }
+    const auto file = path.toStdWString(); FWP_BYTE_BLOB *blob = nullptr;
+    const auto status = FwpmGetAppIdFromFileName0(file.c_str(), &blob);
+    const auto release = [](FWP_BYTE_BLOB *owned) { if (owned) FwpmFreeMemory0(reinterpret_cast<void **>(&owned)); };
+    const std::unique_ptr<FWP_BYTE_BLOB, decltype(release)> owned(blob, release);
+    std::optional<QByteArray> result;
+    if (status == ERROR_SUCCESS && blob && blob->data && blob->size >= 4 && blob->size <= 8192 && !(blob->size & 1) &&
+        blob->data[blob->size - 1] == 0 && blob->data[blob->size - 2] == 0)
+        result = QByteArray(reinterpret_cast<const char *>(blob->data), int(blob->size));
+    return result;
+#else
+    Q_UNUSED(path);
+    return {};
+#endif
+}
 
 ProcessCatalogResult ProcessCatalog::refresh() {
     ProcessCatalogResult result;
