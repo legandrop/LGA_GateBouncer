@@ -51,14 +51,23 @@ bool NativeRuntime::principalEventsReady() const noexcept {
         principalEvents_.context().engineContext == principalSource_->binding_->epoch &&
         principalEvents_.context().engineBindingGeneration == principalSource_->binding_->generation;
 }
-bool NativeRuntime::principalEventCurrent(const PrincipalPeer &peer, const Frame &event) const noexcept {
+bool NativeRuntime::principalEventCurrent(const PrincipalPeer &peer, const Frame &event) noexcept {
+  try {
     if (!principalPeerCurrent(peer) || peer.profile != principalEvents_.profile()) return false;
     wire::iv::ServiceContext actual;
     if (wire::iv::decodeServiceContext(event, actual) != Error::Ok ||
         !NativeActivityRing::same(actual, principalEvents_.context()) ||
         get(event, Tag::ProfileGeneration) != peer.profile) return false;
-    // Gap terminal conserva su contexto; sólo el actor aún admitido puede leerlo.
-    return principalEventsReady() || (event.type == Type::ObservationGap && !principalEvents_.ready());
+    const auto source = principalSource_;
+    const auto catalog = principalCatalog_;
+    const auto current = readServiceContext(); // READ/reconcile real, también entre frames del mismo lote.
+    const bool live = source == principalSource_ && catalog == principalCatalog_ &&
+        NativeActivityRing::same(current, actual) && principalEventsReady();
+    if (!live) principalEvents_.lose();
+    if (!principalPeerCurrent(peer)) return false;
+    // El único frame admisible al perder fuente es Gap, con contexto original.
+    return live || (event.type == Type::ObservationGap && !principalEvents_.ready());
+  } catch (...) { principalEvents_.fail(); return false; }
 }
 Frame NativeRuntime::subscribePrincipalEvents(const Frame &request, const std::shared_ptr<PrincipalPeer> &peer) {
     const auto retainedSource = principalSource_;

@@ -916,13 +916,26 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                     std::vector<Frame> events;
                     bool gap = false;
                     bool usable = true;
+                    bool terminal = false;
                     {
                         std::lock_guard<std::mutex> lock(runtime_.mutex);
                         if (ordinary || principalReader) {
                             runtime_.tick();
                             usable = runtime_.profileGeneration() == profile && ordinaryPeer &&
                                 runtime_.ordinaryPeer(pipe.value,ordinaryPeer,principalReader) &&
-                                runtime_.principalEvents_.after(after,events)==Error::Ok;
+                                NativeActivityRing::same(runtime_.principalEvents_.context(),subscriptionContext);
+                            if (usable) {
+                                // También cuando no llegaron causas: Ready cacheado no acredita catálogo actual.
+                                const auto source=runtime_.principalSource_;
+                                const auto catalog=runtime_.principalCatalog_;
+                                const auto current=runtime_.readServiceContext();
+                                terminal=source!=runtime_.principalSource_ || catalog!=runtime_.principalCatalog_ ||
+                                    !NativeActivityRing::same(current,subscriptionContext) ||
+                                    !runtime_.principalEventsReady();
+                                if (terminal) runtime_.principalEvents_.lose();
+                                usable=runtime_.principalPeerCurrent(*ordinaryPeer) &&
+                                    runtime_.principalEvents_.after(after,events)==Error::Ok;
+                            }
                         } else {
                             usable = runtime_.profileGeneration() == profile &&
                                      runtime_.peer(pipe.value, control, peer, false);
@@ -944,9 +957,8 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                         if (ordinary || principalReader) {
                             std::lock_guard<std::mutex> lock(runtime_.mutex);
                             // Revalidación individual; el wait/cancel/drain posterior no retiene mutex.
-                            wire::iv::ServiceContext actual;
-                            if (!ordinaryPeer || wire::iv::decodeServiceContext(event,actual)!=Error::Ok ||
-                                !NativeActivityRing::same(actual,subscriptionContext) ||
+                            if (!ordinaryPeer ||
+                                !NativeActivityRing::same(runtime_.principalEvents_.context(),subscriptionContext) ||
                                 !runtime_.principalEventCurrent(*ordinaryPeer,event)) {
                                 sent=false; break;
                             }
@@ -963,7 +975,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                         }
                         after = get(event, Tag::EventSeq);
                     }
-                    if (!sent)
+                    if (!sent || terminal)
                         break;
                 }
                 DWORD available = 0;

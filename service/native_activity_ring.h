@@ -91,6 +91,8 @@ public:
             if (wire::get(event, wire::Tag::EventSeq) > cursor) out.push_back(event);
             if (out.size() >= 16) break;
         }
+        // Un productor terminal no puede hacerse pasar por silencio sano.
+        if (!ready() && out.empty()) return wire::Error::BackendUnavailable;
         return wire::Error::Ok;
       } catch (...) { out.clear(); return wire::Error::Capacity; }
     }

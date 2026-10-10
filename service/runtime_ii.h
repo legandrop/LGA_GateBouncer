@@ -86,7 +86,7 @@ class NativeRuntime {
     };
     void collectPrincipalObservations();
     bool principalEventsReady() const noexcept;
-    bool principalEventCurrent(const PrincipalPeer &, const Frame &) const noexcept;
+    bool principalEventCurrent(const PrincipalPeer &, const Frame &) noexcept;
     Frame subscribePrincipalEvents(const Frame &, const std::shared_ptr<PrincipalPeer> &);
     void publishPrincipalAuthorization(PrincipalOutcome &) noexcept;
     void invalidatePrincipalObservations() noexcept;
