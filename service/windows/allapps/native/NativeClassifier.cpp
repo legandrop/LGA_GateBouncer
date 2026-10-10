@@ -168,9 +168,11 @@ std::shared_ptr<ClassifierCause> NativeClassifier::take(bool &lost) noexcept {
         if(pendingApp_) {
             const auto state=pendingApp_->appState_.load();
             if(state==0)return {};
-            if(state!=1) {lost=true;return {};}
+            if(state!=1 || !pendingApp_->appJob_ || !pendingApp_->appDeadline_ || GetTickCount64()>=pendingApp_->appDeadline_) {
+                pendingApp_->appState_.store(2);lost=true;return {};
+            }
             auto accepted=std::move(pendingApp_);lock.unlock();
-            if(!accepted->current()) {
+            if(!accepted->current() || GetTickCount64()>=accepted->appDeadline_) {
                 accepted->appState_.store(2);lock.lock();pendingApp_=std::move(accepted);lost=true;return {};
             }
             return accepted;
@@ -407,9 +409,9 @@ NativeImageWorker::NativeImageWorker():state_(std::make_shared<State>()) {
     thread_=std::thread([state=state_]{run(state);});
 }
 NativeImageWorker::~NativeImageWorker() {stop();if(thread_.joinable())thread_.join();}
-std::uint64_t NativeImageWorker::submit(const std::shared_ptr<ClassifierCause> &cause) noexcept {
+std::uint64_t NativeImageWorker::submit(const std::shared_ptr<ClassifierCause> &cause,std::uint64_t appDeadline) noexcept {
     try {
-        if(!cause || !cause->owner_)return 0;
+        if(!cause || !cause->owner_ || (cause->appState_.load()==0 && (!appDeadline || GetTickCount64()>=appDeadline)))return 0;
         std::uint64_t submitted=0;
         {
             std::lock_guard<std::mutex> lock(state_->mutex);
@@ -429,6 +431,7 @@ std::uint64_t NativeImageWorker::submit(const std::shared_ptr<ClassifierCause> &
             std::lock_guard<std::mutex> lock(state_->mutex);
             if(state_->stop || state_->physical || state_->finishing || state_->queued || state_->sequence==UINT64_MAX)return 0;
             job->id=++state_->sequence;submitted=job->id;state_->id=job->id;state_->eligible=true;state_->completed=false;state_->valid=false;
+            if(cause->appState_.load()==0) {cause->appJob_=job->id;cause->appDeadline_=appDeadline;}
             state_->result={};state_->physical=operation;state_->queued=std::move(job);
         }
         state_->changed.notify_one();return submitted;

@@ -54,6 +54,7 @@ class ClassifierCause final {
     gb::native::TokenEvidence token_;
     // Pending privado; únicamente el worker original puede admitir SameApp.
     std::atomic<unsigned> appState_{0}; // 0 pending, 1 matched, 2 rejected.
+    std::uint64_t appJob_=0,appDeadline_=0; // Inmutables antes de publicar matched.
     bool appGap_=false; // Sólo el productor Runtime, dedup de cobertura del raw original.
 public:
     ~ClassifierCause();
@@ -88,7 +89,7 @@ class NativeImageWorker final {
     std::shared_ptr<State> state_;
     std::thread thread_;
     static void run(std::shared_ptr<State>) noexcept;
-    std::uint64_t submit(const std::shared_ptr<ClassifierCause> &) noexcept;
+    std::uint64_t submit(const std::shared_ptr<ClassifierCause> &,std::uint64_t appDeadline=0) noexcept;
     bool result(std::uint64_t,GB_PROCESS_IMAGE_FACTS &,bool &) noexcept;
     void abandon(std::uint64_t) noexcept;
     void stop() noexcept;

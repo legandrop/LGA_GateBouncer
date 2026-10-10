@@ -948,9 +948,14 @@ void NativeRuntime::pollPrincipalPendingApp() noexcept {
        principalSource_->source_.health().health!=gatebouncer::service::windows::allapps::Health::Ready)) {
         raw->appState_.store(2);state=2;
     }
-    if(state==0 && principalImageJobId_ && raw->record_.session==principalImageSession_ &&
-       raw->record_.cause==principalImageCause_ && principalNow_()>=principalAppDeadline_) {
+    if((state==0 || state==1) && principalImageJobId_ && raw->record_.session==principalImageSession_ &&
+       raw->record_.cause==principalImageCause_ && GetTickCount64()>=principalAppDeadline_) {
         raw->appState_.store(2);principalImageWorker_->abandon(principalImageJobId_);state=2;
+    }
+    if(state==1 && (!principalImageJobId_ || raw->appJob_!=principalImageJobId_ ||
+       raw->appDeadline_!=principalAppDeadline_ || raw->record_.session!=principalImageSession_ ||
+       raw->record_.cause!=principalImageCause_)) {
+        raw->appState_.store(2);if(principalImageJobId_)principalImageWorker_->abandon(principalImageJobId_);state=2;
     }
     if(state==0 && !principalImageJobId_) {
         const auto source=principalSource_;const auto catalog=principalCatalog_;
@@ -961,11 +966,12 @@ void NativeRuntime::pollPrincipalPendingApp() noexcept {
         }
         const auto jobCharge=sizeof(allnative::NativeImageWorker::Operation)+sizeof(allnative::NativeImageWorker::Job)+charge;
         if(state==0 && processBudget(jobCharge)) {
-            const auto job=principalImageWorker_->submit(raw);
+            const auto deadline=GetTickCount64()+250;
+            const auto job=principalImageWorker_->submit(raw,deadline);
             if(job) {
                 principalImageJobId_=job;principalImageJobCharge_=jobCharge;
                 principalImageSession_=raw->record_.session;principalImageCause_=raw->record_.cause;
-                principalAppDeadline_=principalNow_()+250;
+                principalAppDeadline_=deadline;
             } else {raw->appState_.store(2);state=2;}
         } else {raw->appState_.store(2);state=2;}
     }
@@ -1102,6 +1108,14 @@ void NativeRuntime::collectPrincipalObservations() {
         }
         auto event = principalSource_->takeCopied();
         if (!event) {pollPrincipalPendingApp();break;}
+        if(event->classifier_ && (!principalImageJobId_ || event->classifier_->appJob_!=principalImageJobId_ ||
+           event->classifier_->appDeadline_!=principalAppDeadline_ ||
+           event->classifier_->record_.session!=principalImageSession_ || event->classifier_->record_.cause!=principalImageCause_ ||
+           GetTickCount64()>=event->classifier_->appDeadline_)) {
+            event->classifier_->appState_.store(2);
+            if(principalImageJobId_)principalImageWorker_->abandon(principalImageJobId_);
+            principalSource_->lose();break;
+        }
         auto acquired = principalSource_->readCurrentProof(*event, allnative::CatalogReceipt(principalCatalog_));
         if (!acquired.proof || !principalSource_->retainedCause(*event, *acquired.proof,
             allnative::CatalogReceipt(principalCatalog_), allnative::Stage::Active)) continue;
