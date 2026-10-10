@@ -39,7 +39,84 @@ struct NativeRuntime::PrincipalObservation {
     std::optional<allnative::NativeProof> proof;
     std::uint64_t profile = 0;
     std::size_t charged = 0;
+    Frame activityAttempt;
 };
+bool NativeRuntime::principalEventsReady() const noexcept {
+    return principalEvents_.ready() && principalMode_ && !principalWriteFault_ &&
+        principalSource_ && principalCatalog_ && profile_.value().state == 1 &&
+        principalSource_->stage() == allnative::Stage::Active &&
+        principalSource_->source_.health().health == gatebouncer::service::windows::allapps::Health::Ready &&
+        principalEvents_.profile() == profile_.value().generation &&
+        principalEvents_.context().serviceEpoch == epoch_ && principalEvents_.context().boot == boot_ &&
+        principalEvents_.context().engineContext == principalSource_->binding_->epoch &&
+        principalEvents_.context().engineBindingGeneration == principalSource_->binding_->generation;
+}
+bool NativeRuntime::principalEventCurrent(const PrincipalPeer &peer, const Frame &event) const noexcept {
+    if (!principalPeerCurrent(peer) || peer.profile != principalEvents_.profile()) return false;
+    wire::iv::ServiceContext actual;
+    if (wire::iv::decodeServiceContext(event, actual) != Error::Ok ||
+        !NativeActivityRing::same(actual, principalEvents_.context()) ||
+        get(event, Tag::ProfileGeneration) != peer.profile) return false;
+    // Gap terminal conserva su contexto; sólo el actor aún admitido puede leerlo.
+    return principalEventsReady() || (event.type == Type::ObservationGap && !principalEvents_.ready());
+}
+Frame NativeRuntime::subscribePrincipalEvents(const Frame &request, const std::shared_ptr<PrincipalPeer> &peer) {
+    const auto retainedSource = principalSource_;
+    const auto retainedCatalog = principalCatalog_;
+    const auto context = readServiceContext();
+    if (!peer || !principalPeerCurrent(*peer) || !principalEventsReady() ||
+        retainedSource != principalSource_ || retainedCatalog != principalCatalog_ ||
+        !NativeActivityRing::same(context, principalEvents_.context()) ||
+        idValue(request, Tag::SourceEpoch) != context.engineContext ||
+        get(request, Tag::ProfileGeneration) != peer->profile) return principalError(Error::Stale);
+    const auto cursor = get(request, Tag::AfterEventSeq);
+    if (cursor > principalEvents_.latest()) return principalError(Error::Stale);
+    auto ack = principalEvents_.frame(Type::SubscriptionAck);
+    for (auto &field : ack.fields)
+        if (field.tag == Tag::EventSeq) field = value(Tag::EventSeq, cursor ? cursor : principalEvents_.latest());
+    ack.fields.push_back(value(Tag::EventMask, 3, 4));
+    return ordered(std::move(ack));
+}
+void NativeRuntime::publishPrincipalAuthorization(PrincipalOutcome &outcome) noexcept {
+  try {
+    if (outcome.activityCompleted || outcome.activityAttempt.type != Type::Attempt ||
+        !get(outcome.activityAttempt, Tag::EventSeq) || outcome.scope < 3 ||
+        outcome.result.state != State::Applied || outcome.result.error != Error::Ok ||
+        !outcome.result.durable || !outcome.result.appliedReal) return;
+    outcome.activityCompleted = true; // El fallo de historia nunca repite el efecto aplicado.
+    wire::iv::ServiceContext original;
+    if (wire::iv::decodeServiceContext(outcome.activityAttempt, original) != Error::Ok ||
+        !principalEventsReady() || !NativeActivityRing::same(original, principalEvents_.context()) ||
+        outcome.profile != principalEvents_.profile() ||
+        outcome.scoped.session != outcome.activitySession || outcome.scoped.cause != outcome.activityCause ||
+        outcome.scoped.version != GB_CLASSIFIER_VERSION || outcome.scoped.bytes != sizeof(outcome.scoped) ||
+        !outcome.scoped.revision || outcome.scoped.action < 1 || outcome.scoped.action > 2 ||
+        outcome.scoped.revision != outcome.result.desired || outcome.scoped.scope != outcome.scope ||
+        get(outcome.activityAttempt,Tag::Source) != 2) {
+        principalEvents_.lose(); return;
+    }
+    Frame commandFrame;
+    if (wire::decode(outcome.payload,commandFrame)!=Error::Ok || commandFrame.type!=Type::CommitFuturePolicy ||
+        idValue(commandFrame,Tag::SourceEpoch)!=original.engineContext ||
+        idValue(commandFrame,Tag::CaptureBindingId)!=idValue(outcome.activityAttempt,Tag::CaptureBindingId) ||
+        get(commandFrame,Tag::ProfileGeneration)!=outcome.profile ||
+        get(commandFrame,Tag::Decision)!=outcome.scoped.action || get(commandFrame,Tag::ScopeKind)!=outcome.scope) {
+        principalEvents_.lose(); return;
+    }
+    auto event = outcome.activityAttempt; event.type = Type::Authorization;
+    for (auto &field : event.fields) {
+        if (field.tag == Tag::Timestamp) field = value(Tag::Timestamp, 0);
+        if (field.tag == Tag::Presence) field = value(Tag::Presence, get(event, Tag::Presence) & ~1ull);
+    }
+    Id command{}; std::copy(std::begin(outcome.scoped.command), std::end(outcome.scoped.command), command.begin());
+    if (commandFrame.correlation!=command) { principalEvents_.lose(); return; }
+    event.fields.insert(event.fields.end(), {value(Tag::CommandId, command),
+        value(Tag::AttemptLink, wire::iv::attemptLink(get(outcome.activityAttempt, Tag::EventSeq))),
+        value(Tag::EffectiveRev, outcome.scoped.revision), value(Tag::Decision, outcome.scoped.action, 1),
+        value(Tag::ScopeKind, outcome.scope, 1), value(Tag::Durable, 1, 1), value(Tag::ProofState, 2, 1)});
+    if (principalEvents_.append(std::move(event)) != Error::Ok) principalEvents_.lose();
+  } catch (...) { principalEvents_.fail(); }
+}
 bool NativeRuntime::principalPeerCurrent(const PrincipalPeer &peer) const noexcept {
     struct Check { const NativeRuntime &runtime; const PrincipalPeer &peer; } check{*this, peer};
     auto accepts = [](void *raw, const native::TokenEvidence &fresh) noexcept {
@@ -135,7 +212,8 @@ Frame NativeRuntime::ordinaryStatus(Type type, const std::shared_ptr<PrincipalPe
     if (peer && peer->readonly && !admitted) peer->pages.clear();
     for (auto &field : frame.fields) {
         if (field.tag == Tag::Capabilities) field = value(Tag::Capabilities,
-            ReadStatus | (admitted ? ObservedRead | (!peer->readonly && principalPolicyReady() ? FuturePolicyControl : 0) : 0));
+            ReadStatus | (admitted ? ObservedRead | (principalEventsReady() ? wire::iv::NativeEvents : 0) |
+                (!peer->readonly && principalPolicyReady() ? FuturePolicyControl : 0) : 0));
         if (field.tag == Tag::IVProfile) field = value(Tag::IVProfile, admitted && !peer->readonly && principalPolicyReady() ? 1 : 0, 1);
     }
     return ordered(std::move(frame));
@@ -200,6 +278,11 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
     admission->revision = 1; admission->profile = peer->profile;
     admission->target = observation.digest; admission->fullTarget = observation.target;
     admission->source = observation.source; admission->event = observation.event; admission->proof = observation.proof;
+    admission->activityAttempt = observation.activityAttempt;
+    if (observation.event && observation.event->classifier_) {
+        admission->activitySession = observation.event->classifier_->record_.session;
+        admission->activityCause = observation.event->classifier_->record_.cause;
+    }
     admission->direction = static_cast<std::uint8_t>(get(frame, Tag::PolicyDirection));
     admission->package = observation.row.package; admission->expectedDesired = principalDesired_;
     admission->scope = static_cast<std::uint8_t>(scope);
@@ -320,8 +403,12 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
     reserved.pid = peer->actor.pid; reserved.created = peer->actor.created; reserved.imageId = peer->imageId;
     reserved.profile = peer->profile; reserved.type = frame.type;
     reserved.scope = admission->scope;
+    if (admission->scope >= 3) {
+        reserved.activityAttempt = admission->activityAttempt;
+        reserved.activitySession = admission->activitySession; reserved.activityCause = admission->activityCause;
+    }
     const auto charged = reserved.payload.capacity() + reserved.identity.account.capacity() +
-        reserved.identity.logon.capacity() + sizeof(PrincipalOutcome) + 128;
+        reserved.identity.logon.capacity() + sizeof(PrincipalOutcome) + 128 + NativeActivityRing::bytes(reserved.activityAttempt);
     if (charged > 512 * 1024 || principalOutcomeBytes_ > 512 * 1024 - charged) return principalError(Error::Capacity);
     auto inserted = principalOutcomes_.emplace(frame.correlation, std::move(reserved));
     if (!inserted.second) return principalError(Error::Conflict);
@@ -333,12 +420,13 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
             writePrincipal(target, entry, admission); }
     catch (...) { principalWriteFault_ = true; receipt.result.error = Error::RecoveryRequired; }
     if (!receipt.result.desired) receipt.result.desired = command.desired;
+    publishPrincipalAuthorization(receipt);
     if (admission->scope == 2 && (admission->consumed || principalSource_ != admission->source)) invalidatePrincipalObservations();
     return outcomeResult(frame.correlation, receipt);
 }
 Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<PrincipalPeer> &peer) {
     if (peer && peer->readonly && frame.type != Type::GetStatus && frame.type != Type::ListObserved &&
-        frame.type != Type::GetObservedRecord) return principalError(Error::Unauthorized);
+        frame.type != Type::GetObservedRecord && frame.type != Type::SubscribeEvents) return principalError(Error::Unauthorized);
     tick();
     if (frame.minor != 3 || wire::iv::validate(frame) != Error::Ok) return principalError(Error::Malformed);
     if (!peer || frame.connection != peer->connection || !principalPeerCurrent(*peer)) {
@@ -347,6 +435,7 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
     }
     if (frame.type == Type::GetStatus) return ordinaryStatus(Type::Status, peer);
     if (idValue(frame, Tag::ServiceEpoch) != epoch_) return principalError(Error::Stale);
+    if (frame.type == Type::SubscribeEvents) return subscribePrincipalEvents(frame, peer);
     const auto now = principalNow_();
     auto sameActor = [&](const PrincipalOutcome &outcome) {
         return outcome.profile == peer->profile && outcome.pid == peer->actor.pid &&
@@ -530,6 +619,7 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
     return principalError(Error::Unsupported);
 }
 void NativeRuntime::invalidatePrincipalObservations() noexcept {
+    principalEvents_.lose();
     for (auto &entry : principalAdmissions_) entry.second->cancelled = true;
     principalAdmissions_.clear();
     principalPendingBytes_ = 0;
@@ -540,7 +630,8 @@ void NativeRuntime::invalidatePrincipalObservations() noexcept {
         o.row.state = 2; o.row.binding = {}; o.row.reason = Error::Stale;
         o.target = {}; o.source.reset(); o.event.reset(); o.proof.reset(); o.fullDisplay = {};
         o.charged = sizeof(PrincipalObservation) + o.row.display.name.capacity() +
-            o.row.display.principal.capacity() + o.row.display.package.capacity() + o.row.display.path.capacity() + 128;
+            o.row.display.principal.capacity() + o.row.display.package.capacity() + o.row.display.path.capacity() +
+            NativeActivityRing::bytes(o.activityAttempt) + 128;
         principalPendingBytes_ += o.charged;
     }
 }
@@ -548,6 +639,8 @@ void NativeRuntime::collectPrincipalObservations() {
     using namespace gatebouncer::service::windows::allapps;
     if (!principalMode_ || principalWriteFault_ || !principalSource_ || !principalCatalog_ ||
         principalSource_->stage() != allnative::Stage::Active || profile_.value().state != 1) return;
+    const wire::iv::ServiceContext context{epoch_,boot_,principalSource_->binding_->epoch,principalSource_->binding_->generation};
+    if (!principalEvents_.bind(context,profile_.value().generation)) return;
     auto formatter = gatebouncer::appidentity::makeWindowsSidFormatter();
     if (!formatter) return;
     for (auto &item : principalObservations_) {
@@ -604,7 +697,7 @@ void NativeRuntime::collectPrincipalObservations() {
         // No es una afirmación del heap integral del allocator o del proceso.
         const auto charged = 2 * chargedBytes(metadata) + target.ownedCapacityBytes() +
             displayCharge(projected) + displayCharge(full) + sizeof(PrincipalObservation) + sizeof(PrincipalAdmission) +
-            2 * gatebouncer::appidentity::MaximumSidBytes + 512;
+            2 * gatebouncer::appidentity::MaximumSidBytes + 512 + 8192;
         const auto prior = same == principalObservations_.end() ? 0 : same->second->charged;
         if (same == principalObservations_.end() && principalObservations_.size() >= PendingLimit) {
             auto oldest = principalObservations_.end();
@@ -651,7 +744,24 @@ void NativeRuntime::collectPrincipalObservations() {
             principalSource_->lose(); invalidatePrincipalObservations(); break;
         }
         principalPendingBytes_ = principalPendingBytes_ - prior + charged;
-        principalObservations_[observation->row.observed] = std::move(observation);
+        principalObservations_[observation->row.observed] = observation;
+        // Sólo después de la inserción válida y de las pruebas originales arriba.
+      try {
+        auto history = principalEvents_.frame(Type::Attempt);
+        std::uint64_t timestamp = 0;
+        const bool utc = metadata.timestamp && ii::filetimeUtc(*metadata.timestamp,timestamp) && timestamp;
+        const bool protocol = observation->event->classifier_ != nullptr;
+        history.fields.insert(history.fields.end(), {value(Tag::Timestamp,utc ? timestamp : 0),
+            value(Tag::Presence,(utc ? 1 : 0) | (protocol ? 2 : 0)),
+            value(Tag::Source,protocol ? 2 : 1,1),
+            value(Tag::FlowDirection,metadata.direction==Direction::Outbound ? 1 : 2,1),
+            value(Tag::ObservedId,observation->row.observed), value(Tag::ObservedRevision,observation->row.revision),
+            value(Tag::CaptureBindingId,observation->row.binding)});
+        if (protocol) history.fields.push_back(value(Tag::Protocol,observation->event->classifier_->record_.protocol,1));
+        history = ordered(std::move(history));
+        if (principalEvents_.append(history) == Error::Ok) observation->activityAttempt = std::move(history);
+        else { principalEvents_.lose(); observation->activityAttempt = {}; }
+      } catch (...) { principalEvents_.fail(); observation->activityAttempt = {}; }
     }
 }
 } // namespace gb::decisions

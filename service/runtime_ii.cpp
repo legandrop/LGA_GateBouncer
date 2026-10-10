@@ -518,6 +518,14 @@ void NativeRuntime::tick() {
             principalSource_->source_.health().health != gatebouncer::service::windows::allapps::Health::Ready ||
             principalWriteFault_) { if (principalClassifier_) principalClassifier_->reset(); invalidatePrincipalObservations(); }
         else collectPrincipalObservations();
+        // READBACK acotado y circular: conserva la causa histórica precompletion.
+        for (std::size_t work=0, limit=std::min<std::size_t>(8,principalOutcomes_.size()); work<limit; ++work) {
+            auto outcome=principalOutcomes_.upper_bound(principalOutcomeCursor_);
+            if (outcome==principalOutcomes_.end()) outcome=principalOutcomes_.begin();
+            principalOutcomeCursor_=outcome->first;
+            if (outcome->second.activityAttempt.type==Type::Attempt && !outcome->second.activityCompleted)
+                refreshScoped(outcome->second);
+        }
         const auto now = principalNow_();
         for (auto entry = principalAdmissions_.begin(); entry != principalAdmissions_.end();) {
             auto &admission = *entry->second;
@@ -901,6 +909,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
             Pages pages(runtime_.epoch(), profile, hello.minor);
             std::uint64_t rx = 2, tx = 2, lastActivity = GetTickCount64(), after = 0;
             std::uint32_t mask = 0;
+            wire::iv::ServiceContext subscriptionContext{};
             while (WaitForSingleObject(stop, 0) == WAIT_TIMEOUT &&
                    GetTickCount64() - lastActivity < 60000) {
                 if (mask) {
@@ -909,9 +918,16 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                     bool usable = true;
                     {
                         std::lock_guard<std::mutex> lock(runtime_.mutex);
-                        usable = runtime_.profileGeneration() == profile &&
-                                 runtime_.peer(pipe.value, control, peer, false);
-                        if (usable) {
+                        if (ordinary || principalReader) {
+                            runtime_.tick();
+                            usable = runtime_.profileGeneration() == profile && ordinaryPeer &&
+                                runtime_.ordinaryPeer(pipe.value,ordinaryPeer,principalReader) &&
+                                runtime_.principalEvents_.after(after,events)==Error::Ok;
+                        } else {
+                            usable = runtime_.profileGeneration() == profile &&
+                                     runtime_.peer(pipe.value, control, peer, false);
+                        }
+                        if (usable && !(ordinary || principalReader)) {
                             auto e = runtime_.events(after, mask, events, gap);
                             if (gap || e == Error::Capacity) {
                                 auto prior = runtime_.latest();
@@ -925,6 +941,16 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                         break;
                     bool sent = true;
                     for (auto &event : events) {
+                        if (ordinary || principalReader) {
+                            std::lock_guard<std::mutex> lock(runtime_.mutex);
+                            // Revalidación individual; el wait/cancel/drain posterior no retiene mutex.
+                            wire::iv::ServiceContext actual;
+                            if (!ordinaryPeer || wire::iv::decodeServiceContext(event,actual)!=Error::Ok ||
+                                !NativeActivityRing::same(actual,subscriptionContext) ||
+                                !runtime_.principalEventCurrent(*ordinaryPeer,event)) {
+                                sent=false; break;
+                            }
+                        }
                         if (tx == UINT64_MAX) {
                             sent = false;
                             break;
@@ -983,6 +1009,8 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                     !ipc::ii::send(pipe.value, response, stop))
                     break;
                 if (response.type == Type::SubscriptionAck) {
+                    if ((ordinary || principalReader) &&
+                        wire::iv::decodeServiceContext(response,subscriptionContext)!=Error::Ok) break;
                     mask = std::uint32_t(get(f, Tag::EventMask));
                     after = get(f, Tag::AfterEventSeq);
                     if (!after)

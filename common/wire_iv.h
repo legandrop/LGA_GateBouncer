@@ -3,6 +3,10 @@
 
 namespace gb::wire::iv {
 constexpr std::size_t MaxRecordsBytes = 57344;
+constexpr std::uint64_t NativeEvents = 1ull << 25;
+// Enlace histórico a secuencia; no es un identificador de autorización.
+Id attemptLink(std::uint64_t sequence);
+std::uint64_t attemptSequence(const Id &link);
 // Identidad readonly; no prueba continuidad, efecto ni derechos.
 struct ServiceContext {
   Id serviceEpoch{}, boot{}, engineContext{};

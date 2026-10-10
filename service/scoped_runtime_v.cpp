@@ -80,6 +80,7 @@ void NativeRuntime::refreshScoped(PrincipalOutcome &outcome) noexcept {
             outcome.result.state = State::Applied; outcome.result.durable = true;
             outcome.result.error = Error::Ok; outcome.result.observed = directional::Observed::FinalApplied;
         }
+        publishPrincipalAuthorization(outcome);
     } catch (...) { outcome.result.error = Error::StoreFailure; }
 }
 Error NativeRuntime::readScopedOutcome(const Id &id,const std::shared_ptr<PrincipalPeer> &peer,
@@ -106,9 +107,10 @@ void NativeRuntime::pruneScopedOutcomes() noexcept {
     for(auto it=principalOutcomes_.begin();it!=principalOutcomes_.end();) {
         const auto &outcome=it->second;
         if(outcome.scope>=3 && outcome.result.durable &&
+           (outcome.activityAttempt.type!=Type::Attempt || outcome.activityCompleted) &&
            (outcome.result.state==State::Prepared || outcome.result.state==State::Applied)) {
             const auto charged=outcome.payload.capacity()+outcome.identity.account.capacity()+
-                outcome.identity.logon.capacity()+sizeof(PrincipalOutcome)+128;
+                outcome.identity.logon.capacity()+sizeof(PrincipalOutcome)+128+NativeActivityRing::bytes(outcome.activityAttempt);
             if(charged>principalOutcomeBytes_){principalWriteFault_=true;return;}
             principalOutcomeBytes_-=charged;it=principalOutcomes_.erase(it);
         } else ++it;
