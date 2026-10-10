@@ -20,7 +20,7 @@ qt_add_library(gatebouncer_service_view_ui STATIC
     controller/ordinary_qt.cpp controller/ordinary_qt.h
     controller/session_qt.cpp controller/session_qt.h
 )
-target_link_libraries(gatebouncer_service_view_ui PUBLIC Qt6::Core gatebouncer_native_ii)
+target_link_libraries(gatebouncer_service_view_ui PUBLIC Qt6::Core gatebouncer_native_ii gatebouncer_data)
 target_include_directories(gatebouncer_service_view_ui PUBLIC src common controller)
 if(DEFINED ENV{GATEBOUNCER_ORDINARY_HEADER_DIR})
     target_include_directories(gatebouncer_service_view_ui PRIVATE "$ENV{GATEBOUNCER_ORDINARY_HEADER_DIR}")
