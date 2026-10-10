@@ -79,7 +79,7 @@ bool inspectOutput(const std::filesystem::path &path,OutputPin &pin,bool initial
     if (!count || count >= 32768 || _wcsicmp(final,expected.c_str()) != 0 ||
         (!initial && (!sameFile(pin.identity,now) || (!pin.directory &&
             (pin.identity.nFileSizeHigh != now.nFileSizeHigh || pin.identity.nFileSizeLow != now.nFileSizeLow ||
-             CompareFileTime(&pin.identity.ftLastWriteTime,&now.ftLastWriteTime))))) return false;
+             CompareFileTime(&pin.identity.ftLastWriteTime,&now.ftLastWriteTime)))))) return false;
     if (initial) pin.identity = now;
     return true;
 }
