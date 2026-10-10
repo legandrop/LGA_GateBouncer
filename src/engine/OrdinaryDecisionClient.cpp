@@ -113,7 +113,7 @@ bool OrdinaryDecisionClient::select(const Id &id) {
     if (!current_ || !session_.idle() || state_ == State::Sending || state_ == State::Uncertain) return false;
     auto row = std::find_if(rows_.begin(), rows_.end(), [&](const auto &r) { return r.observed == id && r.state == 1; });
     if (row == rows_.end()) return false;
-    closeNotice(); observed_ = *row; visible_ = true; direction_ = 1;
+    closeNotice(); observed_ = *row; visible_ = true; direction_ = 1; scope_ = row->temporal == 2 ? 3 : 2;
     shown_[row->observed] = ShownKey{epoch_, boot_, source_, profile_, row->revision};
     state_ = State::Preparing; message_ = "Rechecking this observation…"; emit changed();
     return send(Type::GetObservedRecord, {value(Tag::ObservedId, row->observed),
@@ -122,13 +122,25 @@ bool OrdinaryDecisionClient::select(const Id &id) {
 bool OrdinaryDecisionClient::direction(int direction) {
     if (!visible_ || !current_ || !observed_ || !session_.idle() || direction < 1 || direction > 3 ||
         state_ == State::Sending || state_ == State::Uncertain) return false;
+    if (scope_ >= 3 && direction != 1) return false;
     ++generation_; draftExpiry_.stop(); draft_.reset(); direction_ = direction;
     state_ = State::Preparing; message_ = "Preparing the selected future scope…"; emit changed(); prepare(); return true;
 }
+bool OrdinaryDecisionClient::scope(int scope) {
+    if (!ready() || !session_.idle() || !observed_ || scope < 2 || scope > 5 ||
+        (observed_->temporal != 2 && scope != 2)) return false;
+    ++generation_; draftExpiry_.stop(); draft_.reset(); scope_ = scope;
+    observedGeneration_ = generation_;
+    if (scope >= 3) direction_ = 1;
+    state_ = State::Preparing; message_ = "Preparing the selected scope…"; emit changed(); prepare(); return true;
+}
 void OrdinaryDecisionClient::prepare() {
-    send(Type::PrepareFuturePolicy, {value(Tag::ExpectedDesiredRev, desired_), value(Tag::PolicyDirection, direction_, 1),
+    std::vector<Field> fields{value(Tag::ExpectedDesiredRev, desired_), value(Tag::PolicyDirection, direction_, 1),
         value(Tag::ProfileGeneration, profile_), value(Tag::ObservedId, observed_->observed),
-        value(Tag::ObservedRevision, observed_->revision), value(Tag::SourceEpoch, source_), value(Tag::IVProfile, 1, 1)});
+        value(Tag::ObservedRevision, observed_->revision), value(Tag::SourceEpoch, source_), value(Tag::IVProfile, 1, 1),
+        value(Tag::ScopeKind, scope_, 1)};
+    if (scope_ == 5) fields.push_back(value(Tag::ScopeDurationMs, 900000, 4));
+    send(Type::PrepareFuturePolicy, std::move(fields));
 }
 void OrdinaryDecisionClient::closeNotice() {
     visible_ = false; draftExpiry_.stop();
@@ -156,14 +168,16 @@ std::optional<OrdinaryDecisionClient::ObservationContext> OrdinaryDecisionClient
 bool OrdinaryDecisionClient::decide(bool allow, bool consent, quint64 selection) {
     if (!consent || selection != generation_ || !ready() || !session_.idle()) return false;
     const auto d = *draft_; const auto accepted = d.accepted | (allow && d.direction == 3 ? 4u : 0u);
-    draftExpiry_.stop(); state_ = State::Sending; message_ = "Saving the reviewed future rule…";
-    const bool sent = send(Type::CommitFuturePolicy, {value(Tag::ExpectedDesiredRev, d.expectedDesired),
+    draftExpiry_.stop(); state_ = State::Sending; message_ = "Saving the reviewed decision…";
+    std::vector<Field> fields{value(Tag::ExpectedDesiredRev, d.expectedDesired),
         value(Tag::Decision, allow ? 2 : 1, 1), value(Tag::ScopeKind, d.scope, 1), value(Tag::SelectorId, d.selector),
         value(Tag::PolicyDirection, d.direction, 1), value(Tag::ProfileGeneration, d.profile), value(Tag::SourceEpoch, d.source),
         value(Tag::DraftId, d.draft), value(Tag::DraftVersion, d.version), value(Tag::TargetRevision, d.targetRevision),
         value(Tag::PackageMode, d.package, 1), value(Tag::AcceptedScope, accepted, 2), digest(Tag::TargetDigest, d.target),
         digest(Tag::MigrationDigest, d.migration), value(Tag::ConsentChallengeId, d.challenge),
-        value(Tag::CaptureBindingId, d.binding), value(Tag::IVProfile, 1, 1)});
+        value(Tag::CaptureBindingId, d.binding), value(Tag::IVProfile, 1, 1)};
+    if (d.scope == 5) fields.push_back(value(Tag::ScopeDurationMs, d.durationMs, 4));
+    const bool sent = send(Type::CommitFuturePolicy, std::move(fields));
     emit changed(); return sent;
 }
 bool OrdinaryDecisionClient::recover() {
@@ -176,13 +190,17 @@ bool OrdinaryDecisionClient::recover() {
     return send(Type::GetFutureCommandStatus, {value(Tag::CommandId, command_)});
 }
 void OrdinaryDecisionClient::outcome(const Frame &f) {
+    const auto submittedScope = submitted_ ? get(submitted_->command, Tag::ScopeKind) : 0;
+    if ((submittedScope >= 3 ? get(f, Tag::ScopeKind) != submittedScope : find(f, Tag::ScopeKind) != nullptr)) {
+        fail("Command scope binding changed.", true); return;
+    }
     if (idValue(f, Tag::CommandId) != command_ ||
         (f.type == Type::FutureCommandStatus && get(f, Tag::CommandFound) && get(f, Tag::OriginalCommandType) != unsigned(Type::CommitFuturePolicy))) {
         fail("Command receipt binding changed.", true); return;
     }
     if ((f.type == Type::FutureCommandStatus && !get(f, Tag::CommandFound)) || get(f, Tag::KnownAppliedUnrecorded) ||
         (get(f, Tag::CommandState) == unsigned(gb::wire::State::Applied) &&
-         (desired_ == UINT64_MAX || get(f, Tag::DesiredRev) != desired_ + 1)) ||
+         (submittedScope == 2 && (desired_ == UINT64_MAX || get(f, Tag::DesiredRev) != desired_ + 1))) ||
         !get(f, Tag::Durable) || get(f, Tag::CommandState) == unsigned(gb::wire::State::Prepared) ||
         get(f, Tag::CommandState) == unsigned(gb::wire::State::AppliedUnrecorded) ||
         get(f, Tag::CommandState) == unsigned(gb::wire::State::RecoveryRequired)) {
@@ -190,7 +208,9 @@ void OrdinaryDecisionClient::outcome(const Frame &f) {
     }
     draft_.reset(); current_ = false;
     if (get(f, Tag::CommandState) == unsigned(gb::wire::State::Applied) && !get(f, Tag::ErrorCode)) {
-        state_ = State::Recorded; message_ = "Future rule recorded. The original attempt was not resumed; coverage remains unvalidated.";
+        state_ = State::Recorded; message_ = submittedScope >= 3
+            ? "Kernel decision recorded for this scope. Other firewall decisions still apply; coverage remains unvalidated."
+            : "Future rule recorded. The original attempt was not resumed; coverage remains unvalidated.";
     } else { state_ = State::Failed; message_ = "The decision was rejected. The observation remains undecided."; }
     emit changed();
 }
@@ -246,7 +266,8 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         if (f.type != Type::FutureDraftRecord || iv::unpack(find(f, Tag::Records)->bytes, 1, rows) != Error::Ok ||
             rows[0].observed != observed_->observed || rows[0].observedRevision != observed_->revision ||
             rows[0].source != source_ || rows[0].binding != observed_->binding || rows[0].profile != profile_ ||
-            rows[0].expectedDesired != desired_ || rows[0].direction != direction_ ||
+            rows[0].expectedDesired != desired_ || rows[0].direction != direction_ || rows[0].scope != scope_ ||
+            rows[0].durationMs != (scope_ == 5 ? 900000u : 0u) ||
             (draft_ && (rows[0].draft != draft_->draft || rows[0].version != draft_->version ||
              rows[0].challenge != draft_->challenge || rows[0].target != draft_->target ||
              rows[0].migration != draft_->migration || rows[0].selector != draft_->selector ||

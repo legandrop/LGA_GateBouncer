@@ -112,6 +112,20 @@ bool NativeSource::retainedCause(const NativeCopiedMetadata &event, const Native
     // temporal ni una solicitud retenida en el socket.
     return required == Stage::Drained || valid(event);
 }
+bool NativeSource::retainedCancelledCause(const NativeCopiedMetadata &event, const NativeProof &proof,
+    const CatalogReceipt &receipt, const GB_SCOPE_DECISION &cancel, HANDLE engine) const noexcept
+{
+    const auto snapshot = std::atomic_load(&catalog_);
+    if (stage() != Stage::Drained || poisoned_.load() || !snapshot || receipt.snapshot_ != snapshot ||
+        receipt.binding_ != binding_ || event.binding_ != binding_ || event.snapshot_ != snapshot ||
+        proof.binding_ != event.binding_ || proof.snapshot_ != event.snapshot_ ||
+        !(proof.stamp_ == event.event_.acquired) || proof.loss_ != event.event_.acquiredLossRevision ||
+        source_.health().lossRevision != proof.loss_ || proof.view_.role != Role::UnknownAppGate ||
+        proof.view_.action != Action::Block || !event.classifier_ || event.classifier_->owner_ != classifier_ ||
+        cancel.scope != 2 || !classifier_) return false;
+    // El negativo superior conserva la causa exacta tras stop/reset y hasta closure/drain.
+    return classifier_->cancelledCurrent(*event.classifier_,cancel,engine);
+}
 Reason NativeSource::readInventory(HANDLE engine, const CatalogReceipt &receipt)
 {
     if (!engine) return Reason::SourceGap;

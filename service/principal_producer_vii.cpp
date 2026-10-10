@@ -163,6 +163,13 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
     const auto found = principalObservations_.find(idValue(frame, Tag::ObservedId));
     if (found == principalObservations_.end()) return principalError(Error::NotFound);
     auto &observation = *found->second;
+    const auto scope = find(frame, Tag::ScopeKind) ? get(frame, Tag::ScopeKind) : 2;
+    const auto duration = get(frame, Tag::ScopeDurationMs);
+    const bool held = observation.event && observation.event->classifier_;
+    if ((!held && scope != 2) ||
+        (scope >= 3 && (observation.row.package != 1 || get(frame, Tag::PolicyDirection) != 1)) ||
+        (scope == 5 && (!duration || duration > GB_SCOPE_MAX_MS)))
+        return principalError(Error::ScopeUnsupported);
     if (observation.row.state != 1 || observation.row.revision != get(frame, Tag::ObservedRevision) ||
         observation.row.source != idValue(frame, Tag::SourceEpoch) || !observation.event || !observation.proof ||
         observation.profile != peer->profile || observation.source != principalSource_ ||
@@ -191,6 +198,8 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
     admission->source = observation.source; admission->event = observation.event; admission->proof = observation.proof;
     admission->direction = static_cast<std::uint8_t>(get(frame, Tag::PolicyDirection));
     admission->package = observation.row.package; admission->expectedDesired = principalDesired_;
+    admission->scope = static_cast<std::uint8_t>(scope);
+    admission->durationMs = static_cast<std::uint32_t>(duration);
     admission->deadline = principalNow_() + 120000;
     if (zero(admission->request) || zero(admission->challenge) || zero(admission->selector) ||
         !principalPeerCurrent(*peer)) return principalError(Error::IdentityUnavailable);
@@ -203,6 +212,8 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
     record.target = admission->target;
     record.ttl = 120000; record.state = 3; record.package = admission->package;
     record.direction = admission->direction; record.accepted = admission->package == 1 ? 3 : 1;
+    record.scope = admission->scope; record.durationMs = admission->durationMs;
+    if (scope >= 3) record.accepted = 1u << scope;
     record.proof = wire::iv::Proof::CurrentShapeUnproven; record.display = observation.fullDisplay;
     Bytes payload;
     if (wire::iv::pack(std::vector<wire::iv::FutureDraftRecord>{record}, payload) != Error::Ok)
@@ -226,7 +237,8 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
     if (existing != principalOutcomes_.end()) {
         if (!sameActor(existing->second)) return principalError(Error::Unauthorized);
         if (existing->second.payload != canonical) return principalError(Error::Conflict);
-        return principalResult(frame.correlation, existing->second.result);
+        refreshScoped(existing->second);
+        return outcomeResult(frame.correlation, existing->second);
     }
     if (principalOutcomes_.size() >= 128 || canonical.capacity() > 4096 ||
         principalOutcomeBytes_ > 512 * 1024 - 4096 - sizeof(PrincipalOutcome)) return principalError(Error::Capacity);
@@ -254,7 +266,7 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         rule.direction = admission->direction;
         rule.mode = rule.action == 1 || rule.direction == 2 ? 0 : rule.direction == 1 ? 1 : 2;
         rule.target = admission->fullTarget;
-        target.rules.push_back(std::move(rule));
+        if (admission->scope == 2) target.rules.push_back(std::move(rule));
     } else if (frame.type == Type::RevokePrincipalRule) {
         auto rule = std::find_if(target.rules.begin(), target.rules.end(), [&](const auto &r) {
             return r.id == idValue(frame, Tag::RuleId);
@@ -295,6 +307,7 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
     reserved.payload = command.payload; reserved.identity = peer->identity;
     reserved.pid = peer->actor.pid; reserved.created = peer->actor.created; reserved.imageId = peer->imageId;
     reserved.profile = peer->profile; reserved.type = frame.type;
+    reserved.scope = admission->scope;
     const auto charged = reserved.payload.capacity() + reserved.identity.account.capacity() +
         reserved.identity.logon.capacity() + sizeof(PrincipalOutcome) + 128;
     if (charged > 512 * 1024 || principalOutcomeBytes_ > 512 * 1024 - charged) return principalError(Error::Capacity);
@@ -304,11 +317,12 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
     auto &receipt = inserted.first->second;
     // Memoria del receipt ya reservada: toda incertidumbre del writer queda
     // consultable antes de enviar bytes al cliente, sin una segunda operación.
-    try { receipt.result = writePrincipal(target, entry, admission); }
+    try { receipt.result = admission->scope >= 3 ? writeScoped(entry, admission, receipt.scoped) :
+            writePrincipal(target, entry, admission); }
     catch (...) { principalWriteFault_ = true; receipt.result.error = Error::RecoveryRequired; }
     if (!receipt.result.desired) receipt.result.desired = command.desired;
-    if (admission->consumed || principalSource_ != admission->source) invalidatePrincipalObservations();
-    return principalResult(frame.correlation, receipt.result);
+    if (admission->scope == 2 && (admission->consumed || principalSource_ != admission->source)) invalidatePrincipalObservations();
+    return outcomeResult(frame.correlation, receipt);
 }
 Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<PrincipalPeer> &peer) {
     if (peer && peer->readonly && frame.type != Type::GetStatus && frame.type != Type::ListObserved &&
@@ -338,7 +352,8 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             return ordered(std::move(response));
         }
         if (!sameActor(found->second)) return principalError(Error::Unauthorized);
-        auto response = principalResult(command, found->second.result, Type::FutureCommandStatus);
+        refreshScoped(found->second);
+        auto response = outcomeResult(command, found->second, Type::FutureCommandStatus);
         response.fields.push_back(value(Tag::CommandFound, 1, 1));
         response.fields.push_back(value(Tag::OriginalCommandType, static_cast<unsigned>(found->second.type), 2));
         return ordered(std::move(response));
@@ -391,6 +406,8 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         record.ttl = static_cast<std::uint32_t>(admission.deadline - now); record.state = 3;
         record.package = admission.package; record.direction = admission.direction;
         record.accepted = admission.package == 1 ? 3 : 1; record.proof = wire::iv::Proof::CurrentShapeUnproven;
+        record.scope = admission.scope; record.durationMs = admission.durationMs;
+        if (admission.scope >= 3) record.accepted = 1u << admission.scope;
         record.display = observed->second->fullDisplay;
         Bytes records;
         if (wire::iv::pack(std::vector<wire::iv::FutureDraftRecord>{record}, records) != Error::Ok)
@@ -505,6 +522,14 @@ void NativeRuntime::collectPrincipalObservations() {
         principalSource_->stage() != allnative::Stage::Active || profile_.value().state != 1) return;
     auto formatter = gatebouncer::appidentity::makeWindowsSidFormatter();
     if (!formatter) return;
+    for (auto &item : principalObservations_) {
+        auto &o = *item.second;
+        if (o.row.state == 1 && o.event && o.event->classifier_ && !o.event->classifier_->current()) {
+            o.row.state = 2; o.row.binding = {}; o.row.reason = Error::Stale;
+            if (principalObservedRevision_ != UINT64_MAX) o.row.revision = ++principalObservedRevision_;
+            o.target = {}; o.event.reset(); o.proof.reset(); o.source.reset();
+        }
+    }
     // Trabajo acotado por tick: no drenar indefinidamente ante un productor ocupado.
     for (unsigned work = 0; work < 8; ++work) {
         auto event = principalSource_->takeCopied();
@@ -526,11 +551,11 @@ void NativeRuntime::collectPrincipalObservations() {
         principal::ByteView target(std::move(encoded));
         const auto digest = principal::targetDigest(target);
         if (digest == Digest{} || principalObservedRevision_ == UINT64_MAX) {
-            principalSource_->source_.lost(); break;
+            principalSource_->lose(); break;
         }
         auto same = std::find_if(principalObservations_.begin(), principalObservations_.end(), [&](const auto &p) {
             const auto &o = *p.second;
-            return o.row.state == 1 && o.source == principalSource_ && o.digest == digest && o.event &&
+            return !event->classifier_ && o.row.state == 1 && o.source == principalSource_ && o.digest == digest && o.event && !o.event->classifier_ &&
                 o.event->owned().direction == metadata.direction;
         });
         wire::iv::Display projected, full;
@@ -565,7 +590,7 @@ void NativeRuntime::collectPrincipalObservations() {
         }
         if (charged > PendingBytesLimit || principalPendingBytes_ - prior > PendingBytesLimit - charged ||
             (same == principalObservations_.end() && principalObservations_.size() >= PendingLimit)) {
-            principalSource_->source_.lost(); invalidatePrincipalObservations(); break;
+            principalSource_->lose(); invalidatePrincipalObservations(); break;
         }
         auto observation = same == principalObservations_.end() ? std::make_shared<PrincipalObservation>() : same->second;
         if (same == principalObservations_.end()) {
@@ -585,6 +610,7 @@ void NativeRuntime::collectPrincipalObservations() {
         }
         observation->target = std::move(target); observation->digest = digest;
         observation->source = principalSource_; observation->event = std::move(event);
+        observation->row.temporal = observation->event->classifier_ ? 2 : 1;
         observation->proof = std::move(acquired.proof); observation->profile = profile_.value().generation;
         observation->charged = charged;
         // Una nueva causa cambia la revisión: no reutilizar un consentimiento anterior.
@@ -594,7 +620,7 @@ void NativeRuntime::collectPrincipalObservations() {
             } else ++entry;
         }
         if (!wire::iv::valid(observation->row)) {
-            principalSource_->source_.lost(); invalidatePrincipalObservations(); break;
+            principalSource_->lose(); invalidatePrincipalObservations(); break;
         }
         principalPendingBytes_ = principalPendingBytes_ - prior + charged;
         principalObservations_[observation->row.observed] = std::move(observation);

@@ -31,6 +31,7 @@ class OrdinaryDecisionClient final : public QObject {
     void startAutomatic();
     bool select(const gb::wire::Id &observed);
     bool direction(int direction);
+    bool scope(int scope);
     void closeNotice();
     bool decide(bool allow, bool consent, quint64 selection);
     bool recover();
@@ -43,6 +44,7 @@ class OrdinaryDecisionClient final : public QObject {
     quint64 selection() const { return generation_; }
     State state() const { return state_; }
     int selectedDirection() const { return direction_; }
+    int selectedScope() const { return scope_; }
     const QString &message() const { return message_; }
     const auto &observations() const { return rows_; }
     const auto &observed() const { return observed_; }
@@ -70,6 +72,7 @@ class OrdinaryDecisionClient final : public QObject {
     quint64 generation_ = 1, desired_ = 0, profile_ = 0, bindingGeneration_ = 0, pageRevision_ = 0;
     quint64 observedGeneration_ = 0;
     int direction_ = 1;
+    int scope_ = 2;
     quint32 cursor_ = 0;
     gb::wire::Id epoch_{}, boot_{}, source_{}, connection_{}, snapshot_{}, expected_{}, command_{};
     gb::wire::Type expectedType_ = gb::wire::Type::GetStatus;

@@ -64,7 +64,7 @@ Reason NativeSource::start(const CatalogReceipt &catalog) noexcept
     try
     {
         auto keep = shared_from_this();
-        if (catalog.binding_ != binding_ || !prerequisites() || (classifier_ && !classifier_->reset()))
+        if (catalog.binding_ != binding_ || !prerequisites())
             return Reason::Unsupported;
         if (!control_.begin())
             return Reason::SourceGap;
@@ -89,14 +89,18 @@ Reason NativeSource::start(const CatalogReceipt &catalog) noexcept
                 const bool ready =
                     (health.health == Health::Ready && health.lossRevision == revision) || source_.recover(revision);
                 if (ready && control_.activate())
-                    admission_.store(true);
+                {
+                    // START sólo después de reconcile/readInventory exacto del baseline.
+                    if (!classifier_ || (classifier_->start() && classifier_->reset())) admission_.store(true);
+                    else reason = Reason::SourceGap;
+                }
                 else
                     reason = Reason::SourceGap;
             }
         }
         if (reason != Reason::None)
         {
-            source_.lost();
+            lose();
             source_.stop();
             if (auto h = control_.requestStop())
                 cancel(h);
@@ -109,7 +113,8 @@ Reason NativeSource::start(const CatalogReceipt &catalog) noexcept
     {
         poisoned_.store(true);
         admission_.store(false);
-        source_.lost();
+        if (classifier_) classifier_->reset();
+        lose();
         return Reason::SourceGap;
     }
 }
@@ -117,6 +122,11 @@ void NativeSource::cancel(HANDLE h)
 {
     auto keep = shared_from_this();
     control_.finishCancel(sdk_.unsubscribe(engine_.engine_, h));
+}
+void NativeSource::lose() noexcept {
+    admission_.store(false);
+    if (classifier_) classifier_->reset();
+    source_.lost();
 }
 void NativeSource::finalize()
 {
@@ -133,6 +143,7 @@ Stage NativeSource::stop() noexcept
         auto keep = shared_from_this();
         admission_.store(false);
         source_.stop();
+        if (classifier_) classifier_->reset();
         if (auto h = control_.requestStop())
             cancel(h);
         finalize();
@@ -171,7 +182,7 @@ void NativeSource::emit(const FWPM_NET_EVENT3 *event) noexcept
         if (count == std::numeric_limits<unsigned>::max())
         {
             poisoned_.store(true);
-            source_.lost();
+            lose();
             return;
         }
     } while (!callbacks_.compare_exchange_weak(count, count + 1));
@@ -179,7 +190,7 @@ void NativeSource::emit(const FWPM_NET_EVENT3 *event) noexcept
     seen_.store(true);
     if (!admission_.load())
     {
-        source_.lost();
+        lose();
         return;
     }
     const auto binding = binding_;
@@ -197,7 +208,7 @@ void NativeSource::emit(const FWPM_NET_EVENT3 *event) noexcept
     }
     if (slot == MaxCopiers)
     {
-        source_.lost();
+        lose();
         return;
     }
     auto release = onExit([this, slot] { slots_[slot].store(false); });
@@ -205,7 +216,7 @@ void NativeSource::emit(const FWPM_NET_EVENT3 *event) noexcept
     if (copied != Reason::None)
     {
         if (copied == Reason::Unreadable || copied == Reason::Oversized)
-            source_.lost();
+            lose();
         return;
     }
     auto result = copyMetadata(pool_[slot].view, source_);
@@ -213,7 +224,7 @@ void NativeSource::emit(const FWPM_NET_EVENT3 *event) noexcept
     if (!result.event)
     {
         if (result.reason == Reason::Oversized)
-            source_.lost();
+            lose();
         return;
     }
     if (!admission_.load() || !snapshot || snapshot != std::atomic_load(&catalog_) || binding != binding_ ||
@@ -243,7 +254,7 @@ std::optional<NativeCopiedMetadata> NativeSource::takeClassifier() noexcept {
         if (!snapshot) return {};
         bool lost = false;
         auto cause = classifier_->take(lost);
-        if (lost) { source_.lost(); return {}; }
+        if (lost) { classifier_->reset(); lose(); return {}; }
         if (!cause) return {};
         const auto &r = cause->record_;
         const auto layer = r.family == 4 ? NativeLayer8::Connect4 : NativeLayer8::Connect6;
@@ -252,7 +263,7 @@ std::optional<NativeCopiedMetadata> NativeSource::takeClassifier() noexcept {
             return s.ruleIndex == BaselineRuleIndex && s.slot == static_cast<unsigned>(layer) &&
                 s.layer == static_cast<unsigned>(layer) && s.layerId == r.layerId;
         });
-        if (slot == snapshot->slots_.end()) { source_.lost(); return {}; }
+        if (slot == snapshot->slots_.end()) { lose(); return {}; }
         NetEventView view;
         view.type = view.classifyType = 3; view.classifyPresent = true;
         view.flags = AppSet | UserSet | IpVersionSet; view.ipVersion = r.family == 4 ? 0 : 1;
@@ -260,13 +271,13 @@ std::optional<NativeCopiedMetadata> NativeSource::takeClassifier() noexcept {
         view.app = {r.app, r.appBytes, r.appBytes}; view.user = {r.user, r.userBytes, r.userBytes};
         view.timestamp = r.timestamp; view.receivedMonotonic = GetTickCount64();
         auto copied = copyMetadata(view, source_);
-        if (!copied.event) { source_.lost(); return {}; }
+        if (!copied.event) { lose(); return {}; }
         copied.event->origin = OwnedNetEvent::Origin::ClassifierInitial;
         copied.event->classifierBytes = sizeof(ClassifierCause) + 1024;
         NativeCopiedMetadata owned(std::move(*copied.event), binding_, snapshot, std::move(cause));
-        if (!valid(owned)) { source_.lost(); return {}; }
+        if (!valid(owned)) { lose(); return {}; }
         return owned;
-    } catch (...) { source_.lost(); return {}; }
+    } catch (...) { lose(); return {}; }
 }
 bool NativeSource::classifierCurrent(const NativeCopiedMetadata &event, HANDLE engine) const noexcept {
     if (event.event_.origin != OwnedNetEvent::Origin::ClassifierInitial) return !event.classifier_ && !classifier_;
@@ -291,7 +302,7 @@ void NativeSource::publishCatalog(const CatalogReceipt &receipt)
         throw std::invalid_argument("Binding de catálogo distinto");
     const auto old = std::atomic_load(&catalog_);
     if (old && old != receipt.snapshot_)
-        source_.lost();
+        lose();
     std::atomic_store(&catalog_, receipt.snapshot_);
 }
 bool NativeSource::pushCopied(NativeCopiedMetadata &&value) noexcept
@@ -303,7 +314,7 @@ bool NativeSource::pushCopied(NativeCopiedMetadata &&value) noexcept
         if (!lock || !valid(value) || bytes > MaxRecordBytes || queueCount_ == MaxRecords ||
             bytes > MaxQueueBytes - queueBytes_)
         {
-            source_.lost();
+            lose();
             return false;
         }
         queue_[(queueHead_ + queueCount_) % MaxRecords].emplace(std::move(value));
@@ -313,7 +324,7 @@ bool NativeSource::pushCopied(NativeCopiedMetadata &&value) noexcept
     }
     catch (...)
     {
-        source_.lost();
+        lose();
         return false;
     }
 }
@@ -337,7 +348,7 @@ std::optional<NativeCopiedMetadata> NativeSource::takeCopied() noexcept
     }
     catch (...)
     {
-        source_.lost();
+        lose();
         return {};
     }
 }

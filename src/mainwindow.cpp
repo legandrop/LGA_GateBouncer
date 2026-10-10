@@ -1399,6 +1399,8 @@ void MainWindow::renderOrdinaryNotice() {
     const auto directionValue = submitted ? int(gb::wire::get(submitted->command, gb::wire::Tag::PolicyDirection))
         : client->selectedDirection();
     const auto selection = client->selection();
+    const bool held = row.temporal == 2;
+    const auto scopeValue = submitted ? int(gb::wire::get(submitted->command, gb::wire::Tag::ScopeKind)) : client->selectedScope();
     notice_ = new QFrame(root_); notice_->setObjectName("access-notice");
     notice_->setAccessibleName("Future application rule review");
     auto *l = new QVBoxLayout(notice_); l->setContentsMargins(15, 12, 15, 12); l->setSpacing(9);
@@ -1415,7 +1417,9 @@ void MainWindow::renderOrdinaryNotice() {
     body->setContentsMargins(0, 0, 0, 0); body->setSpacing(9);
     if (client->state() == OrdinaryDecisionClient::State::Preparing) body->addWidget(new Spinner, 0, Qt::AlignLeft);
     definition(body, "Requested destination", "Unknown · not included in this observation");
-    definition(body, "Original attempt", "Blocked attempt observed · no held connection");
+    definition(body, "Original attempt", held && scopeValue == 2 && client->state() == OrdinaryDecisionClient::State::Recorded
+        ? "Held attempt cancelled · its kernel guard keeps it denied"
+        : held ? "TCP connection held blocked · closing keeps it pending" : "Blocked attempt observed · no held connection");
     ordinaryExplanation_=new Assistance::Ui::ExplanationWidget(assistance_.get(),[this,selection]{
         const auto* current=product_.ordinary();
         QPointer<Assistance::Ui::GeneralSession> explanation=assistance_.get();
@@ -1425,37 +1429,50 @@ void MainWindow::renderOrdinaryNotice() {
     body->addWidget(ordinaryExplanation_);
     definition(body, "Application", recordText(display.name, "Unknown"));
     definition(body, "Account", recordText(display.principal, "Unknown"));
-    definition(body, "Package", package == 1 ? "Unrestricted · any package" : recordText(display.package, "Unknown"));
+    definition(body, "Package", scopeValue >= 3 ? "Non-AppContainer process" : package == 1 ? "Unrestricted · any package" : recordText(display.package, "Unknown"));
     if (!display.path.empty()) {
         auto *path = new QPlainTextEdit(recordText(display.path, "Unknown")); path->setReadOnly(true);
         path->setObjectName("ordinary-path"); path->setWordWrapMode(QTextOption::WrapAnywhere);
         path->setMinimumHeight(52); path->setMaximumHeight(78); body->addWidget(path);
     }
-    body->addWidget(label(QString(submitted ? "Submitted scope: " : "Effective scope: ") +
+    const QString scopeDescription = scopeValue == 3 ? "this exact held TCP connection, once. " : scopeValue == 4
+        ? "this process instance until it exits. " : scopeValue == 5 ? "this process instance for 15 minutes, enforced by the kernel. " :
         "this application and account, across matching instances. "
         + QString(package == 1 ? "No package restriction applies. " : package == 2
             ? "The displayed package is included. " : "Package restriction is unknown. ") +
-        "The rule applies to future attempts; it does not resume this attempt. Protection coverage has not been validated.", "muted", true));
+        "The rule applies to future attempts; it does not resume this attempt. ";
+    body->addWidget(label(QString(submitted ? "Submitted scope: " : "Effective scope: ") + scopeDescription +
+        "Protection coverage has not been validated.", "muted", true));
     l->addWidget(scrollArea(content), 1);
     auto *fields = new QHBoxLayout; fields->setSpacing(9);
     auto *sl = new QVBoxLayout; sl->setSpacing(5); sl->addWidget(label("Apply to", "faint"));
     auto *scope = combo({"Application + account", "Current process", "Once"}, "decision-scope");
-    for (int i : {1, 2}) scope->setItemData(i, 0, Qt::UserRole - 1);
+    if (!held) for (int i : {1, 2}) scope->setItemData(i, 0, Qt::UserRole - 1);
+    scope->setCurrentIndex(scopeValue == 2 ? 0 : scopeValue == 3 ? 2 : 1);
     scope->setEnabled(client->ready()); sl->addWidget(scope); fields->addLayout(sl, 1);
     auto *dl = new QVBoxLayout; dl->setSpacing(5); dl->addWidget(label("Keep this decision", "faint"));
-    auto *duration = combo({"Permanent", "For 15 minutes", "Until restart"}, "decision-duration");
-    for (int i : {1, 2}) duration->setItemData(i, 0, Qt::UserRole - 1);
-    duration->setEnabled(client->ready()); dl->addWidget(duration); fields->addLayout(dl, 1); l->addLayout(fields);
-    l->addWidget(label("Once, process and timed scopes are unavailable. Only a future permanent rule is supported.", "faint", true));
+    auto *duration = combo({scopeValue == 3 ? "This connection" : scopeValue == 2 ? "Permanent" : "Until process exits", "For 15 minutes"}, "decision-duration");
+    duration->setCurrentIndex(scopeValue == 5 ? 1 : 0);
+    duration->setEnabled(client->ready() && scopeValue >= 4); dl->addWidget(duration); fields->addLayout(dl, 1); l->addLayout(fields);
+    connect(scope, &QComboBox::currentIndexChanged, this, [client, selection](int index) {
+        if (selection == client->selection()) client->scope(index == 0 ? 2 : index == 1 ? 4 : 3);
+    });
+    connect(duration, &QComboBox::currentIndexChanged, this, [client, selection](int index) {
+        if (selection == client->selection()) client->scope(index == 1 ? 5 : 4);
+    });
+    if (held) l->addWidget(label(scopeValue == 2
+        ? "Applying this permanent rule cancels the held attempt; its kernel guard keeps that attempt denied."
+        : "Process duration applies only to this instance.", "faint", true));
     auto *direction = combo({"Outbound", "Inbound", "Both"}, "ordinary-direction");
     direction->setCurrentIndex(directionValue - 1);
-    direction->setEnabled(client->ready()); l->addWidget(direction);
+    direction->setEnabled(client->ready() && scopeValue == 2); l->addWidget(direction);
     connect(direction, &QComboBox::currentIndexChanged, this, [client, selection, direction](int index) {
         if (selection != client->selection() || !client->direction(index + 1)) {
             const QSignalBlocker guard(direction); direction->setCurrentIndex(client->selectedDirection() - 1);
         }
     });
-    const QString network = directionValue == 1 ? "Outbound · Allow covers unicast destinations only"
+    const QString network = scopeValue >= 3 ? "TCP outbound authorization; packets in both directions. UDP, QUIC, ICMP and boot coverage are unvalidated."
+        : directionValue == 1 ? "Outbound · Allow covers unicast destinations only"
         : directionValue == 2 ? "Inbound · all destinations and protocols" : "Both · inbound and outbound; Allow includes non-unicast destinations";
     l->addWidget(label(QString(submitted ? "Submitted network scope: " : "Effective network scope: ") + network, "muted", true));
     auto *consent = new QCheckBox("I accept the effective scope shown above.");

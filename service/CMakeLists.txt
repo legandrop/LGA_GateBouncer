@@ -17,6 +17,7 @@ target_link_libraries(gatebouncer_policy PUBLIC gatebouncer_wire bcrypt advapi32
 add_library(gatebouncer_native_ii STATIC ../common/protected_file_win.cpp ../common/token_ii_win.cpp ../common/pipe_ii_win.cpp ../common/client_ii_win.cpp ../controller/deployment_win.cpp journal_ii_store.cpp snapshot_iii.cpp snapshot_iv.cpp store_iv.cpp coordinator_iii.cpp journal_iii.cpp directional_specs.cpp profile_ii.cpp collector_ii.cpp effects_projection_ii.cpp effects_ii.cpp runtime_ii.cpp engine_resource_iv.cpp catalog_plan_iv.cpp)
 target_link_libraries(gatebouncer_native_ii PUBLIC gatebouncer_decisions gatebouncer_policy gatebouncer_allapps_native bcrypt advapi32 wtsapi32 fwpuclnt)
 target_sources(gatebouncer_native_ii PRIVATE principal_producer_vii.cpp)
+target_sources(gatebouncer_native_ii PRIVATE scopes_v.cpp scoped_runtime_v.cpp)
 target_sources(gatebouncer_native_ii PRIVATE ../controller/deployment_prepare_win.cpp)
 target_sources(gatebouncer_native_ii PRIVATE maintenance_iv.cpp ../controller/deployment_maintenance_win.cpp)
 target_link_libraries(gatebouncer_native_ii PRIVATE onecore)

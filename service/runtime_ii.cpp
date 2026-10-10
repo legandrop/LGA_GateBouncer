@@ -91,8 +91,11 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
                 target.user == principal::ByteView(current.account);
         }
         if (frame.type != Type::CommitFuturePolicy || !admission.event || !admission.proof ||
-            !admission.source->retainedCause(*admission.event, *admission.proof,
-                allnative::CatalogReceipt(principalCatalog_), requiredStage) ||
+            !(admission.cancelSealed ?
+                requiredStage == allnative::Stage::Drained && admission.source->retainedCancelledCause(
+                    *admission.event, *admission.proof, allnative::CatalogReceipt(principalCatalog_), admission.cancelledDecision, backend_.engine_) :
+                admission.source->retainedCause(*admission.event, *admission.proof,
+                    allnative::CatalogReceipt(principalCatalog_), requiredStage)) ||
             idValue(frame, Tag::SourceEpoch) != admission.source->binding_->epoch ||
             idValue(frame, Tag::DraftId) != admission.request || get(frame, Tag::DraftVersion) != admission.revision ||
             idValue(frame, Tag::CaptureBindingId) != admission.binding ||
@@ -101,8 +104,11 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
             get(frame, Tag::ExpectedDesiredRev) != admission.expectedDesired ||
             get(frame, Tag::TargetRevision) != 1 || get(frame, Tag::PackageMode) != admission.package ||
             get(frame, Tag::PolicyDirection) != admission.direction ||
-            get(frame, Tag::AcceptedScope) != (1u | (admission.package == 1 ? 2u : 0u) |
-                (get(frame, Tag::Decision) == 2 && admission.direction == 3 ? 4u : 0u)))
+            get(frame, Tag::ScopeKind) != admission.scope ||
+            get(frame, Tag::ScopeDurationMs) != admission.durationMs ||
+            get(frame, Tag::AcceptedScope) != (admission.scope >= 3 ? (1u << admission.scope) :
+                (1u | (admission.package == 1 ? 2u : 0u) |
+                (get(frame, Tag::Decision) == 2 && admission.direction == 3 ? 4u : 0u))))
             return false;
         return true;
     } catch (...) { return false; }
@@ -149,6 +155,31 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
              (identity.packageSid.state != gatebouncer::appidentity::FieldState::Copied ||
               principalTarget.package != principal::ByteView(identity.packageSid.bytes)))) return result;
         }
+        const auto sequence = principalRead_.snapshot.sequence;
+        const auto desired = principalRead_.snapshot.desired;
+        auto prepared = principalStore_->replaceOwned(sequence, desired, bytes);
+        if (!prepared.physicallyConfirmed) { principalWriteFault_ = true; return result; }
+        principalRead_ = principalStore_->read_;
+        principalDesired_ = target.desired;
+        result.state = State::Prepared; result.desired = target.desired;
+        result.observedSequence = sequence + 1; result.observed = directional::Observed::Prepared;
+        profile_.refresh();
+        if (!principalAdmissionCurrent(*admission, command)) return result;
+        if (admission->event && admission->event->classifier_) {
+            auto cause = admission->event->classifier_;
+            if (!principalClassifier_ || cause->owner_ != principalClassifier_ || !cause->current() ||
+                !principalClassifier_->filterCurrent(*cause, backend_.engine_)) return result;
+            auto &cancel = admission->cancelledDecision;
+            cancel.version = GB_CLASSIFIER_VERSION; cancel.bytes = sizeof(cancel);
+            cancel.session = cause->record_.session; cancel.cause = cause->record_.cause;
+            cancel.revision = command.command.desired; cancel.scope = 2;
+            cancel.action = static_cast<UINT32>(get(canonicalCommand, Tag::Decision));
+            std::copy(command.command.id.begin(), command.command.id.end(), cancel.command);
+            GB_CANCEL_RECEIPT delivered{}, retained{};
+            // Prepared ya está durable. CANCEL se manda una vez; guarded no es ACK de Complete.
+            if (!principalClassifier_->cancel(cancel, delivered) || !principalClassifier_->cancelReadback(cancel, retained)) return result;
+            admission->cancelSealed = true;
+        }
         // Retiro irreversible A antes de crear B: conservar A y sus eventos,
         // jamás construir un segundo Source bajo RPC/callback/fault pendiente.
         if (oldSource->stop() != allnative::Stage::Drained) {
@@ -164,14 +195,6 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         if (observationEngine_->readDomain(domain, support, count) != Reason::None ||
             plan.stage(bytes, source->binding_, inventoryRevision_ + 1, domain,
                        {support.data(), count}) != Reason::None) return result;
-        const auto sequence = principalRead_.snapshot.sequence;
-        const auto desired = principalRead_.snapshot.desired;
-        auto prepared = principalStore_->replaceOwned(sequence, desired, bytes);
-        if (!prepared.physicallyConfirmed) { principalWriteFault_ = true; return result; }
-        principalRead_ = principalStore_->read_;
-        principalDesired_ = target.desired;
-        result.state = State::Prepared; result.desired = target.desired;
-        result.observedSequence = sequence + 1; result.observed = directional::Observed::Prepared;
         struct BeforeEffect { NativeRuntime &runtime; PrincipalAdmission &admission;
             const principal::Entry &command; std::shared_ptr<allnative::NativeSource> source;
             std::shared_ptr<const allnative::CatalogSnapshot> catalog; } before{
@@ -182,7 +205,8 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
             // ejecuta en engine NO-DYNAMIC dentro de su write transaction.
             try { b.runtime.profile_.refresh();
                 return b.runtime.principalAdmissionCurrent(b.admission, b.command, allnative::Stage::Drained) &&
-                (!b.admission.event || b.source->classifierCurrent(*b.admission.event, b.runtime.backend_.engine_)) &&
+                (!b.admission.event || b.admission.cancelSealed ||
+                    b.source->classifierCurrent(*b.admission.event, b.runtime.backend_.engine_)) &&
                 b.source->readInventory(b.runtime.backend_.engine_,
                     allnative::CatalogReceipt(b.catalog)) == Reason::None; }
             catch (...) { return false; }
@@ -233,7 +257,7 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
 NativeRuntime::NativeRuntime(WfpBackend &b, SelectorRegistry &r,
                              std::filesystem::path store, Bytes account, Id epoch, Id boot,
                              std::filesystem::path ordinaryImage, std::shared_ptr<controller::Deployment> deployment)
-    : ordinaryImage_(std::move(ordinaryImage)), deployment_(std::move(deployment)), file_(std::move(store)),
+    : ordinaryImage_(std::move(ordinaryImage)), deployment_(std::move(deployment)), scopedJournal_(store), file_(std::move(store)),
       directions_(b), coordinator_(file_, directions_, r, epoch),
       backend_(b), registry_(r), epoch_(epoch), boot_(boot), journal_(coordinator_, r),
       effects_(coordinator_, directions_), engine_(epoch, boot, journal_, effects_, 2),
@@ -321,13 +345,13 @@ ServiceContext NativeRuntime::readServiceContext() const noexcept {
             after.health != gatebouncer::service::windows::allapps::Health::Ready ||
             before.lossRevision != after.lossRevision ||
             std::atomic_load(&source->catalog_) != catalog) {
-            source->source_.lost();
+            source->lose();
             return unavailable;
         }
         return {epoch_, boot_, engine->context_, engine->generation_};
     } catch (...) {
         if (source) {
-            source->source_.lost();
+            source->lose();
             if (worker) {
                 if (auto handle = source->control_.finishWorker()) source->cancel(handle);
             }
@@ -483,6 +507,7 @@ void NativeRuntime::tick() {
     auto prior = profile_.value().generation;
     profile_.refresh();
     if (prior != profile_.value().generation) {
+        if (principalClassifier_) principalClassifier_->reset();
         invalidatePrincipalObservations();
         engine_.invalidateProfile(0, GetTickCount64());
         ring_.invalidate(profile_.value().generation);
@@ -491,7 +516,7 @@ void NativeRuntime::tick() {
         collector_.unavailable(7);
         if (!principalSource_ || principalSource_->stage() != allnative::Stage::Active ||
             principalSource_->source_.health().health != gatebouncer::service::windows::allapps::Health::Ready ||
-            principalWriteFault_) invalidatePrincipalObservations();
+            principalWriteFault_) { if (principalClassifier_) principalClassifier_->reset(); invalidatePrincipalObservations(); }
         else collectPrincipalObservations();
         const auto now = principalNow_();
         for (auto entry = principalAdmissions_.begin(); entry != principalAdmissions_.end();) {

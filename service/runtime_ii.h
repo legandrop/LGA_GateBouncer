@@ -9,6 +9,7 @@
 #include "journal_iii.h"
 #include "wfp_backend.h"
 #include "principal_actor_vi.h"
+#include "scopes_v.h"
 #include "../controller/deployment_win.h"
 namespace gb::decisions {
 class NativeRuntime {
@@ -73,6 +74,10 @@ class NativeRuntime {
         std::uint64_t observedRevision = 0, expectedDesired = 0, deadline = 0;
         principal::ByteView fullTarget;
         std::uint8_t direction = 0, package = 0;
+        std::uint8_t scope = 2;
+        std::uint32_t durationMs = 0;
+        GB_SCOPE_DECISION cancelledDecision{};
+        bool cancelSealed = false;
         bool consumed = false, cancelled = false;
     };
     void collectPrincipalObservations();
@@ -109,10 +114,15 @@ class NativeRuntime {
         BY_HANDLE_FILE_INFORMATION imageId{};
         std::uint64_t profile = 0;
         Type type = Type::CommitFuturePolicy;
+        std::uint8_t scope = 2;
+        GB_SCOPE_DECISION scoped{};
     };
     std::map<Id, PrincipalOutcome> principalOutcomes_;
     std::size_t principalOutcomeBytes_ = 0;
     bool principalActorCurrent(const PrincipalAdmission &) const noexcept;
+    directional::Result writeScoped(const principal::Entry &, const std::shared_ptr<PrincipalAdmission> &, GB_SCOPE_DECISION &);
+    void refreshScoped(PrincipalOutcome &) noexcept;
+    Frame outcomeResult(const Id &, const PrincipalOutcome &, Type = Type::FuturePolicyAck) const;
     directional::Result writePrincipal(const principal::Snapshot &, const principal::Entry &,
         const std::shared_ptr<PrincipalAdmission> &);
     bool principalAdmissionCurrent(const PrincipalAdmission &, const principal::Entry &,
@@ -132,6 +142,7 @@ class NativeRuntime {
     std::shared_ptr<allnative::NativeClassifier> principalClassifier_;
     std::shared_ptr<EngineResource> retainedEngineFault_;
     std::uint64_t observationGeneration_ = 0;
+    ScopedJournal scopedJournal_;
     directional::NativeSnapshotFile file_;
     allnative::CatalogRegistry catalogRegistry_;
     std::unique_ptr<principal::SnapshotStore> principalStore_;

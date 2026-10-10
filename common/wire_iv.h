@@ -32,7 +32,7 @@ struct FutureDraftRecord {
   std::uint64_t version = 0, observedRevision = 0, targetRevision = 0,
                 expectedDesired = 0, profile = 0;
   Digest target{}, migration{};
-  std::uint32_t ttl = 0;
+  std::uint32_t ttl = 0, durationMs = 0;
   std::uint8_t state = 1, package = 0, direction = 1, scope = 2;
   std::uint16_t accepted = 0;
   Proof proof = Proof::Unknown;

@@ -119,6 +119,7 @@ Bytes payload(const FutureDraftRecord &r) {
   b[179] = r.display.projection;
   put(b, 188, static_cast<unsigned>(r.reason), 2);
   put(b, 192, r.migration);
+  put(b, 224, r.durationMs, 4);
   tail(b, 180, r.display);
   return b;
 }
@@ -166,7 +167,7 @@ bool parse(const Bytes &b, ObservedRecord &r) {
   return tail(b, 96, 80, r.display) && valid(r);
 }
 bool parse(const Bytes &b, FutureDraftRecord &r) {
-  if (b.size() < 240 || !zeros(b, 190, 2) || !zeros(b, 224, 16))
+  if (b.size() < 240 || !zeros(b, 190, 2) || !zeros(b, 228, 12))
     return false;
   r.draft = array<16>(b, 0);
   r.version = n(b, 16, 8);
@@ -190,6 +191,7 @@ bool parse(const Bytes &b, FutureDraftRecord &r) {
   r.display.projection = b[179];
   r.reason = static_cast<Error>(n(b, 188, 2));
   r.migration = array<32>(b, 192);
+  r.durationMs = std::uint32_t(n(b, 224, 4));
   return tail(b, 240, 180, r.display) && valid(r);
 }
 bool parse(const Bytes &b, PrincipalRuleRecord &r) {
@@ -303,6 +305,8 @@ Schema schema(const Frame &f) {
     ref[T::PolicyDirection] = 1;
     ref[T::ProfileGeneration] = 8;
     ref[T::IVProfile] = 1;
+    if (find(f, T::ScopeKind)) ref[T::ScopeKind] = 1;
+    if (get(f, T::ScopeKind) == 5) ref[T::ScopeDurationMs] = 4;
     return ref;
   case Type::GetFutureDraft:
     return {{T::ServiceEpoch, 16},
@@ -310,8 +314,8 @@ Schema schema(const Frame &f) {
             {T::DraftId, 16},
             {T::DraftVersion, 8},
             {T::IVProfile, 1}};
-  case Type::CommitFuturePolicy:
-    return {{T::ServiceEpoch, 16},     {T::ExpectedDesiredRev, 8},
+  case Type::CommitFuturePolicy: {
+    Schema command = {{T::ServiceEpoch, 16},     {T::ExpectedDesiredRev, 8},
             {T::Decision, 1},          {T::ScopeKind, 1},
             {T::SelectorId, 16},       {T::PolicyDirection, 1},
             {T::ProfileGeneration, 8}, {T::SourceEpoch, 16},
@@ -320,6 +324,9 @@ Schema schema(const Frame &f) {
             {T::AcceptedScope, 2},     {T::TargetDigest, 32},
             {T::MigrationDigest, 32},  {T::ConsentChallengeId, 16},
             {T::CaptureBindingId, 16}, {T::IVProfile, 1}};
+    if (get(f,T::ScopeKind) == 5) command[T::ScopeDurationMs] = 4;
+    return command;
+  }
   case Type::RevokePrincipalRule:
     return {{T::ServiceEpoch, 16},     {T::ExpectedDesiredRev, 8},
             {T::RuleId, 16},           {T::RuleRevision, 8},
@@ -327,6 +334,7 @@ Schema schema(const Frame &f) {
             {T::TargetDigest, 32},     {T::MigrationDigest, 32},
             {T::IVProfile, 1}};
   case Type::FuturePolicyAck:
+    if (find(f,T::ScopeKind)) result[T::ScopeKind] = 1;
     return result;
   case Type::GetFutureCommandStatus:
     return {{T::ServiceEpoch, 16}, {T::CommandId, 16}};
@@ -334,6 +342,7 @@ Schema schema(const Frame &f) {
     if (get(f, T::CommandFound) == 1) {
       result[T::CommandFound] = 1;
       result[T::OriginalCommandType] = 2;
+      if (find(f,T::ScopeKind)) result[T::ScopeKind] = 1;
       return result;
     }
     return {{T::ServiceEpoch, 16},
@@ -409,7 +418,7 @@ Error decodeServiceContext(const Frame &frame, ServiceContext &out) {
 bool valid(const ObservedRecord &r) {
   auto reason = static_cast<unsigned>(r.reason);
   return !zero(r.observed) && r.revision && !zero(r.source) && r.state >= 1 &&
-         r.state <= 3 && r.temporal == 1 && r.package <= 2 && r.presence <= 3 &&
+         r.state <= 3 && (r.temporal == 1 || r.temporal == 2) && r.package <= 2 && r.presence <= 3 &&
          present(r.presence, 0, r.firstUtc) &&
          present(r.presence, 1, r.lastUtc) &&
          (r.state == 1 ? !zero(r.binding) && reason <= 18
@@ -419,7 +428,7 @@ bool valid(const ObservedRecord &r) {
 bool valid(const FutureDraftRecord &r) {
   if (zero(r.draft) || !r.version || zero(r.observed) || !r.observedRevision ||
       zero(r.source) || zero(r.binding) || !r.profile || r.state < 1 ||
-      r.state > 4 || r.direction < 1 || r.direction > 3 || r.scope != 2 ||
+      r.state > 4 || r.direction < 1 || r.direction > 3 || r.scope < 2 || r.scope > 5 ||
       r.package > 2 || r.display.projection != 2 || !display(r.display))
     return false;
   auto reason = static_cast<unsigned>(r.reason);
@@ -427,7 +436,9 @@ bool valid(const FutureDraftRecord &r) {
     return !zero(r.selector) && r.targetRevision && r.target != Digest{} &&
            !zero(r.challenge) && r.ttl >= 1 && r.ttl <= 120000 &&
            r.package >= 1 && r.proof == Proof::CurrentShapeUnproven &&
-           reason == 0 && r.accepted == (r.package == 1 ? 3 : 1);
+           reason == 0 && (r.scope == 2 ? !r.durationMs && r.accepted == (r.package == 1 ? 3 : 1) :
+             r.package == 1 && r.direction == 1 && r.accepted == (1u << r.scope) &&
+             (r.scope == 5 ? r.durationMs >= 1 && r.durationMs <= 900000 : !r.durationMs));
   return zero(r.selector) && !r.targetRevision && r.target == Digest{} &&
          zero(r.challenge) && !r.ttl && r.proof == Proof::Unknown &&
          !r.accepted &&
@@ -493,7 +504,7 @@ Error validate(const Frame &f) {
   unsigned previous = 0;
   for (const auto &v : f.fields) {
     auto tag = static_cast<unsigned>(v.tag);
-    if (tag < 1 || tag > 88 || tag == 57 ||
+    if (tag < 1 || tag > static_cast<unsigned>(T::ScopeDurationMs) || tag == 57 ||
         (v.tag == T::ServiceContext && f.type != Type::HelloAck && f.type != Type::Status))
       return Error::Unsupported;
     if (tag <= previous)
@@ -576,11 +587,22 @@ Error validate(const Frame &f) {
   if (f.type == Type::CommitFuturePolicy) {
     auto a = get(f, T::Decision), p = get(f, T::PackageMode),
          d = get(f, T::PolicyDirection);
-    if (a < 1 || a > 2 || p < 1 || p > 2 || get(f, T::ScopeKind) != 2 ||
-        get(f, T::AcceptedScope) !=
-            (1u | (p == 1 ? 2u : 0u) | (a == 2 && d == 3 ? 4u : 0u)))
+    auto scope = get(f,T::ScopeKind);
+    if (a < 1 || a > 2 || p < 1 || p > 2 || scope < 2 || scope > 5 ||
+        (scope == 2 ? get(f, T::AcceptedScope) !=
+            (1u | (p == 1 ? 2u : 0u) | (a == 2 && d == 3 ? 4u : 0u)) :
+            p != 1 || d != 1 || get(f,T::AcceptedScope) != (1u << scope)))
       return Error::Malformed;
   }
+  if (f.type == Type::PrepareFuturePolicy || f.type == Type::CommitFuturePolicy) {
+    const auto scope = find(f,T::ScopeKind) ? get(f,T::ScopeKind) : 2;
+    if (scope < 2 || scope > 5 || (scope >= 3 && get(f,T::PolicyDirection) != 1) ||
+        (scope == 5 && (!get(f,T::ScopeDurationMs) || get(f,T::ScopeDurationMs) > 900000)))
+      return Error::Malformed;
+  }
+  if ((f.type == Type::FuturePolicyAck || f.type == Type::FutureCommandStatus) &&
+      find(f,T::ScopeKind) && (get(f,T::ScopeKind) < 3 || get(f,T::ScopeKind) > 5))
+    return Error::Malformed;
   if (find(f, T::TargetDigest) &&
       std::all_of(find(f, T::TargetDigest)->bytes.begin(),
                   find(f, T::TargetDigest)->bytes.end(),

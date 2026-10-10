@@ -68,6 +68,7 @@ class RecoveryReceipt
 class NativeCopiedMetadata
 {
     friend class NativeSource;
+    friend class gb::decisions::NativeRuntime;
     NativeCopiedMetadata(OwnedNetEvent e, std::shared_ptr<const BindingState> b,
                          std::shared_ptr<const CatalogSnapshot> s, std::shared_ptr<ClassifierCause> cause = {})
         : event_(std::move(e)), binding_(std::move(b)), snapshot_(std::move(s)), classifier_(std::move(cause))
@@ -125,6 +126,7 @@ class NativeSource : public std::enable_shared_from_this<NativeSource>
     void emit(const FWPM_NET_EVENT3 *) noexcept;
     void cancel(HANDLE);
     void finalize();
+    void lose() noexcept;
     bool valid(const NativeCopiedMetadata &) const noexcept;
     void publishCatalog(const CatalogReceipt &);
     bool pushCopied(NativeCopiedMetadata &&) noexcept;
@@ -132,7 +134,9 @@ class NativeSource : public std::enable_shared_from_this<NativeSource>
     Reason readInventory(const CatalogReceipt &);
     Reason readInventory(HANDLE, const CatalogReceipt &);
     bool retainedCause(const NativeCopiedMetadata &, const NativeProof &,
-                       const CatalogReceipt &, Stage) const noexcept;
+        const CatalogReceipt &, Stage) const noexcept;
+    bool retainedCancelledCause(const NativeCopiedMetadata &, const NativeProof &,
+        const CatalogReceipt &, const GB_SCOPE_DECISION &, HANDLE) const noexcept;
     Reason reconcile(const CatalogReceipt &);
     std::optional<NativeCopiedMetadata> takeClassifier() noexcept;
     bool classifierCurrent(const NativeCopiedMetadata &, HANDLE) const noexcept;

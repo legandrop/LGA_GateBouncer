@@ -26,4 +26,4 @@ target_link_directories(GateBouncerClassifier PRIVATE
 target_link_libraries(GateBouncerClassifier PRIVATE ntoskrnl hal fwpkclnt wdmsec BufferOverflowFastFailK)
 # El wrapper WDK inicializa la cookie antes de entrar al DriverEntry propio.
 target_link_options(GateBouncerClassifier PRIVATE /DRIVER /SUBSYSTEM:NATIVE /ENTRY:GsDriverEntry
-  /NODEFAULTLIB /INCREMENTAL:NO /MANIFEST:NO /DYNAMICBASE /NXCOMPAT)
+  /NODEFAULTLIB /INCREMENTAL:NO /MANIFEST:NO /DYNAMICBASE /NXCOMPAT /INTEGRITYCHECK)

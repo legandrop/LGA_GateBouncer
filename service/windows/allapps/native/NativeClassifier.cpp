@@ -18,11 +18,54 @@ std::shared_ptr<NativeClassifier> NativeClassifier::open() noexcept {
         auto owner = std::shared_ptr<NativeClassifier>(new NativeClassifier);
         owner->device_.reset(CreateFileW(GB_CLASSIFIER_DEVICE, GENERIC_READ | GENERIC_WRITE,
             0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
-        DWORD bytes = 0;
-        if (!owner->device_ || !DeviceIoControl(owner->device_.value, GB_CLASSIFIER_START, nullptr, 0,
-            nullptr, 0, &bytes, nullptr) || !owner->reset()) return {};
+        if (!owner->device_) return {};
         return owner;
     } catch (...) { return {}; }
+}
+bool NativeClassifier::start() noexcept {
+    std::lock_guard<std::mutex> lock(mutex_); DWORD bytes = 0;
+    return device_ && serviceCaller() && DeviceIoControl(device_.value, GB_CLASSIFIER_START,
+        nullptr, 0, nullptr, 0, &bytes, nullptr);
+}
+bool NativeClassifier::scopeIoctl(DWORD code, const GB_SCOPE_DECISION &decision, GB_SCOPE_RECEIPT &receipt) noexcept {
+    receipt = {};
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto copy = decision; DWORD bytes = 0;
+    return device_ && serviceCaller() && decision.version == GB_CLASSIFIER_VERSION &&
+        decision.bytes == sizeof(decision) && decision.session == session_ &&
+        DeviceIoControl(device_.value, code, &copy, sizeof(copy), &receipt, sizeof(receipt), &bytes, nullptr) &&
+        bytes == sizeof(receipt) && std::memcmp(&receipt.decision, &decision, sizeof(decision)) == 0 &&
+        receipt.state >= GB_SCOPE_COMPLETING && receipt.state <= GB_SCOPE_CLOSED &&
+        receipt.applied <= 1 && receipt.current <= 1 && !receipt.reserved &&
+        (decision.scope == GB_SCOPE_DURATION ? receipt.deadline != 0 : receipt.deadline == 0) &&
+        (!receipt.applied || receipt.observedAt != 0);
+}
+bool NativeClassifier::decide(const GB_SCOPE_DECISION &d, GB_SCOPE_RECEIPT &r) noexcept {
+    return scopeIoctl(GB_CLASSIFIER_DECIDE,d,r);
+}
+bool NativeClassifier::readback(const GB_SCOPE_DECISION &d, GB_SCOPE_RECEIPT &r) noexcept {
+    return scopeIoctl(GB_CLASSIFIER_READBACK,d,r);
+}
+bool NativeClassifier::cancelIoctl(DWORD code, const GB_SCOPE_DECISION &decision, GB_CANCEL_RECEIPT &receipt) const noexcept {
+    receipt = {}; std::lock_guard<std::mutex> lock(mutex_);
+    auto copy = decision; DWORD bytes = 0;
+    return device_ && serviceCaller() && decision.version == GB_CLASSIFIER_VERSION && decision.bytes == sizeof(decision) &&
+        decision.session == session_ && decision.scope == 2 && !decision.durationMs &&
+        DeviceIoControl(device_.value, code, &copy, sizeof(copy), &receipt, sizeof(receipt), &bytes, nullptr) &&
+        bytes == sizeof(receipt) && std::memcmp(&receipt.decision, &decision, sizeof(decision)) == 0 &&
+        receipt.guarded == 1 && receipt.closed <= 1 && receipt.reauthDenied <= 1 && !receipt.reserved &&
+        (receipt.reauthDenied ? receipt.deniedAt != 0 : receipt.deniedAt == 0);
+}
+bool NativeClassifier::cancel(const GB_SCOPE_DECISION &d, GB_CANCEL_RECEIPT &r) noexcept {
+    return cancelIoctl(GB_CLASSIFIER_CANCEL,d,r);
+}
+bool NativeClassifier::cancelReadback(const GB_SCOPE_DECISION &d, GB_CANCEL_RECEIPT &r) const noexcept {
+    return cancelIoctl(GB_CLASSIFIER_CANCEL_READBACK,d,r);
+}
+bool NativeClassifier::cancelledCurrent(const ClassifierCause &cause, const GB_SCOPE_DECISION &decision, HANDLE engine) const noexcept {
+    if (cause.owner_.get() != this || cause.record_.session != decision.session || cause.record_.cause != decision.cause) return false;
+    GB_CANCEL_RECEIPT before{}, after{};
+    return cancelReadback(decision,before) && catalogCurrent(cause,engine) && cancelReadback(decision,after);
 }
 bool NativeClassifier::reset() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -125,7 +168,10 @@ bool NativeClassifier::current(const ClassifierCause &cause) const noexcept {
     } catch (...) { return false; }
 }
 bool NativeClassifier::filterCurrent(const ClassifierCause &cause, HANDLE engine) const noexcept {
-    if (!current(cause) || !engine) return false;
+    return current(cause) && catalogCurrent(cause,engine) && current(cause);
+}
+bool NativeClassifier::catalogCurrent(const ClassifierCause &cause, HANDLE engine) const noexcept {
+    if (cause.owner_.get() != this || !engine) return false;
     Memory filter, callout;
     FWPM_FILTER0 f{}; FWPM_CALLOUT0 c{}; GUID provider{};
     const auto i = cause.record_.family == 4 ? 0 : 1;
@@ -133,15 +179,60 @@ bool NativeClassifier::filterCurrent(const ClassifierCause &cause, HANDLE engine
     if (FwpmFilterGetById0(engine, cause.record_.filterId, reinterpret_cast<FWPM_FILTER0 **>(&filter.p)) != ERROR_SUCCESS ||
         !guardedRead(&f, filter.p, sizeof(f)) || !f.providerKey ||
         !guardedRead(&provider, f.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
-        !equal(f.filterKey, GbClassifierFilters[i]) || !equal(f.subLayerKey, GbClassifierSublayer) ||
-        !equal(f.layerKey, layer) || f.flags || f.action.type != FWP_ACTION_CALLOUT_INSPECTION ||
+        !equal(f.filterKey, GbClassifierFilters[i]) || !equal(f.subLayerKey, GbPolicySublayer) ||
+        !equal(f.layerKey, layer) || f.flags || f.action.type != FWP_ACTION_CALLOUT_UNKNOWN ||
         !equal(f.action.calloutKey, GbClassifierCallouts[i]) || f.rawContext || f.numFilterConditions ||
-        f.providerData.size || f.weight.type != FWP_EMPTY) return false;
+        f.providerData.size || f.weight.type != FWP_UINT64 || !f.weight.uint64) return false;
+    UINT64 weight = 0;
+    if (!guardedRead(&weight, f.weight.uint64, sizeof(weight)) || weight != 50 ||
+        f.effectiveWeight.type != FWP_UINT64 || !f.effectiveWeight.uint64 ||
+        !guardedRead(&weight, f.effectiveWeight.uint64, sizeof(weight)) || weight != 50) return false;
     if (FwpmCalloutGetByKey0(engine, &GbClassifierCallouts[i], reinterpret_cast<FWPM_CALLOUT0 **>(&callout.p)) != ERROR_SUCCESS ||
         !guardedRead(&c, callout.p, sizeof(c)) || !c.providerKey ||
         !guardedRead(&provider, c.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
         !equal(c.calloutKey, GbClassifierCallouts[i]) || !equal(c.applicableLayer, layer) ||
         c.flags != FWPM_CALLOUT_FLAG_REGISTERED) return false;
-    return current(cause);
+    const GUID *layers[6] = {&FWPM_LAYER_STREAM_PACKET_V4, &FWPM_LAYER_STREAM_PACKET_V6,
+        &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4, &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6,
+        &FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V4, &FWPM_LAYER_ALE_ENDPOINT_CLOSURE_V6};
+    for (unsigned n = 0; n < 6; ++n) {
+        Memory scopeFilter, scopeCallout;
+        FWPM_FILTER0 sf{}; FWPM_CALLOUT0 sc{}; UINT64 sw = 0;
+        if (FwpmFilterGetByKey0(engine, &GbScopeCallouts[n], reinterpret_cast<FWPM_FILTER0 **>(&scopeFilter.p)) != ERROR_SUCCESS ||
+            !guardedRead(&sf, scopeFilter.p, sizeof(sf)) || !sf.providerKey ||
+            !guardedRead(&provider, sf.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
+            !equal(sf.filterKey, GbScopeCallouts[n]) || !equal(sf.layerKey, *layers[n]) ||
+            !equal(sf.subLayerKey, GbClassifierSublayer) || sf.flags || sf.rawContext || sf.providerData.size || sf.numFilterConditions ||
+            sf.action.type != (n < 2 ? FWP_ACTION_CALLOUT_UNKNOWN : FWP_ACTION_CALLOUT_INSPECTION) ||
+            !equal(sf.action.calloutKey, GbScopeCallouts[n]) || sf.weight.type != FWP_UINT64 || !sf.weight.uint64 ||
+            !guardedRead(&sw, sf.weight.uint64, sizeof(sw)) || sw != 50 ||
+            sf.effectiveWeight.type != FWP_UINT64 || !sf.effectiveWeight.uint64 ||
+            !guardedRead(&sw, sf.effectiveWeight.uint64, sizeof(sw)) || sw != 50 ||
+            FwpmCalloutGetByKey0(engine, &GbScopeCallouts[n], reinterpret_cast<FWPM_CALLOUT0 **>(&scopeCallout.p)) != ERROR_SUCCESS ||
+            !guardedRead(&sc, scopeCallout.p, sizeof(sc)) || !sc.providerKey ||
+            !guardedRead(&provider, sc.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
+            !equal(sc.calloutKey, GbScopeCallouts[n]) || !equal(sc.applicableLayer, *layers[n]) ||
+            sc.flags != FWPM_CALLOUT_FLAG_REGISTERED) return false;
+    }
+    for (unsigned n = 0; n < 2; ++n) {
+        const auto &guardLayer = n == 0 ? FWPM_LAYER_ALE_AUTH_CONNECT_V4 : FWPM_LAYER_ALE_AUTH_CONNECT_V6;
+        Memory guardFilter, guardCallout;
+        FWPM_FILTER0 gf{}; FWPM_CALLOUT0 gc{}; UINT64 gw = 0;
+        if (FwpmFilterGetByKey0(engine, &GbHeldGuardCallouts[n], reinterpret_cast<FWPM_FILTER0 **>(&guardFilter.p)) != ERROR_SUCCESS ||
+            !guardedRead(&gf, guardFilter.p, sizeof(gf)) || !gf.providerKey ||
+            !guardedRead(&provider, gf.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
+            !equal(gf.filterKey, GbHeldGuardCallouts[n]) || !equal(gf.layerKey, guardLayer) ||
+            !equal(gf.subLayerKey, GbPolicySublayer) || gf.flags || gf.rawContext || gf.providerData.size || gf.numFilterConditions ||
+            gf.action.type != FWP_ACTION_CALLOUT_UNKNOWN || !equal(gf.action.calloutKey, GbHeldGuardCallouts[n]) ||
+            gf.weight.type != FWP_UINT64 || !gf.weight.uint64 || !guardedRead(&gw, gf.weight.uint64, sizeof(gw)) || gw != 1000 ||
+            gf.effectiveWeight.type != FWP_UINT64 || !gf.effectiveWeight.uint64 ||
+            !guardedRead(&gw, gf.effectiveWeight.uint64, sizeof(gw)) || gw != 1000 ||
+            FwpmCalloutGetByKey0(engine, &GbHeldGuardCallouts[n], reinterpret_cast<FWPM_CALLOUT0 **>(&guardCallout.p)) != ERROR_SUCCESS ||
+            !guardedRead(&gc, guardCallout.p, sizeof(gc)) || !gc.providerKey ||
+            !guardedRead(&provider, gc.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
+            !equal(gc.calloutKey, GbHeldGuardCallouts[n]) || !equal(gc.applicableLayer, guardLayer) ||
+            gc.flags != FWPM_CALLOUT_FLAG_REGISTERED) return false;
+    }
+    return true;
 }
 } // namespace gatebouncer::service::windows::allapps::native

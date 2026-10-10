@@ -1,43 +1,71 @@
-# TCP initial classifier
+# Scoped TCP classifier
 
-This WDM driver supplies retained initial outbound TCP causes at ALE connect IPv4
-and IPv6. Its inspection callouts return Continue only with ACTION_WRITE. They
-never authorize traffic. The existing principal policy owns permanent Allow and
-Block rules. UDP, reauthorization, elevated-IRQL acquisition, AppContainer causes,
-Once, process-instance permissions and timed enforcement are unsupported.
+The WDM driver retains initial outbound TCP operations at ALE connect for IPv4
+and IPv6. An authenticated service can deliver a reviewed Once, process-instance
+or timed process-instance decision after recording it durably. CompleteOperation
+causes reauthorization; only the matching operation and classify-completion
+reason consume that decision. Readback records the driver's classification
+decision, rather than claiming that traffic passed every firewall provider.
 
-The device admits only LocalSystem with the enabled LGAGateBouncerLab service SID,
-one retained caller process and one file object. At PASSIVE_LEVEL, the callback
-requires the current process context to match the OS endpoint-owner metadata and
-references that EPROCESS immediately, without looking up a saved PID. The OS
-endpoint token must be the same primary token. It copies
-the OS APP_ID, creation time, endpoint and tuple into a bounded queue. A delivered
-handle is opened directly from that referenced process object in the service's
-handle table. PID and creation-time fields are descriptive; they never reacquire
-authority. Token replacement, exit, queue loss or source reset invalidates causes.
-File cleanup releases the cause queue and its process/token references.
+The device admits LocalSystem with the enabled LGAGateBouncerLab service SID,
+one retained caller process and one file object. Initial acquisition requires
+PASSIVE_LEVEL, the current endpoint-owner process and its primary token. It pins
+EPROCESS and token objects and copies creation time, OS APP_ID, account SID,
+endpoint, compartment and tuple. Saved PID values never reacquire authority.
+AppContainer, missing owner evidence and elevated-IRQL acquisition fail closed.
 
-DriverEntry loads an inert device with no registered callouts. The authenticated
-service performs START before source acquisition; START registers the callbacks
-and dynamic WFP objects after the driver image is already retained. This initial
-cut deliberately provides no DriverUnload: removal requires a guest reboot. A
-partial START failure preserves every acquired session/callout and marks the
-device unavailable until reboot. It never reports a failed unregister as drain
-or unloads an image that might still own callbacks. Closing the service file
-stops cause acquisition; the retained inspection callouts continue without granting
-permissions. Dynamic driver lifecycle and unattended repair are not implemented.
+Once applies to one retained connection. Instance and timed decisions authorize
+new matching TCP connections of that same pinned process and token; they do not
+authorize another initial process instance. Duration is at most fifteen minutes
+and a newer Applied instance decision determines future connections of that
+same instance. Existing scoped connections keep their original root and deadline.
+Duration uses kernel interrupt time, including sleep time. Every scoped stream-packet
+classification checks the deadline in both directions, including control packets.
+Expiry remains enforced while the service is hung. Exit, token replacement,
+source loss, reset or file cleanup revoke the scopes. Existing connections retain
+deny guards until matching OS endpoint closure. Flow deletion alone cannot turn
+a scoped connection into an unguarded one.
 
-NativeSource reads this device through its private owner and retains the cause
-through draft and commit. A cause is an initial classifier indication, not a
-correlated netevent drop or a suspended socket. Before admitting a permanent
-future policy, the source reads the classifier's exact registered callout/filter,
-the existing policy inventory and the current runtime Block baseline, and rejects
-an own matching outbound Allow. That readback does not prove platform-wide traffic
-coverage or precedence over other firewall providers.
+Stream guards require the exact OS endpoint, family, compartment and tuple.
+Flow association additionally requires the OS flow ID, process metadata, APP_ID
+and the same referenced endpoint token. Ineligible flow evidence revokes the
+connection and aborts its OS flow; it never manufactures a permit from a tuple.
+Missing or ambiguous scoped metadata denies traffic. A connection without a
+scope continues to the existing policy. Connect and packet filters therefore
+use CALLOUT_UNKNOWN. Scoped Block clears ACTION_WRITE and can veto a preceding
+Permit; scoped Permit keeps rights so other firewall decisions still apply.
 
-Build the standalone CMake project with MSVC x64 and explicit WDK/SDK roots. It
-produces an unsigned `.sys`. Building does not install, load or sign a driver.
-There is no INF, installer, production signing or driver deployment admission yet.
-The service opens a present device; when absent it retains its netevent producer
-and does not advertise kernel permission scopes. Driver execution and causal
-traffic validation must occur in an explicitly authorized guest deployment.
+The service records temporal commands in a separate protected journal. Prepared
+is flushed and compared before the single device decision. It completes the
+durable receipt only after exact command readback reports Applied. Uncertain
+delivery is queried rather than replayed. Loading history never rearms a scope.
+The principal permanent rule writer also accepts a held operation. It first
+records Prepared, then seals a command-bound negative guard for that exact
+operation before changing the principal rule. A registered connect guard at
+weight 1000 denies the cancelled operation even if a future Allow rule at
+weight 100 would otherwise bypass the temporal classifier. Its receipt proves
+the retained guard, rather than an acknowledgement of CompleteOperation.
+Future attempts follow the new principal rule; the old held attempt remains
+denied. The upper guard never permits or consumes a temporal decision: the
+principal Block at weight 200 keeps precedence and the temporal classifier at
+weight 50 remains the sole publisher of Applied.
+
+DriverEntry creates an inert device. START occurs only after the service reads
+the real baseline policy inventory. START retains registered callouts and WFP
+objects for the driver lifetime. There is no DriverUnload; removal and partial
+START recovery currently require a guest reboot. The retained dynamic session
+manages object lifetime rather than the duration of a permission.
+
+Build this standalone CMake project with MSVC x64 and explicit WDK/SDK roots.
+It produces an unsigned .sys without installing, loading or signing it. There
+is no production signing, INF, unattended repair or deployment admission yet.
+When the device is absent, the service retains its legacy netevent producer.
+
+This source does not establish platform-wide protection. UDP, QUIC, ICMP,
+inbound initial authorization, boot coverage, socket transfer, provider precedence
+and driver lifecycle require separate guest validation. Token replacement is
+detected by a kernel worker at a 100 ms interval, not instantaneously. The kernel
+registry and temporal journal currently have bounded capacities of 64 and 128;
+safe retirement and durable history continuity need further implementation.
+No host deployment or
+causal traffic validation is implied by building the source.
