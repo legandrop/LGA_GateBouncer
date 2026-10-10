@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <set>
 #include <sddl.h>
+#include <cstddef>
 namespace gb::controller {
 namespace {
 struct Descriptor {
@@ -57,15 +58,94 @@ bool parents(const std::filesystem::path &p, std::vector<native::Handle> &held) 
     }
     return true;
 }
-bool createDirectory(const std::filesystem::path &path, PSECURITY_DESCRIPTOR descriptor,
-                     std::vector<native::Handle> &held, bool readable) {
-    SECURITY_ATTRIBUTES attributes{sizeof(attributes),descriptor,FALSE};
-    if (!CreateDirectoryW(path.c_str(), &attributes)) return false; // Existente jamás se adopta.
-    native::Handle h(CreateFileW(path.c_str(),READ_CONTROL | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
-    if (!h || !native::protectedObject(h.value,false,true,readable)) return false;
-    held.push_back(std::move(h)); return true;
+struct OutputPin {
+    native::Handle handle;
+    BY_HANDLE_FILE_INFORMATION identity{};
+    bool directory = true, ancestor = false, readable = true;
+};
+using OutputPins = std::map<std::filesystem::path,OutputPin>;
+bool sameFile(const BY_HANDLE_FILE_INFORMATION &a,const BY_HANDLE_FILE_INFORMATION &b) {
+    return a.dwVolumeSerialNumber == b.dwVolumeSerialNumber &&
+        a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow;
+}
+bool inspectOutput(const std::filesystem::path &path,OutputPin &pin,bool initial) {
+    BY_HANDLE_FILE_INFORMATION now{}; wchar_t final[32768]{};
+    if (!pin.handle || !native::protectedObject(pin.handle.value,pin.ancestor,pin.directory,pin.readable) ||
+        !GetFileInformationByHandle(pin.handle.value,&now) ||
+        bool(now.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != pin.directory ||
+        (now.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    const auto count = GetFinalPathNameByHandleW(pin.handle.value,final,32768,FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    const auto expected = L"\\\\?\\"+path.native();
+    if (!count || count >= 32768 || _wcsicmp(final,expected.c_str()) != 0 ||
+        (!initial && (!sameFile(pin.identity,now) || (!pin.directory &&
+            (pin.identity.nFileSizeHigh != now.nFileSizeHigh || pin.identity.nFileSizeLow != now.nFileSizeLow ||
+             CompareFileTime(&pin.identity.ftLastWriteTime,&now.ftLastWriteTime))))) return false;
+    if (initial) pin.identity = now;
+    return true;
+}
+bool outputsCurrent(OutputPins &pins) {
+    for (auto &row : pins) if (!inspectOutput(row.first,row.second,false)) return false;
+    return true;
+}
+bool pinOutputParents(const std::filesystem::path &path,OutputPins &pins) {
+    if (!native::fixedPath(path) || path == path.root_path()) return false;
+    std::vector<std::filesystem::path> paths;
+    for (auto p = path.parent_path(); !p.empty(); p = p.parent_path()) {
+        paths.push_back(p); if (p == p.parent_path()) break;
+    }
+    for (auto p = paths.rbegin(); p != paths.rend(); ++p) {
+        if (pins.count(*p)) continue;
+        if (pins.size() >= 128 || !outputsCurrent(pins)) return false;
+        OutputPin pin; pin.ancestor = true;
+        pin.handle.reset(CreateFileW(p->c_str(),READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE,
+            FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+        if (!inspectOutput(*p,pin,true)) return false;
+        pins.emplace(*p,std::move(pin));
+    }
+    return outputsCurrent(pins);
+}
+struct NativeName { USHORT length, maximum; PWSTR buffer; };
+struct NativeAttributes {
+    ULONG length; HANDLE root; NativeName *name; ULONG attributes;
+    PSECURITY_DESCRIPTOR descriptor; void *quality;
+};
+struct NativeStatus { union { LONG status; void *pointer; }; ULONG_PTR information; };
+static_assert(sizeof(void *) == 4 || sizeof(void *) == 8,"ABI Windows requerida");
+static_assert(sizeof(NativeName) == (sizeof(void *) == 8 ? 16 : 8),"ABI UNICODE_STRING");
+static_assert(sizeof(NativeAttributes) == (sizeof(void *) == 8 ? 48 : 24),"ABI OBJECT_ATTRIBUTES");
+static_assert(sizeof(NativeStatus) == 2*sizeof(void *),"ABI IO_STATUS_BLOCK");
+static_assert(offsetof(NativeAttributes,root) == (sizeof(void *) == 8 ? 8 : 4),"ABI RootDirectory");
+static_assert(offsetof(NativeStatus,information) == sizeof(void *),"ABI Information");
+using CreateRelative = LONG (NTAPI *)(HANDLE *,ACCESS_MASK,NativeAttributes *,NativeStatus *,LARGE_INTEGER *,
+                                     ULONG,ULONG,ULONG,ULONG,void *,ULONG);
+bool createOutput(const std::filesystem::path &path,PSECURITY_DESCRIPTOR descriptor,
+                  OutputPins &pins,bool directory,bool readable) {
+    const auto leaf = path.filename().native();
+    if (!native::fixedPath(path) || leaf.empty() || leaf.size() > 128 || leaf == L"." || leaf == L".." ||
+        leaf.back() == L'.' || leaf.back() == L' ' || pins.count(path) || pins.size() >= 128) return false;
+    for (auto c : leaf) if (c < 0x20 || c > 0x7e || wcschr(L"\\/:*?\"<>|",c)) return false;
+    const auto parent = pins.find(path.parent_path());
+    const auto module = GetModuleHandleW(L"ntdll.dll");
+    const auto create = module ? reinterpret_cast<CreateRelative>(GetProcAddress(module,"NtCreateFile")) : nullptr;
+    if (parent == pins.end() || !parent->second.directory || !descriptor || !create || !outputsCurrent(pins)) return false;
+    NativeName name{static_cast<USHORT>(leaf.size()*sizeof(wchar_t)),
+        static_cast<USHORT>((leaf.size()+1)*sizeof(wchar_t)),const_cast<PWSTR>(leaf.c_str())};
+    NativeAttributes attributes{sizeof(NativeAttributes),parent->second.handle.value,&name,0x1040,descriptor,nullptr};
+    NativeStatus status{}; HANDLE raw = nullptr;
+    // OBJ_DONT_REPARSE; FILE_CREATE; RootDirectory original y una sola hoja, sin fallback por path.
+    const auto result = create(&raw,directory ? READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_TRAVERSE | SYNCHRONIZE :
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE,&attributes,&status,nullptr,
+        directory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL,FILE_SHARE_READ,2,
+        directory ? 0x21 : 0x200062,nullptr,0);
+    OutputPin pin; pin.handle.reset(raw); pin.directory = directory; pin.readable = readable;
+    if (result != 0 || status.status != 0 || status.information != 2 ||
+        !inspectOutput(path,pin,true) || !outputsCurrent(pins)) return false;
+    pins.emplace(path,std::move(pin));
+    return outputsCurrent(pins);
+}
+bool createDirectory(const std::filesystem::path &path,PSECURITY_DESCRIPTOR descriptor,
+                     OutputPins &held,bool readable) {
+    return createOutput(path,descriptor,held,true,readable);
 }
 bool sourceFile(const std::filesystem::path &path, native::Handle &h, wire::Bytes &out) {
     h.reset(CreateFileW(path.c_str(),GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES,FILE_SHARE_READ,
@@ -76,26 +156,36 @@ bool sourceFile(const std::filesystem::path &path, native::Handle &h, wire::Byte
     out.resize(static_cast<std::size_t>(size.QuadPart)); DWORD done = 0;
     return ReadFile(h.value,out.data(),static_cast<DWORD>(out.size()),&done,nullptr) && done == out.size();
 }
-bool createFile(const std::filesystem::path &path, const wire::Bytes &bytes,
-                PSECURITY_DESCRIPTOR descriptor, std::vector<native::Handle> &held) {
-    SECURITY_ATTRIBUTES attributes{sizeof(attributes),descriptor,FALSE};
-    native::Handle h(CreateFileW(path.c_str(),GENERIC_READ | GENERIC_WRITE | READ_CONTROL | FILE_READ_ATTRIBUTES,
-        0,&attributes,CREATE_NEW,FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_WRITE_THROUGH,nullptr));
+bool createFile(const std::filesystem::path &path,const wire::Bytes &bytes,
+                PSECURITY_DESCRIPTOR descriptor,OutputPins &held) {
+    if (bytes.size() > UINT32_MAX || !createOutput(path,descriptor,held,false,true)) return false;
+    auto &pin = held.at(path); const auto created = pin.identity;
     DWORD done = 0; LARGE_INTEGER begin{};
     bool same = false;
     auto reader = [](void *p,std::uint8_t *b,std::uint32_t n,std::uint32_t &actual) {
         DWORD done = 0; const auto ok = ReadFile(static_cast<HANDLE>(p),b,n,&done,nullptr); actual = done; return ok != FALSE;
     };
-    if (!h || !native::protectedObject(h.value,false,false,true) || bytes.size() > UINT32_MAX ||
-        !WriteFile(h.value,bytes.data(),static_cast<DWORD>(bytes.size()),&done,nullptr) || done != bytes.size() ||
-        !FlushFileBuffers(h.value) || !SetFilePointerEx(h.value,begin,nullptr,FILE_BEGIN) ||
+    if (!outputsCurrent(held) || !WriteFile(pin.handle.value,bytes.data(),static_cast<DWORD>(bytes.size()),&done,nullptr) || done != bytes.size() ||
+        !FlushFileBuffers(pin.handle.value) || !SetFilePointerEx(pin.handle.value,begin,nullptr,FILE_BEGIN) ||
         // El comparador del store tiene cota32MiB; los recursos de Qt deben caber en ella.
-        !native::compareStream(bytes.data(),bytes.size(),h.value,reader,same) || !same) return false;
-    h.reset();
-    native::Handle retained(CreateFileW(path.c_str(),GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
-    if (!retained || !native::protectedObject(retained.value,false,false,true)) return false;
-    held.push_back(std::move(retained)); return true;
+        !native::compareStream(bytes.data(),bytes.size(),pin.handle.value,reader,same) || !same ||
+        !inspectOutput(path,pin,true) || !sameFile(created,pin.identity) || !outputsCurrent(held)) return false;
+    // ReOpenFile trabaja sobre el objeto original. El puente leído conserva su FileID
+    // al soltar el acceso escritor; el pin final vuelve a negar escritores y Delete.
+    OutputPin bridge; bridge.directory = false;
+    bridge.handle.reset(ReOpenFile(pin.handle.value,GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,FILE_FLAG_OPEN_REPARSE_POINT));
+    if (!inspectOutput(path,bridge,true) || !sameFile(pin.identity,bridge.identity)) return false;
+    pin.handle.reset();
+    pin.handle.reset(ReOpenFile(bridge.handle.value,GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,FILE_FLAG_OPEN_REPARSE_POINT));
+    // El último cierre escritor puede publicar timestamps de nuestra escritura.
+    // FileID no cambia; capturar metadata final y releer los mismos bytes originales.
+    if (!inspectOutput(path,pin,true) || !sameFile(created,pin.identity) ||
+        !inspectOutput(path,bridge,true) || !sameFile(created,bridge.identity) ||
+        !SetFilePointerEx(pin.handle.value,begin,nullptr,FILE_BEGIN) ||
+        !native::compareStream(bytes.data(),bytes.size(),pin.handle.value,reader,same) || !same) return false;
+    return outputsCurrent(held);
 }
 bool stringValue(HKEY key,const wchar_t *name,const std::wstring &value) {
     if (value.empty() || value.size() >= 32768) return false;
@@ -155,8 +245,8 @@ bool pinSource(const std::filesystem::path &source,std::vector<native::Handle> &
 bool stagePackage(const std::filesystem::path &source,const std::filesystem::path &package,
                   std::shared_ptr<Deployment> &owner, DeploymentMode mode) {
     if (owner || !disjoint(source,package)) return false;
-    std::vector<native::Handle> held, inputs;
-    if (!parents(package,held) || !pinSource(source,inputs)) return false;
+    OutputPins held; std::vector<native::Handle> inputs;
+    if (!pinOutputParents(package,held) || !pinSource(source,inputs)) return false;
     const auto attr = GetFileAttributesW(package.c_str());
     if (attr != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) return false;
     Descriptor readable(L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;BU)");
@@ -184,7 +274,11 @@ bool stagePackage(const std::filesystem::path &source,const std::filesystem::pat
     wire::Bytes manifest;
     if (!encodeInventory(inventory,manifest) || !createFile(package/L"deployment.gbd",manifest,readable.value,held)) return false;
     auto candidate = std::make_shared<Deployment>(package,mode);
-    if (!candidate->verify(package/L"GateBouncerService.exe",DeploymentRole::Service) || !candidate->current()) return false;
+    if (!outputsCurrent(held) || !candidate->verify(package/L"GateBouncerService.exe",DeploymentRole::Service) ||
+        !candidate->current() || !outputsCurrent(held)) return false;
+    for (const auto &row : held) if (!row.second.directory &&
+        !candidate->matchesCreatedFile(row.first,row.second.handle.value)) return false;
+    if (!candidate->current() || !outputsCurrent(held)) return false;
     owner = std::move(candidate); return true;
 }
 }
@@ -214,8 +308,8 @@ static bool prepareDeployment(DeploymentMode mode, const std::filesystem::path &
             static_cast<BYTE *>(account) + GetLengthSid(account))); LocalFree(account);
         if (accountText != accountSid) return false;
         native::ProtectedDirectory sourceRoot(source,true);
-        std::vector<native::Handle> held;
-        if (!sourceRoot.acquire() || !parents(package,held) || !parents(store,held)) return false;
+        OutputPins held;
+        if (!sourceRoot.acquire() || !pinOutputParents(package,held) || !pinOutputParents(store,held)) return false;
         const auto absent = [](const auto &p) { const auto attr = GetFileAttributesW(p.c_str());
             return attr == INVALID_FILE_ATTRIBUTES && GetLastError() == ERROR_FILE_NOT_FOUND; };
         if (!absent(package) || !absent(store)) return false;
@@ -238,7 +332,7 @@ static bool prepareDeployment(DeploymentMode mode, const std::filesystem::path &
         const auto command = deploymentCommand(package/L"GateBouncerService.exe",mode);
         Key configuration; DWORD disposition = 0;
         SECURITY_ATTRIBUTES attributes{sizeof(attributes),registry.value,FALSE};
-        if (!lease.current() || RegCreateKeyExW(gate,deploymentConfiguration(mode),0,nullptr,REG_OPTION_NON_VOLATILE,
+        if (!lease.current() || !outputsCurrent(held) || RegCreateKeyExW(gate,deploymentConfiguration(mode),0,nullptr,REG_OPTION_NON_VOLATILE,
             KEY_QUERY_VALUE | KEY_SET_VALUE | READ_CONTROL,&attributes,&configuration.value,&disposition) != ERROR_SUCCESS ||
             disposition != REG_CREATED_NEW_KEY || !native::protectedRegistry(configuration.value) ||
             !deployment_detail::setDword(configuration.value,L"MaintenanceVersion",1) ||
@@ -250,27 +344,29 @@ static bool prepareDeployment(DeploymentMode mode, const std::filesystem::path &
         if (!service.value || !ChangeServiceConfig2W(service.value,SERVICE_CONFIG_SERVICE_SID_INFO,&sid) ||
             !SetServiceObjectSecurity(service.value,OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION |
                 DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,scm.value) ||
-            !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode) || !packageOwner->current()) return false;
+            !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode) ||
+            !packageOwner->current() || !outputsCurrent(held)) return false;
         if (!native::protectedRegistry(configuration.value) ||
             !stringValue(configuration.value,L"PackageRoot",package.native()) ||
             !stringValue(configuration.value,L"OrdinaryImage",(package/L"GateBouncer.exe").native()) ||
             !stringValue(configuration.value,L"StoreRoot",store.native()) ||
             !stringValue(configuration.value,L"ViewSid",accountSid) ||
             !serviceConfigurationPhase(service.value,package/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode) || !packageOwner->current() ||
-            !native::protectedRegistry(gate)) return false;
+            !native::protectedRegistry(gate) || !outputsCurrent(held)) return false;
         DWORD initial = 1, repeated = 0, repeatedSize = sizeof(repeated);
         const bool recorded = RegSetValueExW(configuration.value,L"ProvisionPrincipal",0,REG_DWORD,
             reinterpret_cast<const BYTE *>(&initial),sizeof(initial)) == ERROR_SUCCESS &&
             RegFlushKey(configuration.value) == ERROR_SUCCESS &&
             RegGetValueW(configuration.value,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&repeated,&repeatedSize) == ERROR_SUCCESS &&
             repeated == 1 && repeatedSize == sizeof(repeated) && native::protectedRegistry(configuration.value) &&
-            packageOwner->current() && lease.current();
+            packageOwner->current() && lease.current() && outputsCurrent(held);
         DWORD marker = 1;
         if (recorded && deployment_detail::mark(configuration.value,0,marker,lease)) marker = 0;
         else return false; // Flush/readback incierto: no escribir otro marker ni reintentar.
-        if (!ChangeServiceConfigW(service.value,SERVICE_NO_CHANGE,SERVICE_AUTO_START,SERVICE_NO_CHANGE,
+        if (!outputsCurrent(held) || !ChangeServiceConfigW(service.value,SERVICE_NO_CHANGE,SERVICE_AUTO_START,SERVICE_NO_CHANGE,
                 nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr) ||
-            !serviceConfiguration(service.value,package/L"GateBouncerService.exe",0,mode) || !lease.current() || !packageOwner->current()) {
+            !serviceConfiguration(service.value,package/L"GateBouncerService.exe",0,mode) || !lease.current() ||
+            !packageOwner->current() || !outputsCurrent(held)) {
             DWORD actual = 0, size = sizeof(actual);
             if (packageOwner->current() && lease.ownsConfiguration(configuration.value) &&
                 stringMatches(configuration.value,L"PackageRoot",package.native()) &&

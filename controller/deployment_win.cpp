@@ -361,6 +361,17 @@ bool Deployment::matchesImage(const std::filesystem::path &path, const BY_HANDLE
         row->identity.nFileSizeHigh == identity.nFileSizeHigh && row->identity.nFileSizeLow == identity.nFileSizeLow &&
         CompareFileTime(&row->identity.ftLastWriteTime, &identity.ftLastWriteTime) == 0;
 }
+bool Deployment::matchesCreatedFile(const std::filesystem::path &path, HANDLE original) const {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+    if (!verified_ || revoked_ || !native::protectedObject(original,false,false,true)) return false;
+    const auto row = std::find_if(files_.begin(),files_.end(),[&](const auto &p) { return root_/p.path == path; });
+    BY_HANDLE_FILE_INFORMATION identity{};
+    return row != files_.end() && GetFileInformationByHandle(original,&identity) &&
+        row->identity.dwVolumeSerialNumber == identity.dwVolumeSerialNumber &&
+        row->identity.nFileIndexHigh == identity.nFileIndexHigh && row->identity.nFileIndexLow == identity.nFileIndexLow &&
+        row->identity.nFileSizeHigh == identity.nFileSizeHigh && row->identity.nFileSizeLow == identity.nFileSizeLow &&
+        CompareFileTime(&row->identity.ftLastWriteTime,&identity.ftLastWriteTime) == 0;
+}
 bool Deployment::current() noexcept {
     std::unique_lock<std::recursive_mutex> lock(currentMutex_, std::defer_lock);
     try { lock.lock(); } catch (...) { return false; }

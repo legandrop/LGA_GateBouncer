@@ -30,6 +30,8 @@ class Deployment {
                 DeploymentRole role = DeploymentRole::DecisionController);
     bool current() noexcept;
     bool matchesImage(const std::filesystem::path &, const BY_HANDLE_FILE_INFORMATION &) const;
+    // Readback de staging: compara el archivo admitido con su handle creado aún retenido.
+    bool matchesCreatedFile(const std::filesystem::path &, HANDLE original) const;
     // Sólo el helper propio del broker, derivado del GBD1 original retenido.
     bool signatureHelperInventory(std::filesystem::path &, wire::Digest &);
     bool admitServiceConfiguration(wire::Bytes &account, std::filesystem::path &store,
