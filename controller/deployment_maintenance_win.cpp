@@ -314,6 +314,7 @@ class GuestMaintenance {
             const bool exact = i < 4 ? readString(key_,name,text) && text == texts[i] :
                 readDword(key_,name,number) && number == numbers[i-4];
             if (!exact || !native::protectedRegistry(key_) || !lease_.current() || !package_->current() ||
+                (mode_ == DeploymentMode::Product && !lease_.ownsConfiguration(key_)) ||
                 RegDeleteValueW(key_,name) != ERROR_SUCCESS) return false;
             DWORD bytes = 0; if (RegQueryValueExW(key_,name,nullptr,nullptr,nullptr,&bytes) != ERROR_FILE_NOT_FOUND) return false;
         }
