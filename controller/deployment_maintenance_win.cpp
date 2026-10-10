@@ -275,7 +275,7 @@ bool AdministrativeLease::bootIdentity(wire::Id &out) {
         auto error = RegOpenKeyExW(gate_,L"BootSession",REG_OPTION_OPEN_LINK,KEY_QUERY_VALUE | READ_CONTROL,&boot_);
         if (error == ERROR_FILE_NOT_FOUND) {
             PSECURITY_DESCRIPTOR sd = nullptr;
-            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)",SDDL_REVISION_1,&sd)) return false;
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"O:BAG:BAD:P(A;;KA;;;SY)(A;;KA;;;BA)",SDDL_REVISION_1,&sd,nullptr)) return false;
             SECURITY_ATTRIBUTES attributes{sizeof(attributes),sd,FALSE}; DWORD disposition = 0;
             error = RegCreateKeyExW(gate_,L"BootSession",0,nullptr,REG_OPTION_VOLATILE,
                 KEY_QUERY_VALUE | KEY_SET_VALUE | READ_CONTROL,&attributes,&boot_,&disposition);
