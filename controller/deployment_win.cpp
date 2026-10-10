@@ -235,9 +235,9 @@ bool driverPackageSignature(HANDLE sys, HANDLE inf, const wire::Bytes &catalog) 
         data.pCatalog = &info; data.dwStateAction = WTD_STATEACTION_VERIFY;
         data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT |
             WTD_USE_DEFAULT_OSVER_CHECK | WTD_DISABLE_MD2_MD4;
-        ok = verify(INVALID_HANDLE_VALUE,&action,&data) == ERROR_SUCCESS;
+        ok = verify(reinterpret_cast<HWND>(INVALID_HANDLE_VALUE),&action,&data) == ERROR_SUCCESS;
         data.dwStateAction = WTD_STATEACTION_CLOSE;
-        if (verify(INVALID_HANDLE_VALUE,&action,&data) != ERROR_SUCCESS) ok = false;
+        if (verify(reinterpret_cast<HWND>(INVALID_HANDLE_VALUE),&action,&data) != ERROR_SUCCESS) ok = false;
     }
     if (admin && !release(admin,0)) ok = false;
     if (!freeContext(ctl)) ok = false;
