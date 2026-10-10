@@ -332,7 +332,7 @@ bool command(const Entry &e, Frame &f) {
       !sidValid(ByteView(c.logonSid)) || decode(c.payload, f) != Error::Ok ||
       f.minor != 3 ||
       (f.type != Type::CommitFuturePolicy &&
-       f.type != Type::RevokePrincipalRule) ||
+       f.type != Type::RevokePrincipalRule && f.type!=Type::ReplacePrincipalRule) ||
       f.correlation != c.id || f.sequence != 1 ||
       f.connection != Id{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1} ||
       idValue(f, Tag::ServiceEpoch) != c.commandEpoch ||
@@ -540,7 +540,7 @@ bool rulesValid(const std::vector<Rule> &rows) {
       const auto &r = rows[i];
       Target t;
       if (zero(r.id) || zero(r.selector) || !ids.insert(r.id).second ||
-          r.revision != 1 || !r.targetRevision || r.action < 1 ||
+          !r.revision || (r.kind == 2 && r.revision != 1) || !r.targetRevision || r.action < 1 ||
           r.action > 2 || r.direction < 1 || r.direction > 3 ||
           r.mode != mode(r.action, r.direction) ||
           (r.kind == 1 ? !parseTarget(r.target, t)
@@ -628,7 +628,7 @@ Digest targetSetDigest(std::uint64_t desired, const ByteView &p,
 bool project(const Frame &f, const Digest &set, Bytes &out) {
   if (f.minor != 3 || validate(f) != Error::Ok ||
       (f.type != Type::CommitFuturePolicy &&
-       f.type != Type::RevokePrincipalRule))
+       f.type != Type::RevokePrincipalRule && f.type!=Type::ReplacePrincipalRule))
     return false;
   Bytes p(160);
   p[0] = 'P';
@@ -639,22 +639,26 @@ bool project(const Frame &f, const Digest &set, Bytes &out) {
   put(p, 6, 160, 2);
   put(p, 8, 160, 4);
   bool create = f.type == Type::CommitFuturePolicy;
-  p[12] = create ? 1 : 2;
+  const bool replace=f.type==Type::ReplacePrincipalRule;
+  p[12] = create ? 1 : replace ? 3 : 2;
   put(p, 16, get(f, Tag::ExpectedDesiredRev), 8);
-  put(p, 24, create ? 1 : get(f, Tag::RuleRevision), 8);
+  put(p, 24, create ? 1 : get(f, Tag::RuleRevision)+(replace ? 1u : 0u), 8);
   put(p, 32, create ? f.correlation : idValue(f, Tag::RuleId));
   put(p, 64, get(f, Tag::TargetRevision), 8);
   auto target = find(f, Tag::TargetDigest);
   std::copy(target->bytes.begin(), target->bytes.end(), p.begin() + 72);
   put(p, 104, set);
   p[138] = 1;
-  if (create) {
+  if (create || replace) {
     p[13] = std::uint8_t(get(f, Tag::PolicyDirection));
     p[14] = std::uint8_t(get(f, Tag::Decision));
     p[15] = mode(p[14], p[13]);
     put(p, 48, idValue(f, Tag::SelectorId));
     put(p, 136, get(f, Tag::AcceptedScope), 2);
     p[139] = std::uint8_t(get(f, Tag::PackageMode));
+  }
+  if(replace) {
+    put(p,140,get(f,Tag::SelectorRevision),8);put(p,148,get(f,Tag::RuleRevision),8);
   }
   out = std::move(p);
   return true;
@@ -688,8 +692,8 @@ bool entryValid(const Entry &e) {
       return false;
     if (e.targetRevision != get(f, Tag::TargetRevision))
       return false;
-    if (f.type == Type::CommitFuturePolicy)
-      return e.effect == 1 && e.draft == idValue(f, Tag::DraftId) &&
+    if (f.type == Type::CommitFuturePolicy || f.type==Type::ReplacePrincipalRule)
+      return e.effect == (f.type==Type::CommitFuturePolicy ? 1 : 3) && e.draft == idValue(f, Tag::DraftId) &&
              e.draftVersion == get(f, Tag::DraftVersion) &&
              e.source == idValue(f, Tag::SourceEpoch) &&
              e.binding == idValue(f, Tag::CaptureBindingId) &&
@@ -711,9 +715,9 @@ bool bindEntry(Entry &e, const Digest &set) {
     e.targetSet = set;
     if (!project(f, set, e.projected))
       return false;
-    e.effect = f.type == Type::CommitFuturePolicy ? 1 : 2;
+    e.effect = f.type == Type::CommitFuturePolicy ? 1 : f.type==Type::ReplacePrincipalRule ? 3 : 2;
     e.targetRevision = get(f, Tag::TargetRevision);
-    if (e.effect == 1) {
+    if (e.effect == 1 || e.effect==3) {
       e.draft = idValue(f, Tag::DraftId);
       e.draftVersion = get(f, Tag::DraftVersion);
       e.source = idValue(f, Tag::SourceEpoch);
@@ -1080,13 +1084,15 @@ bool parse(ByteView b, Snapshot &out) {
       auto ruleId = active.effect == 1 ? s.active : idValue(f, Tag::RuleId);
       auto row = std::find_if(s.rules.begin(), s.rules.end(),
                               [&](const Rule &r) { return r.id == ruleId; });
-      if (active.effect == 1) {
+      if (active.effect == 1 || active.effect==3) {
         if (row == s.rules.end() || row->kind != 1 ||
             row->selector != idValue(f, Tag::SelectorId) ||
             row->targetRevision != get(f, Tag::TargetRevision) ||
             row->action != get(f, Tag::Decision) ||
             row->direction != active.direction ||
-            targetDigest(row->target) !=
+            (active.effect==1 && (row->revision!=1 || row->targetRevision!=1)) ||
+            (active.effect==3 && (get(f,Tag::RuleRevision)==UINT64_MAX ||
+                row->revision!=get(f,Tag::RuleRevision)+1)) || targetDigest(row->target) !=
                 array<32>(ByteView(find(f, Tag::TargetDigest)->bytes), 0))
           return false;
         Target t;
@@ -1311,12 +1317,32 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
     };
     auto ruleChange = [&](const std::vector<Rule> &old, const Frame &f) {
       bool create = f.type == Type::CommitFuturePolicy;
+      const bool replace=f.type==Type::ReplacePrincipalRule;
       auto removed = create ? Id{} : idValue(f, Tag::RuleId);
       if (create) {
         if (after.rules.size() != old.size() + 1 ||
             std::any_of(old.begin(), old.end(),
                         [&](const Rule &r) { return r.id == f.correlation; }))
           return false;
+      } else if(replace) {
+        auto found=std::find_if(old.begin(),old.end(),[&](const Rule &r){return r.id==removed;});
+        auto changed=std::find_if(after.rules.begin(),after.rules.end(),[&](const Rule &r){return r.id==removed;});
+        Target prior,current;
+        if(found==old.end() || changed==after.rules.end() || old.size()!=after.rules.size() ||
+           found->kind!=1 || changed->kind!=1 || !parseTarget(found->target,prior) ||
+           !parseTarget(changed->target,current) || prior.user!=current.user ||
+           found->revision!=get(f,Tag::RuleRevision) || found->revision==UINT64_MAX ||
+           found->targetRevision!=get(f,Tag::SelectorRevision) ||
+           changed->revision!=found->revision+1 || changed->selector!=found->selector ||
+           changed->selector!=idValue(f,Tag::SelectorId) ||
+           (found->target!=changed->target && found->targetRevision==UINT64_MAX) ||
+           changed->targetRevision!=found->targetRevision+(found->target!=changed->target ? 1u : 0u) ||
+           changed->targetRevision!=get(f,Tag::TargetRevision) ||
+           changed->action!=get(f,Tag::Decision) || changed->direction!=get(f,Tag::PolicyDirection) ||
+           changed->mode!=mode(changed->action,changed->direction) || current.packageMode!=get(f,Tag::PackageMode))return false;
+        const auto previous=targetDigest(found->target),next=targetDigest(changed->target);
+        if(find(f,Tag::PreviousTargetDigest)->bytes!=Bytes(previous.begin(),previous.end()) ||
+           find(f,Tag::TargetDigest)->bytes!=Bytes(next.begin(),next.end()))return false;
       } else {
         auto found = std::find_if(old.begin(), old.end(), [&](const Rule &r) {
           return r.id == removed;

@@ -91,19 +91,48 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
                 principal::targetDigest(rule.target) == admission.target &&
                 target.user == principal::ByteView(current.account);
         }
-        if (frame.type != Type::CommitFuturePolicy || !admission.event || !admission.proof ||
+        if (admission.file) {
+            if (!deployment_ || !deployment_->serviceAdmittedCurrent() || !admission.file->completed ||
+                !admission.file->image || admission.file->directories.empty() ||
+                admission.file->target != admission.fullTarget ||
+                !principalFileActorCurrent(*admission.file) ||
+                (frame.type != Type::CommitFuturePolicy && frame.type != Type::ReplacePrincipalRule) ||
+                bool(admission.replacing) != (frame.type == Type::ReplacePrincipalRule)) return false;
+            if (admission.replacing) {
+                const auto &prior = *admission.replacing;
+                const auto row = std::find_if(principalCatalog_->rules_.begin(), principalCatalog_->rules_.end(),
+                    [&](const auto &r) { return r.rule == prior.id; });
+                principal::Target oldTarget;
+                if (row == principalCatalog_->rules_.end() || prior.kind != 1 ||
+                    !principal::parseTarget(prior.target, oldTarget)) return false;
+                const auto view = principalCatalog_->ruleView(std::size_t(row-principalCatalog_->rules_.begin()));
+                const auto exact = [](const principal::ByteView &bytes, allnative::recipe::ByteView actual) {
+                    return bytes.size() == actual.size && (!actual.size ||
+                        std::equal(bytes.data(), bytes.data()+bytes.size(), actual.data));
+                };
+                const auto digest = principal::targetDigest(prior.target);
+                if (row->ruleRevision != prior.revision || row->targetRevision != prior.targetRevision ||
+                    view.targetKind != 1 || view.packageMode != oldTarget.packageMode ||
+                    !exact(oldTarget.app, view.app) || !exact(oldTarget.user, view.user) ||
+                    !exact(oldTarget.package, view.package) || oldTarget.user != principal::ByteView(current.account) ||
+                    idValue(frame, Tag::RuleId) != prior.id || get(frame, Tag::RuleRevision) != prior.revision ||
+                    get(frame, Tag::SelectorRevision) != prior.targetRevision ||
+                    !find(frame, Tag::PreviousTargetDigest) ||
+                    find(frame, Tag::PreviousTargetDigest)->bytes != Bytes(digest.begin(), digest.end())) return false;
+            }
+        } else if (frame.type != Type::CommitFuturePolicy || !admission.event || !admission.proof ||
             !(admission.cancelSealed ?
                 requiredStage == allnative::Stage::Drained && admission.source->retainedCancelledCause(
                     *admission.event, *admission.proof, allnative::CatalogReceipt(principalCatalog_), admission.cancelledDecision, backend_.engine_) :
                 admission.source->retainedCause(*admission.event, *admission.proof,
-                    allnative::CatalogReceipt(principalCatalog_), requiredStage)) ||
-            idValue(frame, Tag::SourceEpoch) != admission.source->binding_->epoch ||
+                    allnative::CatalogReceipt(principalCatalog_), requiredStage))) return false;
+        if (idValue(frame, Tag::SourceEpoch) != admission.source->binding_->epoch ||
             idValue(frame, Tag::DraftId) != admission.request || get(frame, Tag::DraftVersion) != admission.revision ||
             idValue(frame, Tag::CaptureBindingId) != admission.binding ||
             idValue(frame, Tag::SelectorId) != admission.selector ||
             idValue(frame, Tag::ConsentChallengeId) != admission.challenge ||
             get(frame, Tag::ExpectedDesiredRev) != admission.expectedDesired ||
-            get(frame, Tag::TargetRevision) != 1 || get(frame, Tag::PackageMode) != admission.package ||
+            get(frame, Tag::TargetRevision) != admission.targetRevision || get(frame, Tag::PackageMode) != admission.package ||
             get(frame, Tag::PolicyDirection) != admission.direction ||
             get(frame, Tag::ScopeKind) != admission.scope ||
             get(frame, Tag::ScopeDurationMs) != admission.durationMs ||
@@ -139,12 +168,16 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         if (!principal::parse(bytes, checked) ||
             !principal::validTransition(principalRead_.snapshot.encoded, checked)) return result;
         const auto rule = std::find_if(checked.rules.begin(), checked.rules.end(), [&](const auto &r) {
-            return r.id == command.command.id;
+            return r.id == (admission->replacing ? admission->replacing->id : command.command.id);
         });
         principal::Target principalTarget;
         Frame canonicalCommand;
         if (decode(command.command.payload, canonicalCommand) != Error::Ok) return result;
-        if (canonicalCommand.type == Type::CommitFuturePolicy) {
+        if (admission->file) {
+            if (rule == checked.rules.end() || rule->target != admission->fullTarget ||
+                !principal::parseTarget(rule->target, principalTarget) || principalTarget.packageMode != 1 ||
+                principalTarget.user != principal::ByteView(admission->identity.account)) return result;
+        } else if (canonicalCommand.type == Type::CommitFuturePolicy) {
         const auto &identity = admission->event->owned().identity;
         if (rule == checked.rules.end() || !principal::parseTarget(rule->target, principalTarget) ||
             identity.appId.state != gatebouncer::appidentity::FieldState::Copied ||
@@ -248,7 +281,9 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         profile_.refresh();
         // El flush y start pudieron cruzar un cambio de token: consultar el
         // HANDLE retenido otra vez, sin depender del Source A ya retirado.
-        if (started != Reason::None || !principalActorCurrent(*admission)) {
+        if (started != Reason::None || !principalActorCurrent(*admission) ||
+            (admission->file && (!deployment_ || !deployment_->serviceAdmittedCurrent() ||
+                                !principalFileActorCurrent(*admission->file)))) {
             principalWriteFault_ = true;
             result.state = State::RecoveryRequired; result.error = Error::RecoveryRequired;
         }
@@ -278,6 +313,7 @@ NativeRuntime::NativeRuntime(WfpBackend &b, SelectorRegistry &r,
 NativeRuntime::~NativeRuntime() {
     finishPrincipalImages();
     invalidatePrincipalObservations();
+    drainPrincipalFiles();
     retirePrincipalObservation();
     backend_.attachCollector(nullptr);
 }
@@ -540,7 +576,9 @@ void NativeRuntime::tick() {
             if (admission.cancelled || admission.consumed || admission.profile != profile_.value().generation ||
                 !admission.owner || admission.owner->cancelled || now >= admission.deadline ||
                 !principalActorCurrent(admission)) {
-                admission.cancelled = true; entry = principalAdmissions_.erase(entry);
+                admission.cancelled = true;
+                if (admission.file) admission.file->cancelled.store(true);
+                entry = principalAdmissions_.erase(entry);
             } else ++entry;
         }
         return;
@@ -852,8 +890,11 @@ bool NativeServer::run(HANDLE stop) {
         const auto ready=WaitForMultipleObjects(2,waits,FALSE,250);
         if(ready==WAIT_OBJECT_0)break;
         if(ready!=WAIT_TIMEOUT && ready!=WAIT_OBJECT_0+1) {SetEvent(stop);waited=false;break;}
-        std::lock_guard<std::mutex> lock(runtime_.mutex);
-        runtime_.tick();
+        {
+            std::lock_guard<std::mutex> lock(runtime_.mutex);
+            runtime_.tick();
+        }
+        runtime_.drainPrincipalFiles();
     }
     view.join();
     control.join();
@@ -863,6 +904,7 @@ bool NativeServer::run(HANDLE stop) {
         runtime_.stopPrincipalObservation();
     }
     runtime_.finishPrincipalImages();
+    runtime_.drainPrincipalFiles();
     if(!waited)throw std::runtime_error("Espera original del servidor fallida");
     return true;
 }
@@ -1024,13 +1066,17 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                     tx == UINT64_MAX)
                     break;
                 Frame response;
+                const bool fileRequest = ordinary && (f.type == Type::PrepareFileFuturePolicy ||
+                    f.type == Type::CommitFuturePolicy || f.type == Type::ReplacePrincipalRule ||
+                    f.type == Type::GetFutureDraft);
                 {
                     std::lock_guard<std::mutex> lock(runtime_.mutex);
                     if (runtime_.profileGeneration() != profile ||
                         !(ordinary || principalReader ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer, principalReader)
                                    : runtime_.peer(pipe.value, control, peer, false)))
                         break;
-                    if (ordinary || principalReader) response = runtime_.dispatchOrdinary(f, ordinaryPeer);
+                    if (fileRequest) { /* Preflight del mismo channel fuera Runtime. */ }
+                    else if (ordinary || principalReader) response = runtime_.dispatchOrdinary(f, ordinaryPeer);
                     else if (!hello.minor) {
                         response = runtime_.status(Type::Status);
                         if (f.type != Type::GetStatus) {
@@ -1047,6 +1093,8 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                     } else
                         response = runtime_.dispatch(f, peer, pages);
                 }
+                if (fileRequest) response = runtime_.dispatchFileFuture(f, ordinaryPeer, stop);
+                runtime_.drainPrincipalFiles();
                 response.connection = connection;
                 response.sequence = tx++;
                 response.correlation = f.correlation;
@@ -1067,8 +1115,11 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
             {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
                 if (ordinary || principalReader) runtime_.closeOrdinaryPeer(ordinaryPeer);
-                if (runtime_.profileGeneration() != profile)
-                    break;
+            }
+            runtime_.drainPrincipalFiles();
+            {
+                std::lock_guard<std::mutex> lock(runtime_.mutex);
+                if (runtime_.profileGeneration() != profile) break;
             }
         }
     }

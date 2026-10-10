@@ -55,6 +55,17 @@ class NativeRuntime {
         Id connection{};
         std::uint64_t profile = 0;
         std::map<Id, PrincipalPage> pages;
+        struct RulePage {
+            principal::ByteView snapshot;
+            std::uint64_t desired=0;
+            std::vector<std::size_t> indices;
+            std::shared_ptr<allnative::NativeSource> source;
+            std::shared_ptr<const allnative::CatalogSnapshot> catalog;
+            ServiceContext context;
+            std::uint64_t profile=0, deadline=0;
+            std::uint32_t next=0;
+        };
+        std::map<Id,RulePage> rulePages;
         bool cancelled = false;
         bool readonly = false;
         std::uint32_t subscriptionMask=0;
@@ -63,6 +74,22 @@ class NativeRuntime {
     struct PrincipalObservation;
     struct PrincipalOutcome;
     struct PrincipalProcessRetainer;
+    struct PrincipalFileCapture {
+        native::ProcessEvidence actor;
+        native::TokenEvidence identity;
+        native::Handle primary, image, stop;
+        std::vector<native::Handle> directories;
+        std::vector<std::filesystem::path> paths;
+        std::vector<BY_HANDLE_FILE_INFORMATION> directoryIds;
+        std::filesystem::path path;
+        BY_HANDLE_FILE_INFORMATION imageId{};
+        principal::ByteView target;
+        wire::iv::Display display;
+        std::atomic<bool> cancelled{false};
+        bool completed=false;
+        std::size_t charged=0;
+        std::uint64_t deadline=0;
+    };
     struct PrincipalAdmission {
         Id request{}, binding{};
         std::uint64_t revision = 0, profile = 0;
@@ -71,6 +98,9 @@ class NativeRuntime {
         std::optional<allnative::NativeCopiedMetadata> event;
         std::optional<allnative::NativeProof> proof;
         std::optional<principal::Rule> revocation;
+        std::shared_ptr<PrincipalFileCapture> file;
+        std::optional<principal::Rule> replacing;
+        std::uint64_t targetRevision=1;
         native::ProcessEvidence actor;
         native::TokenEvidence identity;
         std::shared_ptr<PrincipalPeer> owner;
@@ -114,6 +144,15 @@ class NativeRuntime {
     Frame principalError(Error) const;
     Frame principalResult(const Id &, const directional::Result &, Type = Type::FuturePolicyAck) const;
     Frame preparePrincipal(const Frame &, const std::shared_ptr<PrincipalPeer> &);
+    Frame dispatchFileFuture(const Frame &, const std::shared_ptr<PrincipalPeer> &, HANDLE stop);
+    Frame fileFutureRecord(const PrincipalAdmission &);
+    Frame listPrincipalRules(const Frame &, const std::shared_ptr<PrincipalPeer> &);
+    static bool capturePrincipalFile(PrincipalFileCapture &, const Frame &) noexcept;
+    static bool principalFileActorCurrent(const PrincipalFileCapture &) noexcept;
+    static bool principalFileMetadataCurrent(const PrincipalFileCapture &) noexcept;
+    void drainPrincipalFiles() noexcept;
+    std::array<std::shared_ptr<PrincipalFileCapture>,64> principalFiles_{};
+    std::size_t principalFileBytes_=0,principalFilePhysical_=0;
     Frame commitPrincipal(const Frame &, const std::shared_ptr<PrincipalPeer> &);
     std::filesystem::path ordinaryImage_;
     std::shared_ptr<controller::Deployment> deployment_;

@@ -6,6 +6,7 @@ constexpr std::size_t MaxRecordsBytes = 57344;
 constexpr std::uint64_t NativeEvents = 1ull << 25;
 constexpr std::uint64_t NativeTraffic = 1ull << 26;
 constexpr std::uint64_t NativeProcessFacts = 1ull << 27;
+constexpr std::uint64_t FileFutureControl = 1ull << 28;
 // Archivo original custodiado por fuente; no es un HANDLE de imagen del caller.
 struct ProcessFacts {
   std::uint64_t pid=0, created=0, lastWrite=0;
@@ -63,15 +64,38 @@ struct PrincipalRuleRecord {
   std::uint8_t admin = 1, effective = 0, targetKind = 1;
   Proof proof = Proof::Unknown;
   Display display;
+  Bytes originalTarget;
 };
+// Archivo seleccionado y custodiado; ninguna identidad de proceso se inventa.
+struct FileIdentity {
+  std::uint32_t volumeSerial=0, fileIndexHigh=0, fileIndexLow=0,
+                fileSizeHigh=0, fileSizeLow=0, attributes=0;
+  std::uint64_t lastWrite=0;
+};
+struct FileFutureDraftRecord {
+  FutureDraftRecord draft;
+  Bytes originalTarget;
+  FileIdentity file;
+};
+bool validPrincipalTarget(const Bytes &target, std::uint8_t package=0);
+bool validFileTarget(const Bytes &target);
+struct OriginalTarget {
+  Bytes appId, accountSid, packageSid;
+  std::uint8_t packageMode=0;
+};
+Error unpackOriginalTarget(const Bytes &, OriginalTarget &);
+// Entrada del SHA256 original: dominio8 + longitud LE4 + target completo.
+Error principalTargetDigestInput(const Bytes &, Bytes &);
 bool supported(Type type);
 bool valid(const ObservedRecord &record);
 bool valid(const FutureDraftRecord &record);
 bool valid(const PrincipalRuleRecord &record);
+bool valid(const FileFutureDraftRecord &record);
 bool valid(const ProcessFacts &record);
 Error pack(const std::vector<ObservedRecord> &records, Bytes &out);
 Error pack(const std::vector<FutureDraftRecord> &records, Bytes &out);
 Error pack(const std::vector<PrincipalRuleRecord> &records, Bytes &out);
+Error pack(const std::vector<FileFutureDraftRecord> &records, Bytes &out);
 Error pack(const std::vector<ProcessFacts> &records, Bytes &out);
 Error unpack(const Bytes &bytes, std::size_t count,
              std::vector<ObservedRecord> &out);
@@ -79,6 +103,8 @@ Error unpack(const Bytes &bytes, std::size_t count,
              std::vector<FutureDraftRecord> &out);
 Error unpack(const Bytes &bytes, std::size_t count,
              std::vector<PrincipalRuleRecord> &out);
+Error unpack(const Bytes &bytes, std::size_t count,
+             std::vector<FileFutureDraftRecord> &out);
 Error unpack(const Bytes &bytes, std::size_t count,
              std::vector<ProcessFacts> &out);
 Error validate(const Frame &frame);

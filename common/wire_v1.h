@@ -20,7 +20,8 @@ enum class Type : std::uint16_t { Hello=1, HelloAck=2, GetStatus=3, Status=4,
     FuturePolicyAck=32, GetFutureCommandStatus=33, FutureCommandStatus=34,
     ListPrincipalRules=35, PrincipalRulesPage=36, RevokePrincipalRule=37,
     GetFutureDraft=38, ReviewQueued=39, GetNativeProcessContext=40,
-    NativeProcessContext=41 };
+    NativeProcessContext=41, PrepareFileFuturePolicy=42, FileFutureDraftRecord=43,
+    ReplacePrincipalRule=44 };
 enum class Error : std::uint16_t { Ok=0, Unsupported=1, Unauthorized=2, Stale=3,
     Malformed=4, VersionMismatch=5, Conflict=6, Capacity=7, StoreFailure=8,
     WfpFailure=9, RecoveryRequired=10, IdentityUnavailable=11, Timeout=12,
@@ -51,7 +52,8 @@ enum class Tag : std::uint16_t { ClientRole=1, ServiceEpoch=2, BootId=3,
     TargetRevision=75, PackageMode=76, AcceptedScope=77, TargetDigest=78,
     MigrationDigest=79, DraftState=80, ProofState=81, ObservedSnapshotRevision=82,
     KnownAppliedUnrecorded=83, Durable=84, ConsentChallengeId=85,
-    CaptureBindingId=86, IVProfile=87, ServiceContext=88, ScopeDurationMs=89 };
+    CaptureBindingId=86, IVProfile=87, ServiceContext=88, ScopeDurationMs=89,
+    PreviousTargetDigest=90 };
 constexpr std::uint64_t ReadStatus=1ull<<0, PathPermanentRule=1ull<<1,
     BlockRetry=1ull<<2, RuleRevoke=1ull<<3, Ipv4Ale=1ull<<4, Ipv6Ale=1ull<<5,
     DirectionalPath=1ull<<22, ObservedRead=1ull<<23, FuturePolicyControl=1ull<<24;

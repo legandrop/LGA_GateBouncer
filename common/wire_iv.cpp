@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <type_traits>
 
 namespace gb::wire::iv {
 namespace {
@@ -146,7 +147,20 @@ Bytes payload(const PrincipalRuleRecord &r) {
   b[117] = r.display.projection;
   b[118] = r.targetKind;
   put(b, 128, r.generation, 8);
+  if (!r.originalTarget.empty()) put(b, 136, r.originalTarget.size(), 4);
   tail(b, 120, r.display);
+  b.insert(b.end(), r.originalTarget.begin(), r.originalTarget.end());
+  return b;
+}
+Bytes payload(const FileFutureDraftRecord &r) {
+  auto b=payload(r.draft);
+  b.insert(b.begin()+240,32,0);
+  put(b,228,r.originalTarget.size(),4);
+  put(b,240,r.file.volumeSerial,4);put(b,244,r.file.fileIndexHigh,4);
+  put(b,248,r.file.fileIndexLow,4);put(b,252,r.file.fileSizeHigh,4);
+  put(b,256,r.file.fileSizeLow,4);put(b,260,r.file.attributes,4);
+  put(b,264,r.file.lastWrite,8);
+  b.insert(b.end(),r.originalTarget.begin(),r.originalTarget.end());
   return b;
 }
 Bytes payload(const ProcessFacts &r) {
@@ -193,9 +207,7 @@ bool parse(const Bytes &b, ObservedRecord &r) {
   r.reason = static_cast<Error>(n(b, 88, 2));
   return tail(b, 96, 80, r.display) && valid(r);
 }
-bool parse(const Bytes &b, FutureDraftRecord &r) {
-  if (b.size() < 240 || !zeros(b, 190, 2) || !zeros(b, 228, 12))
-    return false;
+void draftFields(const Bytes &b, FutureDraftRecord &r) {
   r.draft = array<16>(b, 0);
   r.version = n(b, 16, 8);
   r.observed = array<16>(b, 24);
@@ -219,10 +231,26 @@ bool parse(const Bytes &b, FutureDraftRecord &r) {
   r.reason = static_cast<Error>(n(b, 188, 2));
   r.migration = array<32>(b, 192);
   r.durationMs = std::uint32_t(n(b, 224, 4));
+}
+bool parse(const Bytes &b, FutureDraftRecord &r) {
+  if (b.size() < 240 || !zeros(b,190,2) || !zeros(b,228,12)) return false;
+  draftFields(b,r);
   return tail(b, 240, 180, r.display) && valid(r);
 }
-bool parse(const Bytes &b, PrincipalRuleRecord &r) {
-  if (b.size() < 160 || b[119] || !zeros(b, 136, 24))
+bool parse(const Bytes &b, FileFutureDraftRecord &r) {
+  if(b.size()<272 || !zeros(b,190,2) || !zeros(b,232,8))return false;
+  const auto target=std::size_t(n(b,228,4));
+  if(!target || target>b.size()-272)return false;
+  draftFields(b,r.draft);
+  r.file={std::uint32_t(n(b,240,4)),std::uint32_t(n(b,244,4)),std::uint32_t(n(b,248,4)),
+    std::uint32_t(n(b,252,4)),std::uint32_t(n(b,256,4)),std::uint32_t(n(b,260,4)),n(b,264,8)};
+  r.originalTarget.assign(b.end()-target,b.end());
+  Bytes displayBytes(b.begin(),b.end()-target);
+  return tail(displayBytes,272,180,r.draft.display) && valid(r);
+}
+bool parse(const Bytes &b, PrincipalRuleRecord &r, unsigned version) {
+  if (b.size() < 160 || b[119] ||
+      (version==1 ? !zeros(b,136,24) : version!=2 || !zeros(b,140,20)))
     return false;
   r.rule = array<16>(b, 0);
   r.selector = array<16>(b, 16);
@@ -245,7 +273,11 @@ bool parse(const Bytes &b, PrincipalRuleRecord &r) {
   r.display.projection = b[117];
   r.targetKind = b[118];
   r.generation = n(b, 128, 8);
-  return tail(b, 160, 120, r.display) && valid(r);
+  const auto target=version==2 ? std::size_t(n(b,136,4)) : 0;
+  if(target>b.size()-160 || (version==2 && !target))return false;
+  r.originalTarget.assign(b.end()-target,b.end());
+  Bytes displayBytes(b.begin(),b.end()-target);
+  return tail(displayBytes, 160, 120, r.display) && valid(r);
 }
 template <class R>
 Error packRecords(const std::vector<R> &rows, Bytes &out, unsigned kind) {
@@ -258,7 +290,10 @@ Error packRecords(const std::vector<R> &rows, Bytes &out, unsigned kind) {
     auto p = payload(r);
     if (p.size() + 8 > MaxRecordsBytes - b.size())
       return Error::Capacity;
-    for (auto v : {integer(p.size(), 4), integer(kind, 2), integer(1, 2)})
+    unsigned version=1;
+    if constexpr(std::is_same_v<R,PrincipalRuleRecord>)
+      if(!r.originalTarget.empty())version=2;
+    for (auto v : {integer(p.size(), 4), integer(kind, 2), integer(version, 2)})
       b.insert(b.end(), v.begin(), v.end());
     b.insert(b.end(), p.begin(), p.end());
   }
@@ -276,13 +311,18 @@ Error unpackRecords(const Bytes &b, std::size_t count, std::vector<R> &out,
     if (b.size() - at < 8)
       return Error::Malformed;
     auto size = std::size_t(n(b, at, 4));
-    if (n(b, at + 4, 2) != kind || n(b, at + 6, 2) != 1)
+    const auto version=unsigned(n(b,at+6,2));
+    if (n(b, at + 4, 2) != kind ||
+        (std::is_same_v<R,PrincipalRuleRecord> ? version!=1 && version!=2 : version!=1))
       return Error::Unsupported;
     if (size > max || size > b.size() - at - 8)
       return Error::Malformed;
     Bytes p(b.begin() + at + 8, b.begin() + at + 8 + size);
     R r;
-    if (!parse(p, r))
+    bool parsed;
+    if constexpr(std::is_same_v<R,PrincipalRuleRecord>) parsed=parse(p,r,version);
+    else parsed=parse(p,r);
+    if (!parsed)
       return Error::Malformed;
     rows.push_back(std::move(r));
     at += 8 + size;
@@ -381,13 +421,33 @@ Schema schema(const Frame &f) {
     if (find(f, T::ScopeKind)) ref[T::ScopeKind] = 1;
     if (get(f, T::ScopeKind) == 5) ref[T::ScopeDurationMs] = 4;
     return ref;
+  case Type::PrepareFileFuturePolicy: {
+    Schema file={{T::ServiceEpoch,16},{T::ExpectedDesiredRev,8},{T::PolicyDirection,1},
+      {T::ProfileGeneration,8},{T::SourceEpoch,16},{T::IVProfile,1},
+      {T::ScopeKind,1},{T::PackageMode,1},{T::Text,Variable}};
+    if(find(f,T::Records))file[T::Records]=Variable;
+    if(find(f,T::RuleId)) {
+      file[T::RuleId]=16;file[T::RuleRevision]=8;file[T::SelectorRevision]=8;
+      file[T::PreviousTargetDigest]=32;
+    }
+    return file;
+  }
+  case Type::FileFutureDraftRecord: {
+    Schema file={{T::ServiceEpoch,16},{T::Records,Variable},{T::SourceEpoch,16},{T::ServiceContext,56}};
+    if(find(f,T::RuleId)) {
+      file[T::RuleId]=16;file[T::RuleRevision]=8;file[T::SelectorRevision]=8;
+      file[T::PreviousTargetDigest]=32;
+    }
+    return file;
+  }
   case Type::GetFutureDraft:
     return {{T::ServiceEpoch, 16},
             {T::ProfileGeneration, 8},
             {T::DraftId, 16},
             {T::DraftVersion, 8},
             {T::IVProfile, 1}};
-  case Type::CommitFuturePolicy: {
+  case Type::CommitFuturePolicy:
+  case Type::ReplacePrincipalRule: {
     Schema command = {{T::ServiceEpoch, 16},     {T::ExpectedDesiredRev, 8},
             {T::Decision, 1},          {T::ScopeKind, 1},
             {T::SelectorId, 16},       {T::PolicyDirection, 1},
@@ -398,6 +458,10 @@ Schema schema(const Frame &f) {
             {T::MigrationDigest, 32},  {T::ConsentChallengeId, 16},
             {T::CaptureBindingId, 16}, {T::IVProfile, 1}};
     if (get(f,T::ScopeKind) == 5) command[T::ScopeDurationMs] = 4;
+    if(f.type==Type::ReplacePrincipalRule) {
+      command[T::RuleId]=16;command[T::RuleRevision]=8;command[T::SelectorRevision]=8;
+      command[T::PreviousTargetDigest]=32;
+    }
     return command;
   }
   case Type::RevokePrincipalRule:
@@ -422,10 +486,15 @@ Schema schema(const Frame &f) {
             {T::ErrorCode, 2},
             {T::CommandId, 16},
             {T::CommandFound, 1}};
-  case Type::PrincipalRulesPage:
-    return {{T::ServiceEpoch, 16}, {T::DesiredRev, 8}, {T::SnapshotId, 16},
+  case Type::PrincipalRulesPage: {
+    Schema page={{T::ServiceEpoch, 16}, {T::DesiredRev, 8}, {T::SnapshotId, 16},
             {T::Cursor, 4},        {T::NextCursor, 4}, {T::Count, 2},
             {T::Records, Variable}};
+    if(find(f,T::ServiceContext)) {
+      page[T::ServiceContext]=56;page[T::SourceEpoch]=16;page[T::ProfileGeneration]=8;
+    }
+    return page;
+  }
   default:
     return {};
   }
@@ -463,7 +532,7 @@ bool supported(Type t) {
          t == Type::Status || t == Type::ProtocolError ||
          t == Type::SubscribeEvents || t == Type::SubscriptionAck ||
          t == Type::Attempt || t == Type::Authorization || t == Type::Traffic || t == Type::ObservationGap ||
-         (t >= Type::ListObserved && t <= Type::NativeProcessContext);
+         (t >= Type::ListObserved && t <= Type::ReplacePrincipalRule);
 }
 Id attemptLink(std::uint64_t sequence) {
   Id id{};
@@ -494,10 +563,12 @@ Error decodeServiceContext(const Frame &frame, ServiceContext &out) {
       (frame.type != Type::HelloAck && frame.type != Type::Status &&
        frame.type != Type::SubscriptionAck && frame.type != Type::Attempt &&
        frame.type != Type::Authorization && frame.type != Type::Traffic && frame.type != Type::ObservationGap &&
-       frame.type != Type::GetNativeProcessContext && frame.type != Type::NativeProcessContext))
+       frame.type != Type::GetNativeProcessContext && frame.type != Type::NativeProcessContext &&
+       frame.type != Type::FileFutureDraftRecord && frame.type != Type::PrincipalRulesPage))
     return Error::Unsupported;
   const auto error = iv::validate(frame);
   if (error != Error::Ok) return error;
+  if(!find(frame,T::ServiceContext))return Error::Unsupported;
   if (get(frame, T::IVProfile) != 0 || (get(frame, T::Capabilities) & FuturePolicyControl))
     return Error::Malformed;
   const auto &bytes = find(frame, T::ServiceContext)->bytes;
@@ -557,6 +628,7 @@ bool valid(const FutureDraftRecord &r) {
                          : reason == 3 || reason == 12);
 }
 bool valid(const PrincipalRuleRecord &r) {
+  if(!r.originalTarget.empty() && (r.targetKind!=1 || !validPrincipalTarget(r.originalTarget,r.package)))return false;
   if (zero(r.rule) || zero(r.selector) || !r.revision || !r.targetRevision ||
       r.target == Digest{} || r.action < 1 || r.action > 2 || r.direction < 1 ||
       r.direction > 3 || r.mode != mode(r.action, r.direction) || r.admin < 1 ||
@@ -575,6 +647,64 @@ bool valid(const PrincipalRuleRecord &r) {
              : r.targetKind == 2 && r.scope == 1 && !r.package && !r.origin &&
                    r.display.principal.empty() && r.display.package.empty();
 }
+bool validPrincipalTarget(const Bytes &b,std::uint8_t package) {
+  if(b.size()<24 || b.size()>65696 || b[0]!='A' || b[1]!='P' || b[2]!='T' || b[3]!='1' ||
+     n(b,4,2)!=1 || n(b,6,2)!=24 || b[17]!=2 || !zeros(b,18,6))return false;
+  const auto app=n(b,8,4),user=n(b,12,2),sid=n(b,14,2);
+  const auto mode=b[16];
+  if(!app || app>65536 || user<8 || user>68 || sid>68 || mode<1 || mode>2 ||
+     (package && mode!=package) || (mode==1 && sid) || 24+app+user+sid!=b.size())return false;
+  auto validSid=[&](std::size_t at,std::size_t size) {
+    return size>=8 && b[at]==1 && b[at+1]<=15 && size==8+std::size_t(b[at+1])*4;
+  };
+  return validSid(24+std::size_t(app),std::size_t(user)) &&
+    (mode==1 || validSid(24+std::size_t(app+user),std::size_t(sid)));
+}
+bool validFileTarget(const Bytes &target) {
+  if(!validPrincipalTarget(target,1))return false;
+  const auto size=n(target,8,4);
+  if(size<4 || size>8192 || (size&1) || target[24+size-1] || target[24+size-2])return false;
+  for(std::size_t i=24;i<24+size-2;i+=2) {
+    const auto unit=n(target,i,2);
+    if(!unit || (unit>=0xdc00 && unit<=0xdfff))return false;
+    if(unit>=0xd800 && unit<=0xdbff) {
+      if(i+4>=24+size)return false;
+      const auto low=n(target,i+2,2);
+      if(low<0xdc00 || low>0xdfff)return false;
+      i+=2;
+    }
+  }
+  return true;
+}
+bool valid(const FileFutureDraftRecord &r) {
+  const auto &d=r.draft;
+  if(!zero(d.observed) || d.observedRevision || d.migration!=Digest{} ||
+    zero(d.draft) || !d.version || zero(d.source) || zero(d.binding) || zero(d.selector) ||
+    !d.targetRevision || zero(d.challenge) || !d.profile || d.expectedDesired==UINT64_MAX ||
+    d.target==Digest{} || d.ttl<1 || d.ttl>120000 || d.state!=3 || d.package!=1 ||
+    d.direction<1 || d.direction>3 || d.scope!=2 || d.durationMs || d.accepted!=3 ||
+    d.proof!=Proof::CurrentShapeUnproven || d.reason!=Error::Ok || d.display.projection!=2 ||
+    !display(d.display) || !validFileTarget(r.originalTarget) ||
+    (!r.file.fileIndexHigh && !r.file.fileIndexLow) || !r.file.lastWrite || r.file.lastWrite>INT64_MAX ||
+    (r.file.attributes & (0x10u|0x400u)))return false;
+  return true;
+}
+Error unpackOriginalTarget(const Bytes &b,OriginalTarget &out) {
+  out={};
+  if(!validPrincipalTarget(b))return Error::Malformed;
+  const auto app=std::size_t(n(b,8,4)),user=std::size_t(n(b,12,2));
+  out.appId.assign(b.begin()+24,b.begin()+24+app);
+  out.accountSid.assign(b.begin()+24+app,b.begin()+24+app+user);
+  out.packageSid.assign(b.begin()+24+app+user,b.end());
+  out.packageMode=b[16];return Error::Ok;
+}
+Error principalTargetDigestInput(const Bytes &b,Bytes &out) {
+  out.clear();
+  if(!validPrincipalTarget(b))return Error::Malformed;
+  out={'G','B','S','4','T','G','T','1'};
+  const auto size=integer(b.size(),4);out.insert(out.end(),size.begin(),size.end());
+  out.insert(out.end(),b.begin(),b.end());return Error::Ok;
+}
 Error pack(const std::vector<ObservedRecord> &r, Bytes &b) {
   return packRecords(r, b, 3);
 }
@@ -583,6 +713,9 @@ Error pack(const std::vector<FutureDraftRecord> &r, Bytes &b) {
 }
 Error pack(const std::vector<PrincipalRuleRecord> &r, Bytes &b) {
   return packRecords(r, b, 5);
+}
+Error pack(const std::vector<FileFutureDraftRecord> &r,Bytes &b) {
+  return r.size()==1 ? packRecords(r,b,7) : Error::Malformed;
 }
 Error pack(const std::vector<ProcessFacts> &r, Bytes &b) {
   return r.size()==1 ? packRecords(r,b,6) : Error::Malformed;
@@ -595,7 +728,10 @@ Error unpack(const Bytes &b, std::size_t c, std::vector<FutureDraftRecord> &r) {
 }
 Error unpack(const Bytes &b, std::size_t c,
              std::vector<PrincipalRuleRecord> &r) {
-  return unpackRecords(b, c, r, 5, 5024);
+  return unpackRecords(b, c, r, 5, MaxRecordsBytes-8);
+}
+Error unpack(const Bytes &b,std::size_t c,std::vector<FileFutureDraftRecord> &r) {
+  return c==1 ? unpackRecords(b,c,r,7,MaxRecordsBytes-8) : Error::Malformed;
 }
 Error unpack(const Bytes &b,std::size_t c,std::vector<ProcessFacts> &r) {
   return c==1 ? unpackRecords(b,c,r,6,60+8192+4096+136) : Error::Malformed;
@@ -620,11 +756,12 @@ Error validate(const Frame &f) {
   unsigned previous = 0;
   for (const auto &v : f.fields) {
     auto tag = static_cast<unsigned>(v.tag);
-    if (tag < 1 || tag > static_cast<unsigned>(T::ScopeDurationMs) || tag == 57 ||
+    if (tag < 1 || tag > static_cast<unsigned>(T::PreviousTargetDigest) || tag == 57 ||
         (v.tag == T::ServiceContext && f.type != Type::HelloAck && f.type != Type::Status &&
          f.type != Type::SubscriptionAck && f.type != Type::Attempt &&
          f.type != Type::Authorization && f.type != Type::Traffic && f.type != Type::ObservationGap &&
-         f.type != Type::GetNativeProcessContext && f.type != Type::NativeProcessContext))
+         f.type != Type::GetNativeProcessContext && f.type != Type::NativeProcessContext &&
+         f.type != Type::FileFutureDraftRecord && f.type != Type::PrincipalRulesPage))
       return Error::Unsupported;
     if (tag <= previous)
       return Error::Malformed;
@@ -653,11 +790,12 @@ Error validate(const Frame &f) {
           boot != idValue(f, T::BootId) || engine != idValue(f, T::SourceEpoch) ||
           zero(engine) != (generation == 0)) return Error::Malformed;
       auto c = number(*caps);
-      if ((c >> 28) || (c & ((0x3full << 6) | (1ull << 16))) ||
+      if ((c >> 29) || (c & ((0x3full << 6) | (1ull << 16))) ||
           ((c & NativeEvents) && (!(c & ObservedRead) || zero(engine) || get(f,T::ReviewProfileState)!=1)) ||
           ((c & NativeTraffic) && !(c & NativeEvents)) ||
           ((c & NativeProcessFacts) && !(c & NativeEvents)) ||
-          ((c & FuturePolicyControl) && !number(*profile)))
+          ((c & FuturePolicyControl) && !number(*profile)) ||
+          ((c & FileFutureControl) && !(c & FuturePolicyControl)))
         return Error::Malformed;
       base.fields.erase(std::remove_if(base.fields.begin(), base.fields.end(),
                                        [](const auto &v) {
@@ -668,7 +806,7 @@ Error validate(const Frame &f) {
                         base.fields.end());
       for (auto &v : base.fields)
         if (v.tag == T::Capabilities)
-          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents | NativeTraffic | NativeProcessFacts), 8);
+          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents | NativeTraffic | NativeProcessFacts | FileFutureControl), 8);
     }
     if (f.type == Type::ProtocolError && get(f, T::ErrorCode) == 18)
       for (auto &v : base.fields)
@@ -691,7 +829,9 @@ Error validate(const Frame &f) {
   const bool activity=f.type==Type::Attempt || f.type==Type::Authorization || f.type==Type::Traffic;
   const bool stream=activity || f.type==Type::ObservationGap || f.type==Type::SubscriptionAck;
   const bool processContext=f.type==Type::GetNativeProcessContext || f.type==Type::NativeProcessContext;
-  if(stream || processContext) {
+  const bool fileContext=f.type==Type::FileFutureDraftRecord ||
+    (f.type==Type::PrincipalRulesPage && find(f,T::ServiceContext));
+  if(stream || processContext || fileContext) {
     const auto &b=find(f,T::ServiceContext)->bytes;
     if(array<16>(b,0)!=idValue(f,T::ServiceEpoch) || zero(array<16>(b,16)) ||
        array<16>(b,32)!=idValue(f,T::SourceEpoch) || !n(b,48,8) ||
@@ -754,7 +894,21 @@ Error validate(const Frame &f) {
         (zero(idValue(f, T::SnapshotId)) && get(f, T::Cursor)))
       return Error::Malformed;
   }
-  if (f.type == Type::CommitFuturePolicy) {
+  if(f.type==Type::PrepareFileFuturePolicy) {
+    const auto &path=find(f,T::Text)->bytes;
+    if(path.empty() || path.size()>4096 || !text(path) || get(f,T::ScopeKind)!=2 ||
+       get(f,T::PackageMode)!=1 ||
+       (find(f,T::Records) && !validPrincipalTarget(find(f,T::Records)->bytes)))return Error::Malformed;
+  }
+  if(f.type==Type::ReplacePrincipalRule ||
+     ((f.type==Type::PrepareFileFuturePolicy || f.type==Type::FileFutureDraftRecord) && find(f,T::RuleId))) {
+    if(!get(f,T::RuleRevision) || get(f,T::RuleRevision)==UINT64_MAX ||
+       !get(f,T::SelectorRevision) || get(f,T::SelectorRevision)==UINT64_MAX ||
+       find(f,T::PreviousTargetDigest)->bytes==Bytes(32))return Error::Malformed;
+    if(f.type==Type::ReplacePrincipalRule &&
+       (get(f,T::ScopeKind)!=2 || get(f,T::PackageMode)!=1 || find(f,T::MigrationDigest)->bytes!=Bytes(32)))return Error::Malformed;
+  }
+  if (f.type == Type::CommitFuturePolicy || f.type==Type::ReplacePrincipalRule) {
     auto a = get(f, T::Decision), p = get(f, T::PackageMode),
          d = get(f, T::PolicyDirection);
     auto scope = get(f,T::ScopeKind);
@@ -793,10 +947,10 @@ Error validate(const Frame &f) {
     if (!found)
       return get(f, T::ErrorCode) == 17 ? Error::Ok : Error::Malformed;
     auto type = get(f, T::OriginalCommandType);
-    if ((type != 31 && type != 37) || !outcome(f))
+    if ((type != 31 && type != 37 && type!=44) || !outcome(f))
       return Error::Malformed;
   }
-  if (auto records = find(f, T::Records)) {
+  if (auto records = find(f, T::Records); records && f.type!=Type::PrepareFileFuturePolicy) {
     bool page =
         f.type == Type::ObservedPage || f.type == Type::PrincipalRulesPage;
     auto count = page ? get(f, T::Count) : 1;
@@ -822,6 +976,10 @@ Error validate(const Frame &f) {
         for (const auto &r : rows)
           if (r.source != idValue(f, T::SourceEpoch))
             return Error::Malformed;
+    } else if(f.type==Type::FileFutureDraftRecord) {
+      std::vector<FileFutureDraftRecord> rows;
+      e=unpack(records->bytes,1,rows);
+      if(e==Error::Ok && rows.front().draft.source!=idValue(f,T::SourceEpoch))return Error::Malformed;
     } else if (f.type == Type::FutureDraftRecord) {
       std::vector<FutureDraftRecord> rows;
       e = unpack(records->bytes, count, rows);
@@ -839,7 +997,7 @@ Error validate(const Frame &f) {
   return Error::Ok;
 }
 Error canonical(const Frame &f, Bytes &out) {
-  if (f.type != Type::CommitFuturePolicy && f.type != Type::RevokePrincipalRule)
+  if (f.type != Type::CommitFuturePolicy && f.type != Type::RevokePrincipalRule && f.type!=Type::ReplacePrincipalRule)
     return Error::Unsupported;
   auto error = iv::validate(f);
   if (error != Error::Ok)

@@ -3,10 +3,35 @@
 #include "../src/appidentity/AppIdentity.h"
 #include <algorithm>
 #include <cstring>
+#include <exception>
 
 namespace gb::decisions {
 namespace {
 constexpr std::size_t PendingLimit = 64, PendingBytesLimit = 4 * 1024 * 1024;
+// Reserva previa incluye las dos cadenas temporales de hasta 64 paths;
+// al regresar físicamente se conserva sólo el cargo de la custodia viva.
+constexpr std::size_t FileReserveBytes=2*1024*1024;
+bool filePath(HANDLE handle,std::filesystem::path &path) noexcept {
+    wchar_t name[4097]{};
+    const auto size=GetFinalPathNameByHandleW(handle,name,4097,FILE_NAME_NORMALIZED|VOLUME_NAME_DOS);
+    if(!size || size>=4097)return false;
+    try {
+        std::wstring text(name,size);
+        if(text.compare(0,4,L"\\\\?\\")!=0)return false;
+        path=std::filesystem::path(text.substr(4));
+        const auto &p=path.native();
+        return native::fixedPath(path) && p.find(L':',2)==std::wstring::npos && p.find(L'/')==std::wstring::npos;
+    } catch(...) {return false;}
+}
+bool samePath(const std::filesystem::path &a,const std::filesystem::path &b) noexcept {
+    return a.native().size()<=4096 && b.native().size()<=4096 &&
+        CompareStringOrdinal(a.c_str(),int(a.native().size()),b.c_str(),int(b.native().size()),TRUE)==CSTR_EQUAL;
+}
+bool directoryIdentity(const BY_HANDLE_FILE_INFORMATION &a,const BY_HANDLE_FILE_INFORMATION &b) noexcept {
+    return a.dwVolumeSerialNumber==b.dwVolumeSerialNumber && a.nFileIndexHigh==b.nFileIndexHigh &&
+        a.nFileIndexLow==b.nFileIndexLow && (b.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(b.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+}
 bool sameImage(const BY_HANDLE_FILE_INFORMATION &a, const BY_HANDLE_FILE_INFORMATION &b) noexcept {
     return a.dwVolumeSerialNumber == b.dwVolumeSerialNumber &&
         a.nFileIndexHigh == b.nFileIndexHigh && a.nFileIndexLow == b.nFileIndexLow &&
@@ -334,8 +359,11 @@ void NativeRuntime::closeOrdinaryPeer(const std::shared_ptr<PrincipalPeer> &peer
     }
     if (!peer) return;
     peer->cancelled = true;
-    for (auto &entry : principalAdmissions_) if (entry.second->owner == peer) entry.second->cancelled = true;
-    peer->pages.clear();
+    for (auto &entry : principalAdmissions_) if (entry.second->owner == peer) {
+        entry.second->cancelled = true;
+        if (entry.second->file) entry.second->file->cancelled.store(true);
+    }
+    peer->pages.clear(); peer->rulePages.clear();
 }
 Frame NativeRuntime::principalError(Error error) const {
     Frame frame; frame.minor = 3; frame.type = Type::ProtocolError;
@@ -366,7 +394,8 @@ Frame NativeRuntime::ordinaryStatus(Type type, const std::shared_ptr<PrincipalPe
             ReadStatus | (admitted ? ObservedRead | (principalEventsReady() ? wire::iv::NativeEvents : 0) |
                 (principalTrafficReady() ? wire::iv::NativeTraffic : 0) |
                 (principalProcessReady() ? wire::iv::NativeProcessFacts : 0) |
-                (!peer->readonly && principalPolicyReady() ? FuturePolicyControl : 0) : 0));
+                (!peer->readonly && principalPolicyReady() ? FuturePolicyControl |
+                    (deployment_ && deployment_->serviceAdmittedCurrent() ? wire::iv::FileFutureControl : 0) : 0) : 0));
         if (field.tag == Tag::IVProfile) field = value(Tag::IVProfile, admitted && !peer->readonly && principalPolicyReady() ? 1 : 0, 1);
     }
     return ordered(std::move(frame));
@@ -388,6 +417,392 @@ Frame NativeRuntime::principalResult(const Id &command, const directional::Resul
         value(Tag::ProofState, 0, 1), value(Tag::KnownAppliedUnrecorded, 0, 1),
         value(Tag::Durable, result.durable || prepared ? 1 : 0, 1)};
     return ordered(std::move(frame));
+}
+bool NativeRuntime::principalFileActorCurrent(const PrincipalFileCapture &file) noexcept {
+  try {
+    if(file.cancelled.load() || !file.actor.current() || !file.primary || !file.stop ||
+       WaitForSingleObject(file.stop.value,0)!=WAIT_TIMEOUT)return false;
+    HANDLE raw=nullptr;native::Handle primary;
+    if(!OpenProcessToken(file.actor.process.value,TOKEN_QUERY,&raw))return false;
+    primary.reset(raw);native::TokenEvidence actual;
+    return CompareObjectHandles(primary.value,file.primary.value) && native::tokenEvidence(primary.value,actual) &&
+      actual.account==file.identity.account && actual.logon==file.identity.logon &&
+      actual.session==file.identity.session && actual.integrity==file.identity.integrity &&
+      actual.administrator==file.identity.administrator && actual.elevated==file.identity.elevated &&
+      actual.uiAccess==file.identity.uiAccess && !file.cancelled.load() && file.actor.current();
+  } catch(...) {return false;}
+}
+bool NativeRuntime::principalFileMetadataCurrent(const PrincipalFileCapture &file) noexcept {
+  try {
+    if(!file.image || !principalFileActorCurrent(file) || GetTickCount64()>=file.deadline ||
+       file.directories.size()!=file.paths.size() || file.paths.size()!=file.directoryIds.size())return false;
+    BY_HANDLE_FILE_INFORMATION actual{};std::filesystem::path path;
+    if(!GetFileInformationByHandle(file.image.value,&actual) || !sameImage(actual,file.imageId) ||
+       actual.dwFileAttributes!=file.imageId.dwFileAttributes ||
+       !filePath(file.image.value,path) || !samePath(path,file.path))return false;
+    for(std::size_t i=0;i<file.directories.size();++i) {
+      if(!GetFileInformationByHandle(file.directories[i].value,&actual) ||
+         !directoryIdentity(file.directoryIds[i],actual) || !filePath(file.directories[i].value,path) ||
+         !samePath(path,file.paths[i]))return false;
+    }
+    return principalFileActorCurrent(file) && GetTickCount64()<file.deadline;
+  } catch(...) {return false;}
+}
+bool NativeRuntime::capturePrincipalFile(PrincipalFileCapture &file,const Frame &request) noexcept {
+  struct Revert {
+    bool active=false;
+    ~Revert() {
+      if(active && !RevertToSelf()) {TerminateProcess(GetCurrentProcess(),ERROR_CANNOT_IMPERSONATE);std::terminate();}
+    }
+  } revert;
+  struct Blob {FWP_BYTE_BLOB *value=nullptr;~Blob(){if(value)FwpmFreeMemory0(reinterpret_cast<void **>(&value));}} blob;
+  try {
+    if(!principalFileActorCurrent(file))return false;
+    const auto &bytes=find(request,Tag::Text)->bytes;
+    const auto units=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,
+      reinterpret_cast<const char *>(bytes.data()),int(bytes.size()),nullptr,0);
+    if(units<=0 || units>4096)return false;
+    std::wstring input(std::size_t(units),L'\0');
+    if(MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,reinterpret_cast<const char *>(bytes.data()),
+       int(bytes.size()),input.data(),units)!=units)return false;
+    file.path=std::filesystem::path(input);
+    if(!native::fixedPath(file.path) || input.find(L':',2)!=std::wstring::npos || input.find(L'/')!=std::wstring::npos)return false;
+    HANDLE raw=nullptr;native::Handle impersonation;
+    if(!DuplicateTokenEx(file.primary.value,TOKEN_QUERY|TOKEN_IMPERSONATE,nullptr,SecurityImpersonation,
+       TokenImpersonation,&raw))return false;
+    impersonation.reset(raw);
+    if(!SetThreadToken(nullptr,impersonation.value))return false;
+    revert.active=true;
+    std::vector<std::filesystem::path> ancestors;
+    for(auto parent=file.path.parent_path();!parent.empty();parent=parent.parent_path()) {
+      if(ancestors.size()>=64)return false;
+      ancestors.push_back(parent);
+      if(parent==parent.parent_path())break;
+    }
+    if(ancestors.empty())return false;
+    for(auto it=ancestors.rbegin();it!=ancestors.rend();++it) {
+      if(file.cancelled.load() || GetTickCount64()>=file.deadline)return false;
+      native::Handle directory(CreateFileW(it->c_str(),FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES,FILE_SHARE_READ,
+        nullptr,OPEN_EXISTING,FILE_FLAG_BACKUP_SEMANTICS|FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+      BY_HANDLE_FILE_INFORMATION info{};std::filesystem::path canonical;
+      if(!directory || !GetFileInformationByHandle(directory.value,&info) ||
+         !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+         !filePath(directory.value,canonical) || !samePath(canonical,*it))return false;
+      file.paths.push_back(std::move(canonical));file.directoryIds.push_back(info);
+      file.directories.push_back(std::move(directory));
+    }
+    file.image.reset(CreateFileW(file.path.c_str(),FILE_READ_DATA|FILE_READ_ATTRIBUTES,FILE_SHARE_READ,
+      nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+    std::filesystem::path canonical;
+    if(!file.image || !GetFileInformationByHandle(file.image.value,&file.imageId) ||
+       (file.imageId.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)) ||
+       (!file.imageId.nFileIndexHigh && !file.imageId.nFileIndexLow) || !filePath(file.image.value,canonical) ||
+       !samePath(canonical,file.path))return false;
+    file.path=std::move(canonical);
+    if(!principalFileMetadataCurrent(file) ||
+       FwpmGetAppIdFromFileName0(file.path.c_str(),&blob.value)!=ERROR_SUCCESS || !blob.value ||
+       !blob.value->data || blob.value->size<4 || blob.value->size>8192 || !principalFileMetadataCurrent(file))return false;
+    Bytes app(blob.value->data,blob.value->data+blob.value->size),target;
+    if(!principal::serializeTarget(principal::ByteView(std::move(app)),principal::ByteView(file.identity.account),1,{},target))return false;
+    file.target=principal::ByteView(std::move(target));
+    file.display.projection=2;
+    const auto name=file.path.filename().native();
+    file.display.name=displayText(std::u16string(reinterpret_cast<const char16_t *>(name.data()),name.size()),256);
+    const auto &path=file.path.native();
+    file.display.path=displayText(std::u16string(reinterpret_cast<const char16_t *>(path.data()),path.size()),4096);
+    if(file.display.path.empty())return false;
+    std::size_t charge=sizeof(file)+sizeof(PrincipalAdmission)+512+
+      2*(file.identity.account.capacity()+file.identity.logon.capacity())+
+      file.actor.image.native().capacity()*sizeof(wchar_t)+file.path.native().capacity()*sizeof(wchar_t)+
+      file.target.ownedCapacityBytes()+file.display.name.capacity()+file.display.path.capacity()+
+      file.directories.capacity()*sizeof(native::Handle)+file.paths.capacity()*sizeof(std::filesystem::path)+
+      file.directoryIds.capacity()*sizeof(BY_HANDLE_FILE_INFORMATION);
+    for(const auto &pathValue:file.paths)charge+=pathValue.native().capacity()*sizeof(wchar_t);
+    if(charge>FileReserveBytes)return false;
+    const auto lastWrite=(std::uint64_t(file.imageId.ftLastWriteTime.dwHighDateTime)<<32)|file.imageId.ftLastWriteTime.dwLowDateTime;
+    if(!lastWrite || lastWrite>INT64_MAX || !wire::iv::validFileTarget(file.target.copy()) || !principalFileMetadataCurrent(file))return false;
+    file.charged=charge;
+    return true;
+  } catch(...) {return false;}
+}
+void NativeRuntime::drainPrincipalFiles() noexcept {
+  for(;;) {
+    std::shared_ptr<PrincipalFileCapture> retired;std::size_t charge=0;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      const auto now=GetTickCount64();
+      for(auto it=principalAdmissions_.begin();it!=principalAdmissions_.end();) {
+        auto &admission=*it->second;
+        if(admission.file && (admission.cancelled || admission.consumed || now>=admission.deadline ||
+            admission.file->cancelled.load() || admission.owner->cancelled)) {
+          admission.file->cancelled.store(true);it=principalAdmissions_.erase(it);
+        } else ++it;
+      }
+      for(auto &slot:principalFiles_)if(slot && slot->completed && slot.use_count()==1) {
+        charge=slot->charged;retired=std::move(slot);break;
+      }
+    }
+    if(!retired)return;
+    retired.reset(); // Cierre físico fuera Runtime; el cargo sigue reservado hasta aquí.
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if(!principalFilePhysical_ || charge>principalFileBytes_) {principalWriteFault_=true;return;}
+      --principalFilePhysical_;principalFileBytes_-=charge;
+    }
+  }
+}
+Frame NativeRuntime::fileFutureRecord(const PrincipalAdmission &admission) {
+  const auto now=principalNow_();
+  if(!admission.file || admission.cancelled || admission.consumed ||
+     !principalFileActorCurrent(*admission.file) || now>=admission.deadline ||
+     admission.deadline-now>120000 || admission.source!=principalSource_)return principalError(Error::Stale);
+  const auto source=principalSource_;const auto catalog=principalCatalog_;
+  const auto fresh=readServiceContext();
+  if(source!=principalSource_ || catalog!=principalCatalog_ || admission.cancelled ||
+     fresh.engineContext!=source->binding_->epoch || fresh.engineBindingGeneration!=source->binding_->generation ||
+     !admission.owner || !principalPeerCurrent(*admission.owner))return principalError(Error::Stale);
+  wire::iv::FileFutureDraftRecord record;
+  auto &draft=record.draft;
+  draft.draft=admission.request;draft.source=admission.source->binding_->epoch;draft.binding=admission.binding;
+  draft.selector=admission.selector;draft.challenge=admission.challenge;draft.version=admission.revision;
+  draft.targetRevision=admission.targetRevision;draft.expectedDesired=admission.expectedDesired;
+  draft.profile=admission.profile;draft.target=admission.target;
+  const auto freshNow=principalNow_();
+  if(freshNow>=admission.deadline || !principalFileActorCurrent(*admission.file))return principalError(Error::Stale);
+  draft.ttl=std::uint32_t(admission.deadline-freshNow);draft.state=3;draft.package=1;
+  draft.direction=admission.direction;draft.scope=2;draft.accepted=3;
+  draft.proof=wire::iv::Proof::CurrentShapeUnproven;draft.display=admission.file->display;
+  record.originalTarget=admission.fullTarget.copy();
+  const auto &file=admission.file->imageId;
+  record.file={file.dwVolumeSerialNumber,file.nFileIndexHigh,file.nFileIndexLow,file.nFileSizeHigh,file.nFileSizeLow,
+    file.dwFileAttributes,(std::uint64_t(file.ftLastWriteTime.dwHighDateTime)<<32)|file.ftLastWriteTime.dwLowDateTime};
+  Bytes packed,context;
+  if(wire::iv::pack(std::vector<wire::iv::FileFutureDraftRecord>{record},packed)!=Error::Ok ||
+     wire::iv::encodeServiceContext(fresh,context)!=Error::Ok)return principalError(Error::IdentityUnavailable);
+  Frame response;response.minor=3;response.type=Type::FileFutureDraftRecord;
+  response.fields={value(Tag::ServiceEpoch,epoch_),{Tag::Records,true,std::move(packed)},
+    value(Tag::SourceEpoch,draft.source),{Tag::ServiceContext,true,std::move(context)}};
+  if(admission.replacing) {
+    const auto &prior=*admission.replacing;const auto digest=principal::targetDigest(prior.target);
+    response.fields.insert(response.fields.end(),{value(Tag::RuleId,prior.id),value(Tag::RuleRevision,prior.revision),
+      value(Tag::SelectorRevision,prior.targetRevision),{Tag::PreviousTargetDigest,true,Bytes(digest.begin(),digest.end())}});
+  }
+  return ordered(std::move(response));
+}
+Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr<PrincipalPeer> &peer,HANDLE stop) {
+  std::shared_ptr<PrincipalFileCapture> file;
+  std::shared_ptr<PrincipalAdmission> held;
+  std::shared_ptr<allnative::NativeSource> source;
+  std::shared_ptr<const allnative::CatalogSnapshot> catalog;
+  std::optional<principal::Rule> replacing;
+  const bool prepare=frame.type==Type::PrepareFileFuturePolicy;
+  try {
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    tick();
+    if(wire::iv::validate(frame)!=Error::Ok || !peer || peer->readonly || frame.connection!=peer->connection ||
+       idValue(frame,Tag::ServiceEpoch)!=epoch_ || !principalPeerCurrent(*peer))return principalError(Error::IdentityUnavailable);
+    // Retransmisión del receipt original no requiere volver a abrir un archivo.
+    if(!prepare && frame.type!=Type::GetFutureDraft && principalOutcomes_.count(frame.correlation))
+      return dispatchOrdinary(frame,peer);
+    if(!prepare) {
+      const auto found=principalAdmissions_.find(idValue(frame,Tag::DraftId));
+      if(found==principalAdmissions_.end() || !found->second->file)return dispatchOrdinary(frame,peer);
+      held=found->second;
+      if(held->owner!=peer || held->cancelled || held->consumed || principalNow_()>=held->deadline)
+        return principalError(Error::Stale);
+      file=held->file;
+    }
+    if(!principalPolicyReady() || !deployment_ || !deployment_->serviceAdmittedCurrent() ||
+       !principalSource_ || !principalCatalog_ || principalSource_->stage()!=allnative::Stage::Active ||
+       principalWriteFault_ || (prepare &&
+         (get(frame,Tag::ExpectedDesiredRev)!=principalDesired_ || get(frame,Tag::ProfileGeneration)!=peer->profile ||
+          idValue(frame,Tag::SourceEpoch)!=principalSource_->binding_->epoch)))return principalError(Error::Stale);
+    source=principalSource_;catalog=principalCatalog_;
+    const auto context=readServiceContext();
+    if(source!=principalSource_ || catalog!=principalCatalog_ || context.engineContext!=source->binding_->epoch ||
+       context.engineBindingGeneration!=source->binding_->generation || !principalPeerCurrent(*peer))return principalError(Error::Stale);
+    if(prepare) {
+      if(find(frame,Tag::RuleId)) {
+        const auto &rules=principalRead_.snapshot.rules;
+        const auto found=std::find_if(rules.begin(),rules.end(),[&](const auto &r){return r.id==idValue(frame,Tag::RuleId);});
+        principal::Target target;
+        if(found==rules.end() || found->kind!=1 || !principal::parseTarget(found->target,target) ||
+           target.user!=principal::ByteView(peer->identity.account) || target.packageMode!=1 ||
+           found->revision!=get(frame,Tag::RuleRevision) || found->revision==UINT64_MAX ||
+           found->targetRevision!=get(frame,Tag::SelectorRevision))return principalError(Error::Unauthorized);
+        const auto digest=principal::targetDigest(found->target);
+        if(find(frame,Tag::PreviousTargetDigest)->bytes!=Bytes(digest.begin(),digest.end()))return principalError(Error::Stale);
+        replacing=*found;
+      }
+      auto free=std::find_if(principalFiles_.begin(),principalFiles_.end(),[](const auto &slot){return !slot;});
+      if(free==principalFiles_.end() || principalFilePhysical_>=64 || principalFileBytes_>PendingBytesLimit-FileReserveBytes ||
+         principalAdmissions_.size()>=PendingLimit)return principalError(Error::Capacity);
+      file=std::make_shared<PrincipalFileCapture>();
+      file->charged=FileReserveBytes;file->deadline=GetTickCount64()+120000;file->identity=peer->identity;
+      *free=file;++principalFilePhysical_;principalFileBytes_+=FileReserveBytes;
+      HANDLE raw=nullptr;
+      if(!principalDuplicate_(GetCurrentProcess(),peer->actor.process.value,GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS)) {
+        file->cancelled.store(true);file->completed=true;return principalError(Error::IdentityUnavailable);
+      }
+      file->actor.process.reset(raw);file->actor.pid=peer->actor.pid;file->actor.created=peer->actor.created;
+      file->actor.image=peer->actor.image;
+      raw=nullptr;
+      if(!OpenProcessToken(file->actor.process.value,TOKEN_QUERY|TOKEN_DUPLICATE,&raw)) {
+        file->cancelled.store(true);file->completed=true;return principalError(Error::IdentityUnavailable);
+      }
+      file->primary.reset(raw);raw=nullptr;
+      if(!DuplicateHandle(GetCurrentProcess(),stop,GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS)) {
+        file->cancelled.store(true);file->completed=true;return principalError(Error::IdentityUnavailable);
+      }
+      file->stop.reset(raw);
+    }
+  }
+  // Llamadas filesystem/RPC del mismo channel, con custodia física reservada.
+  const auto okay=prepare ? capturePrincipalFile(*file,frame) : principalFileMetadataCurrent(*file);
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if(prepare) {
+      file->completed=true;
+      // Una captura fallida conserva el cargo máximo hasta cierre físico real.
+      if(okay)principalFileBytes_-=FileReserveBytes-file->charged;
+      else file->charged=FileReserveBytes;
+    }
+    if(!okay || WaitForSingleObject(stop,0)!=WAIT_TIMEOUT || !principalPeerCurrent(*peer) ||
+       !deployment_ || !deployment_->serviceAdmittedCurrent() || !principalPolicyReady() ||
+       principalSource_!=source || principalCatalog_!=catalog ||
+       !principalFileActorCurrent(*file) || GetTickCount64()>=file->deadline) {
+      file->cancelled.store(true);return principalError(Error::Stale);
+    }
+    const auto context=readServiceContext();
+    if(principalSource_!=source || principalCatalog_!=catalog || context.engineContext!=source->binding_->epoch ||
+       context.engineBindingGeneration!=source->binding_->generation) {
+      file->cancelled.store(true);return principalError(Error::Stale);
+    }
+    if(!prepare) {
+      const auto current=principalAdmissions_.find(held->request);
+      if(current==principalAdmissions_.end() || current->second!=held || held->cancelled || held->consumed ||
+         held->file!=file || held->source!=source)return principalError(Error::Stale);
+      return dispatchOrdinary(frame,peer);
+    }
+    if(get(frame,Tag::ExpectedDesiredRev)!=principalDesired_ || get(frame,Tag::ProfileGeneration)!=peer->profile ||
+       principalAdmissions_.size()>=PendingLimit ||
+       (find(frame,Tag::Records) && find(frame,Tag::Records)->bytes!=file->target.copy())) {
+      file->cancelled.store(true);return principalError(Error::Conflict);
+    }
+    if(replacing) {
+      const auto &rules=principalRead_.snapshot.rules;
+      const auto found=std::find_if(rules.begin(),rules.end(),[&](const auto &r){return r.id==replacing->id;});
+      if(found==rules.end() || found->revision!=replacing->revision || found->targetRevision!=replacing->targetRevision ||
+         found->target!=replacing->target) {file->cancelled.store(true);return principalError(Error::Stale);}
+    }
+    for(auto it=principalAdmissions_.begin();it!=principalAdmissions_.end();) {
+      if(it->second->owner==peer) {
+        it->second->cancelled=true;
+        if(it->second->file)it->second->file->cancelled.store(true);
+        it=principalAdmissions_.erase(it);
+      } else ++it;
+    }
+    auto admission=std::make_shared<PrincipalAdmission>();
+    HANDLE raw=nullptr;
+    if(!principalDuplicate_(GetCurrentProcess(),peer->actor.process.value,GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS)) {
+      file->cancelled.store(true);return principalError(Error::IdentityUnavailable);
+    }
+    admission->actor.process.reset(raw);admission->actor.pid=peer->actor.pid;admission->actor.created=peer->actor.created;
+    admission->identity=peer->identity;admission->owner=peer;admission->source=source;admission->file=file;
+    admission->request=native::randomIdentity();admission->binding=native::randomIdentity();
+    admission->challenge=native::randomIdentity();admission->selector=replacing ? replacing->selector : native::randomIdentity();
+    admission->revision=1;admission->profile=peer->profile;admission->fullTarget=file->target;
+    admission->target=principal::targetDigest(file->target);admission->targetRevision=replacing ? replacing->targetRevision : 1;
+    if(replacing && replacing->target!=file->target) {
+      if(admission->targetRevision==UINT64_MAX) {file->cancelled.store(true);return principalError(Error::Capacity);}
+      ++admission->targetRevision;
+    }
+    admission->replacing=std::move(replacing);admission->direction=std::uint8_t(get(frame,Tag::PolicyDirection));
+    admission->package=1;admission->scope=2;admission->expectedDesired=principalDesired_;admission->deadline=file->deadline;
+    if(zero(admission->request) || zero(admission->binding) || zero(admission->selector) || zero(admission->challenge) ||
+       !principalPeerCurrent(*peer)) {file->cancelled.store(true);return principalError(Error::Stale);}
+    principalAdmissions_[admission->request]=admission;
+    auto response=fileFutureRecord(*admission);
+    if(response.type==Type::ProtocolError) {admission->cancelled=true;file->cancelled.store(true);}
+    return response;
+  }
+  } catch(...) {
+    std::lock_guard<std::mutex> lock(mutex);
+    // Este channel ya regresó de la operación física: el slot conserva sus HANDLE
+    // y su cargo hasta el drenaje fuera Runtime, incluso ante asignación fallida.
+    if(file) {file->cancelled.store(true);if(prepare)file->completed=true;}
+    return principalError(Error::Capacity);
+  }
+}
+Frame NativeRuntime::listPrincipalRules(const Frame &frame,const std::shared_ptr<PrincipalPeer> &peer) {
+  if(!peer || !principalPeerCurrent(*peer) || !principalPolicyReady() || !principalSource_ || !principalCatalog_)
+    return principalError(Error::BackendUnavailable);
+  const auto source=principalSource_;const auto catalog=principalCatalog_;
+  const auto context=readServiceContext();
+  if(source!=principalSource_ || catalog!=principalCatalog_ || context.engineContext!=source->binding_->epoch ||
+     context.engineBindingGeneration!=source->binding_->generation || !principalPeerCurrent(*peer)) {
+    peer->rulePages.clear();return principalError(Error::Stale);
+  }
+  const auto now=principalNow_();
+  for(auto it=peer->rulePages.begin();it!=peer->rulePages.end();) {
+    if(now>=it->second.deadline || it->second.desired!=principalDesired_ || it->second.source!=source ||
+       it->second.catalog!=catalog || it->second.profile!=peer->profile)it=peer->rulePages.erase(it);
+    else ++it;
+  }
+  auto snapshot=idValue(frame,Tag::SnapshotId);
+  if(zero(snapshot)) {
+    if(peer->rulePages.size()>=2)return principalError(Error::Capacity);
+    PrincipalPeer::RulePage page;
+    page.snapshot=principalRead_.snapshot.encoded;page.desired=principalDesired_;page.source=source;page.catalog=catalog;
+    page.context=context;page.profile=peer->profile;page.deadline=now+5000;
+    const auto &rules=principalRead_.snapshot.rules;
+    if(rules.size()>4096)return principalError(Error::Capacity);
+    for(std::size_t i=0;i<rules.size();++i) {
+      principal::Target target;
+      if(rules[i].kind==1 && principal::parseTarget(rules[i].target,target) &&
+         target.user==principal::ByteView(peer->identity.account))page.indices.push_back(i);
+    }
+    snapshot=native::randomIdentity();
+    if(zero(snapshot) || !peer->rulePages.emplace(snapshot,std::move(page)).second)return principalError(Error::Capacity);
+  }
+  const auto found=peer->rulePages.find(snapshot);
+  if(found==peer->rulePages.end())return principalError(Error::SnapshotExpired);
+  auto &page=found->second;
+  if(!NativeActivityRing::same(page.context,context) || page.snapshot.data()!=principalRead_.snapshot.encoded.data() ||
+     page.snapshot.size()!=principalRead_.snapshot.encoded.size()) {
+    peer->rulePages.erase(found);return principalError(Error::SnapshotExpired);
+  }
+  const auto cursor=std::uint32_t(get(frame,Tag::Cursor));
+  if(cursor!=page.next || cursor>page.indices.size())return principalError(Error::Stale);
+  std::vector<wire::iv::PrincipalRuleRecord> rows;Bytes packed;
+  for(std::size_t at=cursor;at<page.indices.size() && rows.size()<get(frame,Tag::Limit);++at) {
+    const auto &rule=principalRead_.snapshot.rules[page.indices[at]];principal::Target target;
+    if(!principal::parseTarget(rule.target,target) || target.user!=principal::ByteView(peer->identity.account))return principalError(Error::Stale);
+    wire::iv::PrincipalRuleRecord record;
+    record.rule=rule.id;record.selector=rule.selector;record.revision=rule.revision;record.targetRevision=rule.targetRevision;
+    record.desired=page.desired;record.target=principal::targetDigest(rule.target);record.action=rule.action;
+    record.direction=rule.direction;record.mode=rule.mode;record.package=target.packageMode;record.display.projection=2;
+    record.originalTarget=rule.target.copy();
+    rows.push_back(std::move(record));Bytes candidate;
+    const auto result=wire::iv::pack(rows,candidate);
+    if(result==Error::Capacity){rows.pop_back();break;}
+    if(result!=Error::Ok)return principalError(result);
+    packed=std::move(candidate);
+  }
+  if(rows.empty() && cursor<page.indices.size())return principalError(Error::Capacity);
+  const auto next=cursor+std::uint32_t(rows.size());const bool terminal=next==page.indices.size();
+  Bytes encodedContext;
+  if(wire::iv::encodeServiceContext(page.context,encodedContext)!=Error::Ok || !principalPeerCurrent(*peer)) {
+    peer->rulePages.clear();return principalError(Error::Stale);
+  }
+  Frame response;response.minor=3;response.type=Type::PrincipalRulesPage;
+  response.fields={value(Tag::ServiceEpoch,epoch_),value(Tag::DesiredRev,page.desired),value(Tag::SnapshotId,snapshot),
+    value(Tag::Cursor,cursor,4),value(Tag::NextCursor,terminal ? UINT32_MAX : next,4),value(Tag::Count,rows.size(),2),
+    {Tag::Records,true,std::move(packed)},value(Tag::ProfileGeneration,page.profile),value(Tag::SourceEpoch,context.engineContext),
+    {Tag::ServiceContext,true,std::move(encodedContext)}};
+  page.next=next;if(terminal)peer->rulePages.erase(found);
+  return ordered(std::move(response));
 }
 Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<PrincipalPeer> &peer) {
     if (!principalPolicyReady()) return principalError(Error::BackendUnavailable);
@@ -416,7 +831,9 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
     if(observation.pendingAttempt.type==Type::Attempt)publishPrincipalAttempt(observation);
     for (auto entry = principalAdmissions_.begin(); entry != principalAdmissions_.end();) {
         if (entry->second->owner == peer || entry->second->binding == observation.row.binding) {
-            entry->second->cancelled = true; entry = principalAdmissions_.erase(entry);
+            entry->second->cancelled = true;
+            if (entry->second->file) entry->second->file->cancelled.store(true);
+            entry = principalAdmissions_.erase(entry);
         } else ++entry;
     }
     if (principalAdmissions_.size() >= PendingLimit) return principalError(Error::Capacity);
@@ -500,23 +917,39 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         return principalError(Error::BackendUnavailable);
     std::shared_ptr<PrincipalAdmission> admission;
     auto target = principalRead_.snapshot;
-    if (frame.type == Type::CommitFuturePolicy) {
+    if (frame.type == Type::CommitFuturePolicy || frame.type == Type::ReplacePrincipalRule) {
         auto found = principalAdmissions_.find(idValue(frame, Tag::DraftId));
         if (found == principalAdmissions_.end()) return principalError(Error::Stale);
         admission = found->second;
         const auto observed = principalObservations_.find(admission->observed);
         if (admission->owner != peer || admission->cancelled || admission->consumed ||
-            principalNow_() >= admission->deadline || observed == principalObservations_.end() ||
-            observed->second->row.revision != admission->observedRevision || observed->second->row.state != 1 ||
+            principalNow_() >= admission->deadline ||
+            (!admission->file && (observed == principalObservations_.end() ||
+              observed->second->row.revision != admission->observedRevision || observed->second->row.state != 1)) ||
+            bool(admission->replacing) != (frame.type == Type::ReplacePrincipalRule) ||
             find(frame, Tag::MigrationDigest)->bytes != Bytes(32))
             return principalError(Error::Stale);
         principal::Rule rule;
-        rule.id = frame.correlation; rule.selector = admission->selector;
+        rule.id = admission->replacing ? admission->replacing->id : frame.correlation;
+        rule.selector = admission->selector; rule.targetRevision = admission->targetRevision;
+        if (admission->replacing) {
+            if (admission->replacing->revision == UINT64_MAX) return principalError(Error::Capacity);
+            rule.revision = admission->replacing->revision + 1;
+        }
         rule.action = static_cast<std::uint8_t>(get(frame, Tag::Decision));
         rule.direction = admission->direction;
         rule.mode = rule.action == 1 || rule.direction == 2 ? 0 : rule.direction == 1 ? 1 : 2;
         rule.target = admission->fullTarget;
-        if (admission->scope == 2) target.rules.push_back(std::move(rule));
+        if (admission->scope == 2) {
+            if (admission->replacing) {
+                const auto prior = std::find_if(target.rules.begin(), target.rules.end(),
+                    [&](const auto &r) {return r.id == admission->replacing->id;});
+                if (prior == target.rules.end() || prior->revision != admission->replacing->revision ||
+                    prior->targetRevision != admission->replacing->targetRevision ||
+                    prior->target != admission->replacing->target) return principalError(Error::Stale);
+                *prior = std::move(rule);
+            } else target.rules.push_back(std::move(rule));
+        }
     } else if (frame.type == Type::RevokePrincipalRule) {
         auto rule = std::find_if(target.rules.begin(), target.rules.end(), [&](const auto &r) {
             return r.id == idValue(frame, Tag::RuleId);
@@ -632,7 +1065,7 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         return ordered(std::move(response));
     }
     // Reconsulta de recibo conservado no depende de que el Source B siga sano.
-    if (frame.type == Type::CommitFuturePolicy || frame.type == Type::RevokePrincipalRule)
+    if (frame.type == Type::CommitFuturePolicy || frame.type == Type::ReplacePrincipalRule || frame.type == Type::RevokePrincipalRule)
         return commitPrincipal(frame, peer);
     if (!principalMode_ || principalWriteFault_ || !principalSource_ || !principalCatalog_ ||
         principalSource_->stage() != allnative::Stage::Active ||
@@ -657,6 +1090,7 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             peer->pages.clear(); return principalError(Error::BackendUnavailable);
         }
     }
+    if (frame.type == Type::ListPrincipalRules) return listPrincipalRules(frame, peer);
     if (frame.type == Type::PrepareFuturePolicy) return preparePrincipal(frame, peer);
     if (frame.type == Type::GetFutureDraft) {
         auto found = principalAdmissions_.find(idValue(frame, Tag::DraftId));
@@ -664,7 +1098,9 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             found->second->consumed || now >= found->second->deadline ||
             get(frame, Tag::ProfileGeneration) != peer->profile ||
             get(frame, Tag::DraftVersion) != found->second->revision) return principalError(Error::Stale);
-        auto &admission = *found->second;
+        const auto held = found->second;
+        auto &admission = *held;
+        if (admission.file) return fileFutureRecord(admission);
         auto observed = principalObservations_.find(admission.observed);
         if (observed == principalObservations_.end() || observed->second->row.revision != admission.observedRevision ||
             observed->second->row.state != 1 || admission.source != principalSource_ || !admission.event || !admission.proof ||
@@ -788,7 +1224,10 @@ void NativeRuntime::invalidatePrincipalObservations() noexcept {
     if(principalImageWorker_ && principalImageJobId_)principalImageWorker_->abandon(principalImageJobId_);
     for(auto &entry:principalProcesses_)entry.second->retired=true;
     principalTrafficAcquired_=false;principalTraffic_.clear();principalTrafficBytes_=0;
-    for (auto &entry : principalAdmissions_) entry.second->cancelled = true;
+    for (auto &entry : principalAdmissions_) {
+        entry.second->cancelled = true;
+        if (entry.second->file) entry.second->file->cancelled.store(true);
+    }
     principalAdmissions_.clear();
     principalPendingBytes_ = 0;
     for (auto &entry : principalObservations_) {
