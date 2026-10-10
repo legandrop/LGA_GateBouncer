@@ -9,6 +9,7 @@ namespace Gate::Data {
 namespace {
 const QString xsi = QStringLiteral("http://www.w3.org/2001/XMLSchema-instance");
 const QString xml = QStringLiteral("http://www.w3.org/XML/1998/namespace");
+thread_local QNameReadDiagnostic lastDiagnostic;
 bool ncName(const QString &value) {
     if (value.isEmpty()) return false;
     bool first = true;
@@ -100,7 +101,9 @@ QString qnameCandidateId(const QNameEvidence &evidence, int node) {
     const QUuid scope(QStringLiteral("b7a5f9d2-758d-4ca1-9258-21914e5f1ab8"));
     return QUuid::createUuidV5(scope, (evidence.digest + ':' + QString::number(evidence.nodes[node].ordinal)).toUtf8()).toString(QUuid::WithoutBraces);
 }
+QNameReadDiagnostic lastQNameReadDiagnostic() noexcept { return lastDiagnostic; }
 QNameReadResult readQNameXml(const QByteArray &bytes, const ImportLimits &limits) {
+    lastDiagnostic = {};
     QNameReadResult result;
     if (bytes.size() > limits.bytes || limits.depth < 1 || limits.elements < 1) { result.error = "XmlBounds"; return result; }
     QXmlStreamReader reader(bytes);
@@ -109,6 +112,7 @@ QNameReadResult readQNameXml(const QByteArray &bytes, const ImportLimits &limits
     QVector<int> stack;
     QVector<QMap<QString, QString>> environments;
     QNameBudget budget;
+    qint64 textChunks = 0;
     int roots = 0;
     while (!reader.atEnd()) {
         const auto token = reader.readNext();
@@ -137,9 +141,45 @@ QNameReadResult readQNameXml(const QByteArray &bytes, const ImportLimits &limits
         } else if (token == QXmlStreamReader::Characters && !stack.isEmpty()) {
             const QString text = reader.text().toString();
             auto &content = result.nodes[stack.last()].content;
-            if (text.size() > limits.text || !budget.string(text) || !budget.structure(48)) { result.error = "XmlTextBudget"; break; }
+            ++textChunks;
+            const auto prior = budget;
+            auto failure = [&](QNameReadGuard guard, qint64 charge = 0) {
+                auto &d = result.diagnostic;
+                d.guard = guard; d.textUnits = text.size(); d.textLimit = limits.text;
+                d.unitsBefore = prior.units; d.unitsAfter = budget.units;
+                d.jsonBefore = prior.jsonBound; d.jsonAfter = budget.jsonBound;
+                d.nodes = result.nodes.size(); d.contentItems = content.size(); d.textChunks = textChunks;
+                d.mergedUnits = !content.isEmpty() && content.last().child < 0 ? content.last().text.size() : 0;
+                d.stringCharge = charge; lastDiagnostic = d;
+            };
+            if (text.size() > limits.text) {
+                failure(QNameReadGuard::TextUnits); result.error = "XmlTextBudget"; break;
+            }
+            if (!budget.string(text)) {
+                auto guard = !prior.valid ? QNameReadGuard::InvalidBudget :
+                    text.size() > 32768 ? QNameReadGuard::StringUnits :
+                    text.size() > QNameBudget::unitLimit - prior.units ? QNameReadGuard::TotalUnits : QNameReadGuard::JsonStringBytes;
+                qint64 charge = 2;
+                // Sólo en fallo: reproduce el cargo conservador sin exponer los caracteres.
+                if (guard == QNameReadGuard::JsonStringBytes) for (qsizetype i = 0; i < text.size(); ++i) {
+                    const auto ch = text[i];
+                    if (ch.isHighSurrogate()) {
+                        if (++i >= text.size() || !text[i].isLowSurrogate()) { guard = QNameReadGuard::InvalidUtf16; break; }
+                        charge += 12;
+                    } else if (ch.isLowSurrogate()) { guard = QNameReadGuard::InvalidUtf16; break; }
+                    else charge += ch == '"' || ch == '\\' ? 2 : ch.unicode() < 32 || ch.unicode() >= 127 ? 6 : 1;
+                }
+                failure(guard, charge);
+                result.error = "XmlTextBudget"; break;
+            }
+            if (!budget.structure(48)) {
+                failure(QNameReadGuard::JsonContentBytes, budget.jsonBound - prior.jsonBound);
+                result.error = "XmlTextBudget"; break;
+            }
             if (!content.isEmpty() && content.last().child < 0) {
-                if (content.last().text.size() + text.size() > limits.text) { result.error = "XmlTextBounds"; break; }
+                if (content.last().text.size() + text.size() > limits.text) {
+                    failure(QNameReadGuard::MergedTextUnits); result.error = "XmlTextBounds"; break;
+                }
                 content.last().text += text;
             } else content.push_back({-1, text});
         } else if (token == QXmlStreamReader::EndElement) { stack.removeLast(); environments.removeLast(); }
