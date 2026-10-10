@@ -1427,7 +1427,7 @@ void MainWindow::renderOrdinaryNotice() {
             ? "Decision result unknown · Check the same command; do not repeat this decision."
         : client->state() == OrdinaryDecisionClient::State::Sending
             ? "Decision sent · waiting for the recorded result"
-        : held ? "TCP connection waiting · closing keeps the request blocked and pending" : "Blocked attempt recorded · no connection is waiting");
+        : held ? "Network request waiting · closing keeps the request blocked and pending" : "Blocked attempt recorded · no connection is waiting");
     QString observedApplication;
     if(const auto source=Assistance::Ui::currentObservation(client)){
         const auto& name=source->record.display.name;
@@ -1449,7 +1449,7 @@ void MainWindow::renderOrdinaryNotice() {
         path->setObjectName("ordinary-path"); path->setWordWrapMode(QTextOption::WrapAnywhere);
         path->setMinimumHeight(52); path->setMaximumHeight(78); body->addWidget(path);
     }
-    const QString scopeDescription = scopeValue == 3 ? "this exact TCP connection, once. " : scopeValue == 4
+    const QString scopeDescription = scopeValue == 3 ? "this exact network flow, once. " : scopeValue == 4
         ? "only this app instance, until it exits. " : scopeValue == 5 ? "only this app instance, for up to 15 minutes or until it exits. " :
         "this application and account, including other matching instances. "
         + QString(package == 1 ? "Any package is included. " : package == 2
@@ -1489,9 +1489,9 @@ void MainWindow::renderOrdinaryNotice() {
         }
     });
     const QString network = scopeValue >= 3 ?
-        QString(directionValue == 1 ? "TCP connections started by this app, with packets in both directions. "
-            : directionValue == 2 ? "TCP connections accepted by this app, with packets in both directions. "
-            : "TCP connection direction unavailable; decisions are not ready. ") +
+        QString(directionValue == 1 ? "Network flows started by this app, with packets in both directions. "
+            : directionValue == 2 ? "Network flows accepted by this app, with packets in both directions. "
+            : "Network flow direction unavailable; decisions are not ready. ") +
         "UDP, QUIC, ICMP and startup coverage have not been validated."
         : directionValue == 1 ? "Outbound · Allow covers unicast destinations only"
         : directionValue == 2 ? "Inbound · all destinations and protocols" : "Both · inbound and outbound; Allow includes non-unicast destinations";

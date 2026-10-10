@@ -41,7 +41,7 @@ directional::Result NativeRuntime::writeScoped(const principal::Entry &command,
     const auto layer = cause->record_.layerId;
     const auto direction = layer == FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 || layer == FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6 ? 2u :
         layer == FWPS_LAYER_ALE_AUTH_CONNECT_V4 || layer == FWPS_LAYER_ALE_AUTH_CONNECT_V6 ? 1u : 0u;
-    if (!direction || cause->record_.protocol != 6 || get(frame, Tag::PolicyDirection) != direction ||
+    if (!direction || (cause->record_.protocol != 6 && cause->record_.protocol != 17) || get(frame, Tag::PolicyDirection) != direction ||
         admission->direction != direction) return result;
     decision.action = static_cast<UINT32>(get(frame, Tag::Decision));
     entry.kernel.state = GB_SCOPE_PENDING;

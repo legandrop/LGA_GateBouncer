@@ -105,7 +105,7 @@ std::shared_ptr<ClassifierCause> NativeClassifier::take(bool &lost) noexcept {
         if (bytes != sizeof(record) || record.version != GB_CLASSIFIER_VERSION || record.bytes != sizeof(record) ||
             record.session != session_ || record.loss != loss_ || !record.cause || !process.process ||
             !record.endpoint || !record.filterId || !record.pid || record.pid > MAXDWORD || !record.created ||
-            !record.timestamp || (record.family != 4 && record.family != 6) || record.protocol != 6 ||
+            !record.timestamp || (record.family != 4 && record.family != 6) || (record.protocol != 6 && record.protocol != 17) ||
             (record.family == 4 ? record.layerId != FWPS_LAYER_ALE_AUTH_CONNECT_V4 && record.layerId != FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 :
                 record.layerId != FWPS_LAYER_ALE_AUTH_CONNECT_V6 && record.layerId != FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6) ||
             (record.flags & FWP_CONDITION_FLAG_IS_REAUTHORIZE) || record.appBytes < 4 ||
@@ -266,6 +266,24 @@ bool NativeClassifier::catalogCurrent(const ClassifierCause &cause, HANDLE engin
             !guardedRead(&nc, cm.p, sizeof(nc)) || !nc.providerKey ||
             !guardedRead(&provider, nc.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
             !equal(nc.calloutKey, GbInboundCallouts[n]) || !equal(nc.applicableLayer, *inboundLayers[n]) ||
+            nc.flags != FWPM_CALLOUT_FLAG_REGISTERED) return false;
+    }
+    const GUID *datagramLayers[2] = {&FWPM_LAYER_DATAGRAM_DATA_V4, &FWPM_LAYER_DATAGRAM_DATA_V6};
+    for (unsigned n = 0; n < 2; ++n) {
+        Memory fm, cm; FWPM_FILTER0 nf{}; FWPM_CALLOUT0 nc{}; UINT64 w = 0;
+        if (FwpmFilterGetByKey0(engine, &GbDatagramCallouts[n], reinterpret_cast<FWPM_FILTER0 **>(&fm.p)) != ERROR_SUCCESS ||
+            !guardedRead(&nf, fm.p, sizeof(nf)) || !nf.providerKey ||
+            !guardedRead(&provider, nf.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
+            !equal(nf.filterKey, GbDatagramCallouts[n]) || !equal(nf.layerKey, *datagramLayers[n]) ||
+            !equal(nf.subLayerKey, GbClassifierSublayer) || nf.flags || nf.rawContext || nf.providerData.size || nf.numFilterConditions ||
+            nf.action.type != FWP_ACTION_CALLOUT_UNKNOWN || !equal(nf.action.calloutKey, GbDatagramCallouts[n]) ||
+            nf.weight.type != FWP_UINT64 || !nf.weight.uint64 || !guardedRead(&w, nf.weight.uint64, sizeof(w)) || w != 50 ||
+            nf.effectiveWeight.type != FWP_UINT64 || !nf.effectiveWeight.uint64 ||
+            !guardedRead(&w, nf.effectiveWeight.uint64, sizeof(w)) || w != 50 ||
+            FwpmCalloutGetByKey0(engine, &GbDatagramCallouts[n], reinterpret_cast<FWPM_CALLOUT0 **>(&cm.p)) != ERROR_SUCCESS ||
+            !guardedRead(&nc, cm.p, sizeof(nc)) || !nc.providerKey ||
+            !guardedRead(&provider, nc.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
+            !equal(nc.calloutKey, GbDatagramCallouts[n]) || !equal(nc.applicableLayer, *datagramLayers[n]) ||
             nc.flags != FWPM_CALLOUT_FLAG_REGISTERED) return false;
     }
     return true;

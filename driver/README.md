@@ -102,7 +102,30 @@ It produces an unsigned .sys without installing, loading or signing it. There
 is no production signing, INF, unattended repair or deployment admission yet.
 When the device is absent, the service retains its legacy netevent producer.
 
-This source does not establish platform-wide protection. UDP, QUIC, ICMP,
+UDP supports an initial ALE generation per socket and remote peer on IPv4/IPv6.
+Its real FLOW_ESTABLISHED handle is associated with a DATAGRAM_DATA context;
+each packet in either direction requires that context, handle, endpoint,
+compartment and tuple to match. Instance and timed grants also retain the exact
+application instance, authorization direction and transport protocol. QUIC uses
+the same UDP transport enforcement, without inspecting QUIC application data.
+Inbound UDP retains an owned packet with an exact eight-byte UDP header and
+length; fragments, IPv6 extension headers and jumbograms are excluded.
+
+UDP flow deletion after idle does not close its socket. A previously scoped
+socket and peer tuple is denied on reuse; UDP tombstones remain for the driver
+lifetime, including after endpoint closure, RESET, session loss or cleanup.
+Different peers can receive their own causes while registry capacity remains.
+Safe same-peer regeneration and sustained operation beyond retained capacity
+are not implemented. Applied acknowledges the exact authorization, not packet
+delivery or successful flow association. Flow association without an immediate
+PASSIVE token proof is denied, including callbacks reached at DISPATCH_LEVEL.
+Completing a pended outbound UDP authorization creates state and flushes the
+original packet. The application must retransmit it; reliable buffering and
+outbound reinjection of that first datagram are not implemented. This source
+does not establish that QUIC will recover or that the original send is delivered.
+
+This source does not establish platform-wide protection. UDP/QUIC OS delivery,
+same-peer regeneration, sustained capacity, ICMP,
 inbound callbacks outside the admitted PASSIVE owner subset, boot coverage,
 socket transfer, provider precedence
 and driver lifecycle require separate guest validation. Token replacement is
