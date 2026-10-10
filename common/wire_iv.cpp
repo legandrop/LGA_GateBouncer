@@ -293,6 +293,8 @@ Error packRecords(const std::vector<R> &rows, Bytes &out, unsigned kind) {
     unsigned version=1;
     if constexpr(std::is_same_v<R,PrincipalRuleRecord>)
       if(!r.originalTarget.empty())version=2;
+    if constexpr(std::is_same_v<R,FileFutureDraftRecord>)
+      if(validConditionalFileTarget(r.originalTarget))version=2;
     for (auto v : {integer(p.size(), 4), integer(kind, 2), integer(version, 2)})
       b.insert(b.end(), v.begin(), v.end());
     b.insert(b.end(), p.begin(), p.end());
@@ -313,7 +315,8 @@ Error unpackRecords(const Bytes &b, std::size_t count, std::vector<R> &out,
     auto size = std::size_t(n(b, at, 4));
     const auto version=unsigned(n(b,at+6,2));
     if (n(b, at + 4, 2) != kind ||
-        (std::is_same_v<R,PrincipalRuleRecord> ? version!=1 && version!=2 : version!=1))
+        ((std::is_same_v<R,PrincipalRuleRecord> || std::is_same_v<R,FileFutureDraftRecord>) ?
+            version!=1 && version!=2 : version!=1))
       return Error::Unsupported;
     if (size > max || size > b.size() - at - 8)
       return Error::Malformed;
@@ -324,6 +327,8 @@ Error unpackRecords(const Bytes &b, std::size_t count, std::vector<R> &out,
     else parsed=parse(p,r);
     if (!parsed)
       return Error::Malformed;
+    if constexpr(std::is_same_v<R,FileFutureDraftRecord>)
+      if((version==2)!=validConditionalFileTarget(r.originalTarget))return Error::Malformed;
     rows.push_back(std::move(r));
     at += 8 + size;
   }
@@ -501,6 +506,17 @@ Schema schemaBase(const Frame &f) {
 }
 Schema schema(const Frame &f) {
   auto s=schemaBase(f);
+  if(find(f,T::OriginalSourceSelection)) {
+    switch(f.type) {
+    case Type::PrepareFileFuturePolicy: case Type::FileFutureDraftRecord:
+      s[T::OriginalSourcePath]=Variable;
+      if(f.type==Type::FileFutureDraftRecord)s[T::Decision]=1;
+      [[fallthrough]];
+    case Type::GetFutureDraft: case Type::CommitFuturePolicy:
+      s[T::OriginalSourceSelection]=Variable;break;
+    default: break;
+    }
+  }
   if(find(f,T::DestinationContext)) {
     switch(f.type) {
     case Type::GetObservedRecord: case Type::SubscribeEvents: case Type::SubscriptionAck:
@@ -559,6 +575,25 @@ bool outcome(const Frame &f) {
   }
 }
 } // namespace
+bool valid(const OriginalSourceSelection &selection) {
+  return selection.rawDigest!=Digest{} && !selection.candidate.empty() &&
+    selection.candidate.size()<=256 && text(selection.candidate);
+}
+Error packOriginalSourceSelection(const OriginalSourceSelection &selection,Bytes &out) {
+  if(!valid(selection))return Error::Malformed;
+  Bytes bytes(40);bytes[0]=1;put(bytes,4,selection.rawDigest);
+  put(bytes,36,selection.candidate.size(),2);
+  bytes.insert(bytes.end(),selection.candidate.begin(),selection.candidate.end());
+  out=std::move(bytes);return Error::Ok;
+}
+Error unpackOriginalSourceSelection(const Bytes &bytes,OriginalSourceSelection &out) {
+  if(bytes.size()<41 || bytes.size()>296 || bytes[0]!=1 || !zeros(bytes,1,3) ||
+     !zeros(bytes,38,2) || n(bytes,36,2)!=bytes.size()-40)return Error::Malformed;
+  OriginalSourceSelection selection;
+  selection.rawDigest=array<32>(bytes,4);selection.candidate.assign(bytes.begin()+40,bytes.end());
+  if(!valid(selection))return Error::Malformed;
+  out=std::move(selection);return Error::Ok;
+}
 bool valid(const DestinationContext &context) {
   const auto empty=[](const auto &address) {
     return std::all_of(address.begin(),address.end(),[](auto byte){return byte==0;});
@@ -693,7 +728,9 @@ bool valid(const FutureDraftRecord &r) {
                          : reason == 3 || reason == 12);
 }
 bool valid(const PrincipalRuleRecord &r) {
-  if(!r.originalTarget.empty() && (r.targetKind!=1 || !validPrincipalTarget(r.originalTarget,r.package)))return false;
+  if(!r.originalTarget.empty() &&
+     (r.targetKind==1 ? !validPrincipalTarget(r.originalTarget,r.package) :
+      r.targetKind!=3 || !validConditionalTarget(r.originalTarget,r.package)))return false;
   if (zero(r.rule) || zero(r.selector) || !r.revision || !r.targetRevision ||
       r.target == Digest{} || r.action < 1 || r.action > 2 || r.direction < 1 ||
       r.direction > 3 || r.mode != mode(r.action, r.direction) || r.admin < 1 ||
@@ -707,8 +744,9 @@ bool valid(const PrincipalRuleRecord &r) {
       return false;
   } else if (r.proof != Proof::CurrentEffect || r.effective < 1)
     return false;
-  return r.targetKind == 1
+  return r.targetKind == 1 || r.targetKind == 3
              ? r.scope == 2 && r.package >= 1 && r.package <= 2 && r.origin == 1
+                 && (r.targetKind!=3 || (r.direction==1 && !r.originalTarget.empty()))
              : r.targetKind == 2 && r.scope == 1 && !r.package && !r.origin &&
                    r.display.principal.empty() && r.display.package.empty();
 }
@@ -741,6 +779,27 @@ bool validFileTarget(const Bytes &target) {
   }
   return true;
 }
+bool validConditionalTarget(const Bytes &target,std::uint8_t package) {
+  if(target.size()<72 || target.size()>65744 || target[0]!='A' || target[1]!='P' ||
+     target[2]!='T' || target[3]!='2' || n(target,4,2)!=1 || n(target,6,2)!=72 ||
+     !zeros(target,28,4))return false;
+  RemoteCondition condition;
+  condition.kind=static_cast<RemoteKind>(target[18]);condition.match=target[19];
+  condition.sourceWeight=std::uint32_t(n(target,20,4));condition.sourceOrdinal=std::uint32_t(n(target,24,4));
+  condition.first=std::uint32_t(n(target,32,4));condition.last=std::uint32_t(n(target,36,4));
+  condition.sourceRule=array<16>(target,40);condition.sourceFilter=array<16>(target,56);
+  if(condition.kind!=RemoteKind::Ipv4Range || !remoteConditionValid(condition))return false;
+  Bytes base(target.begin(),target.begin()+24);base[3]='1';put(base,6,24,2);
+  base[18]=base[19]=base[20]=base[21]=base[22]=base[23]=0;
+  base.insert(base.end(),target.begin()+72,target.end());
+  return validPrincipalTarget(base,package);
+}
+bool validConditionalFileTarget(const Bytes &target) {
+  if(!validConditionalTarget(target,1))return false;
+  Bytes base(target.begin(),target.begin()+24);base[3]='1';put(base,6,24,2);
+  std::fill(base.begin()+18,base.end(),0);base.insert(base.end(),target.begin()+72,target.end());
+  return validFileTarget(base);
+}
 bool valid(const FileFutureDraftRecord &r) {
   const auto &d=r.draft;
   if(!zero(d.observed) || d.observedRevision || d.migration!=Digest{} ||
@@ -749,23 +808,26 @@ bool valid(const FileFutureDraftRecord &r) {
     d.target==Digest{} || d.ttl<1 || d.ttl>120000 || d.state!=3 || d.package!=1 ||
     d.direction<1 || d.direction>3 || d.scope!=2 || d.durationMs || d.accepted!=3 ||
     d.proof!=Proof::CurrentShapeUnproven || d.reason!=Error::Ok || d.display.projection!=2 ||
-    !display(d.display) || !validFileTarget(r.originalTarget) ||
+    !display(d.display) || (!validFileTarget(r.originalTarget) &&
+      !(d.direction==1 && validConditionalFileTarget(r.originalTarget))) ||
     (!r.file.fileIndexHigh && !r.file.fileIndexLow) || !r.file.lastWrite || r.file.lastWrite>INT64_MAX ||
     (r.file.attributes & (0x10u|0x400u)))return false;
   return true;
 }
 Error unpackOriginalTarget(const Bytes &b,OriginalTarget &out) {
   out={};
-  if(!validPrincipalTarget(b))return Error::Malformed;
+  const bool conditional=validConditionalTarget(b);
+  if(!conditional && !validPrincipalTarget(b))return Error::Malformed;
+  const auto offset=conditional ? 72u : 24u;
   const auto app=std::size_t(n(b,8,4)),user=std::size_t(n(b,12,2));
-  out.appId.assign(b.begin()+24,b.begin()+24+app);
-  out.accountSid.assign(b.begin()+24+app,b.begin()+24+app+user);
-  out.packageSid.assign(b.begin()+24+app+user,b.end());
+  out.appId.assign(b.begin()+offset,b.begin()+offset+app);
+  out.accountSid.assign(b.begin()+offset+app,b.begin()+offset+app+user);
+  out.packageSid.assign(b.begin()+offset+app+user,b.end());
   out.packageMode=b[16];return Error::Ok;
 }
 Error principalTargetDigestInput(const Bytes &b,Bytes &out) {
   out.clear();
-  if(!validPrincipalTarget(b))return Error::Malformed;
+  if(!validPrincipalTarget(b) && !validConditionalTarget(b))return Error::Malformed;
   out={'G','B','S','4','T','G','T','1'};
   const auto size=integer(b.size(),4);out.insert(out.end(),size.begin(),size.end());
   out.insert(out.end(),b.begin(),b.end());return Error::Ok;
@@ -821,7 +883,7 @@ Error validate(const Frame &f) {
   unsigned previous = 0;
   for (const auto &v : f.fields) {
     auto tag = static_cast<unsigned>(v.tag);
-    if (tag < 1 || tag > static_cast<unsigned>(T::DestinationContext) || tag == 57 ||
+    if (tag < 1 || tag > static_cast<unsigned>(T::OriginalSourceSelection) || tag == 57 ||
         (v.tag == T::ServiceContext && f.type != Type::HelloAck && f.type != Type::Status &&
          f.type != Type::SubscriptionAck && f.type != Type::Attempt &&
          f.type != Type::Authorization && f.type != Type::Traffic && f.type != Type::ObservationGap &&
@@ -992,7 +1054,22 @@ Error validate(const Frame &f) {
     const auto &path=find(f,T::Text)->bytes;
     if(path.empty() || path.size()>4096 || !text(path) || get(f,T::ScopeKind)!=2 ||
        get(f,T::PackageMode)!=1 ||
-       (find(f,T::Records) && !validPrincipalTarget(find(f,T::Records)->bytes)))return Error::Malformed;
+       (find(f,T::Records) &&
+         !(find(f,T::OriginalSourceSelection) ? validConditionalFileTarget(find(f,T::Records)->bytes) :
+              validPrincipalTarget(find(f,T::Records)->bytes))))return Error::Malformed;
+  }
+  if(const auto source=find(f,T::OriginalSourceSelection)) {
+    OriginalSourceSelection selection;
+    if(unpackOriginalSourceSelection(source->bytes,selection)!=Error::Ok)return Error::Malformed;
+    if(f.type==Type::PrepareFileFuturePolicy || f.type==Type::FileFutureDraftRecord) {
+      const auto path=find(f,T::OriginalSourcePath);
+      if(!path || path->bytes.empty() || path->bytes.size()>4096 || !text(path->bytes) || find(f,T::RuleId))return Error::Malformed;
+    } else if(f.type!=Type::GetFutureDraft && f.type!=Type::CommitFuturePolicy)return Error::Malformed;
+    if(f.type==Type::PrepareFileFuturePolicy || f.type==Type::CommitFuturePolicy) {
+      if(get(f,T::ScopeKind)!=2 || get(f,T::PackageMode)!=1 || get(f,T::PolicyDirection)!=1)
+        return Error::Malformed;
+    }
+    if(f.type==Type::FileFutureDraftRecord && (get(f,T::Decision)<1 || get(f,T::Decision)>2))return Error::Malformed;
   }
   if(f.type==Type::ReplacePrincipalRule ||
      ((f.type==Type::PrepareFileFuturePolicy || f.type==Type::FileFutureDraftRecord) && find(f,T::RuleId))) {
@@ -1076,6 +1153,8 @@ Error validate(const Frame &f) {
       std::vector<FileFutureDraftRecord> rows;
       e=unpack(records->bytes,1,rows);
       if(e==Error::Ok && rows.front().draft.source!=idValue(f,T::SourceEpoch))return Error::Malformed;
+      if(e==Error::Ok && bool(find(f,T::OriginalSourceSelection))!=
+          validConditionalFileTarget(rows.front().originalTarget))return Error::Malformed;
     } else if (f.type == Type::FutureDraftRecord) {
       std::vector<FutureDraftRecord> rows;
       e = unpack(records->bytes, count, rows);

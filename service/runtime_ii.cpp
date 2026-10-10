@@ -66,6 +66,7 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
         const auto &current = admission.identity;
         Frame frame;
         if (decode(command.command.payload, frame) != Error::Ok ||
+            (find(frame,Tag::OriginalSourceSelection) && !admission.file) ||
             !find(frame, Tag::TargetDigest) || find(frame, Tag::TargetDigest)->bytes !=
                 Bytes(admission.target.begin(), admission.target.end()) ||
             !find(frame, Tag::MigrationDigest) || find(frame, Tag::MigrationDigest)->bytes != Bytes(32)) return false;
@@ -86,15 +87,20 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
             const auto currentRule = std::find_if(principalCatalog_->rules_.begin(), principalCatalog_->rules_.end(),
                 [&](const auto &r) { return r.rule == rule.id; });
             principal::Target target;
-            if (currentRule == principalCatalog_->rules_.end() || rule.kind != 1 ||
-                !principal::parseTarget(rule.target, target)) return false;
+            if (currentRule == principalCatalog_->rules_.end() ||
+                !(rule.kind==3 ? principal::parseConditionalTarget(rule.target,target) :
+                  rule.kind==1 && principal::parseTarget(rule.target,target))) return false;
             const auto view = principalCatalog_->ruleView(static_cast<std::size_t>(
                 currentRule - principalCatalog_->rules_.begin()));
             auto exact = [](const principal::ByteView &bytes, allnative::recipe::ByteView current) {
                 return bytes.size() == current.size && (!current.size ||
                     std::equal(bytes.data(), bytes.data() + bytes.size(), current.data));
             };
-            return view.targetKind == 1 && view.packageMode == target.packageMode &&
+            const auto &left=target.remoteCondition;const auto &right=view.remoteCondition;
+            return left.kind==right.kind && left.match==right.match && left.first==right.first && left.last==right.last &&
+                left.sourceWeight==right.sourceWeight && left.sourceOrdinal==right.sourceOrdinal &&
+                left.sourceRule==right.sourceRule && left.sourceFilter==right.sourceFilter &&
+                view.targetKind == rule.kind && view.packageMode == target.packageMode &&
                 exact(target.app, view.app) && exact(target.user, view.user) && exact(target.package, view.package) &&
                 currentRule->ruleRevision == rule.revision && currentRule->targetRevision == rule.targetRevision &&
                 idValue(frame, Tag::RuleId) == rule.id && get(frame, Tag::RuleRevision) == rule.revision &&
@@ -109,6 +115,18 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
                 !principalFileActorCurrent(*admission.file) ||
                 (frame.type != Type::CommitFuturePolicy && frame.type != Type::ReplacePrincipalRule) ||
                 bool(admission.replacing) != (frame.type == Type::ReplacePrincipalRule)) return false;
+            const auto &file=*admission.file;
+            if(bool(file.originalSource)!=bool(find(frame,Tag::OriginalSourceSelection)))return false;
+            if(file.originalSource) {
+                principal::Target original;
+                if(admission.replacing || frame.type!=Type::CommitFuturePolicy ||
+                   !file.originalSelection || !file.originalSource->actorCurrent() ||
+                   find(frame,Tag::OriginalSourceSelection)->bytes!=file.originalSourceSelection ||
+                   get(frame,Tag::Decision)!=std::uint64_t(file.originalSelection->action) ||
+                   admission.direction!=file.originalSelection->direction ||
+                   !principal::parseConditionalTarget(admission.fullTarget,original) ||
+                   !file.originalSource->ownsSelection(file.originalSelection,original.app.copy(),original.user.copy(),file.path))return false;
+            } else if(file.originalSelection || !file.originalSourceSelection.empty())return false;
             if (admission.replacing) {
                 const auto &prior = *admission.replacing;
                 const auto row = std::find_if(principalCatalog_->rules_.begin(), principalCatalog_->rules_.end(),
@@ -186,8 +204,18 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         if (decode(command.command.payload, canonicalCommand) != Error::Ok) return result;
         if (admission->file) {
             if (rule == checked.rules.end() || rule->target != admission->fullTarget ||
-                !principal::parseTarget(rule->target, principalTarget) || principalTarget.packageMode != 1 ||
+                (admission->file->originalSource ? rule->kind!=3 ||
+                    !principal::parseConditionalTarget(rule->target,principalTarget) :
+                    rule->kind!=1 || !principal::parseTarget(rule->target, principalTarget)) || principalTarget.packageMode != 1 ||
                 principalTarget.user != principal::ByteView(admission->administrative ? admission->selectedSid : admission->identity.account)) return result;
+            if(admission->file->originalSource) {
+                plan.conditionalSource_=admission->file->originalSource;
+                plan.conditionalSelection_=admission->file->originalSelection;
+                plan.conditionalTarget_=admission->fullTarget;
+                plan.conditionalImage_=admission->file->path;
+                plan.conditionalRule_=command.command.id;
+                plan.conditionalDesired_=command.command.desired;
+            }
         } else if (canonicalCommand.type == Type::CommitFuturePolicy) {
         const auto &identity = admission->event->owned().identity;
         if (rule == checked.rules.end() || !principal::parseTarget(rule->target, principalTarget) ||
@@ -199,6 +227,11 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
             (principalTarget.packageMode == 2 &&
              (identity.packageSid.state != gatebouncer::appidentity::FieldState::Copied ||
               principalTarget.package != principal::ByteView(identity.packageSid.bytes)))) return result;
+        }
+        if(admission->revocation && admission->revocation->kind==3) {
+            plan.removedConditionalTarget_=admission->revocation->target;
+            plan.conditionalRule_=admission->revocation->id;
+            plan.conditionalDesired_=command.command.desired;
         }
         const auto sequence = principalRead_.snapshot.sequence;
         const auto desired = principalRead_.snapshot.desired;

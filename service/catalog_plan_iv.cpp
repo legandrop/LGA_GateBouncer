@@ -276,6 +276,70 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactInitial(
     HANDLE engine,const WriteApi &api,VerifyBeforeWrite verify,void *context) noexcept {
   return transactBody(engine,api,{},verify,context,true);
 }
+bool CatalogPlanBuilder::conditionalWriteCurrent(const allnative::CatalogSnapshot &after,
+    const std::shared_ptr<const allnative::CatalogSnapshot> &before) const noexcept {
+  try {
+    if(!before || !conditionalDesired_ || after.desired_!=conditionalDesired_ ||
+       before->desired_==UINT64_MAX || conditionalDesired_!=before->desired_+1 || zero(conditionalRule_))return false;
+    const bool create=conditionalSource_ && conditionalSelection_ && conditionalTarget_.size() &&
+        !removedConditionalTarget_.size();
+    const bool remove=!conditionalSource_ && !conditionalSelection_ && !conditionalTarget_.size() &&
+        removedConditionalTarget_.size();
+    if(!create && !remove)return false;
+    principal::Target target;
+    if(!principal::parseConditionalTarget(create ? conditionalTarget_ : removedConditionalTarget_,target))return false;
+    if(create) {
+      Bytes encoded;
+      if(!conditionalSource_->actorCurrent() || conditionalSelection_->direction!=1 ||
+         conditionalSelection_->closureDigest==Digest{} ||
+         !conditionalSource_->ownsSelection(conditionalSelection_,target.app.copy(),target.user.copy(),conditionalImage_) ||
+         !principal::serializeConditionalTarget(target.app,target.user,1,{},conditionalSelection_->condition,encoded) ||
+         principal::ByteView(std::move(encoded))!=conditionalTarget_)return false;
+    }
+    auto exactBytes=[](auto a,auto b) {return a.size==b.size &&
+      (!a.size || std::equal(a.data,a.data+a.size,b.data));};
+    auto condition=[](const auto &a,const auto &b) {
+      return a.kind==b.kind && a.match==b.match && a.first==b.first && a.last==b.last &&
+        a.sourceWeight==b.sourceWeight && a.sourceOrdinal==b.sourceOrdinal &&
+        a.sourceRule==b.sourceRule && a.sourceFilter==b.sourceFilter;
+    };
+    auto targetMatches=[&](const auto &view) {
+      return view.targetKind==3 && view.packageMode==target.packageMode &&
+        exactBytes(view.app,allnative::recipe::ByteView{target.app.data(),target.app.size()}) &&
+        exactBytes(view.user,allnative::recipe::ByteView{target.user.data(),target.user.size()}) &&
+        exactBytes(view.package,allnative::recipe::ByteView{target.package.data(),target.package.size()}) &&
+        condition(view.remoteCondition,target.remoteCondition);
+    };
+    std::size_t admitted=0;
+    for(std::size_t i=0;i<before->rules_.size();++i) {
+      const auto old=before->ruleView(i);
+      if(old.targetKind!=3)continue;
+      const auto found=std::find_if(after.rules_.begin(),after.rules_.end(),[&](const auto &r){return r.rule==old.ruleId;});
+      if(remove && old.ruleId==conditionalRule_) {
+        if(found!=after.rules_.end() || !targetMatches(old))return false;
+        ++admitted;continue;
+      }
+      if(found==after.rules_.end())return false;
+      const auto next=after.ruleView(std::size_t(found-after.rules_.begin()));
+      if(next.targetKind!=3 || old.selectorId!=next.selectorId || old.ruleRevision!=next.ruleRevision ||
+         old.targetRevision!=next.targetRevision || old.action!=next.action || old.direction!=next.direction ||
+         old.mode!=next.mode || old.scope!=next.scope || old.origin!=next.origin || old.packageMode!=next.packageMode ||
+         !exactBytes(old.app,next.app) || !exactBytes(old.user,next.user) || !exactBytes(old.package,next.package) ||
+         !condition(old.remoteCondition,next.remoteCondition))return false;
+    }
+    for(std::size_t i=0;i<after.rules_.size();++i) {
+      const auto next=after.ruleView(i);
+      if(next.targetKind!=3)continue;
+      const auto old=std::find_if(before->rules_.begin(),before->rules_.end(),[&](const auto &r){return r.rule==next.ruleId;});
+      if(old!=before->rules_.end()) {if(old->targetKind!=3)return false;continue;}
+      if(!create || next.ruleId!=conditionalRule_ || next.ruleRevision!=1 || next.targetRevision!=1 ||
+         next.action!=conditionalSelection_->action || next.direction!=conditionalSelection_->direction ||
+         !targetMatches(next))return false;
+      ++admitted;
+    }
+    return admitted==1;
+  } catch(...) {return false;}
+}
 CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactBody(
     HANDLE engine,const WriteApi &api,const std::shared_ptr<const allnative::CatalogSnapshot> &before,
     VerifyBeforeWrite verify,void *context,bool initial) noexcept {
@@ -286,14 +350,14 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactBody(
     return result;
   const auto &after = *storage_.storage_;
   if (!after.binding_) return result;
-  // El actor actual sólo admite APT1. Representar/cotejar APT2 no autoriza una
-  // escritura: el puente de admisión original debe adquirir todas las condiciones
-  // y precedencia antes de reemplazar esta guarda, también para borrar reglas.
+  // El recorrido ordinario conserva el veto. Sólo la capacidad privada ligada
+  // a captura/selección original admite una entrada nueva, o retiro exacto propio.
   auto conditional = [](const auto &catalog) {
     return std::any_of(catalog.rules_.begin(), catalog.rules_.end(),
                        [](const auto &rule) { return rule.targetKind == 3; });
   };
-  if (conditional(after) || (before && conditional(*before))) {
+  const bool hasConditional=conditional(after) || (before && conditional(*before));
+  if (hasConditional && (initial || !conditionalWriteCurrent(after,before))) {
     result.error = ERROR_NOT_SUPPORTED;
     return result;
   }
@@ -326,7 +390,7 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactBody(
     transaction = true;
     // El owner verifica inventario A, objetos propios y lease duradero Prepared
     // dentro de esta transacción; HANDLE/DTO no sustituyen esas adquisiciones.
-    if (!verify(context)) {
+    if (!verify(context) || (hasConditional && !conditionalWriteCurrent(after,before))) {
       result.error = ERROR_INVALID_STATE;
     } else {
       if (before) for (const auto &old : before->slots_) {
@@ -365,6 +429,9 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactBody(
         UINT64 ignored = 0;
         result.error = api.add(engine, &filter, nullptr, &ignored);
       }
+    }
+    if (result.error == ERROR_SUCCESS) {
+      if(hasConditional && !conditionalWriteCurrent(after,before))result.error=ERROR_INVALID_STATE;
     }
     if (result.error == ERROR_SUCCESS) {
       result.error = api.commit(engine);

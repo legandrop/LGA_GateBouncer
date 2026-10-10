@@ -1,5 +1,6 @@
 #pragma once
 #include "snapshot_iv.h"
+#include "principal_source_capture_vii.h"
 #include "windows/allapps/native/NativeCatalog.h"
 #include "windows/allapps/native/NativeSdk.h"
 
@@ -59,6 +60,16 @@ class CatalogPlanBuilder final {
   Phase phase_ = Phase::Reserved;
   bool writeAttempted_ = false;
   bool initialCandidate_ = false;
+  // Sólo NativeRuntime conserva aquí la captura/selección privadas admitidas;
+  // ninguna ruta ordinaria ni payload de formato puede fijar estos originales.
+  std::shared_ptr<PrincipalSourceCapture> conditionalSource_;
+  std::shared_ptr<const PrincipalSourceCapture::Selection> conditionalSelection_;
+  principal::ByteView conditionalTarget_, removedConditionalTarget_;
+  std::filesystem::path conditionalImage_;
+  Id conditionalRule_{};
+  std::uint64_t conditionalDesired_=0;
+  bool conditionalWriteCurrent(const allnative::CatalogSnapshot &,
+      const std::shared_ptr<const allnative::CatalogSnapshot> &) const noexcept;
   const std::uint8_t *outcomePointer_ = nullptr;
   std::size_t outcomeSize_ = 0, outcomeCapacity_ = 0;
   CatalogPlanBuilder(const CatalogPlanBuilder &) = delete;

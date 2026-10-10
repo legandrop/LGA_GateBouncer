@@ -1146,7 +1146,9 @@ bool parse(ByteView b, Snapshot &out) {
       auto row = std::find_if(s.rules.begin(), s.rules.end(),
                               [&](const Rule &r) { return r.id == ruleId; });
       if (active.effect == 1 || active.effect==3) {
-        if (row == s.rules.end() || row->kind != 1 ||
+        if (row == s.rules.end() ||
+            (row->kind==3 ? active.effect!=1 || !find(f,Tag::OriginalSourceSelection) :
+                row->kind!=1 || find(f,Tag::OriginalSourceSelection)) ||
             row->selector != idValue(f, Tag::SelectorId) ||
             row->targetRevision != get(f, Tag::TargetRevision) ||
             row->action != get(f, Tag::Decision) ||
@@ -1157,7 +1159,8 @@ bool parse(ByteView b, Snapshot &out) {
                 array<32>(ByteView(find(f, Tag::TargetDigest)->bytes), 0))
           return false;
         Target t;
-        if (!parseTarget(row->target, t) || t.packageMode != active.packageMode)
+        if (!(row->kind==3 ? parseConditionalTarget(row->target,t) : parseTarget(row->target,t)) ||
+            t.packageMode != active.packageMode)
           return false;
       } else if (row != s.rules.end())
         return false;
@@ -1428,7 +1431,17 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
         const auto id=create ? f.correlation : removed;
         const auto row=std::find_if(rules.begin(),rules.end(),[&](const Rule &r){return r.id==id;});
         Target target;
-        if(!selected || row==rules.end() || row->kind!=1 || !parseTarget(row->target,target) ||
+        if(!selected || row==rules.end() ||
+           !(row->kind==3 ? (!replace && parseConditionalTarget(row->target,target)) :
+             row->kind==1 && parseTarget(row->target,target)) ||
+           target.user!=ByteView(targetSid))return false;
+      }
+      if(create) {
+        const auto row=std::find_if(after.rules.begin(),after.rules.end(),[&](const Rule &r){return r.id==f.correlation;});
+        Target target;
+        if(row==after.rules.end() ||
+           (row->kind==3 ? !find(f,Tag::OriginalSourceSelection) || !parseConditionalTarget(row->target,target) :
+             row->kind!=1 || find(f,Tag::OriginalSourceSelection) || !parseTarget(row->target,target)) ||
            target.user!=ByteView(targetSid))return false;
       }
       for (const auto &r : old) {

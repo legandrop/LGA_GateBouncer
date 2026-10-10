@@ -37,6 +37,14 @@ struct DestinationContext {
 bool valid(const DestinationContext &);
 Error packDestinationContext(const DestinationContext &, Bytes &);
 Error unpackDestinationContext(const Bytes &, DestinationContext &);
+// Selección de formato. La captura de archivo/grafo original pertenece al servicio.
+struct OriginalSourceSelection {
+  Digest rawDigest{};
+  Bytes candidate;
+};
+bool valid(const OriginalSourceSelection &);
+Error packOriginalSourceSelection(const OriginalSourceSelection &, Bytes &);
+Error unpackOriginalSourceSelection(const Bytes &, OriginalSourceSelection &);
 // Archivo original custodiado por fuente; no es un HANDLE de imagen del caller.
 struct ProcessFacts {
   std::uint64_t pid=0, created=0, lastWrite=0;
@@ -109,6 +117,8 @@ struct FileFutureDraftRecord {
 };
 bool validPrincipalTarget(const Bytes &target, std::uint8_t package=0);
 bool validFileTarget(const Bytes &target);
+bool validConditionalTarget(const Bytes &target, std::uint8_t package=0);
+bool validConditionalFileTarget(const Bytes &target);
 struct OriginalTarget {
   Bytes appId, accountSid, packageSid;
   std::uint8_t packageMode=0;

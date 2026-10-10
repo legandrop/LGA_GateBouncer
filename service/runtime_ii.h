@@ -11,8 +11,10 @@
 #include "principal_actor_vi.h"
 #include "native_activity_ring.h"
 #include "scopes_v.h"
+#include "principal_source_capture_vii.h"
 #include "../controller/deployment_win.h"
 namespace gb::decisions {
+class PrincipalSourceCapture;
 class NativeRuntime {
   public:
     NativeRuntime(WfpBackend &backend, SelectorRegistry &registry,
@@ -93,6 +95,9 @@ class NativeRuntime {
         principal::ByteView target;
         Bytes targetSid;
         wire::iv::Display display;
+        std::shared_ptr<PrincipalSourceCapture> originalSource;
+        std::shared_ptr<const PrincipalSourceCapture::Selection> originalSelection;
+        Bytes originalSourcePath, originalSourceSelection;
         std::atomic<bool> cancelled{false};
         bool completed=false;
         std::size_t charged=0;
@@ -166,6 +171,7 @@ class NativeRuntime {
     static bool capturePrincipalFile(PrincipalFileCapture &, const Frame &) noexcept;
     static bool principalFileActorCurrent(const PrincipalFileCapture &) noexcept;
     static bool principalFileMetadataCurrent(const PrincipalFileCapture &) noexcept;
+    static bool principalOriginalSourceCurrent(const PrincipalFileCapture &) noexcept;
     void drainPrincipalFiles() noexcept;
     std::array<std::shared_ptr<PrincipalFileCapture>,64> principalFiles_{};
     std::size_t principalFileBytes_=0,principalFilePhysical_=0;

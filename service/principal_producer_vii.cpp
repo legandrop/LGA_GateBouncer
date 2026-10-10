@@ -40,6 +40,10 @@ bool sameImage(const BY_HANDLE_FILE_INFORMATION &a, const BY_HANDLE_FILE_INFORMA
         a.nFileSizeHigh == b.nFileSizeHigh && a.nFileSizeLow == b.nFileSizeLow &&
         CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) == 0;
 }
+bool originalRuleTarget(const principal::Rule &rule,principal::Target &target) {
+    return rule.kind==3 ? principal::parseConditionalTarget(rule.target,target) :
+        rule.kind==1 && principal::parseTarget(rule.target,target);
+}
 Frame ordered(Frame frame) {
     std::sort(frame.fields.begin(), frame.fields.end(), [](const auto &a, const auto &b) { return a.tag < b.tag; });
     return frame;
@@ -575,6 +579,28 @@ bool NativeRuntime::principalFileMetadataCurrent(const PrincipalFileCapture &fil
     return principalFileActorCurrent(file) && GetTickCount64()<file.deadline;
   } catch(...) {return false;}
 }
+bool NativeRuntime::principalOriginalSourceCurrent(const PrincipalFileCapture &file) noexcept {
+  try {
+    if(!file.originalSource)return !file.originalSelection && file.originalSourceSelection.empty() &&
+        file.originalSourcePath.empty();
+    wire::iv::OriginalSourceSelection request;
+    principal::Target target;
+    if(!file.originalSelection || !principalFileMetadataCurrent(file) ||
+       !file.originalSource->current() ||
+       wire::iv::unpackOriginalSourceSelection(file.originalSourceSelection,request)!=Error::Ok ||
+       !principal::parseConditionalTarget(file.target,target) ||
+       file.originalSelection->rawDigest!=request.rawDigest || file.originalSelection->candidate!=request.candidate ||
+       !file.originalSource->ownsSelection(file.originalSelection,target.app.copy(),target.user.copy(),file.path))return false;
+    const auto fresh=file.originalSource->compareAgainst(request.candidate,target.app.copy(),target.user.copy(),file.path);
+    Bytes encoded;
+    return fresh && fresh->rawDigest==file.originalSelection->rawDigest &&
+      fresh->candidate==file.originalSelection->candidate && fresh->closureDigest==file.originalSelection->closureDigest &&
+      fresh->action==file.originalSelection->action && fresh->direction==file.originalSelection->direction &&
+      principal::serializeConditionalTarget(target.app,target.user,1,{},fresh->condition,encoded) &&
+      principal::ByteView(std::move(encoded))==file.target && file.originalSource->current() &&
+      principalFileMetadataCurrent(file);
+  } catch(...) {return false;}
+}
 bool NativeRuntime::capturePrincipalFile(PrincipalFileCapture &file,const Frame &request) noexcept {
   struct Revert {
     bool active=false;
@@ -642,6 +668,7 @@ bool NativeRuntime::capturePrincipalFile(PrincipalFileCapture &file,const Frame 
       2*(file.identity.account.capacity()+file.identity.logon.capacity())+2*file.targetSid.capacity()+
       file.actor.image.native().capacity()*sizeof(wchar_t)+file.path.native().capacity()*sizeof(wchar_t)+
       file.target.ownedCapacityBytes()+file.display.name.capacity()+file.display.path.capacity()+
+      file.originalSourcePath.capacity()+file.originalSourceSelection.capacity()+512+
       file.directories.capacity()*sizeof(native::Handle)+file.paths.capacity()*sizeof(std::filesystem::path)+
       file.directoryIds.capacity()*sizeof(BY_HANDLE_FILE_INFORMATION);
     for(const auto &pathValue:file.paths)charge+=pathValue.native().capacity()*sizeof(wchar_t);
@@ -709,6 +736,13 @@ Frame NativeRuntime::fileFutureRecord(const PrincipalAdmission &admission) {
   Frame response;response.minor=3;response.type=Type::FileFutureDraftRecord;
   response.fields={value(Tag::ServiceEpoch,epoch_),{Tag::Records,true,std::move(packed)},
     value(Tag::SourceEpoch,draft.source),{Tag::ServiceContext,true,std::move(context)}};
+  if(admission.file->originalSource) {
+    if(!admission.file->originalSelection || !admission.file->originalSource->actorCurrent())return principalError(Error::Stale);
+    response.fields.insert(response.fields.end(),{
+      value(Tag::Decision,admission.file->originalSelection->action,1),
+      {Tag::OriginalSourcePath,true,admission.file->originalSourcePath},
+      {Tag::OriginalSourceSelection,true,admission.file->originalSourceSelection}});
+  }
   if(admission.administrative)response.fields.insert(response.fields.end(),{
     {Tag::SelectedPrincipalSid,true,admission.selectedSid},value(Tag::AdministrativeMode,1,1)});
   if(admission.replacing) {
@@ -723,6 +757,7 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
   std::shared_ptr<PrincipalAdmission> held;
   std::shared_ptr<allnative::NativeSource> source;
   std::shared_ptr<const allnative::CatalogSnapshot> catalog;
+  std::shared_ptr<PrincipalSourceCapture> originalSource;
   std::optional<principal::Rule> replacing;
   Bytes selectedSid;
   const bool administrative=find(frame,Tag::AdministrativeMode)!=nullptr;
@@ -741,12 +776,16 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
       return dispatchOrdinary(frame,peer);
     if(!prepare) {
       const auto found=principalAdmissions_.find(idValue(frame,Tag::DraftId));
-      if(found==principalAdmissions_.end() || !found->second->file)return dispatchOrdinary(frame,peer);
+      if(found==principalAdmissions_.end() || !found->second->file)
+        return find(frame,Tag::OriginalSourceSelection) ? principalError(Error::Stale) : dispatchOrdinary(frame,peer);
       held=found->second;
       if(held->owner!=peer || held->cancelled || held->consumed || principalNow_()>=held->deadline ||
          held->administrative!=administrative || (administrative && held->selectedSid!=find(frame,Tag::SelectedPrincipalSid)->bytes))
         return principalError(Error::Stale);
       file=held->file;
+      if(bool(file->originalSource)!=bool(find(frame,Tag::OriginalSourceSelection)) ||
+         (file->originalSource && find(frame,Tag::OriginalSourceSelection)->bytes!=file->originalSourceSelection))
+        return principalError(Error::Conflict);
     }
     if(!principalPolicyReady() || !deployment_ || !deployment_->serviceAdmittedCurrent() ||
        !principalSource_ || !principalCatalog_ || principalSource_->stage()!=allnative::Stage::Active ||
@@ -798,12 +837,61 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
         file->cancelled.store(true);file->completed=true;return principalError(Error::IdentityUnavailable);
       }
       file->stop.reset(raw);
+      if(find(frame,Tag::OriginalSourceSelection)) {
+        file->originalSourcePath=find(frame,Tag::OriginalSourcePath)->bytes;
+        file->originalSourceSelection=find(frame,Tag::OriginalSourceSelection)->bytes;
+        wire::iv::OriginalSourceSelection requested;
+        if(wire::iv::unpackOriginalSourceSelection(file->originalSourceSelection,requested)!=Error::Ok)
+          {file->cancelled.store(true);file->completed=true;return principalError(Error::Malformed);}
+        // Reutilizar sólo el mismo grafo/actor original de este canal. El campo
+        // request selecciona candidato; no reemplaza la adquisición retenida.
+        for(const auto &prior:principalFiles_)if(prior && prior!=file && prior->originalSource &&
+            prior->originalSourcePath==file->originalSourcePath && prior->originalSelection &&
+            prior->originalSelection->rawDigest==requested.rawDigest &&
+            CompareObjectHandles(prior->actor.process.value,file->actor.process.value) &&
+            CompareObjectHandles(prior->primary.value,file->primary.value)) {
+          const auto retained=std::find_if(principalAdmissions_.begin(),principalAdmissions_.end(),[&](const auto &a) {
+            return a.second->owner==peer && a.second->file==prior && a.second->source==source &&
+              !a.second->cancelled && !a.second->consumed && a.second->profile==peer->profile;
+          });
+          if(retained!=principalAdmissions_.end()) {originalSource=prior->originalSource;break;}
+        }
+      }
     }
   }
   // Llamadas filesystem/RPC del mismo channel, con custodia física reservada.
-  const auto okay=prepare ? capturePrincipalFile(*file,frame) : principalFileMetadataCurrent(*file);
+  bool okay=prepare ? capturePrincipalFile(*file,frame) :
+      principalFileMetadataCurrent(*file) && principalOriginalSourceCurrent(*file);
+  Error sourceReason=Error::Stale;
+  if(prepare && okay && !file->originalSourceSelection.empty()) {
+    wire::iv::OriginalSourceSelection requested;
+    const auto &bytes=file->originalSourcePath;
+    const auto units=MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,
+      reinterpret_cast<const char *>(bytes.data()),int(bytes.size()),nullptr,0);
+    std::wstring path(units>0 ? std::size_t(units) : 0,L'\0');
+    okay=units>0 && units<=4096 &&
+      MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,reinterpret_cast<const char *>(bytes.data()),
+        int(bytes.size()),path.data(),units)==units &&
+      wire::iv::unpackOriginalSourceSelection(file->originalSourceSelection,requested)==Error::Ok;
+    if(okay && !originalSource)originalSource=PrincipalSourceCapture::acquire(std::filesystem::path(path),
+        requested.rawDigest,file->actor,file->identity,file->primary.value,file->stop.value,deployment_,file->deadline,sourceReason);
+    principal::Target original;Bytes target;
+    if(okay && originalSource && originalSource->current() && principal::parseTarget(file->target,original)) {
+      const auto selected=originalSource->compareAgainst(requested.candidate,original.app.copy(),original.user.copy(),file->path);
+      sourceReason=Error::ScopeUnsupported;
+      okay=selected && selected->rawDigest==requested.rawDigest && selected->candidate==requested.candidate &&
+        selected->closureDigest!=Digest{} && std::uint64_t(selected->direction)==get(frame,Tag::PolicyDirection) &&
+        principal::serializeConditionalTarget(original.app,original.user,1,{},selected->condition,target) &&
+        wire::iv::validConditionalFileTarget(target) && principalFileMetadataCurrent(*file) && originalSource->current();
+      if(okay) {
+        file->originalSource=originalSource;file->originalSelection=selected;
+        file->target=principal::ByteView(std::move(target));file->charged+=48;
+        okay=file->charged<=FileReserveBytes && principalOriginalSourceCurrent(*file);
+      }
+    } else okay=false;
+  }
   {
-    std::lock_guard<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(mutex);
     if(prepare) {
       file->completed=true;
       // Una captura fallida conserva el cargo máximo hasta cierre físico real.
@@ -814,7 +902,7 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
        !deployment_ || !deployment_->serviceAdmittedCurrent() || !principalPolicyReady() ||
        principalSource_!=source || principalCatalog_!=catalog ||
        !principalFileActorCurrent(*file) || GetTickCount64()>=file->deadline) {
-      file->cancelled.store(true);return principalError(Error::Stale);
+      file->cancelled.store(true);return principalError(!okay && !file->originalSourceSelection.empty() ? sourceReason : Error::Stale);
     }
     const auto context=readServiceContext();
     if(principalSource_!=source || principalCatalog_!=catalog || context.engineContext!=source->binding_->epoch ||
@@ -825,7 +913,15 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
       const auto current=principalAdmissions_.find(held->request);
       if(current==principalAdmissions_.end() || current->second!=held || held->cancelled || held->consumed ||
          held->file!=file || held->source!=source)return principalError(Error::Stale);
-      return dispatchOrdinary(frame,peer);
+      auto response=dispatchOrdinary(frame,peer);
+      lock.unlock();
+      // El receipt conserva el efecto real. Una fuente que cambió después del
+      // CAS sólo retira esta captura para una admisión futura, no su política.
+      if(file->originalSource && !principalOriginalSourceCurrent(*file)) {
+        file->cancelled.store(true);
+        if(frame.type==Type::GetFutureDraft)return principalError(Error::Stale);
+      }
+      return response;
     }
     if(get(frame,Tag::ExpectedDesiredRev)!=principalDesired_ || get(frame,Tag::ProfileGeneration)!=peer->profile ||
        principalAdmissions_.size()>=PendingLimit ||
@@ -906,7 +1002,7 @@ Frame NativeRuntime::listPrincipalRules(const Frame &frame,const std::shared_ptr
     if(rules.size()>4096)return principalError(Error::Capacity);
     for(std::size_t i=0;i<rules.size();++i) {
       principal::Target target;
-      if(rules[i].kind==1 && principal::parseTarget(rules[i].target,target) &&
+      if(originalRuleTarget(rules[i],target) &&
          (administrative || target.user==principal::ByteView(peer->identity.account)))page.indices.push_back(i);
     }
     snapshot=native::randomIdentity();
@@ -924,12 +1020,13 @@ Frame NativeRuntime::listPrincipalRules(const Frame &frame,const std::shared_ptr
   std::vector<wire::iv::PrincipalRuleRecord> rows;Bytes packed;
   for(std::size_t at=cursor;at<page.indices.size() && rows.size()<get(frame,Tag::Limit);++at) {
     const auto &rule=principalRead_.snapshot.rules[page.indices[at]];principal::Target target;
-    if(!principal::parseTarget(rule.target,target) || (!administrative && target.user!=principal::ByteView(peer->identity.account)))return principalError(Error::Stale);
+    if(!originalRuleTarget(rule,target) || (!administrative && target.user!=principal::ByteView(peer->identity.account)))return principalError(Error::Stale);
     wire::iv::PrincipalRuleRecord record;
     record.rule=rule.id;record.selector=rule.selector;record.revision=rule.revision;record.targetRevision=rule.targetRevision;
     record.desired=page.desired;record.target=principal::targetDigest(rule.target);record.action=rule.action;
     record.direction=rule.direction;record.mode=rule.mode;record.package=target.packageMode;record.display.projection=2;
     record.originalTarget=rule.target.copy();
+    record.targetKind=rule.kind;
     rows.push_back(std::move(record));Bytes candidate;
     const auto result=wire::iv::pack(rows,candidate);
     if(result==Error::Capacity){rows.pop_back();break;}
@@ -1135,6 +1232,7 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         rule.direction = admission->direction;
         rule.mode = rule.action == 1 || rule.direction == 2 ? 0 : rule.direction == 1 ? 1 : 2;
         rule.target = admission->fullTarget;
+        if(admission->file && admission->file->originalSource)rule.kind=3;
         if (admission->scope == 2) {
             if (admission->replacing) {
                 const auto prior = std::find_if(target.rules.begin(), target.rules.end(),
@@ -1150,7 +1248,7 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
             return r.id == idValue(frame, Tag::RuleId);
         });
         principal::Target bound;
-        if (rule == target.rules.end() || rule->kind != 1 || !principal::parseTarget(rule->target, bound) ||
+        if (rule == target.rules.end() || !originalRuleTarget(*rule,bound) ||
             !principalTargetSelected(frame,*peer,bound.user)) return principalError(Error::Unauthorized);
         admission = std::make_shared<PrincipalAdmission>();
         admission->request = native::randomIdentity(); admission->binding = native::randomIdentity();
