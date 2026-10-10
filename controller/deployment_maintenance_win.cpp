@@ -79,7 +79,7 @@ bool AdministrativeLease::acquire(bool fresh) {
     if (!count || count >= 32768) return false;
     image_ = std::filesystem::path(std::wstring(path,count));
     if (image_.filename() != L"GateBouncerService.exe" || !native::fixedPath(image_) ||
-        !pinSource(image_.parent_path(),source_)) return false;
+        !pinSource(image_.parent_path(),source_,mode_)) return false;
     // Crear sólo la raíz propia nueva, después del token y la fuente originales.
     if (fresh) {
         PSECURITY_DESCRIPTOR registry = nullptr;

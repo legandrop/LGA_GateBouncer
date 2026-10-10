@@ -5,12 +5,14 @@ param(
     [Parameter(Mandatory=$true)][string]$MinGwRoot,
     [Parameter(Mandatory=$true)][string]$QtDocsRoot,
     [Parameter(Mandatory=$true)][string]$StandardLicensesRoot,
-    [Parameter(Mandatory=$true)][string]$OutputRoot
+    [Parameter(Mandatory=$true)][string]$OutputRoot,
+    [string]$DriverPackageRoot,
+    [switch]$Laboratory
 )
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-# Bundle de transporte: source contiene sólo deploymentFiles(Service).
+# Bundle de transporte: source contiene sólo deploymentFiles(Service, mode).
 # Las licencias permanecen fuera de source; prepare crea su propio inventario.
 # No instala, no firma, no concede autoridad ni modifica configuración del equipo.
 try { Add-Type -TypeDefinition @'
@@ -235,8 +237,16 @@ try {
     $QtDocsRoot=[GateBouncer.Package.Native]::Fixed($QtDocsRoot)
     $StandardLicensesRoot=[GateBouncer.Package.Native]::Fixed($StandardLicensesRoot)
     $OutputRoot=[GateBouncer.Package.Native]::Fixed($OutputRoot)
+    if ($Laboratory) {
+        if ($DriverPackageRoot) { throw 'Laboratory assembly does not accept a product driver package' }
+    } else {
+        if (-not $DriverPackageRoot) { throw 'Product assembly requires DriverPackageRoot with the signed SYS, INF and CAT inputs; an unsigned build is insufficient' }
+        $DriverPackageRoot=[GateBouncer.Package.Native]::Fixed($DriverPackageRoot)
+    }
     $repo=[GateBouncer.Package.Native]::Fixed([System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')))
-    foreach ($root in @($QtBuild,$SdkBuild,$QtRoot,$MinGwRoot,$QtDocsRoot,$StandardLicensesRoot,$repo)) {
+    $inputRoots=@($QtBuild,$SdkBuild,$QtRoot,$MinGwRoot,$QtDocsRoot,$StandardLicensesRoot,$repo)
+    if (-not $Laboratory) { $inputRoots+=@($DriverPackageRoot) }
+    foreach ($root in $inputRoots) {
         if ($OutputRoot.Equals($root,[System.StringComparison]::OrdinalIgnoreCase) -or
             $OutputRoot.StartsWith($root+'\',[System.StringComparison]::OrdinalIgnoreCase) -or
             $root.StartsWith($OutputRoot+'\',[System.StringComparison]::OrdinalIgnoreCase)) { throw "Output must be disjoint from inputs: $root" }
@@ -251,7 +261,11 @@ try {
     $source['plugins\platforms\qwindows.dll']=Join-Path $QtRoot 'plugins\platforms\qwindows.dll'
     foreach ($name in @('Inter-Regular.ttf','Inter-Medium.ttf','Inter-SemiBold.ttf')) { $source['fonts\'+$name]=Join-Path $repo ('resources\fonts\'+$name) }
     $source['qt.conf']=$null
-    if ($source.Count -ne 18) { throw 'Product inventory must contain exactly 18 files' }
+    if (-not $Laboratory) {
+        foreach ($name in @('GateBouncerClassifier.sys','GateBouncerClassifier.inf','GateBouncerClassifier.cat')) { $source['driver\'+$name]=Join-Path $DriverPackageRoot $name }
+    }
+    $sourceCount=if ($Laboratory) { 18 } else { 21 }
+    if ($source.Count -ne $sourceCount) { throw 'Administrative inventory count is inconsistent' }
     $notices=[ordered]@{
         'Inter-LICENSE.txt'=Join-Path $repo 'resources\fonts\LICENSE.txt'
         'GCC-COPYING3.txt'=Join-Path $MinGwRoot 'licenses\gcc\COPYING3'
@@ -282,6 +296,7 @@ try {
     $payload=Join-Path $OutputRoot 'source'
     $noticeOutput=Join-Path $OutputRoot 'notices'
     foreach ($path in @($payload,$noticeOutput,(Join-Path $payload 'plugins'),(Join-Path $payload 'plugins\platforms'),(Join-Path $payload 'fonts'))) { New-OwnDirectory $path }
+    if (-not $Laboratory) { New-OwnDirectory (Join-Path $payload 'driver') }
     $names=[string[]]@($source.Keys)
     for ($i=0; $i -lt $names.Length; ++$i) {
         $name=$names[$i]
@@ -291,14 +306,15 @@ try {
         Write-OwnFile (Join-Path $payload $name) $bytes
     }
     foreach ($name in $notices.Keys) { Write-OwnFile (Join-Path $noticeOutput $name) ([GateBouncer.Package.Native]::Read($noticeReaders[$name])) }
-    $information="Transport bundle only. source contains the closed administrative input set. Administrative preparation computes its own inventory from retained source files. This bundle is not installed or publisher signed and does not establish network protection. notices contains original Qt 6.8.2 module/attribution documentation and qtbase SBOM, supplied standard license texts (not Qt 6.8.2 source), GCC and winpthreads materials, and the Inter license. The HTML files retain their original bytes; external assets and relative navigation are not bundled. These materials do not certify complete redistribution obligations or identify every compiled third-party component.`n"
+    $driverInformation=if ($Laboratory) { 'Explicit laboratory bundle: no product driver is included.' } else { 'Product driver inputs are copied from DriverPackageRoot. Assembly does not verify signing, install the catalog or load the driver; administrative admission must verify the original signed inputs. A CAT filename or a successful copy is not signing evidence.' }
+    $information="Transport bundle only. source contains the closed administrative input set. Administrative preparation computes its own inventory from retained source files. This bundle is not installed or publisher signed and does not establish network protection. $driverInformation notices contains original Qt 6.8.2 module/attribution documentation and qtbase SBOM, supplied standard license texts (not Qt 6.8.2 source), GCC and winpthreads materials, and the Inter license. The HTML files retain their original bytes; external assets and relative navigation are not bundled. These materials do not certify complete redistribution obligations or identify every compiled third-party component.`n"
     Write-OwnFile (Join-Path $OutputRoot 'BUNDLE.txt') ([System.Text.Encoding]::UTF8.GetBytes($information))
     [GateBouncer.Package.Native]::Closed($payload,$names)
     [GateBouncer.Package.Native]::Flat($noticeOutput,[string[]]@($notices.Keys))
     [GateBouncer.Package.Native]::Flat($OutputRoot,[string[]]@('source','notices','BUNDLE.txt'))
     foreach ($pin in $directories) { [GateBouncer.Package.Native]::Current($pin,$true) }
     foreach ($pin in $files) { [GateBouncer.Package.Native]::Current($pin,$false) }
-    Write-Output "Bundle assembled: $OutputRoot (source files: 18; not installed)"
+    Write-Output "Bundle assembled: $OutputRoot (source files: $sourceCount; not installed)"
     exit 0
 } catch {
     # Se preservan archivos propios parciales como evidencia, nunca se borran por path.

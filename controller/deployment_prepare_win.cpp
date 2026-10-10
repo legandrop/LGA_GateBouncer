@@ -223,9 +223,9 @@ bool disjoint(const std::filesystem::path &a,const std::filesystem::path &b) {
     for (auto *text : {&x,&y}) for (auto &c : *text) if (c >= L'A' && c <= L'Z') c += L'a'-L'A';
     return x != y && x.rfind(y+L"\\",0) != 0 && y.rfind(x+L"\\",0) != 0;
 }
-bool pinSource(const std::filesystem::path &source,std::vector<native::Handle> &inputs) {
+bool pinSource(const std::filesystem::path &source,std::vector<native::Handle> &inputs,DeploymentMode mode) {
     native::ProtectedDirectory root(source,true);
-    const auto &names = deploymentFiles(DeploymentRole::Service);
+    const auto &names = deploymentFiles(DeploymentRole::Service,mode);
     const std::set<std::wstring> expected(names.begin(),names.end());
     std::set<std::wstring> seen;
     if (!root.acquire() || !parents(source,inputs) ||
@@ -240,18 +240,33 @@ bool pinSource(const std::filesystem::path &source,std::vector<native::Handle> &
         if (!sourceFile(source/name,h,bytes)) return false;
         inputs.push_back(std::move(h));
     }
+    if (mode == DeploymentMode::Product) {
+        // La firma se exige antes de crear raíces administrativas o archivos de staging.
+        const auto first = inputs.size()-names.size();
+        const auto handle = [&](const wchar_t *name) {
+            const auto row = std::find(names.begin(),names.end(),name);
+            return row == names.end() ? INVALID_HANDLE_VALUE : inputs[first+std::size_t(row-names.begin())].value;
+        };
+        const auto cat = handle(L"driver\\GateBouncerClassifier.cat");
+        LARGE_INTEGER zero{}, size{}; DWORD done = 0;
+        if (cat == INVALID_HANDLE_VALUE || !SetFilePointerEx(cat,zero,nullptr,FILE_BEGIN) ||
+            !GetFileSizeEx(cat,&size) || size.QuadPart <= 0 || size.QuadPart > 32*1024*1024) return false;
+        wire::Bytes bytes(static_cast<std::size_t>(size.QuadPart));
+        if (!ReadFile(cat,bytes.data(),DWORD(bytes.size()),&done,nullptr) || done != bytes.size() ||
+            !driverPackageSignature(handle(L"driver\\GateBouncerClassifier.sys"),handle(L"driver\\GateBouncerClassifier.inf"),bytes)) return false;
+    }
     return true;
 }
 bool stagePackage(const std::filesystem::path &source,const std::filesystem::path &package,
                   std::shared_ptr<Deployment> &owner, DeploymentMode mode) {
     if (owner || !disjoint(source,package)) return false;
     OutputPins held; std::vector<native::Handle> inputs;
-    if (!pinOutputParents(package,held) || !pinSource(source,inputs)) return false;
+    if (!pinOutputParents(package,held) || !pinSource(source,inputs,mode)) return false;
     const auto attr = GetFileAttributesW(package.c_str());
     if (attr != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) return false;
     Descriptor readable(L"O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FRFX;;;BU)");
     if (!readable.value || !createDirectory(package,readable.value,held,true)) return false;
-    const auto &names = deploymentFiles(DeploymentRole::Service);
+    const auto &names = deploymentFiles(DeploymentRole::Service,mode);
     std::set<std::filesystem::path> directories; Inventory inventory;
     // pinSource conserva todos los files al final, después de los directorios.
     const auto first = inputs.size()-names.size();

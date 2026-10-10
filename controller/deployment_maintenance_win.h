@@ -19,7 +19,8 @@ MaintenanceResult updateProductDeployment(const std::filesystem::path &current,
 MaintenanceResult uninstallProductDeployment(const std::filesystem::path &current);
 MaintenanceResult finalizeProductDeployment(const std::filesystem::path &current);
 namespace deployment_detail {
-bool pinSource(const std::filesystem::path &, std::vector<native::Handle> &);
+bool pinSource(const std::filesystem::path &, std::vector<native::Handle> &,
+               DeploymentMode = DeploymentMode::Laboratory);
 bool stagePackage(const std::filesystem::path &, const std::filesystem::path &,
                   std::shared_ptr<Deployment> &, DeploymentMode = DeploymentMode::Laboratory);
 bool setString(HKEY, const wchar_t *, const std::wstring &);

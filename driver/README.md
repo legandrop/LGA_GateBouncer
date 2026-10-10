@@ -98,8 +98,22 @@ START recovery currently require a guest reboot. The retained dynamic session
 manages object lifetime rather than the duration of a permission.
 
 Build this standalone CMake project with MSVC x64 and explicit WDK/SDK roots.
-It produces an unsigned .sys without installing, loading or signing it. There
-is no production signing, INF, unattended repair or deployment admission yet.
+It produces an unsigned .sys without installing, loading or signing it. That
+artifact cannot satisfy product package admission. `GateBouncerClassifier.inf`
+defines the primitive amd64 product package, Driver Store destination `%13%`,
+and the separate `LGAGateBouncerClassifier` kernel service with demand startup.
+It does not request service startup. Its version identifies a development
+driver package, not a released product version. The final unchanged INF/SYS
+and genuine externally signed catalog must be supplied together; this target
+neither creates a catalog nor signs its output.
+
+The transport assembler includes supplied INF/SYS/CAT inputs in the closed
+21-file product set. Administrative admission verifies original SYS/INF
+handles against the retained CAT under offline Windows driver policy. This
+does not install the package, admit a loaded image or establish Code Integrity
+acceptance. The Windows Driver Store operation and its original-file and
+registration continuity remain pending; see [Windows transport bundle](../docs/WindowsBundle.md).
+There is no unattended repair in this target.
 When the device is absent, the service retains its legacy netevent producer.
 
 UDP supports an initial ALE generation per socket and remote peer on IPv4/IPv6.

@@ -3,6 +3,13 @@
 #include <set>
 #include <aclapi.h>
 #include <sddl.h>
+#include <wintrust.h>
+#include <softpub.h>
+#include <mscat.h>
+// Constante del SDK, ausente en algunas versiones de los headers MinGW.
+#ifndef WTD_DISABLE_MD2_MD4
+#define WTD_DISABLE_MD2_MD4 0x00002000
+#endif
 namespace gb::controller {
 namespace {
 std::wstring lower(std::wstring s) {
@@ -59,7 +66,7 @@ const wchar_t *deploymentConfiguration(DeploymentMode mode) {
 std::wstring deploymentCommand(const std::filesystem::path &image, DeploymentMode mode) {
     return L"\"" + image.native() + (mode == DeploymentMode::Product ? L"\" --service" : L"\" --service --guest-wfp");
 }
-const std::vector<std::wstring> &deploymentFiles(DeploymentRole role) {
+const std::vector<std::wstring> &deploymentFiles(DeploymentRole role, DeploymentMode mode) {
     static const std::vector<std::wstring> decision = {
         L"GateBouncerDecisionBootstrap.exe", L"GateBouncerDecisionStage.dll", L"Qt6Core.dll",
         L"Qt6Gui.dll", L"Qt6Widgets.dll", L"libgcc_s_seh-1.dll", L"libstdc++-6.dll",
@@ -71,7 +78,14 @@ const std::vector<std::wstring> &deploymentFiles(DeploymentRole role) {
             L"GateBouncerService.exe", L"GateBouncerAssistant.exe", L"GateBouncerSignatureHelper.exe"});
         return result;
     }();
-    return role == DeploymentRole::DecisionController ? decision : product;
+    static const std::vector<std::wstring> withDriver = [] {
+        auto result = product;
+        result.insert(result.end(), {L"driver\\GateBouncerClassifier.sys",
+            L"driver\\GateBouncerClassifier.inf", L"driver\\GateBouncerClassifier.cat"});
+        return result;
+    }();
+    return role == DeploymentRole::DecisionController ? decision :
+        mode == DeploymentMode::Product ? withDriver : product;
 }
 bool encodeInventory(const Inventory &inventory, wire::Bytes &out) {
     if (inventory.empty() || inventory.size() > 64) return false;
@@ -173,6 +187,51 @@ bool maintenanceState(HKEY key, bool &present, DWORD &state) {
     if (v != ERROR_SUCCESS || s != ERROR_SUCCESS || vSize != sizeof(version) ||
         sSize != sizeof(state) || version != 1 || state > 4) return false;
     present = true; return true;
+}
+bool driverPackageSignature(HANDLE sys, HANDLE inf, const wire::Bytes &catalog) {
+    if (catalog.empty() || catalog.size() > 32*1024*1024 ||
+        !native::protectedObject(sys,false,false,true) || !native::protectedObject(inf,false,false,true)) return false;
+    struct Libraries {
+        HMODULE trust = LoadLibraryExW(L"wintrust.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        HMODULE crypto = LoadLibraryExW(L"crypt32.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+        ~Libraries() { if (crypto) FreeLibrary(crypto); if (trust) FreeLibrary(trust); }
+    } libraries;
+    if (!libraries.trust || !libraries.crypto) return false;
+    const auto verify = reinterpret_cast<decltype(&WinVerifyTrust)>(GetProcAddress(libraries.trust,"WinVerifyTrust"));
+    const auto acquire = reinterpret_cast<decltype(&CryptCATAdminAcquireContext2)>(GetProcAddress(libraries.trust,"CryptCATAdminAcquireContext2"));
+    const auto release = reinterpret_cast<decltype(&CryptCATAdminReleaseContext)>(GetProcAddress(libraries.trust,"CryptCATAdminReleaseContext"));
+    const auto hash = reinterpret_cast<decltype(&CryptCATAdminCalcHashFromFileHandle2)>(GetProcAddress(libraries.trust,"CryptCATAdminCalcHashFromFileHandle2"));
+    const auto context = reinterpret_cast<decltype(&CertCreateCTLContext)>(GetProcAddress(libraries.crypto,"CertCreateCTLContext"));
+    const auto freeContext = reinterpret_cast<decltype(&CertFreeCTLContext)>(GetProcAddress(libraries.crypto,"CertFreeCTLContext"));
+    if (!verify || !acquire || !release || !hash || !context || !freeContext) return false;
+    // El CTL firmado se decodifica desde bytes originales: ningún CAT se reabre por path.
+    const auto ctl = context(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,catalog.data(),DWORD(catalog.size()));
+    if (!ctl) return false;
+    HCATADMIN admin = nullptr; GUID action = DRIVER_ACTION_VERIFY;
+    bool ok = acquire(&admin,&action,L"SHA256",nullptr,0) != FALSE;
+    for (const auto member : {sys,inf}) {
+        if (!ok) break;
+        LARGE_INTEGER zero{}; DWORD size = 32; BYTE digest[32]{};
+        if (!SetFilePointerEx(member,zero,nullptr,FILE_BEGIN) ||
+            !hash(admin,member,&size,digest,0) || size != sizeof(digest)) { ok = false; break; }
+        wchar_t tag[65]{}; constexpr wchar_t hex[] = L"0123456789ABCDEF";
+        for (unsigned i = 0; i < 32; ++i) { tag[2*i] = hex[digest[i] >> 4]; tag[2*i+1] = hex[digest[i] & 15]; }
+        WINTRUST_CATALOG_INFO info{}; info.cbStruct = sizeof(info); info.pcwszMemberTag = tag;
+        info.hMemberFile = member; info.pbCalculatedFileHash = digest; info.cbCalculatedFileHash = size;
+        info.pcCatalogContext = ctl; info.hCatAdmin = admin;
+        WINTRUST_DATA data{}; data.cbStruct = sizeof(data); data.dwUIChoice = WTD_UI_NONE;
+        data.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN; data.dwUnionChoice = WTD_CHOICE_CATALOG;
+        data.pCatalog = &info; data.dwStateAction = WTD_STATEACTION_VERIFY;
+        data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL | WTD_REVOCATION_CHECK_CHAIN_EXCLUDE_ROOT |
+            WTD_USE_DEFAULT_OSVER_CHECK | WTD_DISABLE_MD2_MD4;
+        ok = verify(INVALID_HANDLE_VALUE,&action,&data) == ERROR_SUCCESS;
+        data.dwStateAction = WTD_STATEACTION_CLOSE;
+        if (verify(INVALID_HANDLE_VALUE,&action,&data) != ERROR_SUCCESS) ok = false;
+    }
+    if (admin && !release(admin,0)) ok = false;
+    if (!freeContext(ctl)) ok = false;
+    // Sólo confianza offline de miembros bajo política driver, nunca imagen cargada/CI/protección.
+    return ok;
 }
 struct Deployment::Registration {
     HKEY key = nullptr, gate = nullptr, parent = nullptr;
@@ -342,13 +401,15 @@ bool Deployment::verify(const std::filesystem::path &own, DeploymentRole role) {
     wire::Bytes manifest;
     if (!readFile(L"deployment.gbd", manifest, 32768) || !parseInventory(manifest, inventory_))
         return false;
-    // Bootstrap admite su conjunto mínimo o el producto completo; ningún extra.
+    // Los lectores ordinarios admiten los conjuntos cerrados; el servicio Product exige driver.
     const auto &expectedFiles = role == DeploymentRole::DecisionController &&
         inventory_.size() == deploymentFiles(role).size() ? deploymentFiles(role) :
-        deploymentFiles(DeploymentRole::Service);
+        deploymentFiles(DeploymentRole::Service, mode_ == DeploymentMode::Product ||
+            (role != DeploymentRole::Service && inventory_.size() == deploymentFiles(DeploymentRole::Service,DeploymentMode::Product).size()) ?
+            DeploymentMode::Product : DeploymentMode::Laboratory);
     if (inventory_.size() != expectedFiles.size()) return false;
     for (const auto &file : expectedFiles) if (!inventory_.count(file)) return false;
-    for (const auto &file : deploymentFiles(role))
+    for (const auto &file : deploymentFiles(role,mode_))
         if (!inventory_.count(file))
             return false;
     std::vector<std::wstring> files;
@@ -368,6 +429,9 @@ bool Deployment::verify(const std::filesystem::path &own, DeploymentRole role) {
     }
     verified_ = true;
     role_ = role;
+    if (mode_ == DeploymentMode::Product && role == DeploymentRole::Service && !driverPackageSigned()) {
+        revoked_ = true; verified_ = false; return false;
+    }
     return true;
 }
 bool Deployment::matchesImage(const std::filesystem::path &path, const BY_HANDLE_FILE_INFORMATION &identity) const {
@@ -468,6 +532,21 @@ bool Deployment::serviceAdmittedCurrent() noexcept {
         const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
         return role_ == DeploymentRole::Service && registration_ && current();
     } catch (...) { return false; }
+}
+bool Deployment::driverPackageSigned() {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+    if (mode_ != DeploymentMode::Product || !current()) return false;
+    const auto handle = [&](const wchar_t *name) {
+        const auto row = std::find_if(files_.begin(),files_.end(),[&](const auto &p) { return p.path == name; });
+        return row == files_.end() ? INVALID_HANDLE_VALUE : held_[row->handle].value;
+    };
+    const auto cat = handle(L"driver\\GateBouncerClassifier.cat");
+    LARGE_INTEGER zero{}, size{}; DWORD done = 0;
+    if (cat == INVALID_HANDLE_VALUE || !SetFilePointerEx(cat,zero,nullptr,FILE_BEGIN) ||
+        !GetFileSizeEx(cat,&size) || size.QuadPart <= 0 || size.QuadPart > 32*1024*1024) return false;
+    wire::Bytes bytes(static_cast<std::size_t>(size.QuadPart));
+    return ReadFile(cat,bytes.data(),DWORD(bytes.size()),&done,nullptr) && done == bytes.size() &&
+        driverPackageSignature(handle(L"driver\\GateBouncerClassifier.sys"),handle(L"driver\\GateBouncerClassifier.inf"),bytes) && current();
 }
 bool Deployment::prepareEnvironment() {
     if (!current())

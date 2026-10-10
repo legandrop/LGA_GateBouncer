@@ -14,7 +14,8 @@ const wchar_t *deploymentService(DeploymentMode);
 const wchar_t *deploymentRegistry(DeploymentMode);
 const wchar_t *deploymentConfiguration(DeploymentMode);
 std::wstring deploymentCommand(const std::filesystem::path &, DeploymentMode);
-const std::vector<std::wstring> &deploymentFiles(DeploymentRole);
+const std::vector<std::wstring> &deploymentFiles(DeploymentRole,
+    DeploymentMode = DeploymentMode::Laboratory);
 bool serviceDescriptor(PSECURITY_DESCRIPTOR);
 bool serviceConfiguration(SC_HANDLE, const std::filesystem::path &, DWORD expectedPid = 0,
                           DeploymentMode = DeploymentMode::Laboratory);
@@ -24,6 +25,8 @@ bool serviceConfigurationPhase(SC_HANDLE, const std::filesystem::path &, DWORD s
 bool maintenanceState(HKEY, bool &present, DWORD &state);
 // Misma comparación nativa, resuelta desde KernelBase de System32; sin equivalencias alternativas.
 bool compareObjectHandles(HANDLE, HANDLE);
+// Política de driver offline sobre SYS/INF originales y CAT leído del original, sin registrar confianza.
+bool driverPackageSignature(HANDLE sys, HANDLE inf, const wire::Bytes &catalog);
 class Deployment {
   public:
     explicit Deployment(std::filesystem::path root, DeploymentMode = DeploymentMode::Laboratory);
@@ -39,6 +42,7 @@ class Deployment {
     bool admitServiceConfiguration(wire::Bytes &account, std::filesystem::path &store,
                                    bool &provision);
     bool serviceAdmittedCurrent() noexcept;
+    bool driverPackageSigned();
     DeploymentMode mode() const { return mode_; }
     bool prepareEnvironment();
     const std::filesystem::path &root() const { return root_; }
