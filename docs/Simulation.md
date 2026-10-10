@@ -8,7 +8,7 @@ Reviewing a pending request opens an in-window, nonmodal notice. Its application
 
 The requested destination is separate from the rule scope: **all outbound destinations and protocols**. Process scope, permanent permissions, timed permissions and restart behavior are simulated descriptions. There is no enforcement or timer that revokes an actual network permission.
 
-Saving or activating a rule records a decision, without creating an authorized attempt or observed traffic. Ask removes the matching sample rule; it does not invent a new network attempt. A future request would require an engine that is not implemented here.
+Saving or activating a rule records a decision, without creating an authorized attempt or observed traffic. Ask removes the matching sample rule; it does not invent a new network attempt. Sample requests do not originate from the live engine. See the [service implementation and validation limits](../service/README.md) for the separate live paths.
 
 ## History
 
@@ -26,7 +26,7 @@ Cleanup previews rules with old sample attempts and requires explicit selection.
 
 Settings can enable a sample configured state and consent to the proposed sharing. Automatic explanations default to enabled after consent and can be turned off for manual requests. Expected purpose, insufficient information and errors are synthetic outcomes. Cancellation, closing a notice, a resolved request, configuration removal, revoked consent, reset or loss of the simulated service invalidates a pending response. Responses are plain text and never change policies or network events.
 
-The API key field stays empty and read only. A future online feature would require separate approval of the provider, terms, transport, limited payload, privacy, key storage, untrusted responses and behavior while an application remains blocked. This prototype does not satisfy or implement those integration requirements.
+In Simulation, the API key field stays empty and read only; sample explanations do not use a provider. The separate live helper has configuration and explanation source paths, with provider rights, consent, transport, payload, key storage and current-context checks. Their complete operating-system/provider workflow is not validated. Simulation does not demonstrate those checks or their behavior while a real application remains blocked. See the [overview](../README.md) and [Roadmap](../Roadmap.md).
 
 The unavailable service scenario rejects policy changes, import, activation, cleanup and restore in both the interface and the model. The UI closed scenario keeps the preview open to illustrate a proposed state; no service continues enforcing anything.
 

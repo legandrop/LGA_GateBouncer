@@ -1,5 +1,7 @@
 # Windows transport bundle
 
+**State:** assembly, guarded preparation, update, finalization, retirement and retained-data reinstall paths are implemented in source. A genuine signed driver package, successful Windows installation/load, Code Integrity and network protection are not validated. There is no release installer. See the [Roadmap](../Roadmap.md) for acceptance tests; the operations below describe capabilities, not successful deployment evidence.
+
 `scripts/assemble_windows_package.ps1` assembles the 26-file product administrative source set from the Qt GUI build (including the offline signature helper), the Windows SDK service build, Qt 6.8.2 MinGW64, its MinGW runtime, a separate Qt 6.8.2 MSVC Release installation, genuine Visual C++ redistributable inputs, and a supplied classifier driver package. It copies the repository's Inter fonts and creates the exact `qt.conf` expected by deployment admission.
 
 Run it in a new PowerShell process with absolute paths on fixed local drives:

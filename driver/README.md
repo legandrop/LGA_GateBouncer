@@ -1,4 +1,4 @@
-# Scoped TCP classifier
+# Scoped TCP/UDP classifier
 
 The WDM driver retains initial outbound TCP operations at ALE connect and
 eligible inbound TCP SYN operations at ALE receive/accept for IPv4 and IPv6.
@@ -32,7 +32,8 @@ authority without rewriting a historical Applied receipt. Storage, NBL and MDL
 are released once after completion; closure cannot retire an entry with queued
 work, a packet, an injection pin, or a dependent flow.
 
-The device admits LocalSystem with the enabled LGAGateBouncerLab service SID,
+The device admits LocalSystem with one unambiguous enabled product
+(`LGAGateBouncer`) or laboratory (`LGAGateBouncerLab`) service SID,
 one retained caller process and one file object. Initial acquisition requires
 PASSIVE_LEVEL, the current endpoint-owner process and its primary token. It pins
 EPROCESS and token objects and copies creation time, OS APP_ID, account SID,
@@ -107,12 +108,15 @@ driver package, not a released product version. The final unchanged INF/SYS
 and genuine externally signed catalog must be supplied together; this target
 neither creates a catalog nor signs its output.
 
-The transport assembler includes supplied INF/SYS/CAT inputs in the closed
-21-file product set. Administrative admission verifies original SYS/INF
+The transport assembler includes supplied INF/SYS/CAT inputs in the new closed
+26-file product source set. The legacy 21-file inventory remains limited to
+its admitted maintenance/read paths. Administrative admission verifies original SYS/INF
 handles against the retained CAT under offline Windows driver policy. This
 does not install the package, admit a loaded image or establish Code Integrity
-acceptance. The Windows Driver Store operation and its original-file and
-registration continuity remain pending; see [Windows transport bundle](../docs/WindowsBundle.md).
+acceptance. Guarded Windows Driver Store installation, retained original-file
+and registration checks, update and retirement are implemented in the deployment
+source; their actual Windows execution and loaded-image/Code Integrity validation
+remain pending. See [Windows transport bundle](../docs/WindowsBundle.md).
 There is no unattended repair in this target.
 When the device is absent, the service retains its legacy netevent producer.
 
