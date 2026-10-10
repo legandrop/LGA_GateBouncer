@@ -237,7 +237,7 @@ void ProductController::startReviewWrite() {
         (!storeWriteRequested_ && !historyDirty_ && !pendingRuleBackup_)) return;
     if (pendingRuleBackup_) {
         const auto bytes = *pendingRuleBackup_; const auto id = pendingRuleBackupId_;
-        pendingRuleBackup_.reset(); pendingRuleBackupId_ = {}; savingRuleBackup_ = true;
+        pendingRuleBackup_.reset(); pendingRuleBackupId_ = QUuid{}; savingRuleBackup_ = true;
         auto *store = store_.get();
         storeWorker_ = QThread::create([this,store,bytes,id] {
             Data::StoreResult saved;
@@ -271,7 +271,7 @@ void ProductController::startReviewWrite() {
             flushingHistory_=false; inFlightReview_.reset();
             if (!saved.ok() || !saved.document) {
                 history_.storageFailed(); ++historyVersion_; reviewWritable_=false;
-                pendingRuleBackup_.reset(); pendingRuleBackupId_ = {};
+                pendingRuleBackup_.reset(); pendingRuleBackupId_ = QUuid{};
                 pendingReview_.reset(); storeWriteRequested_=false; writeNotification_.clear();
                 reviewError_="Review was not saved: "+saved.error; historyError_=reviewError_; emit changed(); return;
             }
