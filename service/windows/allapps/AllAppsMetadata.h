@@ -69,6 +69,10 @@ struct NetEventView {
 };
 enum class Direction : std::uint8_t { Unknown, Outbound, Inbound };
 struct OwnedNetEvent {
+    // Origen de metadata, no certificado ni capability: Source custodia la causa.
+    enum class Origin : std::uint8_t { NetEvent, ClassifierInitial };
+    Origin origin = Origin::NetEvent;
+    std::size_t classifierBytes = 0;
     ai::CopiedIdentity identity;
     Stamp acquired;
     std::uint64_t acquiredLossRevision = 0;

@@ -157,7 +157,7 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         auto sdk = principalSdk_();
         auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
             allnative::EngineLease(observationEngine_->handle(), observationEngine_->pin()),
-            allnative::BindReceipt(observationEngine_->context_, observationEngine_->generation_), sdk));
+            allnative::BindReceipt(observationEngine_->context_, observationEngine_->generation_), sdk, principalClassifier_));
         std::array<std::uint16_t, 8> domain{};
         std::array<allnative::recipe::SupportField, 32> support{};
         std::size_t count = 0;
@@ -182,6 +182,7 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
             // ejecuta en engine NO-DYNAMIC dentro de su write transaction.
             try { b.runtime.profile_.refresh();
                 return b.runtime.principalAdmissionCurrent(b.admission, b.command, allnative::Stage::Drained) &&
+                (!b.admission.event || b.source->classifierCurrent(*b.admission.event, b.runtime.backend_.engine_)) &&
                 b.source->readInventory(b.runtime.backend_.engine_,
                     allnative::CatalogReceipt(b.catalog)) == Reason::None; }
             catch (...) { return false; }
@@ -259,6 +260,9 @@ bool NativeRuntime::deploymentCurrent() const noexcept {
 }
 bool NativeRuntime::initialize(bool provision) {
     if (!deploymentCurrent()) return false;
+    // Adquisición real opcional del dispositivo del servicio. Su ausencia deja
+    // el productor de netevents existente; no anuncia scopes de proceso/Once.
+    principalClassifier_ = allnative::NativeClassifier::open();
     provisionRequested_ = provision;
     if (!loadPrincipalImage()) return false;
     if (principalMode_) {
@@ -396,7 +400,7 @@ bool NativeRuntime::provisionPrincipalImage(CatalogPlanBuilder &plan) {
         auto sdk = principalSdk_();
         auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
             allnative::EngineLease(observationEngine_->handle(),observationEngine_->pin()),
-            allnative::BindReceipt(observationEngine_->context_,observationEngine_->generation_),sdk));
+            allnative::BindReceipt(observationEngine_->context_,observationEngine_->generation_),sdk,principalClassifier_));
         if (!source->prerequisites()) return false;
         std::array<std::uint16_t,8> domain{}; std::array<allnative::recipe::SupportField,32> support{};
         std::size_t count = 0;
@@ -438,7 +442,7 @@ bool NativeRuntime::bindPrincipalObservation(CatalogPlanBuilder &plan) {
         auto sdk = principalSdk_();
         auto source = std::shared_ptr<allnative::NativeSource>(new allnative::NativeSource(
             allnative::EngineLease(observationEngine_->handle(), observationEngine_->pin()),
-            allnative::BindReceipt(observationEngine_->context_, observationEngine_->generation_), sdk));
+            allnative::BindReceipt(observationEngine_->context_, observationEngine_->generation_), sdk, principalClassifier_));
         std::array<std::uint16_t, 8> domain{};
         std::array<allnative::recipe::SupportField, 32> support{};
         std::size_t count = 0;

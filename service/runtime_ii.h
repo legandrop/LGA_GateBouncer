@@ -129,6 +129,7 @@ class NativeRuntime {
     bool provisionPrincipalImage(CatalogPlanBuilder &);
     void retirePrincipalObservation() noexcept;
     std::shared_ptr<EngineResource> observationEngine_;
+    std::shared_ptr<allnative::NativeClassifier> principalClassifier_;
     std::shared_ptr<EngineResource> retainedEngineFault_;
     std::uint64_t observationGeneration_ = 0;
     directional::NativeSnapshotFile file_;

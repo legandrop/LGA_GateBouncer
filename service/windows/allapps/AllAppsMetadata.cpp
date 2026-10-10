@@ -71,7 +71,8 @@ std::size_t chargedBytes(const OwnedNetEvent& e) noexcept
 {
     const auto a = e.identity.appId.bytes.capacity(), u = e.identity.userSid.bytes.capacity(), p = e.identity.packageSid.bytes.capacity();
     if (a > ai::MaximumAppIdBytes || u > ai::MaximumSidBytes || p > ai::MaximumSidBytes) return MaxRecordBytes + 1;
-    return sizeof(OwnedNetEvent) + a + u + p;
+    if (e.classifierBytes > 16384) return MaxRecordBytes + 1;
+    return sizeof(OwnedNetEvent) + a + u + p + e.classifierBytes;
 }
 CopyOutcome copyMetadata(const NetEventView& v, SourceState& source) noexcept
 {

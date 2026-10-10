@@ -106,7 +106,8 @@ bool NativeSource::retainedCause(const NativeCopiedMetadata &event, const Native
         proof.snapshot_ != event.snapshot_ || !(proof.stamp_ == event.event_.acquired) ||
         proof.loss_ != event.event_.acquiredLossRevision ||
         source_.health().lossRevision != proof.loss_ || proof.view_.role != Role::UnknownAppGate ||
-        proof.view_.action != Action::Block) return false;
+        proof.view_.action != Action::Block ||
+        (event.classifier_ && (!event.classifier_->current() || event.classifier_->owner_ != classifier_))) return false;
     // Drained conserva sólo la causa adquirida; no recrea Current, cobertura
     // temporal ni una solicitud retenida en el socket.
     return required == Stage::Drained || valid(event);
@@ -317,7 +318,7 @@ std::vector<ProofOutcome> NativeSource::readCurrentProofBatch(const NativeCopied
         for (std::size_t i = 0; i < count; ++i)
         {
             const auto &event = *events[i];
-            if (!valid(event))
+            if (!valid(event) || !classifierCurrent(event, engine_.engine_))
             {
                 fail(Reason::StaleStamp);
                 return results;

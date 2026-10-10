@@ -9,7 +9,7 @@ if(NOT TARGET gatebouncer_allapps)
     add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/.." "${CMAKE_CURRENT_BINARY_DIR}/allapps")
 endif()
 add_library(gatebouncer_allapps_native STATIC NativeRead.cpp NativeShape.cpp NativeLifecycle.cpp
-    NativeSdk.cpp NativeSource.cpp NativeProof.cpp)
+    NativeSdk.cpp NativeSource.cpp NativeProof.cpp NativeClassifier.cpp)
 target_compile_features(gatebouncer_allapps_native PUBLIC cxx_std_17)
 target_include_directories(gatebouncer_allapps_native PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(gatebouncer_allapps_native PUBLIC _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A000002 NOMINMAX)

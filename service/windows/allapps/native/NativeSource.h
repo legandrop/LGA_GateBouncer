@@ -4,6 +4,7 @@
 #include "NativeLifecycle.h"
 #include "NativeSdk.h"
 #include "NativeShape.h"
+#include "NativeClassifier.h"
 
 namespace gb::decisions
 {
@@ -68,13 +69,14 @@ class NativeCopiedMetadata
 {
     friend class NativeSource;
     NativeCopiedMetadata(OwnedNetEvent e, std::shared_ptr<const BindingState> b,
-                         std::shared_ptr<const CatalogSnapshot> s)
-        : event_(std::move(e)), binding_(std::move(b)), snapshot_(std::move(s))
+                         std::shared_ptr<const CatalogSnapshot> s, std::shared_ptr<ClassifierCause> cause = {})
+        : event_(std::move(e)), binding_(std::move(b)), snapshot_(std::move(s)), classifier_(std::move(cause))
     {
     }
     OwnedNetEvent event_;
     std::shared_ptr<const BindingState> binding_;
     std::shared_ptr<const CatalogSnapshot> snapshot_;
+    std::shared_ptr<ClassifierCause> classifier_;
 
   public:
     const OwnedNetEvent &owned() const noexcept
@@ -118,7 +120,7 @@ struct ProofOutcome
 class NativeSource : public std::enable_shared_from_this<NativeSource>
 {
     friend class gb::decisions::NativeRuntime;
-    NativeSource(EngineLease, BindReceipt, SdkApi = systemSdk());
+    NativeSource(EngineLease, BindReceipt, SdkApi = systemSdk(), std::shared_ptr<NativeClassifier> = {});
     static void CALLBACK callback(void *, const FWPM_NET_EVENT3 *) noexcept;
     void emit(const FWPM_NET_EVENT3 *) noexcept;
     void cancel(HANDLE);
@@ -132,9 +134,12 @@ class NativeSource : public std::enable_shared_from_this<NativeSource>
     bool retainedCause(const NativeCopiedMetadata &, const NativeProof &,
                        const CatalogReceipt &, Stage) const noexcept;
     Reason reconcile(const CatalogReceipt &);
+    std::optional<NativeCopiedMetadata> takeClassifier() noexcept;
+    bool classifierCurrent(const NativeCopiedMetadata &, HANDLE) const noexcept;
     bool readOptions();
     bool prerequisites();
     EngineLease engine_;
+    std::shared_ptr<NativeClassifier> classifier_;
     SdkApi sdk_;
     const std::shared_ptr<const BindingState> binding_;
     SourceState source_;

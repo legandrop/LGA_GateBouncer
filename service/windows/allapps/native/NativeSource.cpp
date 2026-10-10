@@ -41,8 +41,8 @@ CatalogReceipt::CatalogReceipt(std::shared_ptr<const CatalogSnapshot> snapshot)
     if (!binding_ || !revision_ || !snapshot_ || !snapshot_->charge_ || snapshot_->slots_.empty())
         throw std::invalid_argument("Catálogo confirmado inválido");
 }
-NativeSource::NativeSource(EngineLease engine, BindReceipt bind, SdkApi sdk)
-    : engine_(std::move(engine)), sdk_(std::move(sdk)), binding_([&] {
+NativeSource::NativeSource(EngineLease engine, BindReceipt bind, SdkApi sdk, std::shared_ptr<NativeClassifier> classifier)
+    : engine_(std::move(engine)), classifier_(std::move(classifier)), sdk_(std::move(sdk)), binding_([&] {
           LUID luid{};
           if (!sdk_.allocate)
               throw std::invalid_argument("Missing source index API");
@@ -64,7 +64,7 @@ Reason NativeSource::start(const CatalogReceipt &catalog) noexcept
     try
     {
         auto keep = shared_from_this();
-        if (catalog.binding_ != binding_ || !prerequisites())
+        if (catalog.binding_ != binding_ || !prerequisites() || (classifier_ && !classifier_->reset()))
             return Reason::Unsupported;
         if (!control_.begin())
             return Reason::SourceGap;
@@ -162,6 +162,9 @@ void CALLBACK NativeSource::callback(void *context, const FWPM_NET_EVENT3 *event
 }
 void NativeSource::emit(const FWPM_NET_EVENT3 *event) noexcept
 {
+    // Este Source usa causas adquiridas por el clasificador, sin un join heurístico
+    // entre timestamps/tuplas de netevents y procesos.
+    if (classifier_) return;
     unsigned count = callbacks_.load();
     do
     {
@@ -228,7 +231,59 @@ bool NativeSource::valid(const NativeCopiedMetadata &value) const noexcept
            value.binding_ == binding_ && value.binding_->epoch == binding_->epoch &&
            value.binding_->index == binding_->index && value.binding_->generation == binding_->generation &&
            source_.current(value.event_.acquired) && h.health == Health::Ready &&
-           h.lossRevision == value.event_.acquiredLossRevision;
+           h.lossRevision == value.event_.acquiredLossRevision &&
+           (value.event_.origin == OwnedNetEvent::Origin::ClassifierInitial ?
+                value.classifier_ && value.classifier_->owner_ == classifier_ && value.classifier_->current() :
+                !value.classifier_ && !classifier_);
+}
+std::optional<NativeCopiedMetadata> NativeSource::takeClassifier() noexcept {
+    try {
+        if (!classifier_ || !admission_.load() || stage() != Stage::Active) return {};
+        const auto snapshot = std::atomic_load(&catalog_);
+        if (!snapshot) return {};
+        bool lost = false;
+        auto cause = classifier_->take(lost);
+        if (lost) { source_.lost(); return {}; }
+        if (!cause) return {};
+        const auto &r = cause->record_;
+        const auto layer = r.family == 4 ? NativeLayer8::Connect4 : NativeLayer8::Connect6;
+        // Sólo el baseline runtime, jamás un permiso ni filtro boot como causa actual.
+        const auto slot = std::find_if(snapshot->slots_.begin(), snapshot->slots_.end(), [&](const auto &s) {
+            return s.ruleIndex == BaselineRuleIndex && s.slot == static_cast<unsigned>(layer) &&
+                s.layer == static_cast<unsigned>(layer) && s.layerId == r.layerId;
+        });
+        if (slot == snapshot->slots_.end()) { source_.lost(); return {}; }
+        NetEventView view;
+        view.type = view.classifyType = 3; view.classifyPresent = true;
+        view.flags = AppSet | UserSet | IpVersionSet; view.ipVersion = r.family == 4 ? 0 : 1;
+        view.rawDirection = 0x3901; view.filterId = slot->id; view.layerId = slot->layerId;
+        view.app = {r.app, r.appBytes, r.appBytes}; view.user = {r.user, r.userBytes, r.userBytes};
+        view.timestamp = r.timestamp; view.receivedMonotonic = GetTickCount64();
+        auto copied = copyMetadata(view, source_);
+        if (!copied.event) { source_.lost(); return {}; }
+        copied.event->origin = OwnedNetEvent::Origin::ClassifierInitial;
+        copied.event->classifierBytes = sizeof(ClassifierCause) + 1024;
+        NativeCopiedMetadata owned(std::move(*copied.event), binding_, snapshot, std::move(cause));
+        if (!valid(owned)) { source_.lost(); return {}; }
+        return owned;
+    } catch (...) { source_.lost(); return {}; }
+}
+bool NativeSource::classifierCurrent(const NativeCopiedMetadata &event, HANDLE engine) const noexcept {
+    if (event.event_.origin != OwnedNetEvent::Origin::ClassifierInitial) return !event.classifier_ && !classifier_;
+    if (!event.classifier_ || event.classifier_->owner_ != classifier_ ||
+        !classifier_->filterCurrent(*event.classifier_, engine) || !event.snapshot_) return false;
+    const auto &identity = event.event_.identity;
+    auto exact = [](recipe::ByteView a, const ai::Bytes &b) {
+        return a.size == b.size() && (!a.size || std::equal(a.data, a.data + a.size, b.data()));
+    };
+    // El clasificador inspecciona antes del baseline; un Allow propio cambiaría
+    // esa premisa. No inferir bloqueo observado ni cobertura de otros providers.
+    for (std::size_t i = 0; i < event.snapshot_->rules_.size(); ++i) {
+        const auto rule = event.snapshot_->ruleView(i);
+        if (rule.action == 2 && (rule.direction == 1 || rule.direction == 3) && exact(rule.app, identity.appId.bytes) &&
+            (rule.targetKind == 2 || exact(rule.user, identity.userSid.bytes))) return false;
+    }
+    return event.classifier_->current();
 }
 void NativeSource::publishCatalog(const CatalogReceipt &receipt)
 {
@@ -264,6 +319,7 @@ bool NativeSource::pushCopied(NativeCopiedMetadata &&value) noexcept
 }
 std::optional<NativeCopiedMetadata> NativeSource::takeCopied() noexcept
 {
+    if (classifier_) return takeClassifier();
     try
     {
         std::lock_guard<std::mutex> lock(queueMutex_);
