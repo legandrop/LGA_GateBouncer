@@ -20,6 +20,7 @@ qt_add_library(gatebouncer_general_live STATIC
     broker/BrokerLauncher.cpp broker/BrokerLauncher.h
     broker/AssistantBrokerRuntime.cpp broker/AssistantBrokerRuntime.h
     broker/GeneralBrokerHost.cpp broker/GeneralBrokerHost.h
+    broker/OfflineInspection.cpp broker/OfflineInspection.h
     configuration/ConfigurationContracts.cpp configuration/ConfigurationContracts.h
     configuration/ConfigurationCodec.cpp configuration/ConfigurationCodec.h
     configuration/ConfigurationController.cpp configuration/ConfigurationController.h
