@@ -246,7 +246,7 @@ bool SearchClient::begin(const SearchInput &input,std::function<bool()> current)
         (key==lastQuery_&&now>=lastQueryAt_&&now-lastQueryAt_<600000)))return false;
     active_={input,instance_,binding_,config_.provider,Status::Unavailable,cachedNetwork};
     active_.citations+=cachedSearch;current_=std::move(current);working_=true;requests_=0;
-    reusedDestinationCache_=!cachedSearch.isEmpty();resource_=Resource::Search;resourceUrl_={};
+    reusedDestinationCache_=!cachedSearch.isEmpty();resource_=Resource::Search;resourceUrl_=QUrl{};
     deadline_=now+(input.destination?20000:15000);
     QPointer<SearchClient> self(this);if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return true;}if(!self)return true;
     if(completeCache){finishEvidence();return true;}
