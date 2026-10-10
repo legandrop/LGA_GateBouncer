@@ -829,6 +829,10 @@ Error NativeRuntime::events(std::uint64_t after, std::uint32_t mask, std::vector
                             bool &gap) const {
     return ring_.after(after, mask, rows, gap);
 }
+void NativeRuntime::stopPrincipalObservation() noexcept {
+    invalidatePrincipalObservations();
+    if(principalClassifier_)principalClassifier_->reset();
+}
 bool NativeServer::run(HANDLE stop) {
     try {
         runtime_.principalImageWorker_.reset(new allnative::NativeImageWorker());
@@ -851,8 +855,7 @@ bool NativeServer::run(HANDLE stop) {
     ordinary.join();
     {
         std::lock_guard<std::mutex> lock(runtime_.mutex);
-        runtime_.invalidatePrincipalObservations();
-        if(runtime_.principalClassifier_)runtime_.principalClassifier_->reset();
+        runtime_.stopPrincipalObservation();
     }
     runtime_.finishPrincipalImages();
     if(!waited)throw std::runtime_error("Espera original del servidor fallida");

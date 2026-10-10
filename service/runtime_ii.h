@@ -104,6 +104,7 @@ class NativeRuntime {
     bool processBudget(std::size_t extra, std::size_t prior=0) const noexcept;
     static std::size_t activityCauseBytes(const allnative::ClassifierCause &) noexcept;
     void invalidatePrincipalObservations() noexcept;
+    void stopPrincipalObservation() noexcept;
     bool ordinaryPeer(HANDLE, std::shared_ptr<PrincipalPeer> &, bool readonly = false);
     bool principalPeerCurrent(const PrincipalPeer &) const noexcept;
     bool principalPolicyReady() const noexcept;
