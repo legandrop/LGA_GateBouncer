@@ -69,6 +69,12 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
             !find(frame, Tag::TargetDigest) || find(frame, Tag::TargetDigest)->bytes !=
                 Bytes(admission.target.begin(), admission.target.end()) ||
             !find(frame, Tag::MigrationDigest) || find(frame, Tag::MigrationDigest)->bytes != Bytes(32)) return false;
+        const bool administrative=find(frame,Tag::AdministrativeMode)!=nullptr;
+        const auto selection=find(frame,Tag::SelectedPrincipalSid);
+        if(administrative!=admission.administrative ||
+           (administrative && (!admission.owner || !admission.owner->administrative || !selection ||
+               selection->bytes!=admission.selectedSid || admission.scope!=2)))return false;
+        const auto &targetSid=administrative ? admission.selectedSid : current.account;
         if (frame.type == Type::RevokePrincipalRule) {
             if (!admission.revocation) return false;
             const auto &rule = *admission.revocation;
@@ -89,7 +95,7 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
                 idValue(frame, Tag::RuleId) == rule.id && get(frame, Tag::RuleRevision) == rule.revision &&
                 get(frame, Tag::TargetRevision) == rule.targetRevision &&
                 principal::targetDigest(rule.target) == admission.target &&
-                target.user == principal::ByteView(current.account);
+                target.user == principal::ByteView(targetSid);
         }
         if (admission.file) {
             if (!deployment_ || !deployment_->serviceAdmittedCurrent() || !admission.file->completed ||
@@ -114,7 +120,7 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
                 if (row->ruleRevision != prior.revision || row->targetRevision != prior.targetRevision ||
                     view.targetKind != 1 || view.packageMode != oldTarget.packageMode ||
                     !exact(oldTarget.app, view.app) || !exact(oldTarget.user, view.user) ||
-                    !exact(oldTarget.package, view.package) || oldTarget.user != principal::ByteView(current.account) ||
+                    !exact(oldTarget.package, view.package) || oldTarget.user != principal::ByteView(targetSid) ||
                     idValue(frame, Tag::RuleId) != prior.id || get(frame, Tag::RuleRevision) != prior.revision ||
                     get(frame, Tag::SelectorRevision) != prior.targetRevision ||
                     !find(frame, Tag::PreviousTargetDigest) ||
@@ -176,7 +182,7 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         if (admission->file) {
             if (rule == checked.rules.end() || rule->target != admission->fullTarget ||
                 !principal::parseTarget(rule->target, principalTarget) || principalTarget.packageMode != 1 ||
-                principalTarget.user != principal::ByteView(admission->identity.account)) return result;
+                principalTarget.user != principal::ByteView(admission->administrative ? admission->selectedSid : admission->identity.account)) return result;
         } else if (canonicalCommand.type == Type::CommitFuturePolicy) {
         const auto &identity = admission->event->owned().identity;
         if (rule == checked.rules.end() || !principal::parseTarget(rule->target, principalTarget) ||
@@ -184,7 +190,7 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
             identity.userSid.state != gatebouncer::appidentity::FieldState::Copied ||
             principalTarget.app != principal::ByteView(identity.appId.bytes) ||
             principalTarget.user != principal::ByteView(identity.userSid.bytes) ||
-            identity.userSid.bytes != admission->identity.account ||
+            identity.userSid.bytes != (admission->administrative ? admission->selectedSid : admission->identity.account) ||
             (principalTarget.packageMode == 2 &&
              (identity.packageSid.state != gatebouncer::appidentity::FieldState::Copied ||
               principalTarget.package != principal::ByteView(identity.packageSid.bytes)))) return result;
@@ -940,17 +946,20 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
             VerifiedControl peer;
             std::shared_ptr<NativeRuntime::PrincipalPeer> ordinaryPeer;
             bool principalReader = false;
+            bool administrative = false;
             bool authenticated = false;
             if (ipc::ii::receive(pipe.value, hello, stop) &&
                 (ordinary ? hello.minor == 3 : (hello.minor == 2 || hello.minor == 1 ||
                     (!control && (hello.minor == 0 || hello.minor == 3)))) && hello.type == Type::Hello &&
                 zero(hello.connection) && hello.sequence == 1 &&
-                get(hello, Tag::ClientRole) == (control ? 2 : 1)) {
+                (get(hello, Tag::ClientRole) == (control ? 2 : 1) ||
+                 (ordinary && get(hello, Tag::ClientRole) == 2))) {
                 std::lock_guard<std::mutex> lock(runtime_.mutex);
                 runtime_.tick();
                 principalReader = !ordinary && !control && hello.minor == 3;
+                administrative = ordinary && get(hello, Tag::ClientRole) == 2;
                 authenticated = runtime_.profileGeneration() == profile &&
-                                (ordinary || principalReader ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer, principalReader)
+                                (ordinary || principalReader ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer, principalReader, administrative)
                                     : runtime_.peer(pipe.value, control, peer, true));
             }
             if (!authenticated) {
@@ -995,7 +1004,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                         if (ordinary || principalReader) {
                             runtime_.tick();
                             usable = runtime_.profileGeneration() == profile && ordinaryPeer &&
-                                runtime_.ordinaryPeer(pipe.value,ordinaryPeer,principalReader) &&
+                                runtime_.ordinaryPeer(pipe.value,ordinaryPeer,principalReader,administrative) &&
                                 (!runtime_.principalEventsReady() || mask==(runtime_.principalTrafficReady() ? 7u : 3u)) &&
                                 NativeActivityRing::same(runtime_.principalEvents_.context(),subscriptionContext);
                             if (usable) {
@@ -1072,7 +1081,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                 {
                     std::lock_guard<std::mutex> lock(runtime_.mutex);
                     if (runtime_.profileGeneration() != profile ||
-                        !(ordinary || principalReader ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer, principalReader)
+                        !(ordinary || principalReader ? runtime_.ordinaryPeer(pipe.value, ordinaryPeer, principalReader, administrative)
                                    : runtime_.peer(pipe.value, control, peer, false)))
                         break;
                     if (fileRequest) { /* Preflight del mismo channel fuera Runtime. */ }

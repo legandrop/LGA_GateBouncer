@@ -7,6 +7,7 @@ constexpr std::uint64_t NativeEvents = 1ull << 25;
 constexpr std::uint64_t NativeTraffic = 1ull << 26;
 constexpr std::uint64_t NativeProcessFacts = 1ull << 27;
 constexpr std::uint64_t FileFutureControl = 1ull << 28;
+constexpr std::uint64_t AdministrativePrincipalControl = 1ull << 29;
 // Archivo original custodiado por fuente; no es un HANDLE de imagen del caller.
 struct ProcessFacts {
   std::uint64_t pid=0, created=0, lastWrite=0;

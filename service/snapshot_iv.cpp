@@ -1316,6 +1316,11 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
              a.command.logonSid == b.command.logonSid;
     };
     auto ruleChange = [&](const std::vector<Rule> &old, const Frame &f, const Bytes &accountSid) {
+      const auto selected=find(f,Tag::SelectedPrincipalSid);
+      const bool administrative=find(f,Tag::AdministrativeMode)!=nullptr;
+      // Forma archivada no concede autoridad: el runtime exige además el token
+      // administrativo original. Actor Entry y destino de regla son roles distintos.
+      const auto &targetSid=administrative && selected ? selected->bytes : accountSid;
       bool create = f.type == Type::CommitFuturePolicy;
       const bool replace=f.type==Type::ReplacePrincipalRule;
       auto removed = create ? Id{} : idValue(f, Tag::RuleId);
@@ -1330,8 +1335,8 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
         Target prior,current;
         if(found==old.end() || changed==after.rules.end() || old.size()!=after.rules.size() ||
            found->kind!=1 || changed->kind!=1 || !parseTarget(found->target,prior) ||
-           !parseTarget(changed->target,current) || prior.user!=ByteView(accountSid) ||
-           current.user!=ByteView(accountSid) ||
+           !parseTarget(changed->target,current) || prior.user!=ByteView(targetSid) ||
+           current.user!=ByteView(targetSid) ||
            found->revision!=get(f,Tag::RuleRevision) || found->revision==UINT64_MAX ||
            found->targetRevision!=get(f,Tag::SelectorRevision) ||
            changed->revision!=found->revision+1 || changed->selector!=found->selector ||
@@ -1356,6 +1361,14 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
         if (find(f, Tag::TargetDigest)->bytes !=
             Bytes(digest.begin(), digest.end()))
           return false;
+      }
+      if(administrative) {
+        const auto &rules=create || replace ? after.rules : old;
+        const auto id=create ? f.correlation : removed;
+        const auto row=std::find_if(rules.begin(),rules.end(),[&](const Rule &r){return r.id==id;});
+        Target target;
+        if(!selected || row==rules.end() || row->kind!=1 || !parseTarget(row->target,target) ||
+           target.user!=ByteView(targetSid))return false;
       }
       for (const auto &r : old) {
         if (r.id == removed)

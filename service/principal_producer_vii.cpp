@@ -65,6 +65,9 @@ struct NativeRuntime::PrincipalObservation {
     std::optional<allnative::NativeProof> proof;
     std::uint64_t profile = 0;
     std::size_t charged = 0;
+    // Sólo el peer administrativo original puede consumir esta causa ajena.
+    std::shared_ptr<PrincipalPeer> administrativeOwner;
+    bool foreign=false;
     Frame activityAttempt;
     Frame pendingAttempt;
     std::uint64_t imageJob=0,imageDeadline=0;
@@ -294,6 +297,20 @@ bool NativeRuntime::principalPeerCurrent(const PrincipalPeer &peer) const noexce
     auto accepts = [](void *raw, const native::TokenEvidence &fresh) noexcept {
         auto &c = *static_cast<Check *>(raw);
         try {
+            if (c.peer.administrative) {
+                // Role solicitado no concede autoridad: exigir el mismo primary
+                // original del actor y elegibilidad administrativa OS corriente.
+                HANDLE rawToken=nullptr;native::Handle primary;
+                if(c.peer.readonly || !c.peer.administrativePrimary || !c.runtime.deployment_ ||
+                   !c.runtime.deployment_->serviceAdmittedCurrent() ||
+                   !c.runtime.profile_.accepts(fresh,true) ||
+                   !OpenProcessToken(c.peer.actor.process.value,TOKEN_QUERY,&rawToken))return false;
+                primary.reset(rawToken);native::TokenEvidence current;
+                if(!CompareObjectHandles(primary.value,c.peer.administrativePrimary.value) ||
+                   !native::tokenEvidence(primary.value,current) || !c.runtime.profile_.accepts(current,true) ||
+                   current.account!=c.peer.identity.account || current.logon!=c.peer.identity.logon ||
+                   current.session!=c.peer.identity.session)return false;
+            }
             if (c.runtime.principalImageCheck_)
                 return !c.peer.cancelled && c.peer.profile == c.runtime.profile_.value().generation &&
                     c.runtime.profile_.accepts(fresh, false) && !fresh.uiAccess &&
@@ -318,8 +335,9 @@ bool NativeRuntime::principalPeerCurrent(const PrincipalPeer &peer) const noexce
     };
     return PrincipalActorQuery::current(peer.actor, peer.identity, peer.cancelled, &check, accepts, principalActorApi_);
 }
-bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &peer, bool readonly) {
-    if (peer) return peer->readonly == readonly && principalPeerCurrent(*peer);
+bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &peer, bool readonly, bool administrative) {
+    if(readonly && administrative)return false;
+    if (peer) return peer->readonly == readonly && peer->administrative == administrative && principalPeerCurrent(*peer);
     if (ordinaryImage_.empty() || !native::fixedPath(ordinaryImage_) || !principalMode_ ||
         !deploymentCurrent() || ((!principalSource_ || !principalCatalog_ || principalWriteFault_) &&
             (readonly || principalOutcomes_.empty()))) return false;
@@ -331,10 +349,24 @@ bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &pe
         if (!native::systemServiceToken(serviceToken.value)) return false;
         auto acquired = std::make_shared<PrincipalPeer>();
         acquired->readonly = readonly;
+        acquired->administrative = administrative;
         acquired->admittedImage = readonly ? deployment_->root()/L"GateBouncerAssistant.exe" : ordinaryImage_;
         if (!ipc::ii::clientEvidence(pipe, acquired->identity, acquired->actor) ||
             !profile_.accepts(acquired->identity, false) || acquired->identity.uiAccess ||
             acquired->actor.image != acquired->admittedImage) return false;
+        if(administrative) {
+            HANDLE primary=nullptr;
+            if(!deployment_->serviceAdmittedCurrent() || !profile_.accepts(acquired->identity,true) ||
+               !OpenProcessToken(acquired->actor.process.value,TOKEN_QUERY,&primary))return false;
+            acquired->administrativePrimary.reset(primary);
+            const auto type=native::tokenData(primary,TokenType);
+            native::TokenEvidence current;
+            if(type.size()!=sizeof(TOKEN_TYPE) ||
+               *reinterpret_cast<const TOKEN_TYPE *>(type.data())!=TokenPrimary ||
+               !native::tokenEvidence(primary,current) || !profile_.accepts(current,true) ||
+               current.account!=acquired->identity.account || current.logon!=acquired->identity.logon ||
+               current.session!=acquired->identity.session || !acquired->actor.current())return false;
+        }
         acquired->directory = std::make_unique<native::ProtectedDirectory>(acquired->admittedImage.parent_path(), true);
         if (!acquired->directory->acquire()) return false;
         acquired->image.reset(CreateFileW(acquired->admittedImage.c_str(), READ_CONTROL | FILE_READ_ATTRIBUTES,
@@ -348,6 +380,12 @@ bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &pe
         acquired->pipe.reset(duplicate);
         acquired->profile = profile_.value().generation;
         if (!principalPeerCurrent(*acquired)) return false;
+        if(administrative) {
+            auto slot=std::find_if(principalAdministrativePeers_.begin(),principalAdministrativePeers_.end(),
+                [](const auto &p){return p.expired();});
+            if(slot==principalAdministrativePeers_.end())return false;
+            *slot=acquired;
+        }
         peer = std::move(acquired);
         return true;
     } catch (...) { return false; }
@@ -359,6 +397,7 @@ void NativeRuntime::closeOrdinaryPeer(const std::shared_ptr<PrincipalPeer> &peer
     }
     if (!peer) return;
     peer->cancelled = true;
+    for(auto &slot:principalAdministrativePeers_)if(slot.lock()==peer)slot.reset();
     for (auto &entry : principalAdmissions_) if (entry.second->owner == peer) {
         entry.second->cancelled = true;
         if (entry.second->file) entry.second->file->cancelled.store(true);
@@ -382,6 +421,15 @@ bool NativeRuntime::principalPolicyReady() const noexcept {
         !s.effective && !s.storedKnown && s.activeProjection == Digest{} && s.activeAdmission == Digest{} &&
         s.archiveDigest == Digest{};
 }
+bool NativeRuntime::principalTargetSelected(const Frame &frame,const PrincipalPeer &peer,
+    const principal::ByteView &sid) const noexcept {
+    try {
+        if(!find(frame,Tag::AdministrativeMode))return sid==principal::ByteView(peer.identity.account);
+        const auto selected=find(frame,Tag::SelectedPrincipalSid);
+        return peer.administrative && !peer.readonly && selected &&
+            sid==principal::ByteView(selected->bytes) && principalPeerCurrent(peer);
+    } catch(...) {return false;}
+}
 Frame NativeRuntime::ordinaryStatus(Type type, const std::shared_ptr<PrincipalPeer> &peer) const {
     auto frame = status(type, 3);
     if (frame.type == Type::ProtocolError) return frame;
@@ -389,13 +437,17 @@ Frame NativeRuntime::ordinaryStatus(Type type, const std::shared_ptr<PrincipalPe
         principalStore_ && !principalStore_->uncertain() && principalSource_ && principalCatalog_ &&
         principalSource_->stage() == allnative::Stage::Active && !zero(idValue(frame, Tag::SourceEpoch));
     if (peer && peer->readonly && !admitted) peer->pages.clear();
+    const bool administrativeReady=admitted && peer->administrative &&
+        !principalSource_->poisoned_.load() &&
+        principalSource_->source_.health().health==gatebouncer::service::windows::allapps::Health::Ready;
     for (auto &field : frame.fields) {
         if (field.tag == Tag::Capabilities) field = value(Tag::Capabilities,
             ReadStatus | (admitted ? ObservedRead | (principalEventsReady() ? wire::iv::NativeEvents : 0) |
                 (principalTrafficReady() ? wire::iv::NativeTraffic : 0) |
                 (principalProcessReady() ? wire::iv::NativeProcessFacts : 0) |
                 (!peer->readonly && principalPolicyReady() ? FuturePolicyControl |
-                    (deployment_ && deployment_->serviceAdmittedCurrent() ? wire::iv::FileFutureControl : 0) : 0) : 0));
+                    (deployment_ && deployment_->serviceAdmittedCurrent() ? wire::iv::FileFutureControl |
+                        (administrativeReady ? wire::iv::AdministrativePrincipalControl : 0) : 0) : 0) : 0));
         if (field.tag == Tag::IVProfile) field = value(Tag::IVProfile, admitted && !peer->readonly && principalPolicyReady() ? 1 : 0, 1);
     }
     return ordered(std::move(frame));
@@ -503,7 +555,7 @@ bool NativeRuntime::capturePrincipalFile(PrincipalFileCapture &file,const Frame 
        FwpmGetAppIdFromFileName0(file.path.c_str(),&blob.value)!=ERROR_SUCCESS || !blob.value ||
        !blob.value->data || blob.value->size<4 || blob.value->size>8192 || !principalFileMetadataCurrent(file))return false;
     Bytes app(blob.value->data,blob.value->data+blob.value->size),target;
-    if(!principal::serializeTarget(principal::ByteView(std::move(app)),principal::ByteView(file.identity.account),1,{},target))return false;
+    if(!principal::serializeTarget(principal::ByteView(std::move(app)),principal::ByteView(file.targetSid),1,{},target))return false;
     file.target=principal::ByteView(std::move(target));
     file.display.projection=2;
     const auto name=file.path.filename().native();
@@ -512,7 +564,7 @@ bool NativeRuntime::capturePrincipalFile(PrincipalFileCapture &file,const Frame 
     file.display.path=displayText(std::u16string(reinterpret_cast<const char16_t *>(path.data()),path.size()),4096);
     if(file.display.path.empty())return false;
     std::size_t charge=sizeof(file)+sizeof(PrincipalAdmission)+512+
-      2*(file.identity.account.capacity()+file.identity.logon.capacity())+
+      2*(file.identity.account.capacity()+file.identity.logon.capacity())+2*file.targetSid.capacity()+
       file.actor.image.native().capacity()*sizeof(wchar_t)+file.path.native().capacity()*sizeof(wchar_t)+
       file.target.ownedCapacityBytes()+file.display.name.capacity()+file.display.path.capacity()+
       file.directories.capacity()*sizeof(native::Handle)+file.paths.capacity()*sizeof(std::filesystem::path)+
@@ -582,6 +634,8 @@ Frame NativeRuntime::fileFutureRecord(const PrincipalAdmission &admission) {
   Frame response;response.minor=3;response.type=Type::FileFutureDraftRecord;
   response.fields={value(Tag::ServiceEpoch,epoch_),{Tag::Records,true,std::move(packed)},
     value(Tag::SourceEpoch,draft.source),{Tag::ServiceContext,true,std::move(context)}};
+  if(admission.administrative)response.fields.insert(response.fields.end(),{
+    {Tag::SelectedPrincipalSid,true,admission.selectedSid},value(Tag::AdministrativeMode,1,1)});
   if(admission.replacing) {
     const auto &prior=*admission.replacing;const auto digest=principal::targetDigest(prior.target);
     response.fields.insert(response.fields.end(),{value(Tag::RuleId,prior.id),value(Tag::RuleRevision,prior.revision),
@@ -595,13 +649,16 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
   std::shared_ptr<allnative::NativeSource> source;
   std::shared_ptr<const allnative::CatalogSnapshot> catalog;
   std::optional<principal::Rule> replacing;
+  Bytes selectedSid;
+  const bool administrative=find(frame,Tag::AdministrativeMode)!=nullptr;
   const bool prepare=frame.type==Type::PrepareFileFuturePolicy;
   try {
   {
     std::lock_guard<std::mutex> lock(mutex);
     tick();
     if(wire::iv::validate(frame)!=Error::Ok || !peer || peer->readonly || frame.connection!=peer->connection ||
-       idValue(frame,Tag::ServiceEpoch)!=epoch_ || !principalPeerCurrent(*peer))return principalError(Error::IdentityUnavailable);
+       idValue(frame,Tag::ServiceEpoch)!=epoch_ || !principalPeerCurrent(*peer) ||
+       (administrative && !peer->administrative))return principalError(Error::IdentityUnavailable);
     // Retransmisión del receipt original no requiere volver a abrir un archivo.
     if(!prepare && frame.type!=Type::GetFutureDraft && principalOutcomes_.count(frame.correlation))
       return dispatchOrdinary(frame,peer);
@@ -609,7 +666,8 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
       const auto found=principalAdmissions_.find(idValue(frame,Tag::DraftId));
       if(found==principalAdmissions_.end() || !found->second->file)return dispatchOrdinary(frame,peer);
       held=found->second;
-      if(held->owner!=peer || held->cancelled || held->consumed || principalNow_()>=held->deadline)
+      if(held->owner!=peer || held->cancelled || held->consumed || principalNow_()>=held->deadline ||
+         held->administrative!=administrative || (administrative && held->selectedSid!=find(frame,Tag::SelectedPrincipalSid)->bytes))
         return principalError(Error::Stale);
       file=held->file;
     }
@@ -623,22 +681,26 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
     if(source!=principalSource_ || catalog!=principalCatalog_ || context.engineContext!=source->binding_->epoch ||
        context.engineBindingGeneration!=source->binding_->generation || !principalPeerCurrent(*peer))return principalError(Error::Stale);
     if(prepare) {
+      selectedSid=peer->identity.account;
       if(find(frame,Tag::RuleId)) {
         const auto &rules=principalRead_.snapshot.rules;
         const auto found=std::find_if(rules.begin(),rules.end(),[&](const auto &r){return r.id==idValue(frame,Tag::RuleId);});
         principal::Target target;
         if(found==rules.end() || found->kind!=1 || !principal::parseTarget(found->target,target) ||
-           target.user!=principal::ByteView(peer->identity.account) || target.packageMode!=1 ||
+           !principalTargetSelected(frame,*peer,target.user) || target.packageMode!=1 ||
            found->revision!=get(frame,Tag::RuleRevision) || found->revision==UINT64_MAX ||
            found->targetRevision!=get(frame,Tag::SelectorRevision))return principalError(Error::Unauthorized);
         const auto digest=principal::targetDigest(found->target);
         if(find(frame,Tag::PreviousTargetDigest)->bytes!=Bytes(digest.begin(),digest.end()))return principalError(Error::Stale);
         replacing=*found;
+        selectedSid=target.user.copy(); // El catálogo original selecciona el destino.
       }
+      if(administrative && selectedSid!=find(frame,Tag::SelectedPrincipalSid)->bytes)return principalError(Error::Unauthorized);
       auto free=std::find_if(principalFiles_.begin(),principalFiles_.end(),[](const auto &slot){return !slot;});
       if(free==principalFiles_.end() || principalFilePhysical_>=64 || principalFileBytes_>PendingBytesLimit-FileReserveBytes ||
          principalAdmissions_.size()>=PendingLimit)return principalError(Error::Capacity);
       file=std::make_shared<PrincipalFileCapture>();
+      file->targetSid=selectedSid;
       file->charged=FileReserveBytes;file->deadline=GetTickCount64()+120000;file->identity=peer->identity;
       *free=file;++principalFilePhysical_;principalFileBytes_+=FileReserveBytes;
       HANDLE raw=nullptr;
@@ -652,6 +714,9 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
         file->cancelled.store(true);file->completed=true;return principalError(Error::IdentityUnavailable);
       }
       file->primary.reset(raw);raw=nullptr;
+      if(administrative && !CompareObjectHandles(file->primary.value,peer->administrativePrimary.value)) {
+        file->cancelled.store(true);file->completed=true;return principalError(Error::IdentityUnavailable);
+      }
       if(!DuplicateHandle(GetCurrentProcess(),stop,GetCurrentProcess(),&raw,0,FALSE,DUPLICATE_SAME_ACCESS)) {
         file->cancelled.store(true);file->completed=true;return principalError(Error::IdentityUnavailable);
       }
@@ -710,6 +775,7 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
     }
     admission->actor.process.reset(raw);admission->actor.pid=peer->actor.pid;admission->actor.created=peer->actor.created;
     admission->identity=peer->identity;admission->owner=peer;admission->source=source;admission->file=file;
+    admission->administrative=administrative;admission->selectedSid=file->targetSid;
     admission->request=native::randomIdentity();admission->binding=native::randomIdentity();
     admission->challenge=native::randomIdentity();admission->selector=replacing ? replacing->selector : native::randomIdentity();
     admission->revision=1;admission->profile=peer->profile;admission->fullTarget=file->target;
@@ -736,8 +802,10 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
   }
 }
 Frame NativeRuntime::listPrincipalRules(const Frame &frame,const std::shared_ptr<PrincipalPeer> &peer) {
+  const bool administrative=find(frame,Tag::AdministrativeMode)!=nullptr;
   if(!peer || !principalPeerCurrent(*peer) || !principalPolicyReady() || !principalSource_ || !principalCatalog_)
     return principalError(Error::BackendUnavailable);
+  if(administrative && !peer->administrative)return principalError(Error::Unauthorized);
   const auto source=principalSource_;const auto catalog=principalCatalog_;
   const auto context=readServiceContext();
   if(source!=principalSource_ || catalog!=principalCatalog_ || context.engineContext!=source->binding_->epoch ||
@@ -756,12 +824,13 @@ Frame NativeRuntime::listPrincipalRules(const Frame &frame,const std::shared_ptr
     PrincipalPeer::RulePage page;
     page.snapshot=principalRead_.snapshot.encoded;page.desired=principalDesired_;page.source=source;page.catalog=catalog;
     page.context=context;page.profile=peer->profile;page.deadline=now+5000;
+    page.administrative=administrative;
     const auto &rules=principalRead_.snapshot.rules;
     if(rules.size()>4096)return principalError(Error::Capacity);
     for(std::size_t i=0;i<rules.size();++i) {
       principal::Target target;
       if(rules[i].kind==1 && principal::parseTarget(rules[i].target,target) &&
-         target.user==principal::ByteView(peer->identity.account))page.indices.push_back(i);
+         (administrative || target.user==principal::ByteView(peer->identity.account)))page.indices.push_back(i);
     }
     snapshot=native::randomIdentity();
     if(zero(snapshot) || !peer->rulePages.emplace(snapshot,std::move(page)).second)return principalError(Error::Capacity);
@@ -769,7 +838,7 @@ Frame NativeRuntime::listPrincipalRules(const Frame &frame,const std::shared_ptr
   const auto found=peer->rulePages.find(snapshot);
   if(found==peer->rulePages.end())return principalError(Error::SnapshotExpired);
   auto &page=found->second;
-  if(!NativeActivityRing::same(page.context,context) || page.snapshot.data()!=principalRead_.snapshot.encoded.data() ||
+  if(page.administrative!=administrative || !NativeActivityRing::same(page.context,context) || page.snapshot.data()!=principalRead_.snapshot.encoded.data() ||
      page.snapshot.size()!=principalRead_.snapshot.encoded.size()) {
     peer->rulePages.erase(found);return principalError(Error::SnapshotExpired);
   }
@@ -778,7 +847,7 @@ Frame NativeRuntime::listPrincipalRules(const Frame &frame,const std::shared_ptr
   std::vector<wire::iv::PrincipalRuleRecord> rows;Bytes packed;
   for(std::size_t at=cursor;at<page.indices.size() && rows.size()<get(frame,Tag::Limit);++at) {
     const auto &rule=principalRead_.snapshot.rules[page.indices[at]];principal::Target target;
-    if(!principal::parseTarget(rule.target,target) || target.user!=principal::ByteView(peer->identity.account))return principalError(Error::Stale);
+    if(!principal::parseTarget(rule.target,target) || (!administrative && target.user!=principal::ByteView(peer->identity.account)))return principalError(Error::Stale);
     wire::iv::PrincipalRuleRecord record;
     record.rule=rule.id;record.selector=rule.selector;record.revision=rule.revision;record.targetRevision=rule.targetRevision;
     record.desired=page.desired;record.target=principal::targetDigest(rule.target);record.action=rule.action;
@@ -801,6 +870,7 @@ Frame NativeRuntime::listPrincipalRules(const Frame &frame,const std::shared_ptr
     value(Tag::Cursor,cursor,4),value(Tag::NextCursor,terminal ? UINT32_MAX : next,4),value(Tag::Count,rows.size(),2),
     {Tag::Records,true,std::move(packed)},value(Tag::ProfileGeneration,page.profile),value(Tag::SourceEpoch,context.engineContext),
     {Tag::ServiceContext,true,std::move(encodedContext)}};
+  if(administrative)response.fields.push_back(value(Tag::AdministrativeMode,1,1));
   page.next=next;if(terminal)peer->rulePages.erase(found);
   return ordered(std::move(response));
 }
@@ -809,6 +879,12 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
     const auto found = principalObservations_.find(idValue(frame, Tag::ObservedId));
     if (found == principalObservations_.end()) return principalError(Error::NotFound);
     auto &observation = *found->second;
+    principal::Target selected;
+    const bool administrative=find(frame,Tag::AdministrativeMode)!=nullptr;
+    if(!principal::parseTarget(observation.target,selected) ||
+       !principalTargetSelected(frame,*peer,selected.user) ||
+       (observation.foreign && (!administrative || observation.administrativeOwner!=peer)))
+        return principalError(Error::Unauthorized);
     const auto scope = find(frame, Tag::ScopeKind) ? get(frame, Tag::ScopeKind) : 2;
     const auto duration = get(frame, Tag::ScopeDurationMs);
     const bool held = observation.event && observation.event->classifier_;
@@ -844,6 +920,7 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
     admission->actor.process.reset(duplicate); admission->actor.pid = peer->actor.pid;
     admission->actor.created = peer->actor.created; // Imagen retenida una vez en owner.
     admission->identity = peer->identity; admission->owner = peer;
+    admission->administrative=administrative;admission->selectedSid=selected.user.copy();
     admission->request = native::randomIdentity(); admission->challenge = native::randomIdentity();
     admission->selector = native::randomIdentity(); admission->binding = observation.row.binding;
     admission->observed = observation.row.observed; admission->observedRevision = observation.row.revision;
@@ -877,10 +954,13 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
     Bytes payload;
     if (wire::iv::pack(std::vector<wire::iv::FutureDraftRecord>{record}, payload) != Error::Ok)
         return principalError(Error::IdentityUnavailable);
-    principalAdmissions_[admission->request] = std::move(admission);
+    principalAdmissions_[admission->request] = admission;
     Frame response; response.minor = 3; response.type = Type::FutureDraftRecord;
     response.fields = {value(Tag::ServiceEpoch, epoch_), {Tag::Records, true, std::move(payload)},
         value(Tag::SourceEpoch, observation.row.source)};
+    if(administrative)response.fields.insert(response.fields.end(),{
+        {Tag::SelectedPrincipalSid,true,admission->selectedSid},value(Tag::AdministrativeMode,1,1),
+        {Tag::OriginalTarget,true,admission->fullTarget.copy()}});
     return ordered(std::move(response));
 }
 Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<PrincipalPeer> &peer) {
@@ -906,6 +986,14 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         if(archived.payload!=canonical)return principalError(Error::Conflict);
         return outcomeResult(frame.correlation,archived);
     }
+    if(find(frame,Tag::AdministrativeMode)) {
+        const auto source=principalSource_;const auto catalog=principalCatalog_;
+        const auto current=readServiceContext();
+        if(!source || source!=principalSource_ || catalog!=principalCatalog_ ||
+           current.engineContext!=source->binding_->epoch ||
+           current.engineBindingGeneration!=source->binding_->generation || !principalPeerCurrent(*peer))
+            return principalError(Error::Stale);
+    }
     if(principalOutcomes_.size()>=128 || principalOutcomeBytes_>512*1024-4096-sizeof(PrincipalOutcome))pruneScopedOutcomes();
     if (principalOutcomes_.size() >= 128 || canonical.capacity() > 4096 ||
         principalOutcomeBytes_ > 512 * 1024 - 4096 - sizeof(PrincipalOutcome)) return principalError(Error::Capacity);
@@ -923,6 +1011,8 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         admission = found->second;
         const auto observed = principalObservations_.find(admission->observed);
         if (admission->owner != peer || admission->cancelled || admission->consumed ||
+            admission->administrative!=(find(frame,Tag::AdministrativeMode)!=nullptr) ||
+            (admission->administrative && admission->selectedSid!=find(frame,Tag::SelectedPrincipalSid)->bytes) ||
             principalNow_() >= admission->deadline ||
             (!admission->file && (observed == principalObservations_.end() ||
               observed->second->row.revision != admission->observedRevision || observed->second->row.state != 1)) ||
@@ -956,7 +1046,7 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         });
         principal::Target bound;
         if (rule == target.rules.end() || rule->kind != 1 || !principal::parseTarget(rule->target, bound) ||
-            bound.user != principal::ByteView(peer->identity.account)) return principalError(Error::Unauthorized);
+            !principalTargetSelected(frame,*peer,bound.user)) return principalError(Error::Unauthorized);
         admission = std::make_shared<PrincipalAdmission>();
         admission->request = native::randomIdentity(); admission->binding = native::randomIdentity();
         admission->revision = 1; admission->profile = peer->profile;
@@ -964,6 +1054,8 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         admission->source = principalSource_; admission->revocation = *rule;
         admission->target = principal::targetDigest(rule->target); admission->owner = peer;
         admission->identity = peer->identity;
+        admission->administrative=find(frame,Tag::AdministrativeMode)!=nullptr;
+        admission->selectedSid=bound.user.copy();
         HANDLE duplicate = nullptr;
         if (!principalDuplicate_(GetCurrentProcess(), peer->actor.process.value, GetCurrentProcess(),
             &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) return principalError(Error::IdentityUnavailable);
@@ -1028,6 +1120,8 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         if (peer && peer->readonly) peer->pages.clear();
         return principalError(Error::IdentityUnavailable);
     }
+    const bool administrative=find(frame,Tag::AdministrativeMode)!=nullptr;
+    if(administrative && (!peer->administrative || peer->readonly))return principalError(Error::Unauthorized);
     if (frame.type == Type::GetStatus) return ordinaryStatus(Type::Status, peer);
     if (frame.type == Type::GetNativeProcessContext) return readPrincipalProcess(frame,peer);
     if (idValue(frame, Tag::ServiceEpoch) != epoch_) return principalError(Error::Stale);
@@ -1076,10 +1170,11 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
     const auto causeCurrent = [&](const PrincipalObservation &o) {
         return o.row.state == 1 && o.row.source == principalSource_->binding_->epoch &&
             o.source == principalSource_ && o.profile == peer->profile && o.event && o.proof &&
-            o.event->owned().identity.userSid.bytes == peer->identity.account &&
+            (o.foreign ? administrative && o.administrativeOwner==peer :
+                o.event->owned().identity.userSid.bytes == peer->identity.account) &&
             principalSource_->retainedCause(*o.event,*o.proof,allnative::CatalogReceipt(principalCatalog_),allnative::Stage::Active);
     };
-    if (peer->readonly && (frame.type == Type::ListObserved || frame.type == Type::GetObservedRecord)) {
+    if ((peer->readonly || administrative) && frame.type != Type::GetFutureCommandStatus) {
         const auto retainedSource = principalSource_;
         const auto retainedCatalog = principalCatalog_;
         const auto fresh = readServiceContext(); // READ/reconcile real; el cache de páginas no da frescura.
@@ -1100,6 +1195,8 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             get(frame, Tag::DraftVersion) != found->second->revision) return principalError(Error::Stale);
         const auto held = found->second;
         auto &admission = *held;
+        if(admission.administrative!=administrative ||
+           (administrative && admission.selectedSid!=find(frame,Tag::SelectedPrincipalSid)->bytes))return principalError(Error::Unauthorized);
         if (admission.file) return fileFutureRecord(admission);
         auto observed = principalObservations_.find(admission.observed);
         if (observed == principalObservations_.end() || observed->second->row.revision != admission.observedRevision ||
@@ -1123,11 +1220,21 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             return principalError(Error::IdentityUnavailable);
         Frame response; response.minor = 3; response.type = Type::FutureDraftRecord;
         response.fields = {value(Tag::ServiceEpoch, epoch_), {Tag::Records, true, std::move(records)}, value(Tag::SourceEpoch, record.source)};
+        if(administrative)response.fields.insert(response.fields.end(),{
+            {Tag::SelectedPrincipalSid,true,admission.selectedSid},value(Tag::AdministrativeMode,1,1),
+            {Tag::OriginalTarget,true,admission.fullTarget.copy()}});
         return ordered(std::move(response));
     }
     if (frame.type == Type::GetObservedRecord || frame.type == Type::OpenReview) {
         auto found = principalObservations_.find(idValue(frame, Tag::ObservedId));
         if (found == principalObservations_.end()) return principalError(Error::NotFound);
+        const auto &observation=*found->second;
+        if(observation.foreign && (!administrative || observation.administrativeOwner!=peer || !causeCurrent(observation)))
+            return principalError(Error::Unauthorized);
+        principal::Target selected;
+        if(administrative && (!causeCurrent(observation) || !principal::parseTarget(observation.target,selected) ||
+           (frame.type==Type::OpenReview && !principalTargetSelected(frame,*peer,selected.user))))
+            return principalError(Error::Stale);
         const auto &row = found->second->row;
         if (row.revision != get(frame, Tag::ObservedRevision) || row.source != idValue(frame, Tag::SourceEpoch))
             return principalError(Error::Stale);
@@ -1144,6 +1251,9 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             return principalError(Error::IdentityUnavailable);
         Frame response; response.minor = 3; response.type = Type::ObservedRecord;
         response.fields = {value(Tag::ServiceEpoch, epoch_), {Tag::Records, true, std::move(records)}, value(Tag::SourceEpoch, row.source)};
+        if(administrative)response.fields.insert(response.fields.end(),{
+            {Tag::SelectedPrincipalSid,true,selected.user.copy()},value(Tag::AdministrativeMode,1,1),
+            {Tag::OriginalTarget,true,observation.target.copy()}});
         if (row.state == 1 && causeCurrent(*found->second) && found->second->event) {
             const auto direction = found->second->event->owned().direction;
             if (direction == gatebouncer::service::windows::allapps::Direction::Inbound ||
@@ -1165,7 +1275,10 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             PrincipalPage page;
             page.revision = principalObservedRevision_ ? principalObservedRevision_ : 1;
             page.source = principalSource_->binding_->epoch; page.deadline = now + 5000;
+            page.administrative=administrative;
             for (const auto &entry : principalObservations_) {
+                if(entry.second->foreign && (!administrative || entry.second->administrativeOwner!=peer))continue;
+                if(administrative && !causeCurrent(*entry.second))continue;
                 if (peer->readonly && entry.second->row.state != 1) continue;
                 if (peer->readonly && !causeCurrent(*entry.second)) {
                     peer->pages.clear(); return principalError(Error::Stale);
@@ -1178,7 +1291,8 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         auto found = peer->pages.find(snapshot);
         if (found == peer->pages.end()) return principalError(Error::SnapshotExpired);
         auto &page = found->second;
-        if (peer->readonly) {
+        if(page.administrative!=administrative) {peer->pages.erase(found);return principalError(Error::SnapshotExpired);}
+        if (peer->readonly || administrative) {
             if (page.source != principalSource_->binding_->epoch) {
                 peer->pages.clear(); return principalError(Error::Stale);
             }
@@ -1212,6 +1326,7 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             value(Tag::NextCursor, terminal ? UINT32_MAX : next, 4), value(Tag::Count, rows.size(), 2),
             {Tag::Records, true, std::move(packed)}, value(Tag::SourceEpoch, page.source),
             value(Tag::ObservedSnapshotRevision, page.revision)};
+        if(administrative)response.fields.push_back(value(Tag::AdministrativeMode,1,1));
         if (terminal) peer->pages.erase(found);
         return ordered(std::move(response));
     }
@@ -1237,6 +1352,7 @@ void NativeRuntime::invalidatePrincipalObservations() noexcept {
             o.row.revision = ++principalObservedRevision_;
         o.row.state = 2; o.row.binding = {}; o.row.reason = Error::Stale;
         o.target = {}; o.source.reset(); o.event.reset(); o.proof.reset(); o.fullDisplay = {};
+        o.administrativeOwner.reset();
         o.charged = sizeof(PrincipalObservation) + o.row.display.name.capacity() +
             o.row.display.principal.capacity() + o.row.display.package.capacity() + o.row.display.path.capacity() +
             NativeActivityRing::bytes(o.activityAttempt) + 128;
@@ -1245,6 +1361,7 @@ void NativeRuntime::invalidatePrincipalObservations() noexcept {
 }
 void NativeRuntime::publishPrincipalAttempt(PrincipalObservation &o,const GB_PROCESS_IMAGE_FACTS *facts) noexcept {
   try {
+    if(o.foreign)return;
     if(o.activityAttempt.type==Type::Attempt || o.pendingAttempt.type!=Type::Attempt)return;
     if(principalImageWorker_ && o.imageJob)principalImageWorker_->abandon(o.imageJob);
     o.imageJob=0;o.imageDeadline=0;
@@ -1525,11 +1642,13 @@ void NativeRuntime::collectPrincipalObservations() {
     if (!formatter) return;
     for (auto &item : principalObservations_) {
         auto &o = *item.second;
-        if (o.row.state == 1 && o.event && o.event->classifier_ && !o.event->classifier_->current()) {
+        if (o.row.state == 1 &&
+            ((o.foreign && (!o.administrativeOwner || !principalPeerCurrent(*o.administrativeOwner))) ||
+             (o.event && o.event->classifier_ && !o.event->classifier_->current()))) {
             if(o.pendingAttempt.type==Type::Attempt)publishPrincipalAttempt(o);
             o.row.state = 2; o.row.binding = {}; o.row.reason = Error::Stale;
             if (principalObservedRevision_ != UINT64_MAX) o.row.revision = ++principalObservedRevision_;
-            o.target = {}; o.event.reset(); o.proof.reset(); o.source.reset();
+            o.target = {}; o.event.reset(); o.proof.reset(); o.source.reset(); o.administrativeOwner.reset();
         }
     }
     // Trabajo acotado por tick: no drenar indefinidamente ante un productor ocupado.
@@ -1559,8 +1678,17 @@ void NativeRuntime::collectPrincipalObservations() {
         if (!acquired.proof || !principalSource_->retainedCause(*event, *acquired.proof,
             allnative::CatalogReceipt(principalCatalog_), allnative::Stage::Active)) continue;
         const auto &metadata = event->owned();
-        if (metadata.type != 3 || metadata.identity.userSid.bytes != profile_.account() ||
+        if (metadata.type != 3 ||
             (metadata.direction != Direction::Outbound && metadata.direction != Direction::Inbound)) continue;
+        const bool foreign=metadata.identity.userSid.bytes!=profile_.account();
+        std::shared_ptr<PrincipalPeer> administrativeOwner;
+        if(foreign) {
+            for(const auto &slot:principalAdministrativePeers_) {
+                auto current=slot.lock();
+                if(current && current->administrative && principalPeerCurrent(*current)) {administrativeOwner=std::move(current);break;}
+            }
+            if(!administrativeOwner)continue;
+        }
         auto identity = gatebouncer::appidentity::attribute(metadata.identity, *formatter);
         if (identity.state != gatebouncer::appidentity::State::Attributed || !identity.target || !identity.scope)
             continue;
@@ -1576,7 +1704,7 @@ void NativeRuntime::collectPrincipalObservations() {
         }
         auto same = std::find_if(principalObservations_.begin(), principalObservations_.end(), [&](const auto &p) {
             const auto &o = *p.second;
-            return !event->classifier_ && o.row.state == 1 && o.source == principalSource_ && o.digest == digest && o.event && !o.event->classifier_ &&
+            return o.administrativeOwner==administrativeOwner && !event->classifier_ && o.row.state == 1 && o.source == principalSource_ && o.digest == digest && o.event && !o.event->classifier_ &&
                 o.event->owned().direction == metadata.direction;
         });
         wire::iv::Display projected, full;
@@ -1597,7 +1725,7 @@ void NativeRuntime::collectPrincipalObservations() {
         // No es una afirmación del heap integral del allocator o del proceso.
         const auto charged = 2 * chargedBytes(metadata) + target.ownedCapacityBytes() +
             displayCharge(projected) + displayCharge(full) + sizeof(PrincipalObservation) + sizeof(PrincipalAdmission) +
-            2 * gatebouncer::appidentity::MaximumSidBytes + 512 + 8192 +
+            3 * gatebouncer::appidentity::MaximumSidBytes + 512 + 8192 +
             (event->classifier_ ? activityCauseBytes(*event->classifier_) : 0);
         const auto prior = same == principalObservations_.end() ? 0 : same->second->charged;
         if (same == principalObservations_.end() && principalObservations_.size() >= PendingLimit) {
@@ -1632,6 +1760,7 @@ void NativeRuntime::collectPrincipalObservations() {
         }
         observation->target = std::move(target); observation->digest = digest;
         observation->source = principalSource_; observation->event = std::move(event);
+        observation->foreign=foreign;observation->administrativeOwner=std::move(administrativeOwner);
         observation->row.temporal = observation->event->classifier_ ? 2 : 1;
         observation->proof = std::move(acquired.proof); observation->profile = profile_.value().generation;
         observation->charged = charged;
@@ -1646,6 +1775,10 @@ void NativeRuntime::collectPrincipalObservations() {
         }
         principalPendingBytes_ = principalPendingBytes_ - prior + charged;
         principalObservations_[observation->row.observed] = observation;
+        // Future2 administrativo no es un stream de actividad de otras cuentas.
+        // El worker físico sigue drenándose en pollPrincipalImages; no fabricar
+        // Attempt/Authorization/Traffic ni adoptar scopes temporales sin su puente.
+        if(observation->foreign) {principalPendingAppBytes_=0;continue;}
         // Sólo después de la inserción válida y de las pruebas originales arriba.
       try {
         auto history = principalEvents_.frame(Type::Attempt);

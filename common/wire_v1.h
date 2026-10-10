@@ -53,7 +53,8 @@ enum class Tag : std::uint16_t { ClientRole=1, ServiceEpoch=2, BootId=3,
     MigrationDigest=79, DraftState=80, ProofState=81, ObservedSnapshotRevision=82,
     KnownAppliedUnrecorded=83, Durable=84, ConsentChallengeId=85,
     CaptureBindingId=86, IVProfile=87, ServiceContext=88, ScopeDurationMs=89,
-    PreviousTargetDigest=90 };
+    PreviousTargetDigest=90, SelectedPrincipalSid=91, AdministrativeMode=92,
+    OriginalTarget=93 };
 constexpr std::uint64_t ReadStatus=1ull<<0, PathPermanentRule=1ull<<1,
     BlockRetry=1ull<<2, RuleRevoke=1ull<<3, Ipv4Ale=1ull<<4, Ipv6Ale=1ull<<5,
     DirectionalPath=1ull<<22, ObservedRead=1ull<<23, FuturePolicyControl=1ull<<24;

@@ -332,7 +332,7 @@ Error unpackRecords(const Bytes &b, std::size_t count, std::vector<R> &out,
   out = std::move(rows);
   return Error::Ok;
 }
-Schema schema(const Frame &f) {
+Schema schemaBase(const Frame &f) {
   Schema ref = {{T::ServiceEpoch, 16},
                 {T::ObservedId, 16},
                 {T::ObservedRevision, 8},
@@ -498,6 +498,27 @@ Schema schema(const Frame &f) {
   default:
     return {};
   }
+}
+Schema schema(const Frame &f) {
+  auto s=schemaBase(f);
+  if(!find(f,T::AdministrativeMode))return s;
+  switch(f.type) {
+  case Type::ListObserved: case Type::ObservedPage:
+  case Type::ListPrincipalRules: case Type::PrincipalRulesPage:
+  case Type::GetObservedRecord:
+    s[T::AdministrativeMode]=1;break;
+  case Type::ObservedRecord: case Type::FutureDraftRecord:
+    s[T::OriginalTarget]=Variable;
+    [[fallthrough]];
+  case Type::OpenReview: case Type::ReviewQueued:
+  case Type::PrepareFuturePolicy: case Type::GetFutureDraft:
+  case Type::CommitFuturePolicy: case Type::RevokePrincipalRule:
+  case Type::PrepareFileFuturePolicy: case Type::FileFutureDraftRecord:
+  case Type::ReplacePrincipalRule:
+    s[T::AdministrativeMode]=1;s[T::SelectedPrincipalSid]=Variable;break;
+  default: break;
+  }
+  return s;
 }
 bool outcome(const Frame &f) {
   auto d = get(f, T::DesiredRev), e = get(f, T::EffectiveRev),
@@ -756,7 +777,7 @@ Error validate(const Frame &f) {
   unsigned previous = 0;
   for (const auto &v : f.fields) {
     auto tag = static_cast<unsigned>(v.tag);
-    if (tag < 1 || tag > static_cast<unsigned>(T::PreviousTargetDigest) || tag == 57 ||
+    if (tag < 1 || tag > static_cast<unsigned>(T::OriginalTarget) || tag == 57 ||
         (v.tag == T::ServiceContext && f.type != Type::HelloAck && f.type != Type::Status &&
          f.type != Type::SubscriptionAck && f.type != Type::Attempt &&
          f.type != Type::Authorization && f.type != Type::Traffic && f.type != Type::ObservationGap &&
@@ -790,12 +811,13 @@ Error validate(const Frame &f) {
           boot != idValue(f, T::BootId) || engine != idValue(f, T::SourceEpoch) ||
           zero(engine) != (generation == 0)) return Error::Malformed;
       auto c = number(*caps);
-      if ((c >> 29) || (c & ((0x3full << 6) | (1ull << 16))) ||
+      if ((c >> 30) || (c & ((0x3full << 6) | (1ull << 16))) ||
           ((c & NativeEvents) && (!(c & ObservedRead) || zero(engine) || get(f,T::ReviewProfileState)!=1)) ||
           ((c & NativeTraffic) && !(c & NativeEvents)) ||
           ((c & NativeProcessFacts) && !(c & NativeEvents)) ||
           ((c & FuturePolicyControl) && !number(*profile)) ||
-          ((c & FileFutureControl) && !(c & FuturePolicyControl)))
+          ((c & FileFutureControl) && !(c & FuturePolicyControl)) ||
+          ((c & AdministrativePrincipalControl) && !(c & FuturePolicyControl)))
         return Error::Malformed;
       base.fields.erase(std::remove_if(base.fields.begin(), base.fields.end(),
                                        [](const auto &v) {
@@ -806,7 +828,7 @@ Error validate(const Frame &f) {
                         base.fields.end());
       for (auto &v : base.fields)
         if (v.tag == T::Capabilities)
-          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents | NativeTraffic | NativeProcessFacts | FileFutureControl), 8);
+          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents | NativeTraffic | NativeProcessFacts | FileFutureControl | AdministrativePrincipalControl), 8);
     }
     if (f.type == Type::ProtocolError && get(f, T::ErrorCode) == 18)
       for (auto &v : base.fields)
@@ -825,6 +847,22 @@ Error validate(const Frame &f) {
       return Error::Malformed;
     if (it->second == 16 && v.tag != T::SnapshotId && zero(idValue(f, v.tag)))
       return Error::Malformed;
+  }
+  if(find(f,T::AdministrativeMode)) {
+    if(get(f,T::AdministrativeMode)!=1)return Error::Malformed;
+    if(const auto sid=find(f,T::SelectedPrincipalSid)) {
+      const auto &b=sid->bytes;
+      if(b.size()<8 || b.size()>68 || b[0]!=1 || b[1]>15 || b.size()!=8+std::size_t(b[1])*4)
+        return Error::Malformed;
+    }
+    if(const auto target=find(f,T::OriginalTarget)) {
+      OriginalTarget parsed;
+      if(unpackOriginalTarget(target->bytes,parsed)!=Error::Ok || parsed.accountSid!=find(f,T::SelectedPrincipalSid)->bytes)
+        return Error::Malformed;
+    }
+    if(f.type==Type::PrincipalRulesPage && !find(f,T::ServiceContext))return Error::Malformed;
+    if((f.type==Type::PrepareFuturePolicy || f.type==Type::CommitFuturePolicy) &&
+       (find(f,T::ScopeKind) ? get(f,T::ScopeKind) : 2)!=2)return Error::Malformed;
   }
   const bool activity=f.type==Type::Attempt || f.type==Type::Authorization || f.type==Type::Traffic;
   const bool stream=activity || f.type==Type::ObservationGap || f.type==Type::SubscriptionAck;

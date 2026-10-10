@@ -44,12 +44,14 @@ class NativeRuntime {
         Id source{};
         std::uint64_t revision = 0, deadline = 0;
         std::uint32_t next = 0;
+        bool administrative = false;
     };
     struct PrincipalPeer {
         native::ProcessEvidence actor;
         native::TokenEvidence identity;
         native::Handle pipe;
         native::Handle image;
+        native::Handle administrativePrimary;
         std::unique_ptr<native::ProtectedDirectory> directory;
         BY_HANDLE_FILE_INFORMATION imageId{};
         Id connection{};
@@ -64,10 +66,12 @@ class NativeRuntime {
             ServiceContext context;
             std::uint64_t profile=0, deadline=0;
             std::uint32_t next=0;
+            bool administrative=false;
         };
         std::map<Id,RulePage> rulePages;
         bool cancelled = false;
         bool readonly = false;
+        bool administrative = false;
         std::uint32_t subscriptionMask=0;
         std::filesystem::path admittedImage;
     };
@@ -84,6 +88,7 @@ class NativeRuntime {
         std::filesystem::path path;
         BY_HANDLE_FILE_INFORMATION imageId{};
         principal::ByteView target;
+        Bytes targetSid;
         wire::iv::Display display;
         std::atomic<bool> cancelled{false};
         bool completed=false;
@@ -104,6 +109,8 @@ class NativeRuntime {
         native::ProcessEvidence actor;
         native::TokenEvidence identity;
         std::shared_ptr<PrincipalPeer> owner;
+        Bytes selectedSid;
+        bool administrative=false;
         Id observed{}, selector{}, challenge{};
         std::uint64_t observedRevision = 0, expectedDesired = 0, deadline = 0;
         principal::ByteView fullTarget;
@@ -135,8 +142,10 @@ class NativeRuntime {
     static std::size_t activityCauseBytes(const allnative::ClassifierCause &) noexcept;
     void invalidatePrincipalObservations() noexcept;
     void stopPrincipalObservation() noexcept;
-    bool ordinaryPeer(HANDLE, std::shared_ptr<PrincipalPeer> &, bool readonly = false);
+    bool ordinaryPeer(HANDLE, std::shared_ptr<PrincipalPeer> &, bool readonly = false,
+                      bool administrative = false);
     bool principalPeerCurrent(const PrincipalPeer &) const noexcept;
+    bool principalTargetSelected(const Frame &, const PrincipalPeer &, const principal::ByteView &) const noexcept;
     bool principalPolicyReady() const noexcept;
     void closeOrdinaryPeer(const std::shared_ptr<PrincipalPeer> &) noexcept;
     Frame dispatchOrdinary(const Frame &, const std::shared_ptr<PrincipalPeer> &);
@@ -165,6 +174,7 @@ class NativeRuntime {
     decltype(&GetTickCount64) principalNow_ = &GetTickCount64;
     allnative::SdkApi (*principalSdk_)() = &allnative::systemSdk;
     std::map<Id, std::shared_ptr<PrincipalObservation>> principalObservations_;
+    std::array<std::weak_ptr<PrincipalPeer>,64> principalAdministrativePeers_{};
     std::uint64_t principalObservedRevision_ = 0;
     std::size_t principalPendingBytes_ = 0;
     std::unique_ptr<allnative::NativeImageWorker> principalImageWorker_;
