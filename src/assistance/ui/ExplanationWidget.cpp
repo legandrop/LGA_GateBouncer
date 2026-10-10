@@ -54,9 +54,9 @@ void ExplanationWidget::refresh(){
         configuration->activation.cause==Configuration::ActivationCause::Ready;
     const auto binding=binding_?binding_():std::nullopt;
     const auto original=session_?session_->observedDestination():std::nullopt;
-    QString destination="Destination: Unknown\nRouting ASN: Unknown";
+    QString destination="Destination: Unknown\nObserved domain: Unknown\nRouting ASN: Unknown";
     if(original){const auto& d=*original;
-        destination=QString("Destination: %1 · port %2 · %3\nObserved: %4 · original outbound connection\nRouting ASN: Unknown")
+        destination=QString("Destination: %1 · port %2 · %3\nObserved: %4 · original outbound connection\nObserved domain: Unknown\nRouting ASN: Unknown")
             .arg(QString::fromUtf8(d.address)).arg(d.port).arg(d.protocol==6?"TCP":"UDP")
             .arg(QDateTime::fromMSecsSinceEpoch(qint64(d.observedAtMs),Qt::UTC).toString(Qt::ISODateWithMs));}
     destination_->setText(destination);
