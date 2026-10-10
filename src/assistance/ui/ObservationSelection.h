@@ -25,6 +25,10 @@ struct ObservationSelection {
             binding.snapshotRevision==record.revision&&binding.serviceEpoch==service.engineBindingGeneration&&
             binding.generation==profile;
     }
+    bool matches(const General::PendingPresentationContext& pending) const {
+        return pending.service()==service&&pending.request()==record.observed&&pending.selector()==record.binding&&
+            pending.requestRevision()==record.revision&&pending.selectorRevision()==record.revision&&pending.profileGeneration()==profile;
+    }
 };
 namespace Detail {
 template<class T,class=void>struct HasObservationContext:std::false_type{};

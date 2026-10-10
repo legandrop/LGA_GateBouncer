@@ -71,7 +71,15 @@ void GeneralConnection::connectBroker(){
             return owner->selected&&*owner->selected==captured&&after&&*after==captured&&owner->current(nonce,serial);
         },[weak,nonce,serial]{
             const auto owner=weak.lock();return owner&&owner->current(nonce,serial);
-        },Broker::generalSearchConfiguration());
+        },Broker::generalSearchConfiguration(),nullptr,[weak,nonce,serial](const General::PendingPresentationContext& pending){
+            // Lectura LOCAL: mismo contexto original; no fabrica FullBinding ni habilita HTTP.
+            const auto owner=weak.lock();if(!owner||!owner->selected||!owner->current(nonce,serial))return false;
+            const auto captured=*owner->selected;
+            const auto actual=currentObservation(owner->window->product()->ordinary());
+            if(!actual||!(*actual==captured)||!captured.matches(pending))return false;
+            const auto after=currentObservation(owner->window->product()->ordinary());
+            return owner->selected&&*owner->selected==captured&&after&&*after==captured&&owner->current(nonce,serial);
+        });
         window_->setAssistance(std::move(session));
         connect(window_->assistance(),&GeneralSession::changed,this,&GeneralConnection::synchronizePending);
         // La configuración no depende de que exista un registro pendiente canónico.

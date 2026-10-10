@@ -5,9 +5,9 @@
 namespace Gate::Assistance::Ui {
 namespace G=General; namespace C=Configuration;
 GeneralSession::GeneralSession(std::shared_ptr<G::FrameChannel> channel,Current pending,
-    std::function<bool()> presentationCurrent,gatebouncer::websearch::ProviderConfig provider,QObject* parent)
+    std::function<bool()> presentationCurrent,gatebouncer::websearch::ProviderConfig provider,QObject* parent,ObservationCurrent observation)
     :QObject(parent),channel_(std::move(channel)),pendingCurrent_(std::move(pending)),
-     presentationCurrent_(std::move(presentationCurrent)),provider_(std::move(provider)) {
+     observationCurrent_(std::move(observation)),presentationCurrent_(std::move(presentationCurrent)),provider_(std::move(provider)) {
     if(!channel_||!presentationCurrent_) {closed_=true;return;}
     QPointer<GeneralSession> self(this);
     client_=std::make_unique<G::GeneralClient>(channel_,[self](const G::FullBinding& binding){
@@ -22,6 +22,11 @@ GeneralSession::GeneralSession(std::shared_ptr<G::FrameChannel> channel,Current 
         const bool settings=self->current(stamp);if(!self)return;
         if(!settings){self->invalidate();if(!self)return;
             self->problem_="The assistance connection changed. Reconnect to view your settings.";emit self->changed();return;}
+        if(self->pendingPresentation_&&self->observationCurrent_){
+            const auto observed=self->pendingObservation();if(!self||stamp!=self->generation_)return;
+            if(!observed){self->cancel();if(!self)return;
+                self->problem_="The pending observation changed. Local file checks are Unknown.";emit self->changed();return;}
+        }
         if(self->pendingBinding_){const auto binding=*self->pendingBinding_;const auto predicate=self->pendingCurrent_;
             const bool pending=predicate&&predicate(binding);if(!self||stamp!=self->generation_)return;
             if(!pending){self->cancel();self->problem_="The pending request changed. Open its current request to explain it.";emit self->changed();}
@@ -149,6 +154,20 @@ std::optional<G::FullBinding> GeneralSession::pendingBinding() const {
     return self&&valid&&self->current(stamp)&&self->pendingBinding_&&*self->pendingBinding_==binding?
         std::optional<G::FullBinding>(binding):std::nullopt;
 }
+std::optional<G::PendingPresentationContext> GeneralSession::pendingObservation() const {
+    QPointer<const GeneralSession> self(this);
+    if(!pendingPresentation_||!observationCurrent_||!available())return {};
+    if(!self||!self->pendingPresentation_||!self->observationCurrent_)return {};
+    const auto projection=*pendingPresentation_;const auto bytes=G::pendingPresentationBytes(projection);
+    if(!bytes)return {};
+    const auto predicate=observationCurrent_;const auto stamp=generation_;
+    const bool first=predicate(projection);
+    if(!self||!first||!self->current(stamp)||!self->pendingPresentation_||
+        G::pendingPresentationBytes(*self->pendingPresentation_)!=bytes)return {};
+    const bool second=predicate(projection);
+    return self&&second&&self->current(stamp)&&self->pendingPresentation_&&
+        G::pendingPresentationBytes(*self->pendingPresentation_)==bytes?std::optional<G::PendingPresentationContext>(projection):std::nullopt;
+}
 bool GeneralSession::selectPending(const G::Id128& request,G::PendingServiceContext service){
     if(busy_||!pendingCurrent_||!available()||!G::pendingQueryBytes(request)||!G::validPendingService(service))return false;
     review_.reset();cancel();busy_=true;problem_.clear();const auto stamp=generation_;QPointer<GeneralSession> self(this);
@@ -161,30 +180,30 @@ bool GeneralSession::selectPending(const G::Id128& request,G::PendingServiceCont
                 self->failed("The current pending request is unavailable. Your request remains undecided.");return;
             }
             const auto binding=G::pendingFullBinding(*pending,*self->presentation_,*self->view_,self->channel_->connection());
-            if(!binding){self->failed("The current request cannot be explained with this configuration.");return;}
-            const auto predicate=self->pendingCurrent_;const bool valid=predicate&&predicate(*binding);
+            const auto observedPredicate=self->observationCurrent_;
+            const bool observed=observedPredicate&&observedPredicate(*pending);
+            if(!self||!self->current(stamp))return;
+            if((observedPredicate&&!observed)||(!binding&&!observed)){
+                self->failed("The original pending observation is unavailable. Local file checks are Unknown.");return;}
+            const auto predicate=self->pendingCurrent_;const bool valid=!binding||(predicate&&predicate(*binding));
             if(!self||!self->current(stamp))return;
             if(!valid){self->failed("The pending request changed. Your request remains undecided.");return;}
-            self->pendingPresentation_=pending;self->pendingBinding_=binding;self->busy_=false;self->state_=G::State::Insufficient;emit self->changed();
+            if(observedPredicate){const bool final=observedPredicate(*pending);
+                if(!self||!self->current(stamp))return;
+                if(!final){self->failed("The pending observation changed. Local file checks are Unknown.");return;}
+            }
+            self->pendingPresentation_=pending;self->pendingBinding_=binding;self->busy_=false;self->state_=G::State::Insufficient;
+            if(!binding)self->problem_="Online explanation needs search setup. The local file check does not send information.";
+            emit self->changed();
         });
     if(!sent)failed("The current request could not be read. Your request remains undecided.");else emit changed();
     return sent;
 }
 std::optional<G::Destination> GeneralSession::observedDestination() const {
-    const auto stamp=generation_;QPointer<const GeneralSession> self(this);
-    const auto binding=pendingBinding();
-    return self&&binding&&self->generation_==stamp&&self->pendingPresentation_?self->pendingPresentation_->destination():std::nullopt;
+    const auto observed=pendingObservation();return observed?observed->destination():std::nullopt;
 }
 std::optional<G::LocalFilePresentation> GeneralSession::localFileFacts() const {
-    const auto stamp=generation_;QPointer<const GeneralSession> self(this);
-    const auto binding=pendingBinding();
-    if(!self||!binding||self->generation_!=stamp||!self->pendingPresentation_)return {};
-    const auto bytes=G::pendingPresentationBytes(*self->pendingPresentation_);
-    const auto facts=self->pendingPresentation_->localFile();
-    // Dos lecturas del mismo contexto/peer/cause; los datos no sustituyen el predicate original.
-    const auto after=self->pendingBinding();
-    return self&&after&&*after==*binding&&self->generation_==stamp&&self->pendingPresentation_&&
-        bytes&&G::pendingPresentationBytes(*self->pendingPresentation_)==bytes?facts:std::nullopt;
+    const auto observed=pendingObservation();return observed?observed->localFile():std::nullopt;
 }
 bool GeneralSession::publicReviewCurrent() const {
     if(!review_||!view_||!presentation_||!pendingCurrent_||!available())return false;

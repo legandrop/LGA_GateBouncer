@@ -75,14 +75,16 @@ void ExplanationWidget::refresh(){
         configuration->activation.cause==Configuration::ActivationCause::Ready;
     const auto binding=binding_?binding_():std::nullopt;
     if(!self)return;
-    auto original=session_&&binding?session_->observedDestination():std::nullopt;
+    const auto observation=session_?session_->pendingObservation():std::nullopt;
     if(!self)return;
-    auto local=session_&&binding?session_->localFileFacts():std::nullopt;
-    if(!self)return;
+    auto original=observation?observation->destination():std::nullopt;
+    auto local=observation?observation->localFile():std::nullopt;
     const bool reviewed=session_&&session_->publicReviewCurrent();if(!self)return;
     const auto after=session_?session_->pendingBinding():std::nullopt;if(!self)return;
     const bool same=binding&&after&&*binding==*after;
-    if(!same){original.reset();local.reset();}
+    const auto observationAfter=session_?session_->pendingObservation():std::nullopt;if(!self)return;
+    const bool sameObservation=observation&&observationAfter&&G::pendingPresentationBytes(*observation)==G::pendingPresentationBytes(*observationAfter);
+    if(!sameObservation){original.reset();local.reset();}
     QString destination="Destination: Unknown";
     if(original){const auto& d=*original;
         destination=QString("Destination: %1 · port %2 · %3")

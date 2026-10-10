@@ -11,9 +11,10 @@ class GeneralSession final : public QObject {
     Q_OBJECT
 public:
     using Current=General::GeneralCoordinator::Current;
+    using ObservationCurrent=std::function<bool(const General::PendingPresentationContext&)>;
     GeneralSession(std::shared_ptr<General::FrameChannel>,Current,
                    std::function<bool()> presentationCurrent,
-                   gatebouncer::websearch::ProviderConfig,QObject* parent=nullptr);
+                   gatebouncer::websearch::ProviderConfig,QObject* parent=nullptr,ObservationCurrent = {});
     ~GeneralSession() override;
     bool refresh();
     bool store(Broker::SensitiveBytes);
@@ -24,6 +25,8 @@ public:
     bool selectSearch();
     bool selectPending(const General::Id128&,General::PendingServiceContext);
     std::optional<General::FullBinding> pendingBinding() const;
+    // Proyección readonly del pendiente autenticado, independiente de elegibilidad de envío.
+    std::optional<General::PendingPresentationContext> pendingObservation() const;
     std::optional<General::Destination> observedDestination() const;
     std::optional<General::LocalFilePresentation> localFileFacts() const;
     bool reviewPublicFields(General::PublicFields);
@@ -60,6 +63,7 @@ private:
     std::shared_ptr<General::FrameChannel> channel_;
     std::unique_ptr<General::GeneralClient> client_;
     Current pendingCurrent_;
+    ObservationCurrent observationCurrent_;
     std::function<bool()> presentationCurrent_;
     gatebouncer::websearch::ProviderConfig provider_;
     std::optional<General::ConfigurationView> view_;
