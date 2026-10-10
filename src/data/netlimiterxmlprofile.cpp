@@ -136,6 +136,27 @@ struct Deriver {
         else f.value = QString::fromLatin1(decoded.decoded.toBase64());
         return f;
     }
+    SourceFact<bool> explicitNilSid(int i, const SourceFact<QString> &bytes) const {
+        SourceFact<bool> f; f.node = i;
+        if (i < 0 || type(i, "Sid") != "Sid") return f;
+        bool nil = false, present = false;
+        for (const auto &a : e.nodes[i].attributes) {
+            if (a.name == ExpandedName{xsi, "type"}) continue;
+            if (a.name != ExpandedName{xsi, "nil"} || present) return f;
+            present = true;
+            const auto value = a.value.trimmed();
+            if (!QStringList{"true", "false", "1", "0"}.contains(value)) return f;
+            nil = value == "true" || value == "1";
+        }
+        if (nil) {
+            for (const auto &c : e.nodes[i].content)
+                if (c.child >= 0 || !c.text.trimmed().isEmpty()) return f;
+            f.status = FieldStatus::Known; f.value = true;
+        } else if (bytes.known()) {
+            f.status = FieldStatus::Known; f.value = false;
+        }
+        return f;
+    }
     ApplicationConstraint application(int i, const QString &wrapper) {
         ApplicationConstraint app; app.node = i;
         if (type(i, wrapper) != wrapper || !container(i)) return app;
@@ -143,8 +164,11 @@ struct Deriver {
             const bool shape = order(i, {"Path", "Sid"});
             app.path = scalar(i, "Path", {xsd, "string"});
             const auto principals = occurrences(i, "Sid");
-            if (principals.size() == 1) app.sidBytes = sid(principals[0]);
-            if (!shape) { app.path.status = app.sidBytes.status = FieldStatus::Unknown; }
+            if (principals.size() == 1) {
+                app.sidBytes = sid(principals[0]);
+                app.sidExplicitNil = explicitNilSid(principals[0], app.sidBytes);
+            }
+            if (!shape) { app.path.status = app.sidBytes.status = app.sidExplicitNil.status = FieldStatus::Unknown; }
         } else {
             app.path = scalar(i, "path", {xsd, "string"});
             if (!order(i, {"path"})) app.path.status = FieldStatus::Unknown;
@@ -557,6 +581,108 @@ QNameApplicationComparison compareQNameApplicationScope(const QNameProfileView &
     }
     result.representable = true; result.action = selected.action; result.direction = selected.direction.value;
     result.reason = "Source scope comparison matches; original live selector and explicit consent are still required";
+    return result;
+}
+namespace {
+// Sólo prueba disyunción del intervalo completo. Un punto de conexión no acredita
+// equivalencia de toda la regla; zona, tags, negaciones y Composite quedan Unknown.
+QNameMatch compareConditionalFilter(const QNameProfileView &view, int index, quint32 first, quint32 last,
+    const QByteArray &appId, const QByteArray &sid, const QString &image,
+    const QMap<int, QByteArray> &canonical) {
+    if (index < 0 || index >= view.filters.size()) return QNameMatch::Unknown;
+    const auto &f = view.filters[index];
+    if (!f.complete || !f.baseFilters.isEmpty() || f.package.node >= 0 ||
+        !f.filterType.known() || (f.filterType.value != "Filter" && f.filterType.value != "Zone") ||
+        f.predicates.isEmpty()) return QNameMatch::Unknown;
+    for (const auto &p : f.predicates) {
+        if (p.kind == "FFAppIdEqual") {
+            if (compareApplicationPredicate(p, appId, sid, image, canonical) == QNameMatch::No)
+                return QNameMatch::No;
+        } else if (p.kind == "FFRemoteAddressInRange" && p.complete && p.match.known() && p.match.value &&
+                   !p.remoteRanges.isEmpty()) {
+            bool disjoint = true;
+            for (const auto &range : p.remoteRanges) {
+                if (!range.first.known() || !range.last.known() || range.first.value > range.last.value)
+                    return QNameMatch::Unknown;
+                disjoint = disjoint && (last < range.first.value || range.last.value < first);
+            }
+            if (disjoint) return QNameMatch::No;
+        }
+    }
+    return QNameMatch::Unknown;
+}
+}
+QNameConditionalComparison compareQNameConditionalScope(const QNameEvidence &original, const QString &candidateId,
+    const QByteArray &appId, const QByteArray &accountSid, const QString &originalImage,
+    const QMap<int, QByteArray> &canonicalApplications, const ImportLimits &limits) {
+    QNameConditionalComparison result;
+    result.reason = "Original conditional source is incomplete or unsupported";
+    const auto view = deriveQNameProfile(original, limits);
+    if (!view.valid || !view.profileKnown || !view.diagnosticsComplete || candidateId.isEmpty()) return result;
+    int index = -1;
+    for (int i = 0; i < view.candidates.size(); ++i) if (view.candidates[i].candidateId == candidateId) {
+        if (index >= 0) return result;
+        index = i;
+    }
+    if (index < 0) return result;
+    const auto &selected = view.candidates[index];
+    result.candidate = selected; result.sourceOrdinal = index;
+    if (selected.filterIndex < 0 || selected.filterIndex >= view.filters.size()) return result;
+    const auto &filter = view.filters[selected.filterIndex];
+    result.filterId = filter.id;
+    if (!filter.baseFilters.isEmpty() || filter.package.node >= 0 || !filter.filterType.known() ||
+        filter.filterType.value != "Filter" || filter.predicates.size() != 2) return result;
+    const QNamePredicate *application = nullptr, *remote = nullptr;
+    for (const auto &p : filter.predicates) {
+        if (!p.match.known() || !p.match.value) return result;
+        if (p.kind == "FFAppIdEqual" && !application && p.applications.size() == 1) application = &p;
+        else if (p.kind == "FFRemoteAddressInRange" && !remote && p.remoteRanges.size() == 1) remote = &p;
+        else return result;
+    }
+    if (!application || !remote) return result;
+    result.application = application->applications[0]; result.range = remote->remoteRanges[0];
+    if (!remote->complete || !result.range.first.known() || !result.range.last.known() ||
+        result.range.first.value > result.range.last.value) return result;
+    // Se conserva todo posible competidor antes de rechazar el principal. Nunca
+    // se resuelve un empate mediante índice, orden XML ni ordinal de WFP.
+    for (int other = 0; other < view.candidates.size(); ++other) {
+        if (other == index) continue;
+        const auto &c = view.candidates[other];
+        if (c.kind == "limitRule" || (c.enabled.known() && !c.enabled.value)) continue;
+        if (c.kind != "fwRule") {
+            result.closureCandidates.push_back(c.candidateId);
+            result.interferingCandidates.push_back(c.candidateId);
+            continue;
+        }
+        if (selected.direction.known() && selected.direction.value != Direction::Unknown &&
+            c.direction.known() && c.direction.value != Direction::Unknown &&
+            selected.direction.value != Direction::Both && c.direction.value != Direction::Both &&
+            selected.direction.value != c.direction.value) continue;
+        if (selected.weight.known() && c.weight.known() && c.weight.value < selected.weight.value) continue;
+        result.closureCandidates.push_back(c.candidateId);
+        if (compareConditionalFilter(view, c.filterIndex,
+            result.range.first.value, result.range.last.value, appId, accountSid, originalImage,
+            canonicalApplications) != QNameMatch::No) result.interferingCandidates.push_back(c.candidateId);
+    }
+    if (result.application.sidExplicitNil.known() && result.application.sidExplicitNil.value) {
+        result.reason = "Original AppId has explicit nil SID; its principal scope is unknown";
+        return result;
+    }
+    if (!selected.complete || selected.kind != "fwRule" || !selected.enabled.known() || !selected.enabled.value ||
+        !selected.weight.known() || selected.weight.value < 0 || !selected.action.known() ||
+        (selected.action.value != SourceFwAction::Allow && selected.action.value != SourceFwAction::Deny) ||
+        !selected.direction.known() || selected.direction.value != Direction::Out || !filter.complete ||
+        !applicationSidShape(accountSid) || appId.size() < 4 || appId.size() > 8192 || (appId.size() & 1) ||
+        appId[appId.size()-1] != 0 || appId[appId.size()-2] != 0 || originalImage.isEmpty() ||
+        result.application.packageId.node >= 0 || result.application.serviceName.node >= 0 ||
+        compareApplicationPredicate(*application, appId, accountSid, originalImage, canonicalApplications) != QNameMatch::Yes)
+        return result;
+    if (!result.interferingCandidates.isEmpty()) {
+        result.reason = "An equal, higher or unknown source weight may overlap the original conditional scope";
+        return result;
+    }
+    result.representable = true;
+    result.reason = "Original conditional scope comparison matches; service custody and live admission are still required";
     return result;
 }
 QNameProfileView deriveQNameProfile(const QNameEvidence &evidence, const ImportLimits &limits) {

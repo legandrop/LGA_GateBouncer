@@ -12,6 +12,9 @@ template <typename T> struct SourceFact {
 struct ApplicationConstraint {
     // Sid.Bytes declarado en base64; no acredita SID Windows, cuenta ni identidad host.
     SourceFact<QString> path, sidBytes, packageId, serviceName;
+    // Hecho XML: nil explícito no significa wildcard, cuenta actual ni todos los usuarios.
+    // Known false sólo acompaña a Bytes válidos; la ausencia permanece Unknown.
+    SourceFact<bool> sidExplicitNil;
     bool pathExact = false;
     int node = -1;
     QVector<int> metadataNodes;
@@ -89,6 +92,22 @@ struct QNameApplicationComparison {
 QNameApplicationComparison compareQNameApplicationScope(const QNameProfileView &view, int candidate,
     const QByteArray &appId, const QByteArray &accountSid, const QString &originalImage,
     const QMap<int, QByteArray> &canonicalApplications);
+struct QNameConditionalComparison {
+    bool representable = false;
+    QString reason;
+    QNameCandidateFacts candidate;
+    SourceFact<QString> filterId;
+    ApplicationConstraint application;
+    QNamePredicate::AddressRange range;
+    int sourceOrdinal = -1;
+    QStringList closureCandidates, interferingCandidates;
+};
+// Re-deriva el candidato/closure del mismo grafo retenido, sin aceptar una vista
+// editada como fuente. Es comparación declarativa, nunca admisión ni autorización.
+// El productor debe custodiar su original y comparar su captura antes de APT2/CAS.
+QNameConditionalComparison compareQNameConditionalScope(const QNameEvidence &original, const QString &candidateId,
+    const QByteArray &appId, const QByteArray &accountSid, const QString &originalImage,
+    const QMap<int, QByteArray> &canonicalApplications, const ImportLimits &limits = {});
 struct QNameImportResult {
     ImportReport report;
     std::optional<QNameEvidence> evidence;
