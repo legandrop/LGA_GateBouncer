@@ -595,10 +595,10 @@ StoreResult ReviewStore::save(const ReviewDocument &document, quint64 expectedRe
     ReviewDocument validated;
     if (!documentRead(object, validated)) return failure(StoreStatus::Invalid, "Invalid review data");
     const auto bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
-    if (object["schemaVersion"] == 3) {
+    if (object["schemaVersion"] == 2 || object["schemaVersion"] == 3) {
         const auto preflight = scanReviewJson(bytes);
         if (!preflight.syntax || !preflight.schema2Budget)
-            return failure(StoreStatus::Invalid, "History exceeds the preflight limits");
+            return failure(StoreStatus::Invalid, "Review exceeds the preflight limits");
     }
     if (bytes.size() > storeByteLimit || bytes.size() > jsonBound) return failure(StoreStatus::Invalid, "Review exceeds the size limit");
     QSaveFile file(path_);

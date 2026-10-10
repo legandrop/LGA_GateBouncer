@@ -119,17 +119,19 @@ struct Scanner {
         const char c = bytes[at];
         if (c == '"') return string();
         if (c == '{') {
-            ++at; charge(0, 16); space(); if (take('}')) return true;
+            // Cota de JSON compacto: delimitadores/colon/comas reales, como el codec.
+            ++at; charge(0, 2); space(); if (take('}')) return true;
             while (true) {
                 QString key; if (!string(depth == 0 ? &key : nullptr) || !take(':')) return false;
-                charge(0, 4); if (!value(depth + 1, depth == 0 && key == "schemaVersion")) return false;
+                charge(0, 1); if (!value(depth + 1, depth == 0 && key == "schemaVersion")) return false;
                 if (take('}')) return true;
                 if (!take(',')) return false;
+                charge(0, 1);
             }
         }
         if (c == '[') {
-            ++at; charge(0, 16); if (take(']')) return true;
-            while (true) { charge(0, 4); if (!value(depth + 1)) return false; if (take(']')) return true; if (!take(',')) return false; }
+            ++at; charge(0, 2); if (take(']')) return true;
+            while (true) { if (!value(depth + 1)) return false; if (take(']')) return true; if (!take(',')) return false; charge(0, 1); }
         }
         if (c == 't' || c == 'f' || c == 'n') {
             const QByteArray word = c == 't' ? "true" : c == 'f' ? "false" : "null";
