@@ -182,6 +182,7 @@ class ProductController final : public QObject {
     Data::ReviewDocument review_;
     Data::ActivityHistory history_;
     QTimer historyFlush_;
+    QTimer administrativeHistoryNotify_;
     bool historyDirty_ = false, flushingHistory_ = false;
     QString historyError_;
     Data::ImportReport draft_;

@@ -1000,7 +1000,7 @@ void MainWindow::updatePageState() {
             const auto labels = panel->findChildren<QLabel *>();
             if (labels.size() == 2) labels.last()->setText(client->current()
                 ? client->administrative()
-                    ? "Review original target applications and accounts. Always rules cover future connections; Once, app-instance and timed decisions are Unsupported. Protection coverage has not been validated."
+                    ? "Review requests for each application and account. Choose a connection, app-instance or future-connection rule when the request supports it. Protection coverage has not been validated."
                     : "Review each request to choose Allow or Block and how long it applies. Always rules cover future connections for this application and account. Protection coverage has not been validated."
                 : !product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent()
                     ? "View request snapshot · read only. These requests use the separate administrator reviewer; coverage remains unvalidated."
@@ -1396,7 +1396,9 @@ void MainWindow::refreshTable(bool newPage) {
                     : e.kind == Data::ActivityKind::Authorization
                         ? (n.routeMask == 7 ? "Decision recorded · traffic recorded separately" : "Decision recorded · traffic unknown")
                     : n.source == 2 ? "Request recorded · traffic unknown" : "Blocked request reported · limited history";
-                const QString image = n.process ? n.process->image.section('\\',-1) + "\nRecorded application" : "Application unknown";
+                const bool administrativeHistory = e.sourceId.startsWith("NativeAdministrativeEvents:");
+                const QString image = (n.process ? n.process->image.section('\\',-1) + "\nRecorded application" : "Application unknown") +
+                    (administrativeHistory ? "\nAdministrative review" : "\nMy account monitoring");
                 result.push_back({"history:" + Data::nativeEventKey(e),
                     {{at + "\nReceived " + received, {}, qulonglong(e.sequence.toULongLong())},
                      {image, {}, {}},
@@ -1736,8 +1738,8 @@ void MainWindow::renderOrdinaryNotice() {
     definition(body, "Target account", recordText(display.principal, "Unknown") +
         (client->administrative() ? " · " + accountText(client->selectedPrincipalSid()) : QString{}));
     if (client->administrative()) {
-        definition(body,"Acting account","Original authenticated administrative session · separate from the target account");
-        body->addWidget(label("Once, this app instance and timed decisions: Unsupported for administrative targets. Current traffic and protection coverage have not been validated.","warning",true));
+        definition(body,"Acting account","Your signed-in administrative account · separate from the target account");
+        body->addWidget(label("Connection and app-instance decisions require a current request. Observed traffic is recorded separately; protection coverage has not been validated.","warning",true));
     }
     definition(body, "Package", scopeValue >= 3 ? "Non-AppContainer process" : package == 1 ? futureScope.package : recordText(display.package, "Unknown"));
     if (!display.path.empty()) {
@@ -1753,14 +1755,13 @@ void MainWindow::renderOrdinaryNotice() {
     l->addWidget(scrollArea(content), 1);
     auto *fields = new QHBoxLayout; fields->setSpacing(9);
     auto *sl = new QVBoxLayout; sl->setSpacing(5); sl->addWidget(label("Apply to", "faint"));
-    auto *scope = combo({"Application + account", client->administrative() ? "This app instance · Unsupported" : "This app instance",
-        client->administrative() ? "Once · Unsupported" : "Once"}, "decision-scope");
-    if (!held || client->administrative()) for (int i : {1, 2}) scope->setItemData(i, 0, Qt::UserRole - 1);
+    auto *scope = combo({"Application + account", "This app instance", "Once"}, "decision-scope");
+    if (!held) for (int i : {1, 2}) scope->setItemData(i, 0, Qt::UserRole - 1);
     scope->setCurrentIndex(scopeValue == 2 ? 0 : scopeValue == 3 ? 2 : 1);
     scope->setEnabled(client->ready()); sl->addWidget(scope); fields->addLayout(sl, 1);
     auto *dl = new QVBoxLayout; dl->setSpacing(5); dl->addWidget(label("Keep this decision", "faint"));
     auto *duration = combo({scopeValue == 3 ? "This connection" : scopeValue == 2 ? "Always" : "Until this instance exits",
-        client->administrative() ? "15 minutes · Unsupported" : "15 minutes"}, "decision-duration");
+        "15 minutes"}, "decision-duration");
     duration->setCurrentIndex(scopeValue == 5 ? 1 : 0);
     duration->setEnabled(client->ready() && scopeValue >= 4); dl->addWidget(duration); fields->addLayout(dl, 1); l->addLayout(fields);
     connect(scope, &QComboBox::currentIndexChanged, this, [client, selection](int index) {
@@ -2238,6 +2239,7 @@ void MainWindow::reviewSourceSelector() {
     auto *bar = line(pageLayout_);
     bar->addWidget(label("Review source","muted"));
     auto *source = combo({"My account", "Administrative accounts"},"principal-review-source");
+    source->setMinimumWidth(source->fontMetrics().horizontalAdvance("Administrative accounts") + 52);
     source->setCurrentIndex(product_.administrativeSelected() ? 1 : 0); bar->addWidget(source); bar->addStretch();
     connect(source,&QComboBox::currentIndexChanged,this,[this,source](int index) {
         if (!product_.selectAdministrative(index == 1)) {
@@ -2253,13 +2255,13 @@ void MainWindow::reviewSourceSelector() {
     pageLayout_->addWidget(search);
     connect(search,&QLineEdit::textChanged,this,[this](const QString &text) { query_ = text; refreshTable(); });
     pageLayout_->addWidget(label(product_.administrativeSelected()
-        ? "Uses an existing admitted administrative token and the original service catalog. No elevation is requested. The acting account is separate from each target account. Once, app-instance and timed decisions are Unsupported; current traffic is unavailable."
-        : "Review requests and application rules for your account. Administrative review uses a separate original session.","faint",true));
+        ? "Review other accounts using your current administrative sign-in. Your acting account is separate from each target account. Monitoring starts with this review session; missing application identity stays Unknown."
+        : "Review requests and application rules for your account. Administrative review uses a separate signed-in session.","faint",true));
 }
 void MainWindow::renderLive() {
     if (view_ == "pending" || view_ == "rules") reviewSourceSelector();
     if (product_.administrativeSelected() && (view_ == "processes" || view_ == "activity"))
-        pageLayout_->addWidget(note("This page retains its existing process or history source. Administrative target traffic and history are unavailable; administrative requests do not enter the account's history stream."));
+        pageLayout_->addWidget(note("Administrative history is recorded in a separate review session. Application identity is Unknown when no identity records are available; these records do not change the current process list."));
     const auto named = [](QLabel *text, const char *name) { text->setObjectName(name); return text; };
     if (view_ != "settings") pageLayout_->addWidget(note("Process and activity records are read only. Review pending access requests to choose Allow or Block. Protection coverage has not been validated.", true));
     if (view_ == "processes") {
@@ -2286,7 +2288,7 @@ void MainWindow::renderLive() {
         pageLayout_->addWidget(named(label(product_.ordinary()->message(), "muted", true),"ordinary-page-message"));
         auto *contextNote = note(product_.ordinary()->current()
             ? product_.administrativeSelected()
-                ? "Review original target applications and accounts. Always rules cover future connections; Once, app-instance and timed decisions are Unsupported. Protection coverage has not been validated."
+                ? "Review requests for each application and account. Choose a connection, app-instance or future-connection rule when the request supports it. Protection coverage has not been validated."
                 : "Review each request to choose Allow or Block and how long it applies. Always rules cover future connections for this application and account. Protection coverage has not been validated."
             : !product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent()
                 ? "View request snapshot · read only. These requests use the separate administrator reviewer; coverage remains unvalidated."

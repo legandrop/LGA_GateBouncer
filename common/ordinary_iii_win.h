@@ -44,29 +44,83 @@ public:
         }
         request.minor = 3; request.connection = connection_; request.sequence = tx_++;
         if (wire::zero(request.correlation)) request.correlation = native::randomIdentity();
-        wire::Frame received;
-        if (!ii::send(pipe_.value, request, nullptr) || !ii::receive(pipe_.value, received, nullptr) ||
-            received.minor != 3 || received.connection != connection_ || received.sequence != rx_++ ||
-            received.correlation != request.correlation ||
-            (received.type != wire::Type::ProtocolError &&
-             wire::idValue(received, wire::Tag::ServiceEpoch) != wire::idValue(hello_, wire::Tag::ServiceEpoch)) ||
-            (received.type == wire::Type::Status && !statusContext(received)) || !authenticated()) {
-            close(); return false;
+        if (!ii::send(pipe_.value, request, nullptr)) return failedRead();
+        const auto started = GetTickCount64();
+        for (unsigned count = 0; count <= EventLimit; ++count) {
+            wire::Frame received;
+            if (GetTickCount64() - started >= 5000 || !receive(received)) return failedRead();
+            if (event(received)) {
+                wire::Bytes encoded;
+                if (!eventShape(received) || buffered_.size() >= EventLimit ||
+                    wire::encode(received, encoded) != wire::Error::Ok || encoded.size() > ByteLimit - bufferedBytes_)
+                    return failedRead();
+                bufferedBytes_ += encoded.size(); buffered_.push_back(std::move(received)); continue;
+            }
+            if (received.correlation != request.correlation ||
+                (received.type == wire::Type::Status && !statusContext(received))) return failedRead();
+            response = std::move(received); return true;
         }
-        response = std::move(received);
-        return true;
+        return failedRead();
     }
     bool events(std::vector<wire::Frame> &batch) override {
-        batch.clear(); return authenticated(); // Sin suscripción inventada por este canal.
+        std::size_t bytes = bufferedBytes_;
+        takeBuffered(batch);
+        if (!authenticated()) return failedRead();
+        const auto started = GetTickCount64();
+        while (batch.size() < EventLimit && bytes <= ByteLimit - wire::MaxFrameBytes &&
+               GetTickCount64() - started < 5000) {
+            DWORD available = 0;
+            if (!PeekNamedPipe(pipe_.value,nullptr,0,nullptr,&available,nullptr)) return failedRead();
+            if (!available) break;
+            wire::Frame received; wire::Bytes encoded;
+            if (!receive(received) || !eventShape(received) ||
+                wire::encode(received,encoded) != wire::Error::Ok) return failedRead();
+            bytes += encoded.size(); batch.push_back(std::move(received));
+        }
+        return authenticated() || failedRead();
+    }
+    // El worker entrega estos frames antes de la respuesta: un ACK nuevo nunca
+    // cambia retrospectivamente la máscara de los eventos ya recibidos.
+    void takeBuffered(std::vector<wire::Frame> &batch) {
+        batch = std::move(buffered_); buffered_.clear(); bufferedBytes_ = 0;
     }
     void close() override {
         pipe_.reset(); server_ = {}; connection_ = {}; hello_ = {}; tx_ = rx_ = 1; deployment_.reset();
+        buffered_.clear(); bufferedBytes_ = 0;
     }
     const wire::Frame &hello() const override { return hello_; }
+    wire::Id administrativeConnection() const {
+        return role_ == IntentRole::Administrative && actualOsAuthenticated() ? connection_ : wire::Id{};
+    }
     bool actualOsAuthenticated() const override {
         return bool(pipe_) && !wire::zero(connection_);
     }
 private:
+    static constexpr std::size_t EventLimit = 512, ByteLimit = 2 * 1024 * 1024;
+    std::vector<wire::Frame> buffered_;
+    std::size_t bufferedBytes_ = 0;
+    static bool event(const wire::Frame &f) {
+        return f.type == wire::Type::Attempt || f.type == wire::Type::Authorization ||
+            f.type == wire::Type::Traffic || f.type == wire::Type::ObservationGap;
+    }
+    bool eventShape(const wire::Frame &f) const {
+        return role_ == IntentRole::Administrative && event(f) &&
+            wire::iv::validate(f) == wire::Error::Ok && wire::get(f,wire::Tag::Source) == 2;
+    }
+    bool receive(wire::Frame &f) {
+        if (rx_ == UINT64_MAX || !ii::receive(pipe_.value,f,nullptr) || f.minor != 3 ||
+            f.connection != connection_ || f.sequence != rx_ ||
+            (f.type != wire::Type::ProtocolError &&
+             wire::idValue(f,wire::Tag::ServiceEpoch) != wire::idValue(hello_,wire::Tag::ServiceEpoch)) ||
+            !authenticated()) return false;
+        ++rx_; return true;
+    }
+    bool failedRead() {
+        // Conserva sólo las observaciones autenticadas anteriores al fallo para
+        // entregarlas antes del Gap local. Ningún handle/lease sobrevive al cierre.
+        auto retained = std::move(buffered_); const auto bytes = bufferedBytes_;
+        close(); buffered_ = std::move(retained); bufferedBytes_ = bytes; return false;
+    }
     const IntentRole role_;
     bool authenticated() {
         native::ProcessEvidence acquired;

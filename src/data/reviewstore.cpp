@@ -191,15 +191,21 @@ bool reportRead(const QJsonValue &value, ImportReport &report) {
     return report.accepted || (report.candidates.isEmpty() && report.filters.isEmpty() && report.identities.isEmpty());
 }
 QJsonObject bindingJson(const NativeSourceBinding &b) {
-    return {{"service", b.serviceEpoch}, {"boot", b.boot}, {"engine", b.engineContext},
+    QJsonObject o{{"service", b.serviceEpoch}, {"boot", b.boot}, {"engine", b.engineContext},
         {"source", b.sourceEpoch}, {"generation", QString::number(b.generation)}, {"profile", QString::number(b.profile)}};
+    if (b.role == 2) { o["role"] = 2; o["connection"] = b.connection; }
+    return o;
 }
-bool bindingRead(const QJsonValue &value, NativeSourceBinding &b) {
+bool bindingRead(const QJsonValue &value, NativeSourceBinding &b, bool administrativeAllowed) {
     if (!value.isObject()) return false;
     const auto o = value.toObject();
     b.serviceEpoch = o["service"].toString(); b.boot = o["boot"].toString();
     b.engineContext = o["engine"].toString(); b.sourceEpoch = o["source"].toString();
-    return o.size() == 6 && decimalUnsigned(o["generation"].toString(), &b.generation) &&
+    if (o.size() == 8) {
+        if (!administrativeAllowed || !o["role"].isDouble() || o["role"].toDouble() != 2 || !o["connection"].isString()) return false;
+        b.role = 2; b.connection = o["connection"].toString();
+    } else if (o.size() != 6 || o.contains("role") || o.contains("connection")) return false;
+    return decimalUnsigned(o["generation"].toString(), &b.generation) &&
         decimalUnsigned(o["profile"].toString(), &b.profile) && validNativeBinding(b);
 }
 QJsonObject processJson(const NativeProcessFacts &f) {
@@ -340,7 +346,7 @@ QJsonObject historyJson(const HistoryState &state) {
     }
     return result;
 }
-bool historyRead(const QJsonValue &value, HistoryState &state, bool nativeAllowed = false) {
+bool historyRead(const QJsonValue &value, HistoryState &state, bool nativeAllowed = false, bool administrativeAllowed = false) {
     if (!value.isObject()) return false;
     const auto object = value.toObject();
     if (!object["events"].isArray() || object["events"].toArray().size() > 4096 ||
@@ -365,7 +371,7 @@ bool historyRead(const QJsonValue &value, HistoryState &state, bool nativeAllowe
         source.status = CoverageStatus(row["status"].toInt());
         if (row.contains("native")) {
             NativeSourceBinding binding;
-            if (!nativeAllowed || source.synthetic || !bindingRead(row["native"], binding) ||
+            if (!nativeAllowed || source.synthetic || !bindingRead(row["native"], binding, administrativeAllowed) ||
                 source.sourceId != nativeSourceId(binding) || source.sourceEpoch != nativeEpochKey(binding)) return false;
             source.native = binding;
         }
@@ -499,11 +505,12 @@ bool boundedJson(const QJsonValue &value, int depth, int &count) {
 }
 bool documentRead(const QJsonObject &object, ReviewDocument &document) {
     int count = 0;
-    const bool native = object["schemaVersion"] == 3;
+    const bool administrative = object["schemaVersion"] == 4;
+    const bool native = object["schemaVersion"] == 3 || administrative;
     const bool qname = object["schemaVersion"] == 2 || (native && object.contains("qnameEvidence"));
     if (!(boundedJson(object, 0, count) && (object["schemaVersion"] == 1 || qname || native) &&
            decimalUnsigned(object["storeRevision"].toString(), &document.revision) &&
-           reportRead(object["report"], document.report) && historyRead(object["history"], document.history, native))) return false;
+           reportRead(object["report"], document.report) && historyRead(object["history"], document.history, native, administrative))) return false;
     if (!qname) return true;
     QNameEvidence evidence;
     if (!qnameEvidenceRead(object["qnameEvidence"], evidence)) return false;
@@ -513,7 +520,9 @@ bool documentRead(const QJsonObject &object, ReviewDocument &document) {
 QJsonObject documentJson(const ReviewDocument &document) {
     const bool native = std::any_of(document.history.coverage.begin(), document.history.coverage.end(),
                                    [](const Coverage &c) { return bool(c.native); });
-    QJsonObject object{{"schemaVersion", native ? 3 : document.qnameEvidence ? 2 : 1}, {"storeRevision", QString::number(document.revision)},
+    const bool administrative = std::any_of(document.history.coverage.begin(),document.history.coverage.end(),
+                                   [](const Coverage &c) { return c.native && c.native->role == 2; });
+    QJsonObject object{{"schemaVersion", administrative ? 4 : native ? 3 : document.qnameEvidence ? 2 : 1}, {"storeRevision", QString::number(document.revision)},
             {"report", reportJson(document.report)}, {"history", historyJson(document.history)}};
     if (document.qnameEvidence) object["qnameEvidence"] = qnameEvidenceJson(*document.qnameEvidence);
     return object;
@@ -563,14 +572,14 @@ StoreResult ReviewStore::load() {
     if (file.error() != QFileDevice::NoError) return failure(StoreStatus::IoError, "Read did not complete");
     if (bytes.size() > storeByteLimit) return failure(StoreStatus::Corrupt, "Review exceeds the size limit");
     const auto preflight = scanReviewJson(bytes);
-    if (!preflight.syntax || ((preflight.schema == 2 || preflight.schema == 3) && !preflight.schema2Budget))
+    if (!preflight.syntax || ((preflight.schema == 2 || preflight.schema == 3 || preflight.schema == 4) && !preflight.schema2Budget))
         return failure(StoreStatus::Corrupt, "Review failed preflight; the file has been preserved");
     QJsonParseError error;
     const auto parsed = QJsonDocument::fromJson(bytes, &error);
     if (error.error != QJsonParseError::NoError || !parsed.isObject())
         return failure(StoreStatus::Corrupt, "Review is corrupt; the file has been preserved");
     const auto object = parsed.object();
-    if (object["schemaVersion"].isDouble() && object["schemaVersion"].toDouble() > 3)
+    if (object["schemaVersion"].isDouble() && object["schemaVersion"].toDouble() > 4)
         return failure(StoreStatus::FutureSchema, "Review uses a newer format; the file has been preserved");
     ReviewDocument document;
     if (!documentRead(object, document)) return failure(StoreStatus::Corrupt, "Review is invalid; the file has been preserved");
@@ -597,7 +606,7 @@ StoreResult ReviewStore::save(const ReviewDocument &document, quint64 expectedRe
     ReviewDocument validated;
     if (!documentRead(object, validated)) return failure(StoreStatus::Invalid, "Invalid review data");
     const auto bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
-    if (object["schemaVersion"] == 2 || object["schemaVersion"] == 3) {
+    if (object["schemaVersion"] == 2 || object["schemaVersion"] == 3 || object["schemaVersion"] == 4) {
         const auto preflight = scanReviewJson(bytes);
         if (!preflight.syntax || !preflight.schema2Budget)
             return failure(StoreStatus::Invalid, "Review exceeds the preflight limits");

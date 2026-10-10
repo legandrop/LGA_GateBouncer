@@ -30,6 +30,7 @@ class OrdinaryDecisionClient final : public QObject {
     explicit OrdinaryDecisionClient(bool isolatedQa, QObject *parent = nullptr,
                                     std::unique_ptr<gb::ipc::ii::SessionChannel> channel = {}, bool administrative = false);
     bool administrative() const { return administrative_; }
+    void rejectHistory(const QString &reason);
     const auto &selectedPrincipalSid() const { return selectedSid_; }
     const auto &selectedOriginalTarget() const { return selectedTarget_; }
     void pauseAutomatic();
@@ -70,6 +71,11 @@ class OrdinaryDecisionClient final : public QObject {
     gb::wire::Id command() const { return command_; }
   signals:
     void changed();
+    void nativeSourceOpened(const Gate::Data::NativeSourceBinding &binding, quint64 baseline);
+    void nativeEvent(const Gate::Data::ActivityEvent &event);
+    void nativeGap(const Gate::Data::NativeSourceBinding &binding, quint64 after, quint64 resync,
+                   quint64 revision, quint8 reason, bool lostKnown, quint64 lost);
+    void nativeSourceLost(const Gate::Data::NativeSourceBinding &binding, const QString &reason);
   private:
     friend class ProductController;
     bool prepareFile(std::shared_ptr<Data::SelectedApplicationFile>, int direction,
@@ -90,6 +96,10 @@ class OrdinaryDecisionClient final : public QObject {
     void fail(const QString &, bool uncertain = false);
     void showNext();
     void automaticRead();
+    std::optional<Data::NativeSourceBinding> nativeBinding(const gb::wire::Frame &) const;
+    void observation(gb::wire::Frame);
+    void streamRead();
+    void endNativeSource(const QString &reason);
     gb::controller::OrdinarySession session_;
     const bool administrative_;
     gb::wire::Bytes selectedSid_, selectedTarget_;
@@ -122,8 +132,16 @@ class OrdinaryDecisionClient final : public QObject {
     quint64 capabilities_ = 0;
     std::optional<SubmittedPresentation> submitted_;
     QElapsedTimer pageAge_, draftAge_;
+    QElapsedTimer streamStatusAge_;
     QTimer draftExpiry_;
     QTimer poll_;
+    QTimer streamPoll_;
+    std::optional<Data::NativeSourceBinding> nativeSource_;
+    quint64 lastEvent_ = 0, requestedAfter_ = 0;
+    quint8 nativeMask_ = 3, requestedMask_ = 3;
+    int streamPollMs_ = 100;
+    bool subscribed_ = false, requestOutstanding_ = false;
+    bool initialSubscription_ = false, streamStatus_ = false;
     bool automatic_ = false;
     using ShownKey = std::tuple<gb::wire::Id, gb::wire::Id, gb::wire::Id, quint64, quint64>;
     std::map<gb::wire::Id, ShownKey> shown_;

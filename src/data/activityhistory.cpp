@@ -36,6 +36,8 @@ void update(std::optional<EventFact> &target, const ActivityEvent &event) {
 }
 } // namespace
 QString nativeSourceId(const NativeSourceBinding &b) {
+    if (b.role == 2) return "NativeAdministrativeEvents:" + b.serviceEpoch + ':' +
+        QString::number(b.profile) + ":2:" + b.connection;
     return "NativePrincipalEvents:" + b.serviceEpoch + ':' + QString::number(b.profile);
 }
 QString nativeEpochKey(const NativeSourceBinding &b) {
@@ -46,7 +48,8 @@ QString nativeEventKey(const ActivityEvent &e) {
 }
 bool validNativeBinding(const NativeSourceBinding &b) {
     return id(b.serviceEpoch) && id(b.boot) && id(b.engineContext) &&
-        b.sourceEpoch == b.engineContext && b.generation && b.profile;
+        b.sourceEpoch == b.engineContext && b.generation && b.profile &&
+        ((b.role == 0 && b.connection.isEmpty()) || (b.role == 2 && id(b.connection)));
 }
 bool validNativeProcessFacts(const NativeProcessFacts &f) {
     const auto sid = [](const QByteArray &b) {
@@ -74,6 +77,8 @@ bool validNativeEvent(const ActivityEvent &e) {
         !e.requestId.isEmpty() || !e.flowId.isEmpty() || !e.winningRuleId.isEmpty() ||
         !e.winningRuleRevision.isEmpty() || !e.endpoint.isEmpty()) return false;
     const auto &n = *e.native;
+    const bool administrative = e.sourceId.startsWith("NativeAdministrativeEvents:");
+    if (administrative && !e.sourceId.endsWith(":2:" + n.connection)) return false;
     quint64 seq = 0;
     if (!decimalUnsigned(e.sequence, &seq) || !seq || !id(n.connection) || !id(n.observed) ||
         !id(n.captureBinding) || !n.observedRevision || (n.presence & ~7ull) ||
@@ -96,7 +101,9 @@ bool validNativeEvent(const ActivityEvent &e) {
         n.effectiveRevision && n.scope >= 3 && n.scope <= 5 && n.durable && n.currentEffect;
     if (e.kind == ActivityKind::Authorization)
         return applied && e.action && (*e.action == Action::Allow || *e.action == Action::Block) &&
-            (n.routeMask == 7 || !(n.presence & 1)) && !e.bytes && !n.packetCount && !n.packetDirection;
+            (n.routeMask == 7 || !(n.presence & 1) ||
+             administrative) &&
+            !e.bytes && !n.packetCount && !n.packetDirection;
     return e.kind == ActivityKind::Traffic && applied && !e.action && n.routeMask == 7 &&
         (n.presence == 3 || n.presence == 7) && e.bytes.has_value() && n.packetCount &&
         (n.packetDirection == 1 || n.packetDirection == 2);
@@ -183,7 +190,8 @@ bool validNativeHistory(const HistoryState &s) {
         for (const auto &c : s.coverage)
             if (c.native && !c.synthetic && validNativeBinding(*c.native) &&
                 c.sourceId == nativeSourceId(*c.native) && c.sourceEpoch == nativeEpochKey(*c.native) &&
-                e.sourceId == c.sourceId && e.sourceEpoch == c.sourceEpoch && seq <= c.lastSequence) return true;
+                e.sourceId == c.sourceId && e.sourceEpoch == c.sourceEpoch && seq <= c.lastSequence &&
+                (c.native->role != 2 || e.native->connection == c.native->connection)) return true;
         return false;
     };
     for (auto it = s.nativeAttempts.begin(); it != s.nativeAttempts.end(); ++it)
@@ -331,7 +339,8 @@ bool ActivityHistory::ingest(const ActivityEvent &event) {
     auto *coverage = source(event.sourceId, event.sourceEpoch);
     if (event.native) {
         if (!coverage || coverage->synthetic || !coverage->native ||
-            coverage->status == CoverageStatus::Unavailable || !validNativeEvent(event)) return false;
+            coverage->status == CoverageStatus::Unavailable || !validNativeEvent(event) ||
+            (coverage->native->role == 2 && event.native->connection != coverage->native->connection)) return false;
         if (event.kind == ActivityKind::Traffic)
             coverage->declaredScope = "Retained principal causes, causal applied decisions and OS layer activity";
         const auto key = sequenceKey(event.sourceId, event.sourceEpoch);

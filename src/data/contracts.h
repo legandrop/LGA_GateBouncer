@@ -89,10 +89,14 @@ struct ImportLimits {
 struct NativeSourceBinding {
     QString serviceEpoch, boot, engineContext, sourceEpoch;
     quint64 generation = 0, profile = 0;
+    // Copia descriptiva del HelloAck administrativo; nunca reconstruye su peer.
+    quint8 role = 0;
+    QString connection;
     bool operator==(const NativeSourceBinding &other) const {
         return serviceEpoch == other.serviceEpoch && boot == other.boot &&
             engineContext == other.engineContext && sourceEpoch == other.sourceEpoch &&
-            generation == other.generation && profile == other.profile;
+            generation == other.generation && profile == other.profile &&
+            role == other.role && connection == other.connection;
     }
 };
 struct NativeEvidence {

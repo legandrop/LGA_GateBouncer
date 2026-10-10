@@ -201,7 +201,7 @@ bool factBudget(QNameBudget &b, const EventFact &f) {
 ReviewJsonPreflight scanReviewJson(const QByteArray &bytes) {
     if (bytes.size() > QNameBudget::byteLimit) return {};
     const int schema = dispatchSchema(bytes);
-    if (schema != 2 && schema != 3) return {true, false, schema};
+    if (schema != 2 && schema != 3 && schema != 4) return {true, false, schema};
     Scanner s{bytes};
     const bool syntax = s.value(0); s.space();
     return {syntax && s.at == bytes.size() && s.versions == 1 && s.schema == schema, s.budget, s.schema};
@@ -255,6 +255,9 @@ bool budgetQNameReview(const ReviewDocument &d, qint64 *bound) {
             c.checkpointUtc.toUTC().toString(Qt::ISODateWithMs), c.lastObservedUtc.toUTC().toString(Qt::ISODateWithMs)}) || c.gaps.size() > 128) return false;
         if (c.native && (!fixed(b, 96, 1024) || !strings(b, {c.native->serviceEpoch, c.native->boot,
             c.native->engineContext, c.native->sourceEpoch}))) return false;
+        // Shape8 solamente: keys/valor (46 unidades), dos ':'/',' y role2.
+        if (c.native && c.native->role == 2 &&
+            (!strings(b, {"role", "connection", c.native->connection}) || !b.structure(5))) return false;
         for (const auto &gap : c.gaps) if (!fixed(b, c.native ? 96 : 32, c.native ? 1024 : 512) ||
             !strings(b, {gap.reason, gap.atUtc.toUTC().toString(Qt::ISODateWithMs)})) return false;
     }

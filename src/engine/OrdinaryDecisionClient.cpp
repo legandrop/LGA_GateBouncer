@@ -1,4 +1,5 @@
 #include "OrdinaryDecisionClient.h"
+#include "../data/activityhistory.h"
 #include <ordinary_iii_win.h>
 #include <QCoreApplication>
 #include <QDir>
@@ -34,6 +35,16 @@ OrdinaryDecisionClient::OrdinaryDecisionClient(bool isolatedQa, QObject *parent,
     : QObject(parent), session_(this, channelFor(isolatedQa, std::move(channel), administrative)), administrative_(administrative) {
     connect(&session_, &gb::controller::OrdinarySession::opened, this, &OrdinaryDecisionClient::opened);
     connect(&session_, &gb::controller::OrdinarySession::received, this, &OrdinaryDecisionClient::received);
+    connect(&session_, &gb::controller::OrdinarySession::observation, this, &OrdinaryDecisionClient::observation);
+    streamPoll_.setSingleShot(true);
+    connect(&streamPoll_, &QTimer::timeout, this, &OrdinaryDecisionClient::streamRead);
+    connect(&session_, &gb::controller::OrdinarySession::observationsRead,this,[this](bool ok,unsigned count) {
+        if (stopping_ || !administrative_ || !automatic_) return;
+        if (!ok) { connected_ = false; endNativeSource("ObservationConnectionLost");
+            fail("Monitoring connection lost. Saved history remains available.",state_ == State::Sending || state_ == State::Uncertain); return; }
+        streamPollMs_ = count ? 100 : std::min(1000,streamPollMs_ * 2);
+        streamPoll_.start(streamPollMs_);
+    });
     draftExpiry_.setSingleShot(true);
     connect(&draftExpiry_, &QTimer::timeout, this, [this] {
         if (state_ == State::Ready) { draft_.reset(); fileDraft_.reset(); state_ = State::Failed;
@@ -69,9 +80,14 @@ void OrdinaryDecisionClient::automaticRead() {
 void OrdinaryDecisionClient::startAutomatic() {
     if (stopping_) return;
     automatic_ = true; quietPollMs_ = 2000; poll_.start(quietPollMs_);
+    if (administrative_) streamPoll_.start(100);
     if (!visible_ && state_ != State::Sending && state_ != State::Uncertain) refresh();
 }
-void OrdinaryDecisionClient::pauseAutomatic() { automatic_ = false; poll_.stop(); }
+void OrdinaryDecisionClient::pauseAutomatic() {
+    automatic_ = false; poll_.stop(); streamPoll_.stop(); endNativeSource("ObservationPaused");
+    if (administrative_) { connected_ = false; current_ = false; rulesCurrent_ = false;
+        lastEvent_ = 0; session_.closeChannel(); }
+}
 void OrdinaryDecisionClient::showNext() {
     if (!automatic_ || !current_ || visible_ || !session_.idle() || state_ == State::Sending || state_ == State::Uncertain) return;
     for (const auto &row : rows_) {
@@ -197,18 +213,25 @@ bool OrdinaryDecisionClient::status(const Frame &f, bool same) {
     if (f.minor != 3 || iv::validate(f) != Error::Ok ||
         (f.type != Type::HelloAck && f.type != Type::Status) || get(f, Tag::IVProfile) != 1 ||
         (get(f, Tag::Capabilities) & (ObservedRead | FuturePolicyControl)) != (ObservedRead | FuturePolicyControl) ||
-        (administrative_ && !(get(f,Tag::Capabilities) & iv::AdministrativePrincipalControl)) ||
+        (administrative_ && (!(get(f,Tag::Capabilities) & iv::AdministrativePrincipalControl) ||
+            session_.administrativeConnection() != f.connection)) ||
         zero(idValue(f, Tag::SourceEpoch)) || !get(f, Tag::ProfileGeneration) ||
         get(f, Tag::EffectiveKnown) || get(f, Tag::EffectiveRev)) return false;
     const auto *context = find(f, Tag::ServiceContext);
     std::uint64_t binding = 0;
     for (unsigned i = 0; i != 8; ++i) binding |= std::uint64_t(context->bytes[48 + i]) << (i * 8);
-    if (!binding || (same && (f.connection != connection_ || idValue(f, Tag::ServiceEpoch) != epoch_ ||
-        idValue(f, Tag::BootId) != boot_ || idValue(f, Tag::SourceEpoch) != source_ ||
-        get(f, Tag::ProfileGeneration) != profile_ || get(f, Tag::DesiredRev) != desired_ || binding != bindingGeneration_))) return false;
+    const bool contextChanged = connection_ != f.connection || epoch_ != idValue(f,Tag::ServiceEpoch) ||
+        boot_ != idValue(f,Tag::BootId) || source_ != idValue(f,Tag::SourceEpoch) ||
+        profile_ != get(f,Tag::ProfileGeneration) || bindingGeneration_ != binding;
+    if (contextChanged) { endNativeSource("ObservationContextChanged"); lastEvent_ = 0; }
+    if (!binding || (same && (contextChanged || get(f,Tag::DesiredRev) != desired_))) return false;
     connection_ = f.connection; epoch_ = idValue(f, Tag::ServiceEpoch); boot_ = idValue(f, Tag::BootId);
     source_ = idValue(f, Tag::SourceEpoch); profile_ = get(f, Tag::ProfileGeneration);
-    desired_ = get(f, Tag::DesiredRev); bindingGeneration_ = binding; capabilities_ = get(f,Tag::Capabilities); return !zero(connection_);
+    desired_ = get(f, Tag::DesiredRev); bindingGeneration_ = binding; capabilities_ = get(f,Tag::Capabilities);
+    streamStatusAge_.restart();
+    if (nativeSource_ && !(capabilities_ & iv::NativeEvents)) { endNativeSource("ObservationCapabilityLost"); lastEvent_ = 0; }
+    if (administrative_ && automatic_ && !streamPoll_.isActive()) streamPoll_.start(100);
+    return !zero(connection_);
 }
 void OrdinaryDecisionClient::opened(bool ok, Frame f) {
     if (stopping_) return;
@@ -219,12 +242,24 @@ void OrdinaryDecisionClient::opened(bool ok, Frame f) {
             (administrative_ && !(get(f,Tag::Capabilities) & iv::AdministrativePrincipalControl))) {
             connected_ = false; fail("The service that received this decision is unavailable. Its result remains unknown.", true); return;
         }
-        connected_ = true; connection_ = f.connection;
+        if (administrative_ && session_.administrativeConnection() != f.connection) {
+            connected_ = false; fail("Administrative sign-in unavailable. The recorded result remains unknown.",true); return;
+        }
+        connected_ = true; connection_ = f.connection; capabilities_ = 0;
         send(Type::GetFutureCommandStatus, {value(Tag::CommandId, command_)}); return;
     }
     if (state_ != State::Loading) return;
     if (!ok || f.type != Type::HelloAck || !status(f, false)) { fail("Request review unavailable. Check the service connection."); return; }
-    connected_ = true; send(Type::GetStatus);
+    connected_ = true;
+    if (administrative_ && (capabilities_ & iv::NativeEvents)) {
+        // Antes de Get26/Prepare: conserva la primera causa que el propio peer
+        // publicará. La lectura inicial no parte de un cursor del archivo.
+        initialSubscription_ = true; requestedAfter_ = 0;
+        requestedMask_ = capabilities_ & iv::NativeTraffic ? 7 : 3;
+        send(Type::SubscribeEvents,{value(Tag::EventMask,requestedMask_,4),value(Tag::AfterEventSeq,0),
+            value(Tag::ProfileGeneration,profile_),value(Tag::SourceEpoch,source_)}); return;
+    }
+    send(Type::GetStatus);
 }
 bool OrdinaryDecisionClient::send(Type type, std::vector<Field> fields) {
     Frame f; f.minor = 3; f.type = type; f.connection = connection_; f.correlation = freshId();
@@ -251,6 +286,7 @@ bool OrdinaryDecisionClient::send(Type type, std::vector<Field> fields) {
     if (iv::validate(f) != Error::Ok || !session_.request(std::move(f), generation_)) {
         fail("Request review unavailable.", type == Type::CommitFuturePolicy || type == Type::RevokePrincipalRule || type == Type::ReplacePrincipalRule || type == Type::GetFutureCommandStatus); return false;
     }
+    requestOutstanding_ = true;
     return true;
 }
 void OrdinaryDecisionClient::page() {
@@ -279,7 +315,6 @@ bool OrdinaryDecisionClient::direction(int direction) {
     state_ = State::Preparing; message_ = "Checking which connections this rule will cover…"; emit changed(); prepare(); return true;
 }
 bool OrdinaryDecisionClient::scope(int scope) {
-    if (administrative_ && scope >= 3) return false;
     if (!ready() || !session_.idle() || !observed_ || scope < 2 || scope > 5 ||
         (observed_->temporal != 2 && scope != 2)) return false;
     ++generation_; draftExpiry_.stop(); draft_.reset(); scope_ = scope;
@@ -401,6 +436,7 @@ void OrdinaryDecisionClient::outcome(const Frame &f) {
     emit changed();
 }
 void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 generation) {
+    if (correlation == expected_) requestOutstanding_ = false;
     if (stopping_ || generation != generation_ || correlation != expected_) return;
     const bool mutation = expectedType_ == Type::CommitFuturePolicy || expectedType_ == Type::RevokePrincipalRule || expectedType_ == Type::ReplacePrincipalRule || expectedType_ == Type::GetFutureCommandStatus;
     if (!ok || f.minor != 3 || f.connection != connection_ || f.correlation != expected_ || iv::validate(f) != Error::Ok) {
@@ -409,10 +445,38 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
     }
     if (f.type == Type::ProtocolError) {
         const auto error = get(f, Tag::ErrorCode);
+        if (streamStatus_) { connected_ = false; endNativeSource("ObservationStatusChanged"); session_.closeChannel(); }
+        if (expectedType_ == Type::SubscribeEvents) { connected_ = false; endNativeSource("ObservationSubscriptionRejected");
+            session_.closeChannel(); }
         fail(error == unsigned(Error::StoreFailure) || error == unsigned(Error::RecoveryRequired)
             ? commandRecoveryMessage : error == unsigned(Error::ScopeUnsupported)
-            ? "Unsupported: this account has no original connection or app-instance decision bridge."
+            ? "This request does not support the selected connection or app-instance scope."
             : "The service rejected this review.", mutation); return;
+    }
+    if (expectedType_ == Type::SubscribeEvents) {
+        const auto binding = nativeBinding(f);
+        if (!administrative_ || f.type != Type::SubscriptionAck || !binding ||
+            get(f,Tag::SourceCoverage) != 1 || get(f,Tag::EventMask) != requestedMask_ ||
+            (requestedAfter_ && get(f,Tag::EventSeq) != requestedAfter_)) {
+            connected_ = false; endNativeSource("ObservationSubscriptionRejected");
+            fail("Monitoring subscription changed. Saved history remains available."); return;
+        }
+        // El cursor viene sólo de esta conexión viva; nunca se carga del archivo.
+        nativeMask_ = requestedMask_; lastEvent_ = std::max(lastEvent_,get(f,Tag::EventSeq));
+        nativeSource_ = *binding; subscribed_ = true;
+        emit nativeSourceOpened(*binding,lastEvent_);
+        if (!connected_ || !subscribed_) return;
+        if (initialSubscription_) { initialSubscription_ = false; send(Type::GetStatus); return; }
+        if (automatic_ && !stopping_ && subscribed_) streamPoll_.start(100);
+        return;
+    }
+    if (streamStatus_) {
+        streamStatus_ = false;
+        if (f.type != Type::Status || !status(f,false)) {
+            connected_ = false; endNativeSource("ObservationStatusChanged");
+            fail("Monitoring status changed. Saved history remains available."); return;
+        }
+        streamPoll_.start(100); return;
     }
     const bool inventoryReply = expectedType_ == Type::ListObserved || expectedType_ == Type::ListPrincipalRules;
     const bool causeReply = expectedType_ == Type::GetObservedRecord;
@@ -618,7 +682,7 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
             fail("Future review binding changed."); return;
         }
         if (administrative_ && (!find(f,Tag::OriginalTarget) || find(f,Tag::OriginalTarget)->bytes != selectedTarget_ ||
-            !originalTargetDigest(selectedTarget_,rows[0].target) || rows[0].scope != 2)) {
+            !originalTargetDigest(selectedTarget_,rows[0].target))) {
             fail("The draft differs from the original selected application and account."); return;
         }
         draft_ = rows[0];
@@ -634,6 +698,7 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
     fail("Unexpected ordinary response.", mutation);
 }
 void OrdinaryDecisionClient::fail(const QString &message, bool uncertain) {
+    if (!connected_) endNativeSource("ObservationConnectionLost");
     backgroundRead_ = false;
     checkingObservation_ = false;
     checkingObservationAfter_ = false;
@@ -643,10 +708,129 @@ void OrdinaryDecisionClient::fail(const QString &message, bool uncertain) {
     state_ = uncertain ? State::Uncertain : State::Failed; message_ = message; emit changed();
 }
 void OrdinaryDecisionClient::invalidate() {
+    endNativeSource("ObservationInvalidated"); lastEvent_ = 0; streamPoll_.stop();
     poll_.stop(); automatic_ = false;
     if (state_ == State::Sending || state_ == State::Uncertain) { fail("Outcome unknown. The decision will not be repeated.", true); return; }
-    closeNotice(); current_ = false; rulesCurrent_ = false; revocation_.reset(); rows_.clear(); connected_ = false; emit changed();
+    closeNotice(); current_ = false; rulesCurrent_ = false; revocation_.reset(); rows_.clear(); connected_ = false;
+    if (administrative_) session_.closeChannel();
+    emit changed();
 }
 void OrdinaryDecisionClient::stop() { stopping_ = true; poll_.stop(); draftExpiry_.stop(); current_ = false; rulesCurrent_ = false;
+    streamPoll_.stop(); endNativeSource("ObservationStopped");
     fileOwner_.reset(); fileDraft_.reset(); session_.stop(); }
+
+void OrdinaryDecisionClient::endNativeSource(const QString &reason) {
+    subscribed_ = false;
+    initialSubscription_ = false; streamStatus_ = false;
+    if (!nativeSource_) return;
+    const auto binding = *nativeSource_; nativeSource_.reset();
+    emit nativeSourceLost(binding,reason);
+}
+void OrdinaryDecisionClient::rejectHistory(const QString &reason) {
+    connected_ = false; endNativeSource("ObservationEvidenceRejected");
+    session_.closeChannel();
+    fail("History unavailable: " + reason,state_ == State::Sending || state_ == State::Uncertain);
+}
+std::optional<Data::NativeSourceBinding> OrdinaryDecisionClient::nativeBinding(const Frame &f) const {
+    iv::ServiceContext context;
+    if (!administrative_ || !connected_ || f.connection != connection_ || zero(connection_) ||
+        session_.administrativeConnection() != connection_ ||
+        f.minor != 3 || iv::decodeServiceContext(f,context) != Error::Ok ||
+        context.serviceEpoch != epoch_ || context.boot != boot_ || context.engineContext != source_ ||
+        context.engineBindingGeneration != bindingGeneration_ ||
+        get(f,Tag::ProfileGeneration) != profile_ || idValue(f,Tag::SourceEpoch) != source_) return {};
+    const auto text = [](const Id &id) { return QString::fromStdString(hex(id)); };
+    Data::NativeSourceBinding binding;
+    binding.serviceEpoch = text(epoch_); binding.boot = text(boot_);
+    binding.engineContext = text(source_); binding.sourceEpoch = text(source_);
+    binding.generation = bindingGeneration_; binding.profile = profile_;
+    binding.role = 2; binding.connection = text(connection_);
+    return Data::validNativeBinding(binding) ? std::optional<Data::NativeSourceBinding>(binding) : std::nullopt;
+}
+void OrdinaryDecisionClient::streamRead() {
+    if (stopping_ || !administrative_ || !automatic_) return;
+    // Un solo trabajo en el worker. Peek no emite solicitudes periódicas al
+    // servidor; el backoff vacío llega a 1 s y una ráfaga vuelve a 100 ms.
+    if (!connected_ || requestOutstanding_ || !session_.idle()) { streamPoll_.start(200); return; }
+    if (!(capabilities_ & iv::NativeEvents)) { streamPoll_.start(1000); return; }
+    if (subscribed_ && nativeMask_ == 3 && !fileOwner_ && !backgroundRead_ && !checkOnly_ &&
+        (state_ == State::Closed || state_ == State::Recorded || state_ == State::Failed) &&
+        (!streamStatusAge_.isValid() || streamStatusAge_.elapsed() >= 2000)) {
+        // Sólo mientras falta la capacidad Traffic: una lectura auténtica permite
+        // ampliar la suscripción en este mismo peer, sin tocar el recibo visible.
+        streamStatus_ = true;
+        if (!send(Type::GetStatus)) { streamStatus_ = false; streamPoll_.start(1000); }
+        return;
+    }
+    const quint8 mask = capabilities_ & iv::NativeTraffic ? 7 : 3;
+    if (!subscribed_ || mask != nativeMask_) {
+        if (fileOwner_ || backgroundRead_ || checkOnly_ || checkingObservation_ || checkingObservationAfter_ ||
+            state_ == State::Loading || state_ == State::Preparing || state_ == State::Sending || state_ == State::Uncertain) {
+            streamPoll_.start(200); return;
+        }
+        requestedMask_ = mask; requestedAfter_ = lastEvent_;
+        if (!send(Type::SubscribeEvents,{value(Tag::EventMask,mask,4),value(Tag::AfterEventSeq,requestedAfter_),
+            value(Tag::ProfileGeneration,profile_),value(Tag::SourceEpoch,source_)})) streamPoll_.start(1000);
+        return;
+    }
+    if (!session_.pollEvents()) streamPoll_.start(200);
+}
+void OrdinaryDecisionClient::observation(Frame f) {
+    if (stopping_ || !administrative_ || !subscribed_ || !nativeSource_) return;
+    const auto binding = nativeBinding(f);
+    if (!binding || !(*binding == *nativeSource_) || get(f,Tag::Source) != 2 ||
+        (f.type != Type::Attempt && f.type != Type::Authorization && f.type != Type::ObservationGap &&
+         !(nativeMask_ == 7 && f.type == Type::Traffic))) {
+        rejectHistory("The monitoring session or account changed."); return;
+    }
+    const auto seq = get(f,Tag::EventSeq);
+    if (f.type == Type::ObservationGap) {
+        emit nativeGap(*binding,get(f,Tag::AfterEventSeq),seq,get(f,Tag::GapCount),
+            quint8(get(f,Tag::GapReason)),get(f,Tag::LostCountKnown) == 1,get(f,Tag::LostCount));
+    } else {
+        const auto text = [](const Id &id) { return QString::fromStdString(hex(id)); };
+        Data::ActivityEvent event;
+        event.sourceId = Data::nativeSourceId(*binding); event.sourceEpoch = Data::nativeEpochKey(*binding);
+        event.sequence = QString::number(seq); event.receivedAtUtc = QDateTime::currentDateTimeUtc();
+        event.kind = f.type == Type::Attempt ? Data::ActivityKind::Attempt :
+            f.type == Type::Authorization ? Data::ActivityKind::Authorization : Data::ActivityKind::Traffic;
+        Data::NativeEvidence evidence;
+        evidence.connection = text(f.connection); evidence.observed = text(idValue(f,Tag::ObservedId));
+        evidence.captureBinding = text(idValue(f,Tag::CaptureBindingId)); evidence.observedRevision = get(f,Tag::ObservedRevision);
+        evidence.presence = get(f,Tag::Presence); evidence.unixNanoseconds = get(f,Tag::Timestamp);
+        evidence.source = quint8(get(f,Tag::Source)); evidence.direction = quint8(get(f,Tag::FlowDirection));
+        evidence.protocol = quint8(get(f,Tag::Protocol)); evidence.routeMask = nativeMask_;
+        if (evidence.presence & 4) {
+            const auto *records = find(f,Tag::Records); std::vector<iv::ProcessFacts> facts;
+            if (!records || iv::unpack(records->bytes,1,facts) != Error::Ok || facts.size() != 1 || facts[0].pid > UINT32_MAX) {
+                rejectHistory("Application identity records were rejected."); return;
+            }
+            const auto &p = facts.front(); Data::NativeProcessFacts own;
+            const auto bytes = [](const Bytes &b) { return QByteArray(reinterpret_cast<const char *>(b.data()),qsizetype(b.size())); };
+            own.pid = quint32(p.pid); own.created = p.created; own.volumeSerial = p.volumeSerial;
+            own.indexHigh = p.fileIndexHigh; own.indexLow = p.fileIndexLow; own.sizeHigh = p.fileSizeHigh; own.sizeLow = p.fileSizeLow;
+            own.lastWrite = p.lastWrite; own.tokenSession = p.tokenSession; own.appId = bytes(p.appId);
+            own.accountSid = bytes(p.accountSid); own.logonSid = bytes(p.logonSid); own.image = QString::fromUtf8(bytes(p.image));
+            if (own.image.toUtf8() != bytes(p.image) || !Data::validNativeProcessFacts(own)) { rejectHistory("Application identity is unavailable."); return; }
+            evidence.process = std::move(own);
+        }
+        if (evidence.presence & 1) event.observedAtUtc = QDateTime::fromMSecsSinceEpoch(qint64(evidence.unixNanoseconds / 1000000ull),Qt::UTC);
+        if (evidence.presence & 2) event.protocol = evidence.protocol == 6 ? "TCP" : "UDP";
+        event.subjectId = "native:" + event.sourceId + ':' + event.sourceEpoch + ':' + evidence.observed + ':' +
+            evidence.captureBinding + ':' + QString::number(evidence.observedRevision);
+        if (f.type == Type::Authorization || f.type == Type::Traffic) {
+            evidence.command = text(idValue(f,Tag::CommandId)); evidence.attemptSequence = iv::attemptSequence(idValue(f,Tag::AttemptLink));
+            evidence.effectiveRevision = get(f,Tag::EffectiveRev); evidence.scope = quint8(get(f,Tag::ScopeKind));
+            evidence.durable = get(f,Tag::Durable) == 1; evidence.currentEffect = get(f,Tag::ProofState) == 2;
+            if (f.type == Type::Authorization) event.action = get(f,Tag::Decision) == 1 ? Data::Action::Block : Data::Action::Allow;
+            else { event.bytes = get(f,Tag::ByteCount); evidence.packetCount = get(f,Tag::PacketCount);
+                evidence.packetDirection = quint8(get(f,Tag::PacketDirection)); }
+        }
+        event.native = std::move(evidence);
+        if (!Data::validNativeEvent(event)) { rejectHistory("Monitoring evidence shape was rejected."); return; }
+        emit nativeEvent(event);
+        if (event.kind == Data::ActivityKind::Attempt) observationChanged();
+    }
+    if (subscribed_ && nativeSource_ && connected_) lastEvent_ = std::max(lastEvent_,seq);
+}
 }

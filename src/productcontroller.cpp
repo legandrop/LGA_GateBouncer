@@ -139,6 +139,46 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
             cancelNativeProcesses();
             history_.disconnectNative(binding, reason); historyChanged();
         });
+    // El canal administrativo conserva su conexión propia. Ninguna observación
+    // foreign entra al catálogo de procesos/lease Own ni al comparador de import.
+    administrativeHistoryNotify_.setSingleShot(true);
+    connect(&administrativeHistoryNotify_,&QTimer::timeout,this,[this] { if (!stopped_) emit changed(); });
+    const auto administrativeChanged = [this] {
+        historyChanged();
+        if (!stopped_ && !administrativeHistoryNotify_.isActive()) administrativeHistoryNotify_.start(150);
+    };
+    connect(&administrative_,&OrdinaryDecisionClient::nativeSourceOpened,this,
+        [this,administrativeChanged](const Data::NativeSourceBinding &binding,quint64 baseline) {
+            if (stopped_ || simulation()) return;
+            if (binding.role != 2 || !history_.addNativeSource(binding,baseline)) {
+                historyError_ = "Administrative history source was rejected; saved records are preserved.";
+                administrative_.rejectHistory(historyError_); return;
+            }
+            administrativeChanged();
+        });
+    connect(&administrative_,&OrdinaryDecisionClient::nativeEvent,this,
+        [this,administrativeChanged](const Data::ActivityEvent &event) {
+            if (stopped_ || simulation()) return;
+            if (!history_.ingest(event)) {
+                historyError_ = "Administrative monitoring evidence was not retained; history is incomplete.";
+                administrativeChanged(); administrative_.rejectHistory(historyError_); return;
+            }
+            administrativeChanged();
+        });
+    connect(&administrative_,&OrdinaryDecisionClient::nativeGap,this,
+        [this,administrativeChanged](const Data::NativeSourceBinding &binding,quint64 after,quint64 resync,
+            quint64 revision,quint8 reason,bool known,quint64 lost) {
+            if (stopped_ || simulation()) return;
+            if (!history_.nativeGap(binding,after,resync,revision,reason,known,lost)) {
+                historyError_ = "Administrative history discontinuity was rejected.";
+                administrative_.rejectHistory(historyError_); return;
+            }
+            administrativeChanged();
+        });
+    connect(&administrative_,&OrdinaryDecisionClient::nativeSourceLost,this,
+        [this,administrativeChanged](const Data::NativeSourceBinding &binding,const QString &reason) {
+            history_.disconnectNative(binding,reason); administrativeChanged();
+        });
     historyFlush_.setInterval(1000);
     connect(&historyFlush_, &QTimer::timeout, this, [this] {
         if (!stopped_ && !simulation() && historyDirty_ && history_.flushDue(QDateTime::currentDateTimeUtc())) flushHistory();
