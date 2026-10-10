@@ -396,12 +396,13 @@ bool NativeClassifier::catalogIdentity(const ClassifierCause &cause, HANDLE engi
     for (unsigned n = 0; n < 6; ++n) {
         Memory scopeFilter, scopeCallout;
         FWPM_FILTER0 sf{}; FWPM_CALLOUT0 sc{}; UINT64 sw = 0;
+        const FWP_ACTION_TYPE action = n < 2 ? FWP_ACTION_CALLOUT_UNKNOWN : FWP_ACTION_CALLOUT_INSPECTION;
         if (FwpmFilterGetByKey0(engine, &GbScopeCallouts[n], reinterpret_cast<FWPM_FILTER0 **>(&scopeFilter.p)) != ERROR_SUCCESS ||
             !guardedRead(&sf, scopeFilter.p, sizeof(sf)) || !sf.providerKey ||
             !guardedRead(&provider, sf.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
             !equal(sf.filterKey, GbScopeCallouts[n]) || !equal(sf.layerKey, *layers[n]) ||
             !equal(sf.subLayerKey, GbClassifierSublayer) || sf.flags || sf.rawContext || sf.providerData.size || sf.numFilterConditions ||
-            sf.action.type != (n < 2 ? FWP_ACTION_CALLOUT_UNKNOWN : FWP_ACTION_CALLOUT_INSPECTION) ||
+            sf.action.type != action ||
             !equal(sf.action.calloutKey, GbScopeCallouts[n]) || sf.weight.type != FWP_UINT64 || !sf.weight.uint64 ||
             !guardedRead(&sw, sf.weight.uint64, sizeof(sw)) || sw != 50 ||
             sf.effectiveWeight.type != FWP_UINT64 || !sf.effectiveWeight.uint64 ||
@@ -438,12 +439,13 @@ bool NativeClassifier::catalogIdentity(const ClassifierCause &cause, HANDLE engi
         Memory fm, cm; FWPM_FILTER0 nf{}; FWPM_CALLOUT0 nc{}; UINT64 w = 0;
         const auto &sub = n < 4 ? GbPolicySublayer : GbClassifierSublayer;
         const auto wanted = n >= 2 && n < 4 ? 1000u : 50u;
+        const FWP_ACTION_TYPE action = n < 4 ? FWP_ACTION_CALLOUT_UNKNOWN : FWP_ACTION_CALLOUT_INSPECTION;
         if (FwpmFilterGetByKey0(engine, &GbInboundCallouts[n], reinterpret_cast<FWPM_FILTER0 **>(&fm.p)) != ERROR_SUCCESS ||
             !guardedRead(&nf, fm.p, sizeof(nf)) || !nf.providerKey ||
             !guardedRead(&provider, nf.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
             !equal(nf.filterKey, GbInboundCallouts[n]) || !equal(nf.layerKey, *inboundLayers[n]) || !equal(nf.subLayerKey, sub) ||
             nf.flags || nf.rawContext || nf.numFilterConditions || nf.providerData.size ||
-            nf.action.type != (n < 4 ? FWP_ACTION_CALLOUT_UNKNOWN : FWP_ACTION_CALLOUT_INSPECTION) ||
+            nf.action.type != action ||
             !equal(nf.action.calloutKey, GbInboundCallouts[n]) || nf.weight.type != FWP_UINT64 || !nf.weight.uint64 ||
             !guardedRead(&w, nf.weight.uint64, sizeof(w)) || w != wanted ||
             nf.effectiveWeight.type != FWP_UINT64 || !nf.effectiveWeight.uint64 ||

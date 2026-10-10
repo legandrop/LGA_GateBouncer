@@ -423,6 +423,8 @@ static void freeEntry(GB_ENTRY *e) {
 }
 static ULONG serviceNamespace(PACCESS_TOKEN token) {
     PTOKEN_USER user=NULL; PTOKEN_GROUPS groups=NULL; ULONG accepted=0,present=0;
+    // Bits documentados de TOKEN_GROUPS; no depender del header de usermode.
+    const ULONG groupEnabled=0x00000004u, groupDenyOnly=0x00000010u;
     SID_IDENTIFIER_AUTHORITY authority=SECURITY_NT_AUTHORITY;
     UCHAR storage[SECURITY_MAX_SID_SIZE]; PSID service=(PSID)storage; ULONG i,n;
     // S-1-5-80 de los dos nombres cerrados; RID derivados de SHA1 UTF-16 mayúsculas.
@@ -436,8 +438,8 @@ static ULONG serviceNamespace(PACCESS_TOKEN token) {
             for(i=0;i<5;++i)*RtlSubAuthoritySid(service,i+1)=rid[n][i];
             for(i=0;i<groups->GroupCount;++i)if(RtlEqualSid(groups->Groups[i].Sid,service)) {
                 ++present;
-                if((groups->Groups[i].Attributes & SE_GROUP_ENABLED) &&
-                   !(groups->Groups[i].Attributes & SE_GROUP_USE_FOR_DENY_ONLY))accepted=n+1;
+                if((groups->Groups[i].Attributes & groupEnabled) &&
+                   !(groups->Groups[i].Attributes & groupDenyOnly))accepted=n+1;
             }
         }
     if(user) ExFreePool(user);
