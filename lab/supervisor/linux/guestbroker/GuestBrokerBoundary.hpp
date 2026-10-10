@@ -13,10 +13,12 @@ class GuestNoJobObserver;
 class OwnedSuspendedProcess;
 class RetainedFile;
 class DesktopWorkerEntry;
+class OwnMemorySshCredential;
 class BrokerAdmission final {
     friend class GuestBrokerBoundary;
     friend class FixedGuestBrokerSource;
     friend class DesktopWorkerEntry;
+    friend class OwnMemorySshCredential;
     BrokerAdmission() = default;
     bool CurrentOwn() const;
     std::shared_ptr<GuestBrokerBoundary> boundary_;

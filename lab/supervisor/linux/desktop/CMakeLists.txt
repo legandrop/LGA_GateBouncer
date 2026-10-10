@@ -5,6 +5,7 @@ if(NOT WIN32 OR NOT MSVC)
 endif()
 add_library(GateBouncerGuestResources STATIC
     PrivateDesktopOwner.cpp ../WindowsNativeOwnedLaunchContext.cpp ../LinuxSshCreator.cpp
+    ../OwnMemorySshCredential.cpp
     ../helper/OwnedSuspendedProcess.cpp ../helper/OwnedHelperContainer.cpp
     ../helper/OwnedHelperLaunchAdapter.cpp ../guestbroker/GuestNoJobObserver.cpp
     ../guestbroker/FixedGuestBrokerSource.cpp ../../files/RetainedFile.cpp
