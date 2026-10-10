@@ -1329,6 +1329,8 @@ void MainWindow::refreshTable(bool newPage) {
             if (view_ == "rules" && !product_.administrativeSelected() && product_.recordsSelected() && product_.records()->recordsCurrent())
                 for (const auto &r : product_.records()->rules()) {
                     const auto name = recordText(r.name, "Selector " + QString::fromStdString(gb::wire::hex(r.selector)));
+                    if (!query_.isEmpty() && !(name + " " + recordText(r.path,{}))
+                        .contains(query_,Qt::CaseInsensitive)) continue;
                     result.push_back({engineRowId("rule", product_.engine().serviceEpoch, r.rule),
                         {{name, "strong", {}}, {r.action == 2 ? "Allow · soft" : "Block", {}, {}},
                          {r.direction == 1 ? (r.mode == 1 ? "Outbound unicast · path" : "Outbound · path")
@@ -1344,6 +1346,7 @@ void MainWindow::refreshTable(bool newPage) {
                 const QString status = qname ? (qname->complete ? "Known source subset" : "Incomplete · known fields retained") : derived ? reconstructionText(derived)
                     : derivedView.busy ? "Deriving facts" : "Derived facts unavailable";
                 const QString source = c.sourceId.isEmpty() ? c.source.name : c.sourceId;
+                if (view_ == "rules" && !query_.isEmpty() && !source.contains(query_,Qt::CaseInsensitive)) continue;
                 const QString action = qname ? qnameAction(qname) : derived && derived->action ? Data::actionName(*derived->action) : "Unknown";
                 if (view_ == "import") result.push_back({"candidate:" + report.digest + ":" + c.id,
                     {{source, "strong", {}}, {action, {}, {}}, {status, status, {}},
@@ -1533,7 +1536,9 @@ void MainWindow::refreshTable(bool newPage) {
         emptyState_->setText(!product_.simulation()
             ? view_ == "pending" ? product_.ordinary()->current() ? "No requests awaiting a decision" : "Requests unavailable · refresh to check the connection"
                 : view_ == "activity" ? "Network activity collector unavailable"
-                : view_ == "rules" ? "No local review candidates\nEngine rules unavailable in this version"
+                : view_ == "rules" ? QString(query_.isEmpty() ? "No rules or saved review candidates" : "No matching rules or saved review candidates\nChange or clear the search.")
+                    + (!product_.ordinary()->rulesCurrent() && !(product_.recordsSelected() && product_.records()->recordsCurrent())
+                        ? "\nLive rule catalog unavailable" : "")
                 : view_ == "import" ? "Choose a migration file for structural analysis"
                 : "No matching observed processes"
             : view_ == "pending"
