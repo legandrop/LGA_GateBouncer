@@ -40,7 +40,7 @@ foreach(target gatebouncer_wire gatebouncer_policy gatebouncer_decisions gatebou
   target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00)
 endforeach()
 target_link_options(GateBouncerService PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT)
-target_link_options(GateBouncerService PRIVATE /DEPENDENTLOADFLAG:0x800
+target_link_options(GateBouncerService PRIVATE /DEPENDENTLOADFLAG:0xA00
   "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../controller/deployment_ordinary.manifest")
 # El loader propio debe cargar la QtCore MSVC inventariada antes del parser.
 # La QtCore MinGW del directorio GUI no es compatible con este servicio.
