@@ -39,6 +39,22 @@ The service records temporal commands in a separate protected journal. Prepared
 is flushed and compared before the single device decision. It completes the
 durable receipt only after exact command readback reports Applied. Uncertain
 delivery is queried rather than replayed. Loading history never rearms a scope.
+New temporal history uses a protected file per command and a separate monotonic
+revision counter. A mutex and the writer lease serialize counter reservation
+before Prepared; a crash between them leaves a revision gap. History from the
+earlier journal remains read-only. Durable results can leave the memory cache
+and be queried by their exact command and current admitted actor; this never
+resends a decision. A missing counter with command files or backups fails closed.
+A missing counter, command or legacy journal with its own backup also requires
+recovery. Storage failures retain uncertainty rather than replaying effects.
+Command identifiers and command-status queries share one namespace across
+temporal and permanent decisions. New committed decisions and uncached status
+queries require that temporal namespace to be readable. Uncertain storage can
+therefore reject a new permanent Allow or Block, or a revocation, before the
+principal writer runs. Existing permanent rules can remain active; such a
+failure does not mean traffic is blocked or the previous policy changed.
+Recovery of that namespace, reliable revocation during recovery, and separation
+of command namespaces remain open work.
 The principal permanent rule writer also accepts a held operation. It first
 records Prepared, then seals a command-bound negative guard for that exact
 operation before changing the principal rule. A registered connect guard at
@@ -65,7 +81,10 @@ This source does not establish platform-wide protection. UDP, QUIC, ICMP,
 inbound initial authorization, boot coverage, socket transfer, provider precedence
 and driver lifecycle require separate guest validation. Token replacement is
 detected by a kernel worker at a 100 ms interval, not instantaneously. The kernel
-registry and temporal journal currently have bounded capacities of 64 and 128;
-safe retirement and durable history continuity need further implementation.
+registry supports at most 64 simultaneous retained operations, grants and
+tombstones. Saturation rejects a new operation without revoking other grants.
+A superseded root retires only after closure, completion drain and flow deletion,
+with no dependent entries or writer pin. Live tombstones are never evicted by
+age or capacity. Permanent outcomes still have a separate memory limit of 128.
 No host deployment or
 causal traffic validation is implied by building the source.

@@ -23,6 +23,7 @@ directional::Result NativeRuntime::writeScoped(const principal::Entry &command,
     entry.payload = command.command.payload; entry.account = admission->identity.account;
     entry.logon = admission->identity.logon; entry.session = admission->identity.session;
     entry.pid = admission->actor.pid;
+    entry.format = 2; entry.image = admission->owner->imageId;
     entry.created = std::uint64_t(admission->actor.created.dwLowDateTime) |
         (std::uint64_t(admission->actor.created.dwHighDateTime) << 32);
     auto &decision = entry.kernel.decision;
@@ -71,5 +72,37 @@ void NativeRuntime::refreshScoped(PrincipalOutcome &outcome) noexcept {
             outcome.result.error = Error::Ok; outcome.result.observed = directional::Observed::FinalApplied;
         }
     } catch (...) { outcome.result.error = Error::StoreFailure; }
+}
+Error NativeRuntime::readScopedOutcome(const Id &id,const std::shared_ptr<PrincipalPeer> &peer,
+    PrincipalOutcome &outcome,bool &found) {
+    ScopedEntry entry;found=false;
+    if(!scopedJournal_.read(id,entry,found))return Error::StoreFailure;
+    if(!found)return Error::Ok;
+    // V1 es sólo histórico; jamás sustituye evidencia de imagen ausente ni consulta kernel actual.
+    if(!peer || !principalPeerCurrent(*peer) || !scopedActorMatches(entry,epoch_,boot_,peer->profile,
+        peer->actor.pid,peer->actor.created,peer->imageId,peer->identity))
+        return Error::Unauthorized;
+    outcome={};outcome.payload=entry.payload;outcome.identity=peer->identity;
+    outcome.pid=entry.pid;outcome.created=peer->actor.created;outcome.imageId=peer->imageId;
+    outcome.profile=peer->profile;outcome.type=Type::CommitFuturePolicy;
+    outcome.scope=std::uint8_t(entry.kernel.decision.scope);outcome.scoped=entry.kernel.decision;
+    outcome.result.desired=entry.kernel.decision.revision;outcome.result.state=entry.state;
+    outcome.result.durable=true;outcome.result.error=Error::Ok;
+    outcome.result.appliedReal=entry.state==State::Applied;
+    outcome.result.observed=entry.state==State::Applied ? directional::Observed::FinalApplied : directional::Observed::Prepared;
+    // Sólo READBACK de la sesión actual. Nunca DECIDE ni rearme de una entrada persistida.
+    refreshScoped(outcome);return Error::Ok;
+}
+void NativeRuntime::pruneScopedOutcomes() noexcept {
+    for(auto it=principalOutcomes_.begin();it!=principalOutcomes_.end();) {
+        const auto &outcome=it->second;
+        if(outcome.scope>=3 && outcome.result.durable &&
+           (outcome.result.state==State::Prepared || outcome.result.state==State::Applied)) {
+            const auto charged=outcome.payload.capacity()+outcome.identity.account.capacity()+
+                outcome.identity.logon.capacity()+sizeof(PrincipalOutcome)+128;
+            if(charged>principalOutcomeBytes_){principalWriteFault_=true;return;}
+            principalOutcomeBytes_-=charged;it=principalOutcomes_.erase(it);
+        } else ++it;
+    }
 }
 }

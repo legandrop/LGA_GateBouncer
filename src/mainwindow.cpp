@@ -810,12 +810,12 @@ void MainWindow::buildPage() {
             footer_->setText("View II snapshots · WFP attempts only when present · no authorization or traffic evidence");
         }
         if (product_.ordinary()->current()) {
-            status_->setText("Future rule review available\nCoverage not validated");
-            footer_->setText("Admitted blocked observations · permanent application + account rules · no held connection");
+            status_->setText("Request review available\nCoverage not validated");
+            footer_->setText("Pending requests · review each connection or save a rule for this application and account");
         }
         const QMap<QString, QStringList> liveHeadings{
             {"processes", {"Processes", "Observed local processes · policy and network history are unknown."}},
-            {"pending", {"Pending decisions", "Admitted observations · review future permanent rules."}},
+            {"pending", {"Pending requests", "Review an application's request and choose how long your decision applies."}},
             {"activity", {"Activity", "Observed attempts and gaps · authorization and traffic unavailable."}},
             {"rules", {"Rules", "Service policy records and inactive local review candidates."}},
             {"import", {"Import from NetLimiter", "Structural analysis only · compatibility not validated."}},
@@ -1163,7 +1163,7 @@ void MainWindow::refreshTable(bool newPage) {
                     {{recordText(p.display.name, "Unattributed application"), "strong", {}},
                      {"Requested destination unknown", {}, {}},
                      {recordUtc(p.lastUtc, p.presence & 2), {}, qulonglong(p.lastUtc)},
-                     {"Review future rule →", "action", {}}}});
+                     {"Review request →", "action", {}}}});
         }
         else if (view_ == "pending" && product_.recordsSelected() && product_.records()->recordsCurrent())
             for (const auto &p : product_.records()->pending())
@@ -1280,7 +1280,7 @@ void MainWindow::refreshTable(bool newPage) {
               : "Synthetic fixtures only. Enter opens the selected row where available.");
     if (emptyState_) {
         emptyState_->setText(!product_.simulation()
-            ? view_ == "pending" ? product_.ordinary()->current() ? "No admitted observations awaiting a decision" : "Admitted observations unavailable · refresh to check the ordinary channel"
+            ? view_ == "pending" ? product_.ordinary()->current() ? "No requests awaiting a decision" : "Requests unavailable · refresh to check the connection"
                 : view_ == "activity" ? "Network activity collector unavailable"
                 : view_ == "rules" ? "No local review candidates\nEngine rules unavailable in this version"
                 : view_ == "import" ? "Choose a migration file for structural analysis"
@@ -1402,24 +1402,31 @@ void MainWindow::renderOrdinaryNotice() {
     const bool held = row.temporal == 2;
     const auto scopeValue = submitted ? int(gb::wire::get(submitted->command, gb::wire::Tag::ScopeKind)) : client->selectedScope();
     notice_ = new QFrame(root_); notice_->setObjectName("access-notice");
-    notice_->setAccessibleName("Future application rule review");
+    notice_->setAccessibleName("Application access request");
     auto *l = new QVBoxLayout(notice_); l->setContentsMargins(15, 12, 15, 12); l->setSpacing(9);
     auto *head = line(l); head->addWidget(label("LGA   GateBouncer · access request", "faint"), 1);
     auto *close = button("×", "close-request", "ghost"); close->setFixedSize(25, 25);
-    close->setAccessibleName("Close review and keep the observation undecided"); head->addWidget(close);
+    close->setAccessibleName(client->state() == OrdinaryDecisionClient::State::Uncertain
+        ? "Close review; the decision result remains unknown"
+        : submitted ? "Close review" : "Close review and keep the request pending"); head->addWidget(close);
     connect(close, &QPushButton::clicked, client, &OrdinaryDecisionClient::closeNotice);
     l->addWidget(label(recordText(display.name, "Unattributed application"), "heading", true));
     auto *status = label(client->message(), "warning", true); status->setObjectName("ordinary-state"); l->addWidget(status);
-    if (submitted) l->addWidget(label(QString("Submitted decision: ") +
-        (gb::wire::get(submitted->command, gb::wire::Tag::Decision) == 2 ? "Allow" : "Block") +
-        " · retained for receipt verification", "faint", true));
+    if (submitted) l->addWidget(label(QString(client->state() == OrdinaryDecisionClient::State::Recorded ? "Recorded decision: " : "Submitted decision: ") +
+        (gb::wire::get(submitted->command, gb::wire::Tag::Decision) == 2 ? "Allow" : "Block"), "faint", true));
     auto *content = new QWidget; auto *body = new QVBoxLayout(content);
     body->setContentsMargins(0, 0, 0, 0); body->setSpacing(9);
     if (client->state() == OrdinaryDecisionClient::State::Preparing) body->addWidget(new Spinner, 0, Qt::AlignLeft);
-    definition(body, "Requested destination", "Unknown · not included in this observation");
+    definition(body, "Requested destination", "Unknown · not provided with this request");
     definition(body, "Original attempt", held && scopeValue == 2 && client->state() == OrdinaryDecisionClient::State::Recorded
-        ? "Held attempt cancelled · its kernel guard keeps it denied"
-        : held ? "TCP connection held blocked · closing keeps it pending" : "Blocked attempt observed · no held connection");
+        ? "Request cancelled · the original connection stays blocked"
+        : held && client->state() == OrdinaryDecisionClient::State::Recorded
+            ? "Decision recorded for this connection · current traffic has not been validated"
+        : client->state() == OrdinaryDecisionClient::State::Uncertain
+            ? "Decision result unknown · Check the same command; do not repeat this decision."
+        : client->state() == OrdinaryDecisionClient::State::Sending
+            ? "Decision sent · waiting for the recorded result"
+        : held ? "TCP connection waiting · closing keeps the request blocked and pending" : "Blocked attempt recorded · no connection is waiting");
     ordinaryExplanation_=new Assistance::Ui::ExplanationWidget(assistance_.get(),[this,selection]{
         const auto* current=product_.ordinary();
         QPointer<Assistance::Ui::GeneralSession> explanation=assistance_.get();
@@ -1435,23 +1442,23 @@ void MainWindow::renderOrdinaryNotice() {
         path->setObjectName("ordinary-path"); path->setWordWrapMode(QTextOption::WrapAnywhere);
         path->setMinimumHeight(52); path->setMaximumHeight(78); body->addWidget(path);
     }
-    const QString scopeDescription = scopeValue == 3 ? "this exact held TCP connection, once. " : scopeValue == 4
-        ? "this process instance until it exits. " : scopeValue == 5 ? "this process instance for 15 minutes, enforced by the kernel. " :
-        "this application and account, across matching instances. "
-        + QString(package == 1 ? "No package restriction applies. " : package == 2
+    const QString scopeDescription = scopeValue == 3 ? "this exact TCP connection, once. " : scopeValue == 4
+        ? "only this app instance, until it exits. " : scopeValue == 5 ? "only this app instance, for up to 15 minutes or until it exits. " :
+        "this application and account, including other matching instances. "
+        + QString(package == 1 ? "Any package is included. " : package == 2
             ? "The displayed package is included. " : "Package restriction is unknown. ") +
-        "The rule applies to future attempts; it does not resume this attempt. ";
-    body->addWidget(label(QString(submitted ? "Submitted scope: " : "Effective scope: ") + scopeDescription +
+        "The rule applies only to future connections; it does not resume this attempt. ";
+    body->addWidget(label(QString(client->state() == OrdinaryDecisionClient::State::Recorded ? "Recorded scope: " : submitted ? "Submitted scope: " : "Will apply to: ") + scopeDescription +
         "Protection coverage has not been validated.", "muted", true));
     l->addWidget(scrollArea(content), 1);
     auto *fields = new QHBoxLayout; fields->setSpacing(9);
     auto *sl = new QVBoxLayout; sl->setSpacing(5); sl->addWidget(label("Apply to", "faint"));
-    auto *scope = combo({"Application + account", "Current process", "Once"}, "decision-scope");
+    auto *scope = combo({"Application + account", "This app instance", "Once"}, "decision-scope");
     if (!held) for (int i : {1, 2}) scope->setItemData(i, 0, Qt::UserRole - 1);
     scope->setCurrentIndex(scopeValue == 2 ? 0 : scopeValue == 3 ? 2 : 1);
     scope->setEnabled(client->ready()); sl->addWidget(scope); fields->addLayout(sl, 1);
     auto *dl = new QVBoxLayout; dl->setSpacing(5); dl->addWidget(label("Keep this decision", "faint"));
-    auto *duration = combo({scopeValue == 3 ? "This connection" : scopeValue == 2 ? "Permanent" : "Until process exits", "For 15 minutes"}, "decision-duration");
+    auto *duration = combo({scopeValue == 3 ? "This connection" : scopeValue == 2 ? "Always" : "Until this instance exits", "15 minutes"}, "decision-duration");
     duration->setCurrentIndex(scopeValue == 5 ? 1 : 0);
     duration->setEnabled(client->ready() && scopeValue >= 4); dl->addWidget(duration); fields->addLayout(dl, 1); l->addLayout(fields);
     connect(scope, &QComboBox::currentIndexChanged, this, [client, selection](int index) {
@@ -1461,8 +1468,11 @@ void MainWindow::renderOrdinaryNotice() {
         if (selection == client->selection()) client->scope(index == 1 ? 5 : 4);
     });
     if (held) l->addWidget(label(scopeValue == 2
-        ? "Applying this permanent rule cancels the held attempt; its kernel guard keeps that attempt denied."
-        : "Process duration applies only to this instance.", "faint", true));
+        ? client->state() == OrdinaryDecisionClient::State::Recorded
+            ? "The Always rule was saved. This request was cancelled and its original connection stays blocked."
+            : submitted ? "The submitted Always rule would cover only future connections. Its result is shown above."
+                : "Saving an Always rule will cancel this request and keep its original connection blocked."
+        : "This decision applies only to the selected connection or app instance.", "faint", true));
     auto *direction = combo({"Outbound", "Inbound", "Both"}, "ordinary-direction");
     direction->setCurrentIndex(directionValue - 1);
     direction->setEnabled(client->ready() && scopeValue == 2); l->addWidget(direction);
@@ -1471,14 +1481,14 @@ void MainWindow::renderOrdinaryNotice() {
             const QSignalBlocker guard(direction); direction->setCurrentIndex(client->selectedDirection() - 1);
         }
     });
-    const QString network = scopeValue >= 3 ? "TCP outbound authorization; packets in both directions. UDP, QUIC, ICMP and boot coverage are unvalidated."
+    const QString network = scopeValue >= 3 ? "TCP connections started by this app, with packets in both directions. UDP, QUIC, ICMP and startup coverage have not been validated."
         : directionValue == 1 ? "Outbound · Allow covers unicast destinations only"
         : directionValue == 2 ? "Inbound · all destinations and protocols" : "Both · inbound and outbound; Allow includes non-unicast destinations";
-    l->addWidget(label(QString(submitted ? "Submitted network scope: " : "Effective network scope: ") + network, "muted", true));
+    l->addWidget(label(QString(client->state() == OrdinaryDecisionClient::State::Recorded ? "Recorded connections: " : submitted ? "Submitted connections: " : "Will cover: ") + network, "muted", true));
     auto *consent = new QCheckBox("I accept the effective scope shown above.");
     consent->setObjectName("ordinary-consent"); consent->setEnabled(client->ready());
     consent->setStyleSheet("QCheckBox { font-size: 11px; }"); l->addWidget(consent);
-    auto *actions = line(l); auto *keep = button("Keep pending", "keep-access-pending", "ghost"); actions->addWidget(keep);
+    auto *actions = line(l); auto *keep = button(submitted || client->state() == OrdinaryDecisionClient::State::Uncertain ? "Close" : "Keep pending", "keep-access-pending", "ghost"); actions->addWidget(keep);
     connect(keep, &QPushButton::clicked, client, &OrdinaryDecisionClient::closeNotice); actions->addStretch();
     auto *block = button("Block", "decide-block", "danger"); auto *allow = button("Allow", "decide-allow", "primary");
     block->setEnabled(false); allow->setEnabled(false); actions->addWidget(block); actions->addWidget(allow);
@@ -1912,7 +1922,7 @@ void MainWindow::modeSelector(QVBoxLayout *layout) {
     layout->addWidget(panel);
 }
 void MainWindow::renderLive() {
-    if (view_ != "settings") pageLayout_->addWidget(note("Process, activity and View records are read only. Admitted observations can be reviewed for future permanent rules. Coverage remains unvalidated.", true));
+    if (view_ != "settings") pageLayout_->addWidget(note("Process and activity records are read only. Review pending access requests to choose Allow or Block. Protection coverage has not been validated.", true));
     if (view_ == "processes") {
         auto *bar = line(pageLayout_); auto *search = new QLineEdit(query_);
         search->setObjectName("process-search"); search->setPlaceholderText("Search observed processes and paths…");
@@ -1924,7 +1934,7 @@ void MainWindow::renderLive() {
         if (!product_.catalog().error.isEmpty()) pageLayout_->addWidget(label(product_.catalog().error, "warning", true));
     } else if (view_ == "pending") {
         auto *bar = line(pageLayout_);
-        auto *refresh = button("Refresh admitted observations", "refresh-ordinary"); bar->addWidget(refresh);
+        auto *refresh = button("Refresh requests", "refresh-ordinary"); bar->addWidget(refresh);
         refresh->setEnabled(product_.ordinary()->idle() && product_.ordinary()->state() != OrdinaryDecisionClient::State::Uncertain);
         connect(refresh, &QPushButton::clicked, product_.ordinary(), &OrdinaryDecisionClient::refresh);
         if (product_.ordinary()->state() == OrdinaryDecisionClient::State::Uncertain) {
@@ -1935,10 +1945,10 @@ void MainWindow::renderLive() {
         bar->addStretch();
         pageLayout_->addWidget(label(product_.ordinary()->message(), "muted", true));
         pageLayout_->addWidget(note(product_.ordinary()->current()
-            ? "Admitted blocked observations are available. Review future permanent application + account rules in the access request. Coverage remains unvalidated."
+            ? "Review each request to choose Allow or Block and how long it applies. Always rules cover future connections for this application and account. Protection coverage has not been validated."
             : product_.recordsSelected() && product_.records()->recordsCurrent()
                 ? "View request snapshot · read only. These requests use the separate administrator reviewer; coverage remains unvalidated."
-                : "No active observation snapshot. Refresh admitted observations to check the ordinary channel; observed processes are not requests."));
+                : "No current request list. Refresh requests to check the connection; a running process is not an access request."));
         makeTable({"Application", "Destination", "Last request", "Decision"}, {32, 31, 14, 23}, 57);
     } else if (view_ == "activity") {
         makeTable({"Time", "Process", "Event", "Destination", "Reason"}, {19, 22, 19, 20, 20}, 42);
@@ -1984,9 +1994,9 @@ void MainWindow::renderLive() {
         modeSelector(l);
         auto *panel = frame("panel"); auto *p = new QVBoxLayout(panel); p->setContentsMargins(16, 16, 16, 16); p->setSpacing(8);
         p->addWidget(label("Network engine", "heading"));
-        p->addWidget(label(product_.ordinary()->current() ? "Ordinary review connected · future permanent rules"
+        p->addWidget(label(product_.ordinary()->current() ? "Request review connected"
             : product_.engine().current ? "View connected · reading service status" : "No current service snapshot", "warning", true));
-        p->addWidget(label("Network protection has not been validated. Admitted ordinary observations can be decided in the access request without administrator confirmation. View requests use the separate administrator reviewer.", "faint", true));
+        p->addWidget(label("Network protection has not been validated. Access requests can be reviewed here without administrator confirmation. Read-only View requests require the separate administrator reviewer.", "faint", true));
         auto *refresh = button("Refresh connection", "refresh-engine"); p->addWidget(refresh, 0, Qt::AlignLeft);
         connect(refresh, &QPushButton::clicked, &product_, &ProductController::refreshEngine);
         auto *connectRecords = button("Connect requests", "connect-view-ii"); p->addWidget(connectRecords, 0, Qt::AlignLeft);

@@ -125,6 +125,8 @@ class NativeRuntime {
     Frame outcomeResult(const Id &, const PrincipalOutcome &, Type = Type::FuturePolicyAck) const;
     directional::Result writePrincipal(const principal::Snapshot &, const principal::Entry &,
         const std::shared_ptr<PrincipalAdmission> &);
+    Error readScopedOutcome(const Id &, const std::shared_ptr<PrincipalPeer> &, PrincipalOutcome &, bool &found);
+    void pruneScopedOutcomes() noexcept;
     bool principalAdmissionCurrent(const PrincipalAdmission &, const principal::Entry &,
         allnative::Stage requiredStage = allnative::Stage::Active) const noexcept;
     std::map<Id, std::shared_ptr<PrincipalAdmission>> principalAdmissions_;

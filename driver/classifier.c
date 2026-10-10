@@ -108,9 +108,24 @@ static void retireFutureRoots(GB_ENTRY *e) {
     }
     e->futureRetired=FALSE;
 }
+static BOOLEAN retireable(GB_ENTRY *e) {
+    ULONG i;
+    if(!e->closed || e->completion || e->completing || e->associated || e->cancelPin)return FALSE;
+    for(i=0;!e->parent && i<GB_CLASSIFIER_CAPACITY;++i) {
+        GB_ENTRY *p=gbEntries[i];
+        if(p && p!=e && p->record.session==e->record.session && p->parent==e->record.cause)return FALSE;
+    }
+    return e->revoked || !e->receipt.applied || e->receipt.decision.scope==GB_SCOPE_ONCE || e->parent || e->futureRetired;
+}
 static void revoke(GB_ENTRY *e) {
     e->revoked=TRUE; e->receipt.current=0;
     e->receipt.state=e->closed ? GB_SCOPE_CLOSED : GB_SCOPE_REVOKED;
+}
+static void drainDeniedCompletion(GB_ENTRY *e,BOOLEAN exactCompletion,FWP_ACTION_TYPE action) {
+    if(exactCompletion && e->completing && action==FWP_ACTION_BLOCK) {
+        // Clasificación negativa exacta, no ACK de Complete ni Applied temporal.
+        revoke(e);e->completing=FALSE;e->consumed=TRUE;
+    }
 }
 static void loss(void) {
     ULONG i; if(gbLoss!=GB_MAX64) ++gbLoss;
@@ -173,6 +188,15 @@ static BOOLEAN sameTuple(const GB_ENTRY *e,const GB_TUPLE *t) {
     return e->record.family==t->family && e->record.compartment==t->compartment &&
         e->record.localPort==t->localPort && e->record.remotePort==t->remotePort &&
         RtlCompareMemory(e->record.localAddress,t->local,16)==16 && RtlCompareMemory(e->record.remoteAddress,t->remote,16)==16;
+}
+static ULONG slotFor(GB_ENTRY *e,const GB_TUPLE *t,BOOLEAN *duplicate) {
+    ULONG i,empty=GB_CLASSIFIER_CAPACITY;*duplicate=FALSE;
+    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
+        GB_ENTRY *p=gbEntries[i];
+        if(!p){if(empty==GB_CLASSIFIER_CAPACITY)empty=i;continue;}
+        if(!p->closed && p->record.endpoint==e->record.endpoint && sameTuple(p,t))*duplicate=TRUE;
+    }
+    return empty;
 }
 static GB_ENTRY *endpoint(const FWPS_INCOMING_METADATA_VALUES0 *m,const GB_TUPLE *t,BOOLEAN fieldCompartment,BOOLEAN closingCompletion,BOOLEAN *ambiguous) {
     GB_ENTRY *found=NULL; ULONG i; *ambiguous=FALSE;
@@ -316,7 +340,7 @@ fail:
 }
 static void NTAPI classify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA_VALUES0 *m,
     void *data,const void *context,const FWPS_FILTER3 *filter,UINT64 flow,FWPS_CLASSIFY_OUT0 *out) {
-    ULONG protocolField,flagsField,appField,reasonField,i,empty=GB_CLASSIFIER_CAPACITY;
+    ULONG protocolField,flagsField,appField,reasonField,empty=GB_CLASSIFIER_CAPACITY;
     GB_TUPLE t; GB_ENTRY *e,*grant=NULL; BOOLEAN ambiguous; KIRQL irql; UINT64 now=KeQueryInterruptTime();
     NTSTATUS status; HANDLE completion=NULL;
     UNREFERENCED_PARAMETER(data); UNREFERENCED_PARAMETER(context); UNREFERENCED_PARAMETER(flow);
@@ -359,14 +383,12 @@ static void NTAPI classify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_ME
     if(!e) { KeAcquireSpinLock(&gbLock,&irql); if(gbFile) loss(); KeReleaseSpinLock(&gbLock,irql); block(out); return; }
     KeAcquireSpinLock(&gbLock,&irql);
     if(!gbFile || gbFault || gbLoss==GB_MAX64 || gbSequence==GB_MAX64) goto deny;
-    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
-        GB_ENTRY *p=gbEntries[i];
-        if(!p) { if(empty==GB_CLASSIFIER_CAPACITY) empty=i; continue; }
-        if(!p->closed && p->record.endpoint==e->record.endpoint && sameTuple(p,&t)) goto deny;
-    }
+    empty=slotFor(e,&t,&ambiguous);
+    if(ambiguous)goto deny;
     grant=futureRoot(e,now,&ambiguous);
     if(ambiguous) { loss(); goto deny; }
-    if(empty==GB_CLASSIFIER_CAPACITY) { loss(); goto deny; }
+    // Saturación simultánea rechaza sólo esta initial; no invalida grants ajenos.
+    if(empty==GB_CLASSIFIER_CAPACITY) goto deny;
     e->record.session=gbSession; e->record.cause=++gbSequence; e->record.loss=gbLoss;
     e->pendingDeadline=now+GB_PENDING_TICKS;
     if(grant) {
@@ -416,7 +438,10 @@ static void NTAPI heldGuardClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_IN
                 (e->receipt.decision.scope!=GB_SCOPE_DURATION || now<e->receipt.deadline)))) {
             // Nunca Permit ni consume aquí: Block200 conserva prioridad; scope50 decide.
             out->actionType=FWP_ACTION_CONTINUE;
-        } else block(out);
+        } else {
+            block(out);
+            drainDeniedCompletion(e,completion,out->actionType);
+        }
     }
     KeReleaseSpinLock(&gbLock,irql);
 }
@@ -437,8 +462,7 @@ static void maintenance(void *ignored) {
            (e->receipt.decision.scope==GB_SCOPE_DURATION && now>=e->receipt.deadline)) revoke(e);
         if(e->revoked && e->completion) { completions[nc++]=e->completion; e->completion=NULL; e->completing=TRUE; }
         if(e->revoked && e->associated && e->receipt.flow) aborts[na++]=e->receipt.flow;
-        if(e->closed && !e->completion && !e->completing && !e->associated && !e->cancelPin &&
-           (e->revoked || !e->receipt.applied || e->receipt.decision.scope==GB_SCOPE_ONCE || e->parent)) {
+        if(retireable(e)) {
             gbEntries[i]=NULL; discard[nd++]=e;
         }
     }

@@ -7,6 +7,7 @@
 namespace Gate {
 using namespace gb::wire;
 namespace {
+constexpr auto commandRecoveryMessage = "Command history needs recovery. No new change was confirmed; existing rules may still allow traffic. Do not repeat this command.";
 Id freshId() {
     const auto bytes = QUuid::createUuid().toRfc4122();
     Id id{}; std::copy_n(reinterpret_cast<const unsigned char *>(bytes.constData()), 16, id.begin()); return id;
@@ -51,11 +52,11 @@ void OrdinaryDecisionClient::showNext() {
 bool OrdinaryDecisionClient::refresh() {
     if (stopping_ || !session_.idle() || state_ == State::Sending || state_ == State::Uncertain) return false;
     closeNotice(); current_ = false; rows_.clear(); pageRows_.clear(); ids_.clear();
-    state_ = State::Loading; message_ = "Reading admitted observations…"; finalStatus_ = false; checkOnly_ = false;
+    state_ = State::Loading; message_ = "Reading pending requests…"; finalStatus_ = false; checkOnly_ = false;
     emit changed();
     if (!connected_) {
         const auto image = QDir(QCoreApplication::applicationDirPath()).filePath("GateBouncerService.exe");
-        if (!session_.open(std::filesystem::path(image.toStdWString()))) { fail("Ordinary decisions unavailable."); return false; }
+        if (!session_.open(std::filesystem::path(image.toStdWString()))) { fail("Request review unavailable."); return false; }
         return true;
     }
     return send(Type::GetStatus);
@@ -82,13 +83,13 @@ void OrdinaryDecisionClient::opened(bool ok, Frame f) {
         if (!ok || f.type != Type::HelloAck || iv::validate(f) != Error::Ok ||
             idValue(f, Tag::ServiceEpoch) != epoch_ || idValue(f, Tag::BootId) != boot_ ||
             get(f, Tag::ProfileGeneration) != profile_ || get(f, Tag::EffectiveKnown) || get(f, Tag::EffectiveRev) || zero(f.connection)) {
-            connected_ = false; fail("The original receipt owner is unavailable. Outcome remains unknown.", true); return;
+            connected_ = false; fail("The service that received this decision is unavailable. Its result remains unknown.", true); return;
         }
         connected_ = true; connection_ = f.connection;
         send(Type::GetFutureCommandStatus, {value(Tag::CommandId, command_)}); return;
     }
     if (state_ != State::Loading) return;
-    if (!ok || f.type != Type::HelloAck || !status(f, false)) { fail("Ordinary actor or source admission unavailable."); return; }
+    if (!ok || f.type != Type::HelloAck || !status(f, false)) { fail("Request review unavailable. Check the service connection."); return; }
     connected_ = true; send(Type::GetStatus);
 }
 bool OrdinaryDecisionClient::send(Type type, std::vector<Field> fields) {
@@ -102,7 +103,7 @@ bool OrdinaryDecisionClient::send(Type type, std::vector<Field> fields) {
             observed_->revision, bindingGeneration_};
     }
     if (iv::validate(f) != Error::Ok || !session_.request(std::move(f), generation_)) {
-        fail("Ordinary request unavailable.", type == Type::CommitFuturePolicy || type == Type::GetFutureCommandStatus); return false;
+        fail("Request review unavailable.", type == Type::CommitFuturePolicy || type == Type::GetFutureCommandStatus); return false;
     }
     return true;
 }
@@ -115,7 +116,7 @@ bool OrdinaryDecisionClient::select(const Id &id) {
     if (row == rows_.end()) return false;
     closeNotice(); observed_ = *row; visible_ = true; direction_ = 1; scope_ = row->temporal == 2 ? 3 : 2;
     shown_[row->observed] = ShownKey{epoch_, boot_, source_, profile_, row->revision};
-    state_ = State::Preparing; message_ = "Rechecking this observation…"; emit changed();
+    state_ = State::Preparing; message_ = "Rechecking this request…"; emit changed();
     return send(Type::GetObservedRecord, {value(Tag::ObservedId, row->observed),
         value(Tag::ObservedRevision, row->revision), value(Tag::SourceEpoch, row->source)});
 }
@@ -124,7 +125,7 @@ bool OrdinaryDecisionClient::direction(int direction) {
         state_ == State::Sending || state_ == State::Uncertain) return false;
     if (scope_ >= 3 && direction != 1) return false;
     ++generation_; draftExpiry_.stop(); draft_.reset(); direction_ = direction;
-    state_ = State::Preparing; message_ = "Preparing the selected future scope…"; emit changed(); prepare(); return true;
+    state_ = State::Preparing; message_ = "Checking which connections this rule will cover…"; emit changed(); prepare(); return true;
 }
 bool OrdinaryDecisionClient::scope(int scope) {
     if (!ready() || !session_.idle() || !observed_ || scope < 2 || scope > 5 ||
@@ -132,7 +133,7 @@ bool OrdinaryDecisionClient::scope(int scope) {
     ++generation_; draftExpiry_.stop(); draft_.reset(); scope_ = scope;
     observedGeneration_ = generation_;
     if (scope >= 3) direction_ = 1;
-    state_ = State::Preparing; message_ = "Preparing the selected scope…"; emit changed(); prepare(); return true;
+    state_ = State::Preparing; message_ = "Checking how long this decision will apply…"; emit changed(); prepare(); return true;
 }
 void OrdinaryDecisionClient::prepare() {
     std::vector<Field> fields{value(Tag::ExpectedDesiredRev, desired_), value(Tag::PolicyDirection, direction_, 1),
@@ -184,19 +185,23 @@ bool OrdinaryDecisionClient::recover() {
     if (stopping_ || state_ != State::Uncertain || zero(command_) || !session_.idle()) return false;
     if (!connected_) {
         const auto image = QDir(QCoreApplication::applicationDirPath()).filePath("GateBouncerService.exe");
-        if (!session_.open(std::filesystem::path(image.toStdWString()))) { fail("The original receipt owner is unavailable.", true); return false; }
+        if (!session_.open(std::filesystem::path(image.toStdWString()))) { fail("The service that received this decision is unavailable. Its result remains unknown.", true); return false; }
         return true;
     }
     return send(Type::GetFutureCommandStatus, {value(Tag::CommandId, command_)});
 }
 void OrdinaryDecisionClient::outcome(const Frame &f) {
     const auto submittedScope = submitted_ ? get(submitted_->command, Tag::ScopeKind) : 0;
-    if ((submittedScope >= 3 ? get(f, Tag::ScopeKind) != submittedScope : find(f, Tag::ScopeKind) != nullptr)) {
-        fail("Command scope binding changed.", true); return;
-    }
     if (idValue(f, Tag::CommandId) != command_ ||
         (f.type == Type::FutureCommandStatus && get(f, Tag::CommandFound) && get(f, Tag::OriginalCommandType) != unsigned(Type::CommitFuturePolicy))) {
         fail("Command receipt binding changed.", true); return;
+    }
+    if (get(f, Tag::ErrorCode) == unsigned(Error::StoreFailure) ||
+        get(f, Tag::ErrorCode) == unsigned(Error::RecoveryRequired)) {
+        fail(commandRecoveryMessage, true); return;
+    }
+    if ((submittedScope >= 3 ? get(f, Tag::ScopeKind) != submittedScope : find(f, Tag::ScopeKind) != nullptr)) {
+        fail("Command scope binding changed.", true); return;
     }
     if ((f.type == Type::FutureCommandStatus && !get(f, Tag::CommandFound)) || get(f, Tag::KnownAppliedUnrecorded) ||
         (get(f, Tag::CommandState) == unsigned(gb::wire::State::Applied) &&
@@ -209,9 +214,9 @@ void OrdinaryDecisionClient::outcome(const Frame &f) {
     draft_.reset(); current_ = false;
     if (get(f, Tag::CommandState) == unsigned(gb::wire::State::Applied) && !get(f, Tag::ErrorCode)) {
         state_ = State::Recorded; message_ = submittedScope >= 3
-            ? "Kernel decision recorded for this scope. Other firewall decisions still apply; coverage remains unvalidated."
-            : "Future rule recorded. The original attempt was not resumed; coverage remains unvalidated.";
-    } else { state_ = State::Failed; message_ = "The decision was rejected. The observation remains undecided."; }
+            ? "Decision recorded for the selected connection or app instance. Other firewall rules still apply; protection coverage has not been validated."
+            : "Always rule recorded for future connections. The original attempt stays blocked; protection coverage has not been validated.";
+    } else { state_ = State::Failed; message_ = "The decision was rejected. The request remains undecided."; }
     emit changed();
 }
 void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 generation) {
@@ -221,7 +226,11 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         connected_ = false;
         fail("Connection or response binding lost.", mutation); return;
     }
-    if (f.type == Type::ProtocolError) { fail("The service rejected this review.", mutation); return; }
+    if (f.type == Type::ProtocolError) {
+        const auto error = get(f, Tag::ErrorCode);
+        fail(error == unsigned(Error::StoreFailure) || error == unsigned(Error::RecoveryRequired)
+            ? commandRecoveryMessage : "The service rejected this review.", mutation); return;
+    }
     if (expectedType_ == Type::GetStatus) {
         if (checkOnly_) {
             checkOnly_ = false;
@@ -233,7 +242,7 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
             for (auto it = shown_.begin(); it != shown_.end();) {
                 if (!ids_.count(it->first)) it = shown_.erase(it); else ++it;
             }
-            message_ = "Admitted observations · future permanent rules only"; emit changed();
+            message_ = "Pending requests ready to review"; emit changed();
             showNext(); return; }
         cursor_ = 0; snapshot_ = {}; pageRevision_ = 0; pageAge_.restart(); page(); return;
     }
@@ -258,7 +267,7 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         std::vector<iv::ObservedRecord> rows;
         if (f.type != Type::ObservedRecord || iv::unpack(find(f, Tag::Records)->bytes, 1, rows) != Error::Ok ||
             rows[0].observed != observed_->observed || rows[0].revision != observed_->revision || rows[0].source != source_ ||
-            rows[0].binding != observed_->binding || rows[0].state != 1) { fail("This observation is no longer current."); return; }
+            rows[0].binding != observed_->binding || rows[0].state != 1) { fail("This request is no longer current."); return; }
         observed_ = rows[0]; observedGeneration_ = generation_; prepare(); return;
     }
     if (expectedType_ == Type::PrepareFuturePolicy || expectedType_ == Type::GetFutureDraft) {
@@ -276,12 +285,12 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
             fail("Future review binding changed."); return;
         }
         draft_ = rows[0];
-        if (draft_->state != 3 || draft_->proof != iv::Proof::CurrentShapeUnproven) { fail("The service cannot admit this future scope."); return; }
+        if (draft_->state != 3 || draft_->proof != iv::Proof::CurrentShapeUnproven) { fail("The service cannot prepare this decision."); return; }
         if (expectedType_ == Type::PrepareFuturePolicy) { send(Type::GetFutureDraft, {value(Tag::DraftId, draft_->draft),
             value(Tag::DraftVersion, draft_->version), value(Tag::ProfileGeneration, profile_), value(Tag::IVProfile, 1, 1)}); return; }
         draftAge_.restart(); draftExpiry_.start(int(draft_->ttl)); state_ = State::Ready;
         observedGeneration_ = generation_;
-        message_ = "Review the effective scope before choosing Allow or Block."; emit changed(); return;
+        message_ = "Review what this decision will cover, then choose Allow or Block."; emit changed(); return;
     }
     if ((expectedType_ == Type::CommitFuturePolicy && f.type == Type::FuturePolicyAck) ||
         (expectedType_ == Type::GetFutureCommandStatus && f.type == Type::FutureCommandStatus)) { outcome(f); return; }

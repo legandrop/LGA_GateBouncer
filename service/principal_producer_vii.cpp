@@ -240,6 +240,14 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         refreshScoped(existing->second);
         return outcomeResult(frame.correlation, existing->second);
     }
+    PrincipalOutcome archived;bool found=false;
+    const auto disk=readScopedOutcome(frame.correlation,peer,archived,found);
+    if(disk!=Error::Ok)return principalError(disk);
+    if(found) {
+        if(archived.payload!=canonical)return principalError(Error::Conflict);
+        return outcomeResult(frame.correlation,archived);
+    }
+    if(principalOutcomes_.size()>=128 || principalOutcomeBytes_>512*1024-4096-sizeof(PrincipalOutcome))pruneScopedOutcomes();
     if (principalOutcomes_.size() >= 128 || canonical.capacity() > 4096 ||
         principalOutcomeBytes_ > 512 * 1024 - 4096 - sizeof(PrincipalOutcome)) return principalError(Error::Capacity);
     if (principalWriteFault_ || !principalPolicyReady() || !principalCatalog_ ||
@@ -346,6 +354,15 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         const auto command = idValue(frame, Tag::CommandId);
         auto found = principalOutcomes_.find(command);
         if (found == principalOutcomes_.end()) {
+            PrincipalOutcome archived;bool present=false;
+            const auto disk=readScopedOutcome(command,peer,archived,present);
+            if(disk!=Error::Ok)return principalError(disk);
+            if(present) {
+                auto response=outcomeResult(command,archived,Type::FutureCommandStatus);
+                response.fields.push_back(value(Tag::CommandFound,1,1));
+                response.fields.push_back(value(Tag::OriginalCommandType,static_cast<unsigned>(archived.type),2));
+                return ordered(std::move(response));
+            }
             Frame response; response.minor = 3; response.type = Type::FutureCommandStatus;
             response.fields = {value(Tag::ServiceEpoch, epoch_), value(Tag::ErrorCode, static_cast<unsigned>(Error::CommandUnknown), 2),
                 value(Tag::CommandId, command), value(Tag::CommandFound, 0, 1)};
