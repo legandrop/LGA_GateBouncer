@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <limits>
 #include <QSet>
+#include <QHash>
 
 namespace Gate::Data {
 namespace {
@@ -166,6 +167,90 @@ NativeHistoryDates nativeProcessHistoryDates(const HistoryState &state,
     return {!ambiguous[0] && selected[0] ? selected[0]->atUtc:QDateTime{},
         !ambiguous[1] && selected[1] ? selected[1]->atUtc:QDateTime{},
         !ambiguous[2] && selected[2] ? selected[2]->atUtc:QDateTime{}};
+}
+QVector<RuleHistoryReview> nativeRuleHistoryReview(const HistoryState &state, const NativeSourceBinding &binding,
+    const QVector<RuleHistoryTarget> &targets, int days, const QDateTime &nowUtc) {
+    if (targets.size() > 10000) return {};
+    QVector<RuleHistoryReview> result(targets.size());
+    for (auto &row : result) row.reason = "Monitoring history unavailable; activity dates are Unknown.";
+    if (!validNativeBinding(binding) || !utc(nowUtc) || (days != 90 && days != 180 && days != 365) ||
+        !validNativeHistory(state)) return result;
+    const auto sourceId = nativeSourceId(binding), epoch = nativeEpochKey(binding);
+    const Coverage *coverage = nullptr;
+    for (const auto &c : state.coverage) if (c.native && *c.native == binding &&
+        c.sourceId == sourceId && c.sourceEpoch == epoch) { coverage = &c; break; }
+    if (!coverage) return result;
+    struct Slot { quint64 sequence = 0; QDateTime at; };
+    struct Dates { Slot request, allowed, traffic, activity; };
+    QHash<QByteArray, Dates> indexed;
+    const auto identity = [](const QByteArray &app, const QByteArray &account, quint8 direction) {
+        return QByteArray::number(app.size()) + ':' + app + QByteArray::number(account.size()) + ':' + account + char(direction);
+    };
+    const auto matching = [&](const ActivityEvent &e) {
+        return e.native && e.native->source == 2 && !e.native->externalPartial && e.native->process &&
+            e.sourceId == sourceId && e.sourceEpoch == epoch && validNativeEvent(e) &&
+            (binding.role != 2 || e.native->connection == binding.connection);
+    };
+    const auto admit = [&](const ActivityEvent &e) {
+        const auto &p = *e.native->process;
+        for (const quint8 direction : {e.native->direction, quint8(3)}) {
+            auto &dates = indexed[identity(p.appId,p.accountSid,direction)];
+            const auto updateSlot = [&](Slot &slot) {
+                const auto sequence = e.sequence.toULongLong();
+                if (sequence > slot.sequence) { slot.sequence = sequence; slot.at = e.observedAtUtc; }
+            };
+            updateSlot(dates.activity);
+            if (e.kind == ActivityKind::Attempt) updateSlot(dates.request);
+            else if (e.kind == ActivityKind::Traffic) updateSlot(dates.traffic);
+            else if (e.action == Action::Allow) updateSlot(dates.allowed);
+        }
+    };
+    QMap<QString, const ActivityEvent *> admitted, authorizations;
+    for (const auto &attempt : state.nativeAttempts) if (matching(attempt)) {
+        admitted.insert(nativeEventKey(attempt),&attempt); admit(attempt);
+    }
+    for (const auto &auth : state.nativeAuthorizations) if (matching(auth)) {
+        auto link = auth; link.sequence = QString::number(auth.native->attemptSequence);
+        const auto cause = admitted.constFind(nativeEventKey(link));
+        if (cause == admitted.cend() || !nativeCauseMatches(**cause,auth)) continue;
+        admit(auth);
+        if (auth.action == Action::Allow)
+            authorizations.insert(sequenceKey(auth.sourceId,auth.sourceEpoch) + ':' + auth.native->command,&auth);
+    }
+    for (const auto &traffic : state.nativeTraffic) if (matching(traffic)) {
+        auto link = traffic; link.sequence = QString::number(traffic.native->attemptSequence);
+        const auto cause = admitted.constFind(nativeEventKey(link));
+        const auto auth = authorizations.constFind(sequenceKey(traffic.sourceId,traffic.sourceEpoch) + ':' + traffic.native->command);
+        if (cause != admitted.cend() && auth != authorizations.cend() && nativeTrafficMatches(**cause,**auth,traffic)) admit(traffic);
+    }
+    const bool clockGap = std::any_of(coverage->gaps.begin(),coverage->gaps.end(),[](const CoverageGap &g) {
+        return g.reason == "TimestampDiscontinuity";
+    });
+    for (qsizetype i = 0; i < targets.size(); ++i) {
+        auto &row = result[i]; const auto &target = targets[i];
+        if (target.package != 1 || target.appId.isEmpty() || target.accountSid.isEmpty() ||
+            target.direction < 1 || target.direction > 3) {
+            row.reason = "Application, account or package identity cannot be matched exactly; dates are Unknown."; continue;
+        }
+        const auto found = indexed.constFind(identity(target.appId,target.accountSid,target.direction));
+        if (found == indexed.cend()) {
+            row.reason = "No recorded activity with this exact application, account, direction and monitoring source."; continue;
+        }
+        const auto &dates = *found;
+        row.dates = {dates.request.at,dates.allowed.at,dates.traffic.at};
+        row.lastRecorded = dates.activity.at;
+        if (!row.lastRecorded.isValid() || clockGap || row.lastRecorded > nowUtc) {
+            row.reason = "Recorded activity time is Unknown or inconsistent; age cannot be determined."; continue;
+        }
+        // Fechas OS sólo dentro del mismo namespace; ni receivedAt ni silencio acreditan edad/inactividad.
+        for (const auto &at : {row.dates.attempt,row.dates.authorization,row.dates.traffic})
+            if (at.isValid() && row.lastRecorded < at) row.lastRecorded = at;
+        row.age = row.lastRecorded < nowUtc.addDays(-days) ? RuleHistoryAge::Before : RuleHistoryAge::Recent;
+        row.reason = coverage->status == CoverageStatus::Unavailable
+            ? "Saved activity only; monitoring history is unavailable. No record does not prove inactivity."
+            : "Partial recorded history; gaps and missing records do not prove inactivity.";
+    }
+    return result;
 }
 bool validNativeHistory(const HistoryState &s) {
     if (s.nativeAttempts.size() > 20000 || s.nativeAuthorizations.size() > 20000 || s.nativeTraffic.size() > 20000) return false;

@@ -39,5 +39,16 @@ bool nativeTrafficMatches(const ActivityEvent &attempt, const ActivityEvent &aut
 struct NativeHistoryDates { QDateTime attempt, authorization, traffic; };
 // Selector de datos, sin construir custodia/autoridad: el caller aporta sólo sus causas originales admitidas.
 NativeHistoryDates nativeProcessHistoryDates(const HistoryState &, const QVector<std::shared_ptr<const ActivityEvent>> &);
+// Identidad descriptiva del selector de regla original, sin autoridad de proceso.
+struct RuleHistoryTarget { QByteArray appId, accountSid; quint8 package = 0, direction = 0; };
+enum class RuleHistoryAge { Unknown, Before, Recent };
+struct RuleHistoryReview {
+    NativeHistoryDates dates;
+    QDateTime lastRecorded;
+    RuleHistoryAge age = RuleHistoryAge::Unknown;
+    QString reason;
+};
+QVector<RuleHistoryReview> nativeRuleHistoryReview(const HistoryState &, const NativeSourceBinding &,
+    const QVector<RuleHistoryTarget> &, int days, const QDateTime &nowUtc);
 bool validNativeHistory(const HistoryState &state);
 } // namespace Gate::Data

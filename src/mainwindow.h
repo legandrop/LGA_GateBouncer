@@ -80,7 +80,8 @@ class MainWindow final : public QMainWindow {
     void positionOverlays();
     void edit(const QString &id, bool candidate = false);
     void cleanup();
-    void cleanupLiveRule();
+    void reviewOlderLiveRules();
+    void cleanupLiveRule(const QString &ruleId = {}, quint64 selection = 0);
     void prepareFileRules(const QStringList &candidates = {}, const std::optional<gb::wire::Id> &editing = {}, int backupIndex = -1);
     void editSelectedFileRule();
     void backupSelectedFileRules();

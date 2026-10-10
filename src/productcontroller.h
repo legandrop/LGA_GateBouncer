@@ -98,6 +98,7 @@ class ProductController final : public QObject {
     bool recordsSelected() const { return recordsSelected_; }
     bool selectDecisionRecords();
     bool backupSelectedRules(const std::vector<gb::wire::Id> &, quint64 selection, bool consent);
+    QVector<Data::RuleHistoryReview> reviewLiveRuleHistory(int days, const QDateTime &nowUtc) const;
     bool ruleBackupBusy() const { return pendingRuleBackup_.has_value() || savingRuleBackup_; }
     QString ruleBackupDirectory() const;
     void selectStatusOnly();

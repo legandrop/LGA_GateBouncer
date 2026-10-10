@@ -1077,6 +1077,30 @@ bool ProductController::loadSelectedRuleBackup(const QString &path) {
     });
     worker->start(); emit changed(); return true;
 }
+QVector<Data::RuleHistoryReview> ProductController::reviewLiveRuleHistory(int days, const QDateTime &nowUtc) const {
+    const auto *client = ordinary();
+    if (simulation() || !client->rulesCurrent_ || !client->connected_) return {};
+    if (client->administrative_ && client->session_.administrativeConnection() != client->connection_) return {};
+    const auto text = [](const gb::wire::Id &id) { return QString::fromStdString(gb::wire::hex(id)); };
+    Data::NativeSourceBinding binding{text(client->epoch_),text(client->boot_),text(client->source_),
+        text(client->source_),client->bindingGeneration_,client->profile_};
+    if (client->administrative_) { binding.role = 2; binding.connection = text(client->connection_); }
+    QVector<Data::RuleHistoryTarget> targets; targets.reserve(qsizetype(client->rules_.size()));
+    const auto bytes = [](const gb::wire::Bytes &value) {
+        return QByteArray(reinterpret_cast<const char *>(value.data()),qsizetype(value.size()));
+    };
+    for (const auto &rule : client->rules_) {
+        gb::wire::iv::OriginalTarget original;
+        Data::RuleHistoryTarget target;
+        if (rule.desired == client->desired_ && rule.scope == 2 && rule.targetKind == 1 &&
+            gb::wire::iv::unpackOriginalTarget(rule.originalTarget,original) == gb::wire::Error::Ok &&
+            original.packageMode == rule.package) {
+            target = {bytes(original.appId),bytes(original.accountSid),rule.package,rule.direction};
+        }
+        targets.push_back(std::move(target));
+    }
+    return Data::nativeRuleHistoryReview(history_.state(),binding,targets,days,nowUtc);
+}
 QString ProductController::ruleBackupDirectory() const {
     return store_ ? QFileInfo(store_->filePath()).absolutePath() : QString{};
 }

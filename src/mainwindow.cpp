@@ -34,6 +34,7 @@
 #include <QStyleOptionViewItem>
 #include <QStyledItemDelegate>
 #include <QTableView>
+#include <QTreeWidget>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <algorithm>
@@ -2321,7 +2322,7 @@ void MainWindow::renderLive() {
             product_.ordinary()->state() != OrdinaryDecisionClient::State::Uncertain);
         bar->addWidget(refresh);
         connect(refresh,&QPushButton::clicked,product_.ordinary(),&OrdinaryDecisionClient::refreshRules);
-        auto *remove = button("Review rule removal","cleanup-live-rules","ghost");
+        auto *remove = button("Review older rules…","cleanup-live-rules","ghost");
         remove->setEnabled(product_.ordinary()->rulesCurrent()); bar->addWidget(remove);
         connect(remove,&QPushButton::clicked,this,&MainWindow::cleanup);
         auto *files = line(pageLayout_);
@@ -2783,7 +2784,7 @@ void MainWindow::edit(const QString &id, bool candidate) {
     cancel->setFocus();
 }
 void MainWindow::cleanup() {
-    if (!product_.simulation()) { cleanupLiveRule(); return; }
+    if (!product_.simulation()) { reviewOlderLiveRules(); return; }
     if (!model_.available())
         return;
     const auto epoch = model_.epoch();
@@ -2857,15 +2858,138 @@ void MainWindow::cleanup() {
     });
     cancel->setFocus();
 }
-void MainWindow::cleanupLiveRule() {
+void MainWindow::reviewOlderLiveRules() {
+    if (product_.simulation() || !product_.ordinary()->rulesCurrent()) return;
+    const auto rules = product_.ordinary()->rules();
+    const auto selection = product_.ordinary()->selection();
+    const auto *reviewer = product_.ordinary();
+    const auto now = QDateTime::currentDateTimeUtc();
+    auto *layout = modal("Review older application rules",ModalOwner::FileRule);
+    modalPanel_->setMaximumWidth(1050);
+    layout->addWidget(note("Review recorded activity for each exact application and account. These dates do not prove that a rule matched or that an app was inactive. Nothing is removed automatically.",true));
+    auto *controls = line(layout); controls->addWidget(label("Recorded activity age","muted"));
+    auto *threshold = combo({"90 days","180 days","365 days"},"live-rule-history-threshold");
+    threshold->setCurrentIndex(cleanupDays_ == 90 ? 0 : cleanupDays_ == 180 ? 1 : 2); controls->addWidget(threshold);
+    auto *group = combo({"All rules","Last recorded activity before…","No recorded activity / monitoring history unavailable","Recent recorded activity"},"live-rule-history-group");
+    group->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon); group->setMinimumContentsLength(22);
+    controls->addWidget(group,1);
+    auto *search = new QLineEdit; search->setObjectName("live-rule-history-search");
+    search->setPlaceholderText("Find an application or account…"); layout->addWidget(search);
+    auto *cutoff = label({},"faint",true); cutoff->setObjectName("live-rule-history-cutoff"); layout->addWidget(cutoff);
+    auto *tree = new QTreeWidget; tree->setObjectName("live-rule-history-list");
+    tree->setHeaderLabels({"Application and account","Last request","Last access allowed","Last traffic","Review group / reason"});
+    tree->setRootIsDecorated(false); tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
+    tree->setWordWrap(true); tree->setMinimumHeight(240); tree->setMaximumHeight(360);
+    tree->header()->setSectionResizeMode(QHeaderView::Stretch); layout->addWidget(tree);
+    auto *pages = line(layout); auto *previous = button("Previous","live-rule-history-previous","ghost");
+    auto *next = button("Next","live-rule-history-next","ghost"); auto *count = label({},"faint");
+    pages->addWidget(previous); pages->addWidget(count,1); pages->addWidget(next);
+    auto *actions = line(layout); auto *cancel = button("Close","close-old-rule-review","ghost"); actions->addWidget(cancel);
+    auto *backup = button("Back up selected…","backup-old-rule-selection","ghost"); actions->addWidget(backup);
+    auto *remove = button("Review selected removal…","review-old-rule-removal","danger"); actions->addWidget(remove);
+    backup->setEnabled(false); remove->setEnabled(false);
+    struct Page { int offset = 0; QVector<Data::RuleHistoryReview> history; };
+    const auto page = std::make_shared<Page>();
+    const auto current = [this,selection,reviewer] { return !product_.simulation() && product_.ordinary() == reviewer &&
+        product_.ordinary()->rulesCurrent() && product_.ordinary()->selection() == selection; };
+    const auto selected = [tree] {
+        QStringList ids; for (const auto *item : tree->selectedItems()) ids.push_back(item->data(0,Qt::UserRole).toString()); return ids;
+    };
+    const auto populate = [this,rules,now,group,search,tree,previous,next,count,cutoff,page,current,backup,remove,selected] {
+        const auto kept = selected(); const QSignalBlocker block(tree);
+        tree->clear();
+        cutoff->setText("Last recorded activity before " + QLocale().toString(now.addDays(-cleanupDays_).toLocalTime().date(),QLocale::ShortFormat) +
+            ". Snapshot opened " + QLocale().toString(now.toLocalTime(),QLocale::ShortFormat) + ". Missing dates stay Unknown; all rules remain available for review.");
+        QVector<int> indices;
+        for (int i = 0; i < int(rules.size()); ++i) {
+            const auto &rule = rules[std::size_t(i)];
+            if (!search->text().isEmpty() && !(recordText(rule.display.name,{}) + " " +
+                recordText(rule.display.principal,{}) + " " + targetAccountText(rule)).contains(search->text(),Qt::CaseInsensitive)) continue;
+            const auto age = i < page->history.size() ? page->history[i].age : Data::RuleHistoryAge::Unknown;
+            if (group->currentIndex() == 0 || (group->currentIndex() == 1 && age == Data::RuleHistoryAge::Before) ||
+                (group->currentIndex() == 2 && age == Data::RuleHistoryAge::Unknown) ||
+                (group->currentIndex() == 3 && age == Data::RuleHistoryAge::Recent)) indices.push_back(i);
+        }
+        std::stable_sort(indices.begin(),indices.end(),[page](int a,int b) {
+            const auto age = [page](int i) { return i < page->history.size() ? int(page->history[i].age) : int(Data::RuleHistoryAge::Unknown); };
+            return age(a) < age(b);
+        });
+        const int total = int(indices.size()); page->offset = std::min(page->offset,total ? ((total-1)/128)*128 : 0);
+        const auto at = [](const QDateTime &value) { return value.isValid() ? QLocale().toString(value.toLocalTime(),QLocale::ShortFormat) : QString("Unknown"); };
+        QMap<int,QTreeWidgetItem *> sections;
+        for (int j = page->offset; j < std::min(total,page->offset+128); ++j) {
+            const int i = indices[j]; const auto &rule = rules[std::size_t(i)];
+            const auto row = i < page->history.size() ? page->history[i] : Data::RuleHistoryReview{};
+            const auto title = row.age == Data::RuleHistoryAge::Before ? "Last recorded activity before the selected date" :
+                row.age == Data::RuleHistoryAge::Recent ? "Recent recorded activity" : "No recorded activity / monitoring history unavailable";
+            auto *section = sections.value(int(row.age));
+            if (!section) {
+                section = new QTreeWidgetItem(tree,{QString(title)}); section->setFlags(Qt::ItemIsEnabled);
+                section->setFirstColumnSpanned(true); section->setExpanded(true); sections.insert(int(row.age),section);
+            }
+            auto *item = new QTreeWidgetItem(section,{recordText(rule.display.name,"Application unknown") + "\n" + targetAccountText(rule),
+                at(row.dates.attempt),at(row.dates.authorization),at(row.dates.traffic),
+                (row.reason.isEmpty() ? "Monitoring history unavailable; dates are Unknown." : row.reason)});
+            const auto id = QString::fromStdString(gb::wire::hex(rule.rule)); item->setData(0,Qt::UserRole,id);
+            item->setSelected(kept.contains(id));
+        }
+        count->setText(QString("%1–%2 of %3 rules · %4 in the current catalog").arg(total ? page->offset+1 : 0).arg(std::min(total,page->offset+128)).arg(total).arg(rules.size()));
+        previous->setEnabled(page->offset > 0); next->setEnabled(page->offset+128 < total);
+        const auto size = selected().size(); backup->setEnabled(current() && size > 0 && !product_.ruleBackupBusy() && product_.reviewWritable());
+        remove->setEnabled(current() && size == 1);
+    };
+    const auto recalculate = [this,page,now,populate,current] {
+        page->history = current() ? product_.reviewLiveRuleHistory(cleanupDays_,now) : QVector<Data::RuleHistoryReview>{}; populate();
+    };
+    connect(threshold,&QComboBox::currentIndexChanged,tree,[this,page,recalculate](int index) {
+        cleanupDays_ = index == 0 ? 90 : index == 1 ? 180 : 365; page->offset = 0; recalculate();
+    });
+    connect(group,&QComboBox::currentIndexChanged,tree,[page,populate] { page->offset = 0; populate(); });
+    connect(search,&QLineEdit::textChanged,tree,[page,populate] { page->offset = 0; populate(); });
+    connect(previous,&QPushButton::clicked,tree,[page,populate] { page->offset = std::max(0,page->offset-128); populate(); });
+    connect(next,&QPushButton::clicked,tree,[page,populate] { page->offset += 128; populate(); });
+    connect(tree,&QTreeWidget::itemSelectionChanged,tree,[current,selected,backup,remove,this] {
+        const auto size = selected().size(); backup->setEnabled(current() && size > 0 && !product_.ruleBackupBusy() && product_.reviewWritable());
+        remove->setEnabled(current() && size == 1);
+    });
+    connect(product_.ordinary(),&OrdinaryDecisionClient::changed,tree,[current,selected,backup,remove,this] {
+        const auto size = selected().size(); backup->setEnabled(current() && size > 0 && !product_.ruleBackupBusy() && product_.reviewWritable());
+        remove->setEnabled(current() && size == 1);
+    });
+    connect(cancel,&QPushButton::clicked,this,&MainWindow::closeModal);
+    connect(remove,&QPushButton::clicked,this,[this,current,selected,selection] {
+        const auto ids = selected();
+        if (!current() || ids.size() != 1) { message("The rule catalog changed. Refresh before reviewing removal."); return; }
+        cleanupLiveRule("principal-rule:" + ids.front(),selection);
+    });
+    connect(backup,&QPushButton::clicked,this,[this,current,selected,rules,selection] {
+        if (!current()) { message("The rule catalog changed. Refresh before selecting a backup."); return; }
+        std::vector<gb::wire::Id> ids;
+        for (const auto &id : selected()) for (const auto &rule : rules)
+            if (id == QString::fromStdString(gb::wire::hex(rule.rule))) { ids.push_back(rule.rule); break; }
+        if (ids.empty() || ids.size() > 128) return;
+        auto *body = modal("Back up reviewed rules",ModalOwner::FileRule);
+        body->addWidget(note(QString("Save %1 selected application and account rules as an inactive backup. No rule is changed and no permission is restored automatically.").arg(ids.size()),true));
+        auto *consent = new QCheckBox("Save these selected rules as an inactive backup"); body->addWidget(consent);
+        auto *save = button("Save inactive backup","save-old-rule-backup","primary"); save->setEnabled(false); body->addWidget(save);
+        connect(consent,&QCheckBox::toggled,save,&QPushButton::setEnabled);
+        connect(save,&QPushButton::clicked,this,[this,ids,selection,consent,current] {
+            if (!current() || !product_.backupSelectedRules(ids,selection,consent->isChecked())) { message("The selection changed or the stored review is unavailable."); return; }
+            closeModal(); message("Saving the selected inactive backup in the background. No rule was changed.");
+        });
+    });
+    recalculate(); cancel->setFocus();
+}
+void MainWindow::cleanupLiveRule(const QString &ruleId, quint64 selection) {
     if (product_.simulation() || !table_ || !product_.ordinary()->rulesCurrent()) return;
-    const auto selected = table_->currentIndex().data(IdRole).toString();
+    if (selection && product_.ordinary()->selection() != selection) return;
+    const auto selected = ruleId.isEmpty() ? table_->currentIndex().data(IdRole).toString() : ruleId;
     const auto &rules = product_.ordinary()->rules();
     const auto found = std::find_if(rules.begin(),rules.end(),[&](const auto &r) {
         return selected == "principal-rule:" + QString::fromStdString(gb::wire::hex(r.rule));
     });
     if (found == rules.end()) { message("Select a rule for your account before reviewing removal."); return; }
-    const auto rule = *found; const auto selection = product_.ordinary()->selection();
+    const auto rule = *found; selection = product_.ordinary()->selection();
     auto *layout = modal("Review rule removal",ModalOwner::FileRule);
     layout->addWidget(label(recordText(rule.display.name,"Application unknown"),"heading",true));
     definition(layout,"Target account",recordText(rule.display.principal,"Account display unavailable") + " · " + targetAccountText(rule));
