@@ -31,13 +31,14 @@ bool ncName(const QString &value) {
 }
 bool names(QNameBudget &b, const ExpandedName &n) { return b.string(n.uri) && b.string(n.local); }
 bool nodeBudget(QNameBudget &b, const QNameNode &n) {
-    if (!names(b, n.name) || !b.string(n.qualifiedName) || !b.structure(512)) return false;
+    // Cota de estructura JSON (keys/puntuación/índices), no tamaño ficticio de un objeto RAM.
+    if (!names(b, n.name) || !b.string(n.qualifiedName) || !b.structure(192)) return false;
     for (const auto &a : n.attributes)
-        if (!names(b, a.name) || !b.string(a.qualifiedName) || !b.string(a.value) || !b.structure(256)) return false;
+        if (!names(b, a.name) || !b.string(a.qualifiedName) || !b.string(a.value) || !b.structure(80)) return false;
     for (const auto *bindings : {&n.declarations, &n.closure})
-        for (const auto &d : *bindings) if (!b.string(d.prefix) || !b.string(d.uri) || !b.structure(128)) return false;
+        for (const auto &d : *bindings) if (!b.string(d.prefix) || !b.string(d.uri) || !b.structure(48)) return false;
     if (n.resolvedType && !names(b, *n.resolvedType)) return false;
-    for (const auto &c : n.content) if (!b.string(c.text) || !b.structure(128)) return false;
+    for (const auto &c : n.content) if (!b.string(c.text) || !b.structure(48)) return false;
     return true;
 }
 QString prefix(const QString &qualified) { return qualified.contains(':') ? qualified.section(':', 0, 0) : QString{}; }
@@ -129,14 +130,14 @@ QNameReadResult readQNameXml(const QByteArray &bytes, const ImportLimits &limits
             if (!nodeBudget(budget, n) || !nodeNames(n, env)) { result.error = "XmlNamesOrBudget"; break; }
             const int index = result.nodes.size();
             if (!stack.isEmpty()) {
-                if (!budget.structure(128)) { result.error = "XmlBudget"; break; }
+                if (!budget.structure(48)) { result.error = "XmlBudget"; break; }
                 result.nodes[stack.last()].content.push_back({index, {}});
             }
             result.nodes.push_back(std::move(n)); stack.push_back(index); environments.push_back(std::move(env));
         } else if (token == QXmlStreamReader::Characters && !stack.isEmpty()) {
             const QString text = reader.text().toString();
             auto &content = result.nodes[stack.last()].content;
-            if (text.size() > limits.text || !budget.string(text) || !budget.structure(128)) { result.error = "XmlTextBudget"; break; }
+            if (text.size() > limits.text || !budget.string(text) || !budget.structure(48)) { result.error = "XmlTextBudget"; break; }
             if (!content.isEmpty() && content.last().child < 0) {
                 if (content.last().text.size() + text.size() > limits.text) { result.error = "XmlTextBounds"; break; }
                 content.last().text += text;

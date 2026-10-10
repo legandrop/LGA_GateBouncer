@@ -34,7 +34,8 @@ struct QNameEvidence {
 struct QNameBudget {
     qint64 units = 0, jsonBound = 0;
     bool valid = true;
-    static constexpr qint64 unitLimit = 8 * 1024 * 1024;
+    // Incluye también keys repetidas del JSON; bytes/tokens/filas conservan sus cotas.
+    static constexpr qint64 unitLimit = 16 * 1024 * 1024;
     static constexpr qint64 byteLimit = 32 * 1024 * 1024;
     bool string(const QString &value) {
         if (!valid || value.size() > 32768 || value.size() > unitLimit - units) return valid = false;

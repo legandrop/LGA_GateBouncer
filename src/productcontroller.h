@@ -52,7 +52,8 @@ class ProductController final : public QObject {
     const Data::QNameCandidateFacts *derivedQNameCandidate(bool draft, const QString &id) const;
     QString reviewError() const { return reviewError_; }
     QString importError() const { return importError_; }
-    bool reviewWritable() const { return reviewWritable_ && !simulation(); }
+    bool reviewWritable() const { return reviewWritable_ && !simulation() && !storeLoading_; }
+    bool reviewBusy() const { return storeLoading_ || flushingHistory_ || storeWriteRequested_ || bool(pendingReview_); }
     bool analyzeChosenFile(const QString &path);
     void setImportFormat(ImportFormat format) { importFormat_ = format; }
     ImportFormat importFormat() const { return importFormat_; }
@@ -77,13 +78,17 @@ class ProductController final : public QObject {
     QString revisionSummary() const;
     quint64 generation() const { return generation_; }
     void stop();
-    bool idle() const { return (!worker_ || !worker_->isRunning()) && (!semanticWorker_ || !semanticWorker_->isRunning()) && (!importWorker_ || !importWorker_->isRunning()) && engine_.idle() && records_.idle() && ordinary_.idle(); }
+    bool idle() const { return (!worker_ || !worker_->isRunning()) && (!semanticWorker_ || !semanticWorker_->isRunning()) && (!importWorker_ || !importWorker_->isRunning()) && (!storeWorker_ || !storeWorker_->isRunning()) && !storeLoading_ && !flushingHistory_ &&
+        !(reviewWritable_ && (storeWriteRequested_ || historyDirty_)) && engine_.idle() && records_.idle() && ordinary_.idle(); }
   signals:
     void changed();
     void invalidated();
     void importedViewsInvalidated();
+    void reviewSaved(const QString &message);
   private:
     void loadReview(const QString &root);
+    void startReviewWrite();
+    void queueReview(Data::ReviewDocument document, const QString &notification);
     void deriveImportedViews();
     void startImportedViews();
     void startImport();
@@ -120,6 +125,11 @@ class ProductController final : public QObject {
     gb::wire::Id lastEpoch_{}, lastBoot_{};
     quint64 lastProfile_ = 0;
     std::unique_ptr<Data::ReviewStore> store_;
+    QThread *storeWorker_ = nullptr;
+    bool storeLoading_ = false, storeWriteRequested_ = false;
+    quint64 historyVersion_ = 0;
+    std::optional<Data::ReviewDocument> pendingReview_, inFlightReview_;
+    QString writeNotification_;
     Data::ReviewDocument review_;
     Data::ActivityHistory history_;
     QTimer historyFlush_;

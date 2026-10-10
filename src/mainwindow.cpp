@@ -525,6 +525,7 @@ MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
     connect(&explanation_, &Explanation::changed, this, &MainWindow::renderNotice);
     connect(&product_, &ProductController::changed, this, &MainWindow::refresh);
     connect(&product_, &ProductController::changed, this, &MainWindow::updateLifecycle);
+    connect(&product_, &ProductController::reviewSaved, this, [this](const QString &text) { if (!closing_) message(text); });
     connect(product_.ordinary(), &OrdinaryDecisionClient::changed, this, &MainWindow::renderOrdinaryNotice);
     connect(&product_, &ProductController::importedViewsInvalidated, this, &MainWindow::closeStaleModal);
     connect(&model_, &Simulation::changed, this, &MainWindow::updateLifecycle);
@@ -2057,14 +2058,15 @@ void MainWindow::renderLive() {
             connect(dialog, &QFileDialog::fileSelected, &product_, &ProductController::analyzeChosenFile); dialog->open();
         });
         if (product_.importBusy()) pageLayout_->addWidget(label("Analyzing the chosen file in the background · preview preserved", "muted", true));
+        if (product_.reviewBusy()) pageLayout_->addWidget(label("Loading or saving inactive review in the background · previous file preserved until commit", "muted", true));
         if (!product_.importError().isEmpty()) pageLayout_->addWidget(note("Preview preserved · " + product_.importError()));
         if (!product_.reviewError().isEmpty()) pageLayout_->addWidget(note(product_.reviewError()));
         makeTable({"Source target", "Original policy", "Mapping", "Review reason"}, {27, 17, 18, 38}, 38);
         auto *foot = line(pageLayout_);
         foot->addWidget(label(QString::number(product_.draft().candidates.size()) + " inactive rows · compatibility: not validated", "faint"), 1);
         auto *save = button("Save all inactive candidates", "save-candidates", "primary");
-        save->setEnabled(!product_.importBusy() && product_.reviewWritable() && product_.draft().accepted); foot->addWidget(save);
-        connect(save, &QPushButton::clicked, this, [this] { if (product_.saveCandidates()) message("All candidates saved inactive. No firewall policy was changed."); });
+        save->setEnabled(!product_.importBusy() && !product_.reviewBusy() && product_.reviewWritable() && product_.draft().accepted); foot->addWidget(save);
+        connect(save, &QPushButton::clicked, this, [this] { if (product_.saveCandidates()) message("Saving inactive candidates in the background…"); });
     } else {
         auto *content = new QWidget; auto *l = new QVBoxLayout(content); l->setContentsMargins(0, 0, 0, 15); l->setSpacing(12); content->setMaximumWidth(830);
         modeSelector(l);
@@ -2243,7 +2245,7 @@ void MainWindow::reviewCandidate(const QString &rowId, bool draft) {
         connect(save, &QPushButton::clicked, this, [this, id = c.id, digest = report.digest, revision = product_.review().revision, generation = product_.importGeneration(), policy] {
             if (product_.simulation() || product_.importGeneration() != generation || product_.review().report.digest != digest || product_.review().revision != revision) return;
             const auto action = policy->currentIndex() == 0 ? Data::Action::Allow : policy->currentIndex() == 1 ? Data::Action::Block : Data::Action::Ask;
-            if (product_.updateCandidate(id, action)) { closeModal(); message("Local review saved. Candidate remains inactive."); }
+            if (product_.updateCandidate(id, action)) { closeModal(); message("Saving local review in the background…"); }
         }); return;
     }
 }

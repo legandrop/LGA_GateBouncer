@@ -136,32 +136,60 @@ ProductController::~ProductController() {
     if (worker_) { worker_->wait(); delete worker_; }
     if (semanticWorker_) { semanticWorker_->wait(); delete semanticWorker_; }
     if (importWorker_) { importWorker_->wait(); delete importWorker_; }
+    if (storeWorker_) { storeWorker_->wait(); delete storeWorker_; }
 }
 void ProductController::historyChanged() {
-    historyDirty_ = true;
-    if (!flushingHistory_ && !simulation() && history_.flushDue(QDateTime::currentDateTimeUtc())) flushHistory();
+    ++historyVersion_; historyDirty_ = true;
+    if (!simulation() && history_.flushDue(QDateTime::currentDateTimeUtc())) flushHistory();
 }
 bool ProductController::flushHistory() {
     if (!historyDirty_) return true;
-    if (flushingHistory_ || !store_ || !reviewWritable_) {
+    if (storeLoading_) { storeWriteRequested_=true; return true; }
+    if (!store_ || !reviewWritable_) {
         historyError_ = "History could not be saved; previous stored records are preserved.";
         history_.storageFailed(); return false;
     }
-    flushingHistory_ = true;
-    auto next = review_; next.history = history_.state();
-    const auto saved = store_->save(next, review_.revision);
-    flushingHistory_ = false;
-    if (!saved.ok() || !saved.document) {
-        history_.storageFailed(); reviewWritable_ = false;
-        historyError_ = "History could not be saved: " + saved.error;
-        reviewError_ = historyError_; emit changed(); return false;
-    }
-    review_ = *saved.document;
-    history_.checkpoint(QDateTime::currentDateTimeUtc());
-    historyDirty_ = false; historyError_.clear();
-    // La revision del store cambia; las vistas derivadas siguen el mismo import.
-    if (reviewView_.digest == review_.report.digest) reviewView_.revision = review_.revision;
-    emit changed(); return true;
+    storeWriteRequested_=true; startReviewWrite(); return true;
+}
+void ProductController::queueReview(Data::ReviewDocument document,const QString &notification) {
+    pendingReview_=std::move(document); writeNotification_=notification;
+    storeWriteRequested_=true; startReviewWrite(); emit changed();
+}
+void ProductController::startReviewWrite() {
+    // Único escritor físico: la revisión se toma al despachar, nunca de una captura vieja.
+    if (storeLoading_ || storeWorker_ || !store_ || !reviewWritable_ ||
+        (!storeWriteRequested_ && !historyDirty_)) return;
+    auto next=pendingReview_ ? *pendingReview_ : review_;
+    next.revision=review_.revision; next.history=history_.state();
+    pendingReview_.reset(); inFlightReview_=next; storeWriteRequested_=false; flushingHistory_=true;
+    const auto version=historyVersion_; const auto notification=writeNotification_; writeNotification_.clear();
+    auto *store=store_.get(); const auto expected=review_.revision;
+    storeWorker_=QThread::create([this,store,next,expected,version,notification] {
+        Data::StoreResult saved;
+        try { saved=store->save(next,expected); }
+        catch (...) { saved={Data::StoreStatus::IoError,"Review processing failed; previous file preserved",{}}; }
+        QMetaObject::invokeMethod(this,[this,saved,version,notification] {
+            flushingHistory_=false; inFlightReview_.reset();
+            if (!saved.ok() || !saved.document) {
+                history_.storageFailed(); ++historyVersion_; reviewWritable_=false;
+                pendingReview_.reset(); storeWriteRequested_=false; writeNotification_.clear();
+                reviewError_="Review was not saved: "+saved.error; historyError_=reviewError_; emit changed(); return;
+            }
+            review_=*saved.document;
+            if (historyVersion_==version) { history_.checkpoint(QDateTime::currentDateTimeUtc()); historyDirty_=false; }
+            else storeWriteRequested_=true; // El siguiente write incluye toda la historia más reciente.
+            historyError_.clear(); reviewError_.clear();
+            if (!notification.isEmpty()) { deriveImportedViews(); emit reviewSaved(notification); }
+            else if (reviewView_.digest==review_.report.digest) reviewView_.revision=review_.revision;
+            emit changed();
+        },Qt::QueuedConnection);
+    });
+    auto *thread=storeWorker_;
+    connect(thread,&QThread::finished,this,[this,thread] {
+        if (storeWorker_==thread) storeWorker_=nullptr;
+        thread->deleteLater(); startReviewWrite(); emit changed();
+    });
+    thread->start();
 }
 void ProductController::stop() {
     if (stopped_) return;
@@ -171,16 +199,30 @@ void ProductController::stop() {
     flushHistory();
 }
 void ProductController::loadReview(const QString &root) {
-    store_ = std::make_unique<Data::ReviewStore>(root);
-    const auto result = store_->load();
-    reviewWritable_ = result.ok() || result.status == Data::StoreStatus::Missing;
-    if (result.document) review_ = *result.document;
-    if (!history_.restore(review_.history)) {
-        reviewWritable_ = false; historyError_ = "Stored history could not be restored; the file is preserved.";
-    } else if (!review_.history.coverage.isEmpty()) historyDirty_ = true;
-    if (!reviewWritable_) reviewError_ = result.status == Data::StoreStatus::Busy
-        ? "Review store is open in another instance" : "Review store unavailable: " + result.error;
-    deriveImportedViews();
+    store_=std::make_unique<Data::ReviewStore>(root); storeLoading_=true;
+    auto *store=store_.get();
+    storeWorker_=QThread::create([this,store] {
+        Data::StoreResult result;
+        try { result=store->load(); }
+        catch (...) { result={Data::StoreStatus::IoError,"Review processing failed; file preserved",{}}; }
+        QMetaObject::invokeMethod(this,[this,result] {
+            storeLoading_=false; reviewWritable_=result.ok() || result.status==Data::StoreStatus::Missing;
+            if (result.document) review_=*result.document;
+            if (!history_.restore(review_.history)) {
+                reviewWritable_=false; historyError_="Stored history could not be restored; the file is preserved.";
+            } else if (!review_.history.coverage.isEmpty()) { ++historyVersion_; historyDirty_=true; }
+            if (!reviewWritable_) reviewError_=result.status==Data::StoreStatus::Busy
+                ? "Review store is open in another instance" : "Review store unavailable: "+result.error;
+            deriveImportedViews(); emit changed();
+        },Qt::QueuedConnection);
+    });
+    auto *thread=storeWorker_;
+    connect(thread,&QThread::finished,this,[this,thread] {
+        if (storeWorker_==thread) storeWorker_=nullptr;
+        thread->deleteLater(); if (stopped_ && historyDirty_) storeWriteRequested_=true;
+        startReviewWrite(); emit changed();
+    });
+    thread->start();
 }
 void ProductController::deriveImportedViews() {
     ++importGeneration_;
@@ -283,7 +325,7 @@ bool ProductController::refreshEngine() {
     return !stopped_ && !simulation() && (recordsSelected_ ? records_.refresh() : engine_.refresh());
 }
 bool ProductController::selectDecisionRecords() {
-    if (stopped_ || simulation()) return false;
+    if (stopped_ || simulation() || storeLoading_) return false;
     if (!recordsSelected_) {
         recordsSelected_ = true; engine_.invalidate();
         ++generation_; emit invalidated(); emit changed();
@@ -356,26 +398,17 @@ void ProductController::startImport() {
 }
 void ProductController::clearDraft() { if (stopped_) return; cancelImport(); draft_ = {}; draftEvidence_.reset(); importError_.clear(); deriveImportedViews(); emit changed(); }
 bool ProductController::saveCandidates() {
-    if (stopped_ || importBusy() || !reviewWritable() || !store_ || !draft_.accepted) return false;
-    auto next = review_; next.report = draft_; next.history = history_.state();
-    next.qnameEvidence = draftEvidence_;
-    const auto result = store_->save(next, review_.revision);
-    if (!result.ok() || !result.document) {
-        reviewWritable_ = false; reviewError_ = "Candidates were not saved: " + result.error;
-        emit changed(); return false;
-    }
-    review_ = *result.document; history_.checkpoint(QDateTime::currentDateTimeUtc()); historyDirty_ = false;
-    deriveImportedViews(); emit changed(); return true;
+    if (stopped_ || importBusy() || reviewBusy() || !reviewWritable() || !store_ || !draft_.accepted) return false;
+    auto next=review_; next.report=draft_; next.qnameEvidence=draftEvidence_;
+    queueReview(std::move(next),"All candidates saved inactive. No firewall policy was changed."); return true;
 }
-bool ProductController::updateCandidate(const QString &id, Data::Action action) {
+bool ProductController::updateCandidate(const QString &id,Data::Action action) {
     if (stopped_ || !reviewWritable() || !store_) return false;
-    auto next = review_; next.history = history_.state(); bool found = false;
-    for (auto &c : next.report.candidates) if (c.id == id) { c.reviewAction = action; c.reviewed = true; found = true; }
+    auto next=pendingReview_ ? *pendingReview_ : inFlightReview_ ? *inFlightReview_ : review_;
+    bool found=false;
+    for (auto &c:next.report.candidates) if(c.id==id) { c.reviewAction=action; c.reviewed=true; found=true; }
     if (!found) return false;
-    const auto result = store_->save(next, review_.revision);
-    if (!result.ok() || !result.document) { reviewWritable_ = false; reviewError_ = "Review was not saved: " + result.error; emit changed(); return false; }
-    review_ = *result.document; history_.checkpoint(QDateTime::currentDateTimeUtc()); historyDirty_ = false;
-    deriveImportedViews(); emit changed(); return true;
+    queueReview(std::move(next),"Local review saved. Candidate remains inactive."); return true;
 }
 QString ProductController::engineSummary() const {
     const auto &e = engine();

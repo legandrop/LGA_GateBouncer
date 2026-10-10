@@ -134,7 +134,7 @@ struct Scanner {
         if (c == 't' || c == 'f' || c == 'n') {
             const QByteArray word = c == 't' ? "true" : c == 'f' ? "false" : "null";
             if (bytes.mid(at, word.size()) != word) return false;
-            at += word.size(); charge(0, 64); return true;
+            at += word.size(); charge(0, word.size()); return true;
         }
         const auto start = at;
         if (bytes[at] == '-') ++at;
@@ -150,7 +150,7 @@ struct Scanner {
             const auto first = at; while (at < bytes.size() && bytes[at] >= '0' && bytes[at] <= '9') ++at;
             if (at == first) return false;
         }
-        charge(0, 64); if (at - start > 64) budget = false;
+        charge(0, at - start); if (at - start > 64) budget = false;
         if (schemaValue) {
             ++versions; bool ok = false;
             const auto number = bytes.mid(start, at - start).toDouble(&ok);
@@ -223,11 +223,11 @@ bool budgetQNameReview(const ReviewDocument &d, qint64 *bound) {
     const auto &e = *d.qnameEvidence;
     if (!fixed(b, 64, 512) || !strings(b, {e.profileId, e.digest}) || e.nodes.size() > 200000) return false;
     for (const auto &n : e.nodes) {
-        if (!fixed(b, 128, 512) || !strings(b, {n.name.uri, n.name.local, n.qualifiedName}) || n.attributes.size() + n.declarations.size() > 32) return false;
+        if (!fixed(b, 104, 80) || !strings(b, {n.name.uri, n.name.local, n.qualifiedName}) || n.attributes.size() + n.declarations.size() > 32) return false;
         if (n.resolvedType && (!fixed(b, 8, 64) || !strings(b, {n.resolvedType->uri, n.resolvedType->local}))) return false;
-        for (const auto &a : n.attributes) if (!fixed(b, 40, 256) || !strings(b, {a.name.uri, a.name.local, a.qualifiedName, a.value})) return false;
-        for (const auto *list : {&n.declarations, &n.closure}) for (const auto &a : *list) if (!fixed(b, 12, 128) || !strings(b, {a.prefix, a.uri})) return false;
-        for (const auto &c : n.content) if (!fixed(b, 9, 128) || !b.string(c.text)) return false;
+        for (const auto &a : n.attributes) if (!fixed(b, 40, 40) || !strings(b, {a.name.uri, a.name.local, a.qualifiedName, a.value})) return false;
+        for (const auto *list : {&n.declarations, &n.closure}) for (const auto &a : *list) if (!fixed(b, 12, 24) || !strings(b, {a.prefix, a.uri})) return false;
+        for (const auto &c : n.content) if (!fixed(b, 9, 24) || !b.string(c.text)) return false;
     }
     for (const auto &r : e.rows) if (!fixed(b, 15, 128) || !b.string(r.candidateId)) return false;
     if (!b.structure(e.roles.size() * 68ll)) return false;

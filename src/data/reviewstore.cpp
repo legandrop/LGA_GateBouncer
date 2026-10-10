@@ -15,7 +15,7 @@
 
 namespace Gate::Data {
 namespace {
-constexpr qint64 storeByteLimit = 32 * 1024 * 1024;
+constexpr qint64 storeByteLimit = QNameBudget::byteLimit;
 QString dateText(const QDateTime &date) { return date.toUTC().toString(Qt::ISODateWithMs); }
 QDateTime dateRead(const QJsonValue &value) {
     const auto date = QDateTime::fromString(value.toString(), Qt::ISODateWithMs);
