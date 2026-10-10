@@ -57,7 +57,7 @@ target_include_directories(GateBouncer PRIVATE ../resources)
 target_link_libraries(GateBouncer PRIVATE gatebouncer_native_ii shell32)
 target_compile_definitions(GateBouncer PRIVATE UNICODE _UNICODE _WIN32_WINNT=0x0A00)
 target_compile_options(GateBouncer PRIVATE /W4 /permissive- /utf-8 /guard:cf)
-target_link_options(GateBouncer PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT /DEPENDENTLOADFLAG:0x800
+target_link_options(GateBouncer PRIVATE /guard:cf /DYNAMICBASE /NXCOMPAT /DEPENDENTLOADFLAG:0xA00
   "/MANIFESTINPUT:${CMAKE_CURRENT_SOURCE_DIR}/../controller/deployment_ordinary.manifest")
 # QtCore MSVC compartida usa CRT dinámico. La misma selección debe alcanzar
 # todos los objetos de esta clausura, incluidos los compartidos con bootstrap.
