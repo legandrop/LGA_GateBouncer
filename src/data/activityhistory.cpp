@@ -55,8 +55,8 @@ bool validNativeEvent(const ActivityEvent &e) {
     if (!decimalUnsigned(e.sequence, &seq) || !seq || !id(n.connection) || !id(n.observed) ||
         !id(n.captureBinding) || !n.observedRevision || (n.presence & ~3ull) ||
         (n.source != 1 && n.source != 2) || (n.direction != 1 && n.direction != 2) ||
-        (!(n.presence & 1) && n.unixNanoseconds) ||
-        ((n.presence & 2) ? (n.protocol != 6 && n.protocol != 17) : n.protocol != 0) ||
+        ((n.presence & 1) ? !n.unixNanoseconds : n.unixNanoseconds != 0) ||
+        ((n.presence & 2) ? (n.source != 2 || (n.protocol != 6 && n.protocol != 17)) : n.protocol != 0) ||
         e.protocol != ((n.presence & 2) ? (n.protocol == 6 ? "TCP" : "UDP") : QString{}) ||
         e.subjectId != "native:" + e.sourceId + ':' + e.sourceEpoch + ':' + n.observed + ':' + n.captureBinding + ':' + QString::number(n.observedRevision)) return false;
     if (n.presence & 1) {
@@ -83,6 +83,21 @@ bool nativeCauseMatches(const ActivityEvent &a, const ActivityEvent &b) {
 }
 bool validNativeHistory(const HistoryState &s) {
     if (s.nativeAttempts.size() > 20000 || s.nativeAuthorizations.size() > 20000) return false;
+    for (const auto &c : s.coverage) {
+        if (!c.native) continue;
+        QSet<QString> intervals;
+        for (const auto &g : c.gaps) {
+            if ((!g.lostKnown && g.lost) || g.resync > c.lastSequence ||
+                (g.remote && (g.nativeReason < 1 || g.nativeReason > 4 || g.after > g.resync ||
+                    (g.lostKnown && (!g.lost || g.after >= g.resync || g.lost != g.resync - g.after)))) ||
+                (!g.remote && (g.nativeReason || g.after || g.revision))) return false;
+            if (!g.remote) continue;
+            const auto interval = QString::number(g.nativeReason) + ':' + QString::number(g.after) + ':' +
+                QString::number(g.resync) + ':' + QString::number(g.revision);
+            if (intervals.contains(interval)) return false;
+            intervals.insert(interval);
+        }
+    }
     const auto known = [&](const ActivityEvent &e) {
         quint64 seq = 0;
         if (!validNativeEvent(e) || !decimalUnsigned(e.sequence, &seq)) return false;
@@ -94,23 +109,38 @@ bool validNativeHistory(const HistoryState &s) {
     };
     for (auto it = s.nativeAttempts.begin(); it != s.nativeAttempts.end(); ++it)
         if (it.key() != nativeEventKey(it.value()) || it->kind != ActivityKind::Attempt || !known(it.value())) return false;
-    QSet<QString> commands;
+    QMap<QString, QString> commands;
     for (auto it = s.nativeAuthorizations.begin(); it != s.nativeAuthorizations.end(); ++it) {
         auto linked = it.value(); linked.sequence = QString::number(it->native ? it->native->attemptSequence : 0);
         if (it.key() != nativeEventKey(it.value()) || it->kind != ActivityKind::Authorization ||
-            !known(it.value()) || it->native->externalPartial ||
+            !known(it.value()) || it->native->externalPartial || s.nativeAttempts.contains(it.key()) ||
             !s.nativeAttempts.contains(nativeEventKey(linked)) ||
             !nativeCauseMatches(s.nativeAttempts[nativeEventKey(linked)], it.value())) return false;
         const auto command = sequenceKey(it->sourceId, it->sourceEpoch) + ':' + it->native->command;
         if (commands.contains(command)) return false;
-        commands.insert(command);
+        commands.insert(command, it.key());
     }
+    QSet<QString> cursors;
     for (const auto &e : s.events) {
         if (e.synthetic) { if (e.native) return false; continue; }
         if (!known(e)) return false;
-        if (e.kind == ActivityKind::Authorization && !e.native->externalPartial &&
-            (!s.nativeAuthorizations.contains(nativeEventKey(e)) ||
-             !equivalent(s.nativeAuthorizations[nativeEventKey(e)], e))) return false;
+        const auto cursor = nativeEventKey(e);
+        if (cursors.contains(cursor)) return false;
+        cursors.insert(cursor);
+        const auto &sameKind = e.kind == ActivityKind::Attempt ? s.nativeAttempts : s.nativeAuthorizations;
+        const auto &otherKind = e.kind == ActivityKind::Attempt ? s.nativeAuthorizations : s.nativeAttempts;
+        if (otherKind.contains(cursor)) return false;
+        if (sameKind.contains(cursor)) {
+            const auto &compact = sameKind[cursor];
+            if (!equivalent(compact, e) || compact.receivedAtUtc != e.receivedAtUtc ||
+                compact.native->connection != e.native->connection ||
+                compact.native->externalPartial != e.native->externalPartial) return false;
+        } else if (e.kind == ActivityKind::Authorization && !e.native->externalPartial) return false;
+        if (e.kind == ActivityKind::Authorization) {
+            const auto command = sequenceKey(e.sourceId, e.sourceEpoch) + ':' + e.native->command;
+            if (commands.contains(command) && commands[command] != cursor) return false;
+            commands.insert(command, cursor);
+        }
     }
     for (auto it = s.subjects.begin(); it != s.subjects.end(); ++it)
         for (int kind = 0; kind < 3; ++kind) {
@@ -185,11 +215,11 @@ void ActivityHistory::disconnectNative(const NativeSourceBinding &b, const QStri
 bool ActivityHistory::nativeGap(const NativeSourceBinding &b, quint64 after, quint64 resync,
                                 quint64 revision, quint8 reason, bool lostKnown, quint64 lost) {
     auto *c = source(nativeSourceId(b), nativeEpochKey(b));
-    if (!c || !c->native || !(*c->native == b) || reason < 1 || reason > 4 ||
+    if (!c || !c->native || !(*c->native == b) || reason < 1 || reason > 4 || after > resync ||
         (lostKnown ? (!lost || after >= resync || lost != resync - after) : lost != 0)) return false;
     for (const auto &g : c->gaps)
         if (g.remote && g.after == after && g.resync == resync && g.revision == revision && g.nativeReason == reason)
-            return true;
+            return g.lostKnown == lostKnown && g.lost == lost;
     if (resync < c->lastSequence) return true;
     gap(c->sourceId, c->sourceEpoch, "RemoteGap:" + QString::number(reason), lost, lostKnown);
     auto &g = c->gaps.back(); g.remote = true; g.after = after; g.resync = resync;
@@ -226,7 +256,12 @@ bool ActivityHistory::ingest(const ActivityEvent &event) {
             } else state_.nativeAttempts.insert(nativeEventKey(admitted), admitted);
         } else {
             const auto command = key + ':' + admitted.native->command;
-            if (nativeCommands_.contains(command)) {
+            const bool retainedCommand = std::any_of(state_.events.cbegin(), state_.events.cend(), [&](const ActivityEvent &old) {
+                return old.native && old.kind == ActivityKind::Authorization &&
+                    old.sourceId == admitted.sourceId && old.sourceEpoch == admitted.sourceEpoch &&
+                    old.native->command == admitted.native->command;
+            });
+            if (nativeCommands_.contains(command) || retainedCommand) {
                 disconnectNative(*coverage->native, "AuthorizationCommandReplay"); return false;
             }
             auto link = admitted; link.sequence = QString::number(admitted.native->attemptSequence);
@@ -257,7 +292,8 @@ bool ActivityHistory::ingest(const ActivityEvent &event) {
         }
         state_.events.push_back(std::move(admitted));
         if (state_.events.size() > eventLimit_) {
-            state_.events.removeFirst(); gap(event.sourceId, event.sourceEpoch, "DetailRetention", 1);
+            const auto retired = state_.events.takeFirst();
+            gap(retired.sourceId, retired.sourceEpoch, "DetailRetention", 1);
         }
         stage(event.receivedAtUtc);
         return true;

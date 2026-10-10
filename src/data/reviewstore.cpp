@@ -334,7 +334,7 @@ bool historyRead(const QJsonValue &value, HistoryState &state, bool nativeAllowe
                 gap.lostKnown = parsed["lostKnown"].toBool(); gap.remote = parsed["remote"].toBool();
                 gap.nativeReason = quint8(parsed["nativeReason"].toInt());
                 if ((!gap.lostKnown && gap.lost) || gap.resync > source.lastSequence ||
-                    (gap.remote && (!gap.nativeReason || (gap.lostKnown &&
+                    (gap.remote && (!gap.nativeReason || gap.after > gap.resync || (gap.lostKnown &&
                       (!gap.lost || gap.after >= gap.resync || gap.lost != gap.resync - gap.after)))) ||
                     (!gap.remote && (gap.nativeReason || gap.after || gap.revision))) return false;
             }
