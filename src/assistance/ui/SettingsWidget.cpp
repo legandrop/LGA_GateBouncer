@@ -17,10 +17,10 @@ QString activationMessage(const C::NetworkActivationSnapshot& activation){
     case C::ActivationCause::Ready:
         return activation.technicallyAvailable?"Ready to explain reviewed public information":"Configuration could not be confirmed. Refresh to check it again.";
     case C::ActivationCause::LocalConfigurationUnavailable:return "Local assistance settings are unavailable. Refresh to inspect them.";
-    case C::ActivationCause::CredentialMissing:return "Store your own NVIDIA API key to continue setup.";
+    case C::ActivationCause::CredentialMissing:return "You can save your NVIDIA API key locally. Saving it does not enable explanations; your account type and service offer still need to be confirmed.";
     case C::ActivationCause::CredentialCorrupt:return "The saved API key cannot be read safely. Forget it before storing it again.";
-    case C::ActivationCause::EntitlementMissing:return "Permission for everyday use of this hosted model service has not been verified.";
-    case C::ActivationCause::OperationalUseRestricted:return "This service permits internal trial evaluation; permission for everyday explanations is not configured.";
+    case C::ActivationCause::EntitlementMissing:return "Explanations are unavailable. Confirm your NVIDIA account type and a service offer that permits everyday use.";
+    case C::ActivationCause::OperationalUseRestricted:return "Explanations are unavailable. Saving an API key does not enable this service. The API Catalog trial is for development and testing; confirm your account type and a service offer that permits everyday use.";
     case C::ActivationCause::EntitlementExpired:return "The reviewed service permission has expired. Explanations are unavailable.";
     case C::ActivationCause::EntitlementConflict:return "The reviewed permission does not match this account, model or service configuration.";
     case C::ActivationCause::ModelConsentMissing:return "Read the current model notice and agree before explanations can start.";
@@ -46,6 +46,7 @@ SettingsWidget::SettingsWidget(GeneralSession* session,QWidget* parent):QFrame(p
     auto addButton=[&](const QString& text,const char* name){auto* button=new QPushButton(text,this);button->setObjectName(name);
         layout->addWidget(button,0,Qt::AlignLeft);return button;};
     addText("NVIDIA assistance","heading");
+    addText("Configured model: NVIDIA Nemotron 3 Ultra (text).","faint");
     status_=addText({},"assistance-status");
     addText("Explanations can be wrong. They never allow or block a connection, decide a pending request, or establish that a file is safe.","faint");
     connect_=addButton("Connect assistance","connect-assistance");
@@ -54,7 +55,7 @@ SettingsWidget::SettingsWidget(GeneralSession* session,QWidget* parent):QFrame(p
     key_=new QLineEdit(this);key_->setObjectName("nvidia-key-input");key_->setEchoMode(QLineEdit::Password);
     key_->setMaxLength(512);key_->setPlaceholderText("Your NVIDIA Developer API key");key_->setInputMethodHints(Qt::ImhSensitiveData|Qt::ImhNoPredictiveText);layout->addWidget(key_);
     store_=addButton("Store API key","store-assistance-key");forget_=addButton("Forget API key","forget-assistance-key");
-    addText("Saving a key does not verify it with NVIDIA or establish permission to use the service.","faint");
+    addText("Saving a key stores it locally. It does not verify your NVIDIA account or enable explanations. Confirm which service offer your account covers.","faint");
     addText("When to explain","heading");
     mode_=new QComboBox(this);mode_->setObjectName("assistance-mode");mode_->addItems({"Not selected","Automatic","Manual"});layout->addWidget(mode_);
     addText("Automatic is the default after setup and consent. It explains each new request using the executable name observed by the service when current permissions are available. The name can reveal which app you use. Manual waits for Explain.","faint");
