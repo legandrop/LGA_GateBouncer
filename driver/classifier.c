@@ -123,9 +123,13 @@ static BOOLEAN reservePacketLocked(GB_ENTRY *e) {
     ++gbPacketOwned;e->packetCharged=TRUE;return TRUE;
 }
 static void unchargePacket(GB_ENTRY *e,BOOLEAN locked) {
-    KIRQL irql;if(!locked)KeAcquireSpinLock(&gbLock,&irql);
-    if(e->packetCharged){e->packetCharged=FALSE;--gbPacketOwned;}
-    if(!locked)KeReleaseSpinLock(&gbLock,irql);
+    if(locked) {
+        if(e->packetCharged){e->packetCharged=FALSE;--gbPacketOwned;}
+    } else {
+        KIRQL irql;KeAcquireSpinLock(&gbLock,&irql);
+        if(e->packetCharged){e->packetCharged=FALSE;--gbPacketOwned;}
+        KeReleaseSpinLock(&gbLock,irql);
+    }
 }
 static BOOLEAN inboundLayer(UINT16 layer) {
     return layer==FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 || layer==FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6;
