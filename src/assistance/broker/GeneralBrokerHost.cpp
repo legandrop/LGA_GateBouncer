@@ -3,6 +3,7 @@
 #include "client_ii_win.h"
 #include "../general/ObservationReader.h"
 #include "../../localfacts/WinFile.h"
+#include "../../../controller/deployment_win.h"
 #include <QPointer>
 #include <QThread>
 #include <QUuid>
@@ -44,6 +45,7 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
     std::shared_ptr<QObject> dispatcher;
     mutable std::unique_ptr<gb::ipc::ii::Client> source;
     std::unique_ptr<GeneralFactory> factory;
+    std::shared_ptr<gb::controller::Deployment> deployment;
     Broker::Id connection{};
     std::shared_ptr<OwnedFacts> selected;
     std::shared_ptr<L::Cancellation> cancellation;
@@ -62,12 +64,12 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
     // Adquiere observaciones actuales del MISMO canal, nunca del cache de la GUI.
     std::optional<ReadSource> readSource(const Id128& request) const;
     bool sourceCurrent(const OwnedFacts& owner) const {
-        if(closed||!owner.sourcePeer||owner.sourcePeer->checkLive()!=gb::ipc::ii::ReadPeerState::Current||!owner.fileCurrent())return false;
+        if(closed||!deployment||!deployment->current()||!owner.sourcePeer||owner.sourcePeer->checkLive()!=gb::ipc::ii::ReadPeerState::Current||!owner.fileCurrent())return false;
         const auto observation=readSource(owner.record.observed);
         return !closed&&observation&&observation->context==owner.service&&observation->peer==owner.sourcePeer&&
             observation->peer->checkLive()==gb::ipc::ii::ReadPeerState::Current&&
             owner.sourcePeer&&owner.sourcePeer->checkLive()==gb::ipc::ii::ReadPeerState::Current&&
-            observation->connection==owner.sourceConnection&&observation->profile==owner.profile&&observation->desired==owner.desired&&ObservationReader::sameRecord(observation->record,owner.record)&&owner.fileCurrent();
+            observation->connection==owner.sourceConnection&&observation->profile==owner.profile&&observation->desired==owner.desired&&ObservationReader::sameRecord(observation->record,owner.record)&&owner.fileCurrent()&&deployment->current();
     }
     bool current(const FullBinding& binding) const {
         const auto owner=selected;
@@ -89,7 +91,7 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
     }
     void resolve(const Id128& request,GeneralFactory::PendingResolver::Completion completion){
         retire();
-        if(closed||worker||!host){completion({});return;}
+        if(closed||worker||!host||!deployment||!deployment->current()){completion({});return;}
         const auto observation=readSource(request);
         if(!observation||!observation->peer||observation->peer->checkLive()!=gb::ipc::ii::ReadPeerState::Current||
             !observation->record.revision||!observation->profile||
@@ -100,14 +102,16 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
         cancellation=std::make_shared<L::Cancellation>();const auto cancelled=cancellation;
         const auto path=text(owner->record.display.path).toStdWString();const auto before=serial;
         const auto self=shared_from_this();
-        worker=QThread::create([owner,path,cancelled]{
+        const auto package=deployment;
+        worker=QThread::create([owner,path,cancelled,package]{
+            if(!package->current())return;
             DWORD error=0;L::Request request{path,owner->generation,{}};
             const auto opened=L::detail::openLocal(request,owner->pin,error);
             if(opened!=L::State::Complete||cancelled->requested){owner->facts.state=opened;return;}
             request.expected=owner->pin.binding;
-            // Sin inventario protegido, el backend conserva Unavailable.
-            L::WindowsSignatureBackend signature({});
+            L::WindowsSignatureBackend signature(package);
             owner->facts=L::inspect(request,{},*cancelled,signature);
+            if(!package->current())owner->facts.state=L::State::Stale;
         });
         const auto thread=worker;
         QObject::connect(thread,&QThread::finished,thread,&QObject::deleteLater);
@@ -129,7 +133,7 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
     void close(){
         if(closed&&!factory&&!source)return;
         retire();closed=true;if(factory)factory->close();if(source)source->close();
-        factory.reset();
+        factory.reset();deployment.reset();
     }
 };
 std::optional<GeneralBrokerHost::Data::ReadSource> GeneralBrokerHost::Data::readSource(const Id128& request) const {
@@ -161,7 +165,11 @@ void GeneralBrokerHost::close(){data_->close();}
 std::unique_ptr<GeneralBrokerHost> GeneralBrokerHost::forCurrentUser(std::unique_ptr<Broker::PipeSession> session,
     const gatebouncer::websearch::ProviderConfig& provider){
     if(!session||session->version()!=Broker::WireVersion::General3)return {};
+    const auto image=std::filesystem::path(Broker::imagePath(GetCurrentProcess()).toStdWString());
+    auto deployment=std::make_shared<gb::controller::Deployment>(image.parent_path());
+    if(!deployment->verify(image,gb::controller::DeploymentRole::AssistantBroker)||!deployment->current())return {};
     auto host=std::unique_ptr<GeneralBrokerHost>(new GeneralBrokerHost);const auto data=host->data_;
+    data->deployment=std::move(deployment);
     data->connection=session->connection();
     const std::weak_ptr<Data> weak=data;
     GeneralFactory::PendingResolver resolver;
@@ -175,7 +183,8 @@ std::unique_ptr<GeneralBrokerHost> GeneralBrokerHost::forCurrentUser(std::unique
     QObject::connect(monitor,&QTimer::timeout,host.get(),[weak]{
         const auto owner=weak.lock();if(!owner)return;
         if(!owner->closed&&owner->factory){
-            if(owner->factory->peerCurrent())owner->seenPeer=true;
+            if(!owner->deployment||!owner->deployment->current())owner->close();
+            else if(owner->factory->peerCurrent())owner->seenPeer=true;
             else if(owner->seenPeer||owner->peerAge.elapsed()>6000)owner->close();
         }
         if(owner->closed&&!owner->worker)QCoreApplication::quit();

@@ -1,6 +1,6 @@
 # Windows transport bundle
 
-`scripts/assemble_windows_package.ps1` assembles the current 17-file administrative source set from the Qt GUI build, the Windows SDK service build, Qt 6.8.2 MinGW64, and its MinGW runtime. It copies the repository's Inter fonts and creates the exact `qt.conf` expected by deployment admission.
+`scripts/assemble_windows_package.ps1` assembles the current 18-file administrative source set from the Qt GUI build (including the offline signature helper), the Windows SDK service build, Qt 6.8.2 MinGW64, and its MinGW runtime. It copies the repository's Inter fonts and creates the exact `qt.conf` expected by deployment admission.
 
 Run it in a new PowerShell process with absolute paths on fixed local drives:
 
@@ -14,7 +14,7 @@ The notice input set is explicit: 49 original Qt Core/GUI attribution pages, the
 
 The resulting directories have different purposes:
 
-- `source/` contains exactly the 17 input files expected by the administrative preparation code, without a deployment manifest or license extras.
+- `source/` contains exactly the 18 input files expected by the administrative preparation code, without a deployment manifest or license extras.
 - `notices/` contains the supplied license materials.
 - `BUNDLE.txt` identifies the output as a transport bundle.
 

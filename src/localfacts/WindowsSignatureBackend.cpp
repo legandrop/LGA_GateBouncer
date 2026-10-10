@@ -1,27 +1,35 @@
 #include "WinFile.h"
 #include "SignatureWire.h"
+#include "../../controller/deployment_win.h"
 #include <algorithm>
 #include <cwchar>
 #include <utility>
 
 namespace gatebouncer::localfacts {
-WindowsSignatureBackend::WindowsSignatureBackend(HelperInventory inventory): inventory_(std::move(inventory)) {}
+WindowsSignatureBackend::WindowsSignatureBackend(std::shared_ptr<gb::controller::Deployment> deployment)
+    : deployment_(std::move(deployment)) {}
 Signature WindowsSignatureBackend::verify(const SignatureInput& input, std::chrono::milliseconds budget,
                                          const Cancellation& cancel) {
     Signature result;
     if (cancel.requested.load()) { result.state = SignatureState::Cancelled; return result; }
     if (budget.count() <= 0) { result.state = SignatureState::TimedOut; return result; }
-    // El inventario se revalida y retiene: no basta una verificación en el arranque.
-    if (inventory_.sha256.size() != 64 || !std::all_of(inventory_.sha256.begin(), inventory_.sha256.end(),
-        [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) return result;
+    // El inventario sale del GBD1 protegido y su dueño vive hasta el último readback.
+    std::filesystem::path helperPath; gb::wire::Digest expectedHash{};
+    if (!deployment_ || !deployment_->signatureHelperInventory(helperPath, expectedHash)) return result;
+    std::string expectedHex; expectedHex.reserve(64);
+    constexpr char hex[] = "0123456789abcdef";
+    for (auto byte : expectedHash) { expectedHex.push_back(hex[byte >> 4]); expectedHex.push_back(hex[byte & 15]); }
     detail::OpenFile helper;
     DWORD error = 0;
-    if (detail::openLocal({inventory_.absolutePath, 0, {}}, helper, error) != State::Complete) return result;
+    if (detail::openLocal({helperPath.native(), 0, {}}, helper, error) != State::Complete) return result;
+    BY_HANDLE_FILE_INFORMATION helperIdentity{};
+    if (!GetFileInformationByHandle(helper.file.value, &helperIdentity) ||
+        !deployment_->matchesImage(helperPath, helperIdentity)) return result;
     Limits inventoryLimits; inventoryLimits.maxBytes = 16 * 1024 * 1024;
     inventoryLimits.hashBudget = std::chrono::milliseconds(1000);
     std::string hash;
     if (detail::hashFile(helper.file.value, helper.binding.size, inventoryLimits, cancel, hash, error) != State::Complete
-        || hash != inventory_.sha256) return result;
+        || hash != expectedHex || !deployment_->current()) return result;
     // Sólo el archivo y el mapping se heredan. No stdout, sockets, claves ni perfiles.
     HANDLE duplicate = nullptr;
     if (!DuplicateHandle(GetCurrentProcess(), reinterpret_cast<HANDLE>(input.fileHandle),
@@ -58,7 +66,7 @@ Signature WindowsSignatureBackend::verify(const SignatureInput& input, std::chro
         || !UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY, &mitigation,
         sizeof(mitigation), nullptr, nullptr)) return result;
     STARTUPINFOEXW startup{}; startup.StartupInfo.cb = sizeof(startup); startup.lpAttributeList = attributes;
-    std::wstring command = L"\"" + inventory_.absolutePath + L"\" "
+    std::wstring command = L"\"" + helperPath.native() + L"\" "
         + std::to_wstring(reinterpret_cast<std::uintptr_t>(subject.value)) + L" "
         + std::to_wstring(reinterpret_cast<std::uintptr_t>(mapping.value));
     wchar_t windows[512]{};
@@ -68,13 +76,16 @@ Signature WindowsSignatureBackend::verify(const SignatureInput& input, std::chro
         + L"WINDIR=" + std::wstring(windows) + L'\0';
     environment.push_back(L'\0');
     PROCESS_INFORMATION process{};
-    if (!CreateProcessW(inventory_.absolutePath.c_str(), command.data(), nullptr, nullptr, TRUE,
+    if (!deployment_->current() || !CreateProcessW(helperPath.c_str(), command.data(), nullptr, nullptr, TRUE,
         CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT | EXTENDED_STARTUPINFO_PRESENT,
         environment.data(), windows, &startup.StartupInfo, &process)) return result;
     detail::Handle child(process.hProcess), thread(process.hThread);
     // Sólo se termina el proceso creado por esta llamada y retenido por handle.
     if (!AssignProcessToJobObject(job.value, child.value)) {
         TerminateProcess(child.value, ERROR_CANCELLED); WaitForSingleObject(child.value, 1000); return result;
+    }
+    if (!deployment_->current()) {
+        TerminateJobObject(job.value, ERROR_CANCELLED); WaitForSingleObject(child.value, 1000); return result;
     }
     const auto deadline = std::chrono::steady_clock::now() + std::min(budget, std::chrono::milliseconds(30000));
     if (ResumeThread(thread.value) == static_cast<DWORD>(-1)) {
@@ -93,7 +104,9 @@ Signature WindowsSignatureBackend::verify(const SignatureInput& input, std::chro
         if (wait == WAIT_FAILED) { TerminateJobObject(job.value, ERROR_CANCELLED); return result; }
     }
     DWORD exitCode = 1;
-    if (!GetExitCodeProcess(child.value, &exitCode) || exitCode != 0 || wire->magic != detail::wireMagic
+    if (!deployment_->current() || !GetFileInformationByHandle(helper.file.value, &helperIdentity) ||
+        !deployment_->matchesImage(helperPath, helperIdentity) ||
+        !GetExitCodeProcess(child.value, &exitCode) || exitCode != 0 || wire->magic != detail::wireMagic
         || wire->state > 3 || wire->publisherLength > 255) return result;
     result.state = static_cast<SignatureState>(wire->state);
     result.nativeStatus = wire->nativeStatus;

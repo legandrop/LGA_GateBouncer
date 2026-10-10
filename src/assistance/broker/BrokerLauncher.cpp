@@ -2,6 +2,7 @@
 #include "AssistantBrokerRuntime.h"
 #include "../grounded_bridge/GroundedBrokerRuntime.h"
 #include "GeneralBrokerHost.h"
+#include "../../../controller/deployment_win.h"
 #include <QCoreApplication>
 #include <QDir>
 #include <cstring>
@@ -65,6 +66,12 @@ std::unique_ptr<PipeSession> launchSiblingBroker(WireVersion version) {
     const QString exe=QDir::toNativeSeparators(QCoreApplication::applicationDirPath()+"/GateBouncerAssistant.exe");
     const QString expectedUi=QDir::toNativeSeparators(QCoreApplication::applicationDirPath()+"/GateBouncer.exe");
     if(imagePath(GetCurrentProcess()).compare(expectedUi,Qt::CaseInsensitive))return {};
+    std::unique_ptr<gb::controller::Deployment> deployment;
+    if(version==WireVersion::General3){
+        const auto image=std::filesystem::path(imagePath(GetCurrentProcess()).toStdWString());
+        deployment=std::make_unique<gb::controller::Deployment>(image.parent_path());
+        if(!deployment->verify(image,gb::controller::DeploymentRole::OrdinaryGui)||!deployment->current())return {};
+    }
     std::vector<Handle> pathGuards;if(!lockFixedImage(exe,pathGuards)||!lockFixedImage(expectedUi,pathGuards))return {};
     auto environment=BrokerEnvironment::forSibling();if(!environment)return {};
     // Runtime de despliegue junto al broker; no resolver Qt/MinGW desde PATH ajeno.
@@ -83,6 +90,7 @@ std::unique_ptr<PipeSession> launchSiblingBroker(WireVersion version) {
     if(!UpdateProcThreadAttribute(list,0,PROC_THREAD_ATTRIBUTE_HANDLE_LIST,inherited,sizeof(inherited),nullptr,nullptr)){DeleteProcThreadAttributeList(list);return {};}
     STARTUPINFOEXW startup{};startup.StartupInfo.cb=sizeof(startup);startup.StartupInfo.dwFlags=STARTF_USESHOWWINDOW;startup.StartupInfo.wShowWindow=SW_HIDE;startup.lpAttributeList=list;
     std::wstring command=L"\""+exe.toStdWString()+L"\" --bootstrap-handle "+std::to_wstring(reinterpret_cast<quintptr>(read.value));PROCESS_INFORMATION info{};
+    if(deployment&&!deployment->current()){DeleteProcThreadAttributeList(list);return {};}
     const BOOL launched=CreateProcessW(exe.toStdWString().c_str(),command.data(),nullptr,nullptr,TRUE,EXTENDED_STARTUPINFO_PRESENT|CREATE_NO_WINDOW|CREATE_UNICODE_ENVIRONMENT,environment->block_.data(),environment->directory_.c_str(),&startup.StartupInfo,&info);
     DeleteProcThreadAttributeList(list);if(!launched)return {};Handle process(info.hProcess),thread(info.hThread);read.reset();
     SensitiveBytes bootstrap(52+size_t(name.size()));auto *d=bootstrap.data();std::memcpy(d,"GBAB",4);d[4]=quint8(version);d[5]=version==WireVersion::Grounded2?2:version==WireVersion::General3?3:0;
@@ -98,7 +106,7 @@ std::unique_ptr<PipeSession> launchSiblingBroker(WireVersion version) {
         if(WaitForSingleObject(peer.process.value,0)!=WAIT_TIMEOUT)return {};
         Sleep(10);
     }
-    if(!pipe)return {};
+    if(!pipe||(deployment&&!deployment->current()))return {};
     return std::make_unique<PipeSession>(std::move(pipe),std::move(peer),connection,false,nullptr,version);
 }
 int runBrokerFromBootstrap(quintptr inheritedHandle) {

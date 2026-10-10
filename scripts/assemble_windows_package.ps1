@@ -244,14 +244,14 @@ try {
     }
     Hold-Parents ([System.IO.Path]::GetDirectoryName($OutputRoot))
     $source = [ordered]@{}
-    foreach ($name in @('GateBouncerDecisionBootstrap.exe','GateBouncerDecisionStage.dll','GateBouncerGuiStage.dll','GateBouncerAssistant.exe')) { $source[$name]=Join-Path $QtBuild $name }
+    foreach ($name in @('GateBouncerDecisionBootstrap.exe','GateBouncerDecisionStage.dll','GateBouncerGuiStage.dll','GateBouncerAssistant.exe','GateBouncerSignatureHelper.exe')) { $source[$name]=Join-Path $QtBuild $name }
     foreach ($name in @('GateBouncer.exe','GateBouncerService.exe')) { $source[$name]=Join-Path $SdkBuild $name }
     foreach ($name in @('Qt6Core.dll','Qt6Gui.dll','Qt6Widgets.dll')) { $source[$name]=Join-Path $QtRoot ('bin\'+$name) }
     foreach ($name in @('libgcc_s_seh-1.dll','libstdc++-6.dll','libwinpthread-1.dll')) { $source[$name]=Join-Path $MinGwRoot ('bin\'+$name) }
     $source['plugins\platforms\qwindows.dll']=Join-Path $QtRoot 'plugins\platforms\qwindows.dll'
     foreach ($name in @('Inter-Regular.ttf','Inter-Medium.ttf','Inter-SemiBold.ttf')) { $source['fonts\'+$name]=Join-Path $repo ('resources\fonts\'+$name) }
     $source['qt.conf']=$null
-    if ($source.Count -ne 17) { throw 'Product inventory must contain exactly 17 files' }
+    if ($source.Count -ne 18) { throw 'Product inventory must contain exactly 18 files' }
     $notices=[ordered]@{
         'Inter-LICENSE.txt'=Join-Path $repo 'resources\fonts\LICENSE.txt'
         'GCC-COPYING3.txt'=Join-Path $MinGwRoot 'licenses\gcc\COPYING3'
@@ -298,7 +298,7 @@ try {
     [GateBouncer.Package.Native]::Flat($OutputRoot,[string[]]@('source','notices','BUNDLE.txt'))
     foreach ($pin in $directories) { [GateBouncer.Package.Native]::Current($pin,$true) }
     foreach ($pin in $files) { [GateBouncer.Package.Native]::Current($pin,$false) }
-    Write-Output "Bundle assembled: $OutputRoot (source files: 17; not installed)"
+    Write-Output "Bundle assembled: $OutputRoot (source files: 18; not installed)"
     exit 0
 } catch {
     # Se preservan archivos propios parciales como evidencia, nunca se borran por path.

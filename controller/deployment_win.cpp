@@ -38,7 +38,7 @@ const std::vector<std::wstring> &deploymentFiles(DeploymentRole role) {
     static const std::vector<std::wstring> product = [] {
         auto result = decision;
         result.insert(result.end(), {L"GateBouncer.exe", L"GateBouncerGuiStage.dll",
-            L"GateBouncerService.exe", L"GateBouncerAssistant.exe"});
+            L"GateBouncerService.exe", L"GateBouncerAssistant.exe", L"GateBouncerSignatureHelper.exe"});
         return result;
     }();
     return role == DeploymentRole::DecisionController ? decision : product;
@@ -285,12 +285,19 @@ bool Deployment::enumerate(const std::filesystem::path &relative, unsigned depth
 }
 bool Deployment::verify(const std::filesystem::path &own, DeploymentRole role) {
     const auto expected = role == DeploymentRole::DecisionController ? L"GateBouncerDecisionBootstrap.exe" :
-        role == DeploymentRole::OrdinaryGui ? L"GateBouncer.exe" : L"GateBouncerService.exe";
+        role == DeploymentRole::OrdinaryGui ? L"GateBouncer.exe" :
+        role == DeploymentRole::AssistantBroker ? L"GateBouncerAssistant.exe" : L"GateBouncerService.exe";
     if (verified_ || revoked_ || !held_.empty() || own != root_ / expected || !directory_.acquire())
         return false;
     wire::Bytes manifest;
     if (!readFile(L"deployment.gbd", manifest, 32768) || !parseInventory(manifest, inventory_))
         return false;
+    // Bootstrap admite su conjunto mínimo o el producto completo; ningún extra.
+    const auto &expectedFiles = role == DeploymentRole::DecisionController &&
+        inventory_.size() == deploymentFiles(role).size() ? deploymentFiles(role) :
+        deploymentFiles(DeploymentRole::Service);
+    if (inventory_.size() != expectedFiles.size()) return false;
+    for (const auto &file : expectedFiles) if (!inventory_.count(file)) return false;
     for (const auto &file : deploymentFiles(role))
         if (!inventory_.count(file))
             return false;
@@ -314,6 +321,7 @@ bool Deployment::verify(const std::filesystem::path &own, DeploymentRole role) {
     return true;
 }
 bool Deployment::matchesImage(const std::filesystem::path &path, const BY_HANDLE_FILE_INFORMATION &identity) const {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
     if (!verified_ || revoked_ || path.parent_path() != root_) return false;
     const auto row = std::find_if(files_.begin(), files_.end(), [&](const auto &p) { return root_ / p.path == path; });
     return row != files_.end() && row->identity.dwVolumeSerialNumber == identity.dwVolumeSerialNumber &&
@@ -322,6 +330,8 @@ bool Deployment::matchesImage(const std::filesystem::path &path, const BY_HANDLE
         CompareFileTime(&row->identity.ftLastWriteTime, &identity.ftLastWriteTime) == 0;
 }
 bool Deployment::current() noexcept {
+    std::unique_lock<std::recursive_mutex> lock(currentMutex_, std::defer_lock);
+    try { lock.lock(); } catch (...) { return false; }
     if (!verified_ || revoked_) return false;
     try {
         bool ok = directory_.acquire();
@@ -349,6 +359,15 @@ bool Deployment::current() noexcept {
         if (!ok) revoked_ = true;
         return ok;
     } catch (...) { revoked_ = true; return false; }
+}
+bool Deployment::signatureHelperInventory(std::filesystem::path &path, wire::Digest &hash) {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+    if (role_ != DeploymentRole::AssistantBroker || !current()) return false;
+    const auto row = inventory_.find(L"GateBouncerSignatureHelper.exe");
+    if (row == inventory_.end()) return false;
+    path = root_ / row->first;
+    hash = row->second;
+    return true;
 }
 bool Deployment::admitServiceConfiguration(wire::Bytes &account, std::filesystem::path &store, bool &provision) {
     if (role_ != DeploymentRole::Service || registration_ || !current()) return false;

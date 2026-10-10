@@ -4,8 +4,10 @@
 #include <chrono>
 #include <cstdint>
 #include <optional>
+#include <memory>
 #include <string>
 
+namespace gb::controller { class Deployment; }
 namespace gatebouncer::localfacts {
 enum class State { Complete, Rejected, Unavailable, Stale, TooLarge, TimedOut, Cancelled };
 enum class SignatureState { VerifiedOffline, Unsigned, Invalid, Unavailable, TimedOut, Cancelled };
@@ -52,14 +54,13 @@ public:
 // Sólo archivo escogido por el caller. No enumera procesos ni transmite información.
 // Ejecutar fuera del hilo de UI: hash y apertura tienen plazo cooperativo, no duro.
 Snapshot inspect(const Request&, const Limits&, const Cancellation&, SignatureBackend&);
-// El dueño suministra inventario de su helper propio, nunca un valor del modelo.
-struct HelperInventory { std::wstring absolutePath; std::string sha256; };
+// Retiene el despliegue original; no acepta autoridad por ruta/hash del caller.
 class WindowsSignatureBackend final : public SignatureBackend {
 public:
-    explicit WindowsSignatureBackend(HelperInventory inventory);
+    explicit WindowsSignatureBackend(std::shared_ptr<gb::controller::Deployment> deployment);
     Signature verify(const SignatureInput&, std::chrono::milliseconds,
                      const Cancellation&) override;
 private:
-    HelperInventory inventory_;
+    std::shared_ptr<gb::controller::Deployment> deployment_;
 };
 } // namespace gatebouncer::localfacts

@@ -2,12 +2,13 @@
 #include "../common/protected_file_win.h"
 #include <map>
 #include <memory>
+#include <mutex>
 namespace gb::controller {
 // Inventory nativo cerrado, provisto por despliegue administrativo protegido.
 using Inventory = std::map<std::wstring, wire::Digest>;
 bool parseInventory(const wire::Bytes &bytes, Inventory &inventory);
 bool encodeInventory(const Inventory &, wire::Bytes &);
-enum class DeploymentRole { DecisionController, OrdinaryGui, Service };
+enum class DeploymentRole { DecisionController, OrdinaryGui, Service, AssistantBroker };
 const std::vector<std::wstring> &deploymentFiles(DeploymentRole);
 bool serviceDescriptor(PSECURITY_DESCRIPTOR);
 bool serviceConfiguration(SC_HANDLE, const std::filesystem::path &, DWORD expectedPid = 0);
@@ -23,6 +24,8 @@ class Deployment {
                 DeploymentRole role = DeploymentRole::DecisionController);
     bool current() noexcept;
     bool matchesImage(const std::filesystem::path &, const BY_HANDLE_FILE_INFORMATION &) const;
+    // Sólo el helper propio del broker, derivado del GBD1 original retenido.
+    bool signatureHelperInventory(std::filesystem::path &, wire::Digest &);
     bool admitServiceConfiguration(wire::Bytes &account, std::filesystem::path &store,
                                    bool &provision);
     bool prepareEnvironment();
@@ -44,5 +47,6 @@ class Deployment {
     DeploymentRole role_ = DeploymentRole::DecisionController;
     bool verified_ = false;
     bool revoked_ = false;
+    mutable std::recursive_mutex currentMutex_;
 };
 } // namespace gb::controller
