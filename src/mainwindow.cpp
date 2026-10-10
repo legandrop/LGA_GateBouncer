@@ -866,10 +866,11 @@ void MainWindow::buildPage() {
         {"settings", {"Settings", "Explore protection states without changing your system."}}};
     title_->setText(headings[view_][0]);
     subtitle_->setText(headings[view_][1]);
-    if (!model_.available()) {
+    {
         auto *n = note("Simulated service unavailable. Permission changes, import, activation, "
                        "cleanup and restore are disabled. No firewall engine is connected.");
         n->setObjectName("degraded-banner");
+        n->setVisible(!model_.available());
         pageLayout_->addWidget(n);
     }
     if (view_ == "processes")
@@ -884,6 +885,7 @@ void MainWindow::buildPage() {
         renderImport();
     else
         renderSettings();
+    updatePageState();
     refreshing_ = false;
     refreshTable(true);
     restoreFocus();
@@ -911,6 +913,31 @@ void MainWindow::updatePageState() {
     footer_->setText(product_.simulation()
         ? "Synthetic fixtures · session memory only                 Sample clock: 2026-10-08 10:42:40 UTC−03"
         : "Live process catalog · files not inspected · network collector unavailable");
+    if (product_.simulation()) {
+        const bool available = model_.available();
+        for (const char *name : {"review-stale","edit-selected","review-selected","detail-edit","load-sample","reset-import"})
+            if (auto *control = pageControl<QPushButton>(page_,name)) control->setEnabled(available);
+        if (auto *banner = pageControl<QFrame>(page_,"degraded-banner")) banner->setVisible(!available);
+        if (auto *restore = pageControl<QPushButton>(page_,"restore-backup")) {
+            restore->setVisible(model_.hasBackup()); restore->setEnabled(available && model_.hasBackup());
+        }
+        if (auto *start = pageControl<QFrame>(page_,"import-start")) start->setVisible(!model_.state().importLoaded);
+        if (auto *preview = pageControl<QWidget>(page_,"simulation-import-preview")) preview->setVisible(model_.state().importLoaded);
+        if (auto *apply = pageControl<QPushButton>(page_,"apply-import")) {
+            apply->setText(model_.state().importApplied ? "Candidates saved" : "Save 7 inactive candidates");
+            apply->setEnabled(available && model_.state().importLoaded && !model_.state().importApplied);
+        }
+        if (auto *result = pageControl<QLabel>(page_,"simulation-import-result")) result->setText(model_.state().importApplied
+            ? "7 inactive sample candidates saved. Review them in Rules." : "Only ready mappings are saved as inactive candidates.");
+        if (auto *count = pageControl<QLabel>(page_,"simulation-rule-count")) {
+            int active = 0; for (const auto &r : model_.state().rules) active += r.active;
+            count->setText(QString("%1 active demo rules · %2 inactive candidates").arg(active).arg(model_.state().rules.size() - active));
+        }
+        if (auto *pending = pageControl<QFrame>(page_,"pending-state")) {
+            const auto labels = pending->findChildren<QLabel *>();
+            if (labels.size() == 2) labels.last()->setText(QString("%1 applications need a decision. Closing a request keeps it pending in this session. Repeated sample attempts are grouped by identity.").arg(model_.state().pending.size()));
+        }
+    }
     if (!product_.simulation()) {
         sideStatus_->setText(product_.engineSummary() + "\nCoverage not validated");
         status_->setText("Read only · no administrator control\nNetwork collector unavailable");
@@ -1132,17 +1159,19 @@ void MainWindow::renderRules() {
     for (const auto &r : model_.state().rules)
         if (r.active)
             ++active;
-    toolbar->addWidget(label(QString("%1 active demo rules · %2 inactive candidates")
+    auto *summary = label(QString("%1 active demo rules · %2 inactive candidates")
                                  .arg(active)
                                  .arg(model_.state().rules.size() - active),
-                             "muted"));
+                             "muted");
+    summary->setObjectName("simulation-rule-count"); toolbar->addWidget(summary);
     toolbar->addStretch();
-    if (model_.hasBackup()) {
+    {
         auto *restore = button("Restore demo backup", "restore-backup", "ghost");
         restore->setEnabled(model_.available());
+        restore->setVisible(model_.hasBackup());
         toolbar->addWidget(restore);
-        connect(restore, &QPushButton::clicked, this, [this, epoch = model_.epoch()] {
-            if (model_.restore(epoch))
+        connect(restore, &QPushButton::clicked, this, [this] {
+            if (model_.restore(model_.epoch()))
                 message("Demo backup restored in memory, including pending state and import "
                         "candidates.");
         });
@@ -1176,7 +1205,7 @@ void MainWindow::renderImport() {
                    true);
     n->setObjectName("experimental-import");
     pageLayout_->addWidget(n);
-    if (!model_.state().importLoaded) {
+    {
         auto *p = frame("panel");
         p->setObjectName("import-start");
         auto *l = new QVBoxLayout(p);
@@ -1193,12 +1222,14 @@ void MainWindow::renderImport() {
         load->setEnabled(model_.available());
         h->addWidget(load, 0, Qt::AlignTop);
         connect(load, &QPushButton::clicked, this,
-                [this, epoch = model_.epoch()] { model_.loadImport(epoch); });
+                [this] { model_.loadImport(model_.epoch()); });
         pageLayout_->addWidget(p);
-        pageLayout_->addStretch();
-        return;
+        p->setVisible(!model_.state().importLoaded);
     }
-    auto *counts = line(pageLayout_);
+    auto *preview = new QWidget; preview->setObjectName("simulation-import-preview");
+    auto *previewLayout = new QVBoxLayout(preview); previewLayout->setContentsMargins(0,0,0,0);
+    pageLayout_->addWidget(preview,1); preview->setVisible(model_.state().importLoaded);
+    auto *counts = line(previewLayout);
     counts->addWidget(label("7 Ready", "strong"));
     counts->addWidget(label("3 Need review", "warning"));
     counts->addWidget(label("2 Unsupported", "warning"));
@@ -1207,22 +1238,23 @@ void MainWindow::renderImport() {
     reset->setEnabled(model_.available());
     counts->addWidget(reset);
     connect(reset, &QPushButton::clicked, this,
-            [this, epoch = model_.epoch()] { model_.resetImport(epoch); });
+            [this] { model_.resetImport(model_.epoch()); });
     makeTable({"Original target", "Original policy", "Mapping", "Preview result"}, {27, 17, 18, 38},
               38);
-    auto *foot = line(pageLayout_);
-    foot->addWidget(label(model_.state().importApplied
+    pageLayout_->removeWidget(table_); previewLayout->addWidget(table_,1);
+    auto *foot = line(previewLayout);
+    auto *result = label(model_.state().importApplied
                               ? "7 inactive sample candidates saved. Review them in Rules."
                               : "Only ready mappings are saved as inactive candidates.",
-                          "faint", true),
-                    1);
+                          "faint", true);
+    result->setObjectName("simulation-import-result"); foot->addWidget(result,1);
     auto *apply =
         button(model_.state().importApplied ? "Candidates saved" : "Save 7 inactive candidates",
                "apply-import", "primary");
     apply->setEnabled(model_.available() && !model_.state().importApplied);
     foot->addWidget(apply);
-    connect(apply, &QPushButton::clicked, this, [this, epoch = model_.epoch()] {
-        if (model_.applyImport(epoch))
+    connect(apply, &QPushButton::clicked, this, [this] {
+        if (model_.applyImport(model_.epoch()))
             message(
                 "7 inactive candidates saved. Review each candidate in Rules before activation.");
     });
@@ -1436,7 +1468,7 @@ void MainWindow::refreshTable(bool newPage) {
                   {timestamp(r.last), {}, r.last},
                   {r.source, {}, {}},
                   {r.active ? "Edit" : "Review", "action", {}}}});
-    else if (view_ == "import")
+    else if (view_ == "import" && state.importLoaded)
         for (const auto &r : model_.sampleImport())
             result.push_back({r.id,
                               {{r.name, "strong", {}},
@@ -2553,7 +2585,8 @@ QVBoxLayout *MainWindow::modal(const QString &title, ModalOwner owner) {
     closeModal();
     modalOwner_ = owner;
     const bool draft = owner == ModalOwner::ImportedDraft;
-    modalGeneration_ = owner == ModalOwner::ImportedDraft || owner == ModalOwner::ImportedReview ? product_.importGeneration() : product_.generation();
+    modalGeneration_ = owner == ModalOwner::Simulation ? model_.epoch() :
+        owner == ModalOwner::ImportedDraft || owner == ModalOwner::ImportedReview ? product_.importGeneration() : product_.generation();
     modalDigest_ = draft ? product_.draft().digest : product_.review().report.digest;
     modalRevision_ = draft ? 0 : product_.review().revision;
     previousFocus_ = QApplication::focusWidget();
@@ -2595,7 +2628,7 @@ void MainWindow::closeStaleModal() {
     if ((imported && (product_.simulation() || product_.importGeneration() != modalGeneration_ ||
          modalDigest_ != (draft ? product_.draft().digest : product_.review().report.digest) ||
          (!draft && modalRevision_ != product_.review().revision))) ||
-        (modalOwner_ == ModalOwner::Simulation && (!product_.simulation() || !model_.available())) ||
+        (modalOwner_ == ModalOwner::Simulation && (!product_.simulation() || !model_.available() || model_.epoch() != modalGeneration_)) ||
         (modalOwner_ == ModalOwner::ImportedActivation && (product_.simulation() || product_.generation() != modalGeneration_)) ||
         ((modalOwner_ == ModalOwner::FileRule || modalOwner_ == ModalOwner::FileBackup) &&
          (product_.simulation() || product_.generation() != modalGeneration_)) ||
