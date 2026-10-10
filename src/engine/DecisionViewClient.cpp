@@ -1,4 +1,5 @@
 #include "DecisionViewClient.h"
+#include "../data/activityhistory.h"
 #include <QCoreApplication>
 #include <QDir>
 #include <QUuid>
@@ -47,6 +48,7 @@ bool DecisionViewClient::refresh() {
     return send(Type::GetStatus);
 }
 void DecisionViewClient::invalidate() {
+    endNativeSource("ConnectionLost");
     poll_.stop();
     status_.current = false;
     serviceContext_.reset();
@@ -67,8 +69,34 @@ void DecisionViewClient::invalidate() {
 }
 void DecisionViewClient::stop() {
     stopping_ = true;
+    endNativeSource("ObservationStopped");
     invalidate();
     session_.stop();
+}
+void DecisionViewClient::rejectHistory(const QString &reason) {
+    fail("History unavailable: " + reason);
+}
+void DecisionViewClient::endNativeSource(const QString &reason) {
+    if (!nativeSource_) return;
+    const auto old = *nativeSource_;
+    nativeSource_.reset();
+    emit nativeSourceLost(old, reason);
+}
+std::optional<Data::NativeSourceBinding> DecisionViewClient::nativeBinding(const Frame &f) const {
+    const auto current = serviceContext();
+    iv::ServiceContext decoded;
+    if (!current || f.minor != 3 || f.connection != status_.connection ||
+        iv::validate(f) != Error::Ok || iv::decodeServiceContext(f, decoded) != Error::Ok ||
+        decoded.serviceEpoch != current->serviceEpoch || decoded.boot != current->boot ||
+        decoded.engineContext != current->engineContext || decoded.engineBindingGeneration != current->engineBindingGeneration ||
+        get(f, Tag::ProfileGeneration) != profile_ || idValue(f, Tag::SourceEpoch) != decoded.engineContext) return {};
+    Data::NativeSourceBinding b;
+    b.serviceEpoch = QString::fromStdString(hex(decoded.serviceEpoch));
+    b.boot = QString::fromStdString(hex(decoded.boot));
+    b.engineContext = QString::fromStdString(hex(decoded.engineContext));
+    b.sourceEpoch = QString::fromStdString(hex(idValue(f, Tag::SourceEpoch)));
+    b.generation = decoded.engineBindingGeneration; b.profile = profile_;
+    return Data::validNativeBinding(b) ? std::optional<Data::NativeSourceBinding>(b) : std::nullopt;
 }
 void DecisionViewClient::fail(const QString &reason) {
     invalidate();
@@ -85,8 +113,13 @@ std::optional<iv::ServiceContext> DecisionViewClient::serviceContext() const {
 void DecisionViewClient::statusOnly() {
     recordsCurrent_ = false;
     pending_.clear(); rules_.clear(); pendingDraft_.clear(); rulesDraft_.clear();
-    expected_ = {}; busy_ = false; subscribed_ = false;
+    expected_ = {}; busy_ = false;
+    if (minor_ != 3) subscribed_ = false;
     status_.error = "Pending request records are not available in this service version.";
+    if (minor_ == 3 && (status_.capabilities & iv::NativeEvents) && serviceContext()) {
+        if (subscribed_) { poll_.start(); emit changed(); return; }
+        busy_ = true; send(Type::SubscribeEvents); return;
+    }
     poll_.start();
     emit changed();
 }
@@ -111,6 +144,7 @@ bool DecisionViewClient::adoptStatus(const Frame &f) {
     const auto epoch = idValue(f, Tag::ServiceEpoch), boot = idValue(f, Tag::BootId);
     const auto profile = get(f, Tag::ProfileGeneration);
     if (contextChanged || epoch != status_.serviceEpoch || boot != status_.bootId || profile != profile_) {
+        endNativeSource("SourceContextChanged");
         pending_.clear();
         rules_.clear();
         events_.clear();
@@ -129,6 +163,9 @@ bool DecisionViewClient::adoptStatus(const Frame &f) {
     status_.effective = get(f, Tag::EffectiveRev);
     status_.effectiveKnown = get(f, Tag::EffectiveKnown);
     status_.capabilities = get(f, Tag::Capabilities);
+    if (f.minor == 3 && !(status_.capabilities & iv::NativeEvents)) {
+        endNativeSource("SourceCapabilityLost"); subscribed_ = false; lastEvent_ = 0;
+    }
     status_.gaps = get(f, Tag::GapCount);
     status_.state = EngineState(get(f, Tag::EngineState));
     status_.backend = BackendMode(get(f, Tag::BackendMode));
@@ -161,9 +198,16 @@ bool DecisionViewClient::send(Type type) {
         f.fields = {value(Tag::ServiceEpoch, status_.serviceEpoch),
                     value(Tag::SnapshotId, snapshot_), value(Tag::Cursor, cursor_, 4),
                     value(Tag::Limit, 32, 2)};
-    if (type == Type::SubscribeEvents)
-        f.fields = {value(Tag::ServiceEpoch, status_.serviceEpoch), value(Tag::EventMask, 1, 4),
+    if (type == Type::SubscribeEvents) {
+        f.fields = {value(Tag::ServiceEpoch, status_.serviceEpoch), value(Tag::EventMask, minor_ == 3 ? 3 : 1, 4),
                     value(Tag::AfterEventSeq, lastEvent_)};
+        if (minor_ == 3) {
+            const auto context = serviceContext();
+            if (!context) { fail("History source lease unavailable"); return false; }
+            f.fields.push_back(value(Tag::ProfileGeneration, profile_));
+            f.fields.push_back(value(Tag::SourceEpoch, context->engineContext));
+        }
+    }
     if (!session_.request(std::move(f))) {
         fail("View II request queue unavailable");
         return false;
@@ -183,12 +227,13 @@ void DecisionViewClient::startPages(bool rules) {
     send(rules ? Type::ListRules : Type::ListPending);
 }
 void DecisionViewClient::received(bool ok, Frame f, Id correlation) {
-    if (stopping_ || !busy_)
+    if (stopping_)
         return;
     if (!ok) {
-        fail("View II channel lost; request and observation data unavailable");
+        if (busy_ || connected_) fail("View II channel lost; request and observation data unavailable");
         return;
     }
+    if (!busy_) return;
     if (correlation != expected_)
         return;
     if (f.minor != minor_ || validate(f) != Error::Ok || f.correlation != expected_ ||
@@ -224,9 +269,18 @@ void DecisionViewClient::received(bool ok, Frame f, Id correlation) {
     }
     if (expectedType_ == Type::SubscribeEvents) {
         if (f.type != Type::SubscriptionAck || get(f, Tag::ProfileGeneration) != profile_ ||
-            get(f, Tag::EventMask) != 1) {
+            get(f, Tag::EventMask) != (minor_ == 3 ? 3u : 1u)) {
             fail("View II subscription rejected");
             return;
+        }
+        if (minor_ == 3) {
+            const auto binding = nativeBinding(f);
+            if (!binding || get(f, Tag::SourceCoverage) != 1) { fail("History subscription context changed"); return; }
+            nativeSource_ = *binding; lastEvent_ = get(f, Tag::EventSeq);
+            subscribed_ = true; busy_ = false;
+            emit nativeSourceOpened(*binding, lastEvent_);
+            if (!connected_ || !nativeSource_ || !subscribed_) return;
+            historyGap_ = true; poll_.start(); emit changed(); return;
         }
         subscribed_ = true;
         // After=0 fija un ancla; no promete historia anterior ni cobertura completa.
@@ -311,6 +365,50 @@ void DecisionViewClient::page(const Frame &f) {
 void DecisionViewClient::observation(Frame f) {
     if (stopping_ || !connected_ || !status_.current || !subscribed_)
         return;
+    if (minor_ == 3) {
+        const auto binding = nativeBinding(f);
+        if (!binding || !nativeSource_ || !(*binding == *nativeSource_) ||
+            (f.type != Type::Attempt && f.type != Type::Authorization && f.type != Type::ObservationGap)) {
+            fail("History observation context changed"); return;
+        }
+        const auto sequence = get(f, Tag::EventSeq);
+        if (f.type == Type::ObservationGap) {
+            emit nativeGap(*binding, get(f, Tag::AfterEventSeq), sequence, get(f, Tag::GapCount),
+                           quint8(get(f, Tag::GapReason)), get(f, Tag::LostCountKnown) == 1, get(f, Tag::LostCount));
+        } else {
+            Data::ActivityEvent e;
+            e.sourceId = Data::nativeSourceId(*binding); e.sourceEpoch = Data::nativeEpochKey(*binding);
+            e.sequence = QString::number(sequence); e.receivedAtUtc = QDateTime::currentDateTimeUtc();
+            e.kind = f.type == Type::Attempt ? Data::ActivityKind::Attempt : Data::ActivityKind::Authorization;
+            Data::NativeEvidence n;
+            n.connection = QString::fromStdString(hex(f.connection)); n.observed = QString::fromStdString(hex(idValue(f, Tag::ObservedId)));
+            n.captureBinding = QString::fromStdString(hex(idValue(f, Tag::CaptureBindingId)));
+            n.observedRevision = get(f, Tag::ObservedRevision); n.unixNanoseconds = get(f, Tag::Timestamp);
+            n.presence = get(f, Tag::Presence); n.source = quint8(get(f, Tag::Source));
+            n.direction = quint8(get(f, Tag::FlowDirection)); n.protocol = quint8(get(f, Tag::Protocol));
+            if (n.presence & 1) e.observedAtUtc = QDateTime::fromMSecsSinceEpoch(qint64(n.unixNanoseconds / 1000000ull), Qt::UTC);
+            if (n.presence & 2) e.protocol = n.protocol == 6 ? "TCP" : "UDP";
+            e.subjectId = "native:" + e.sourceId + ':' + e.sourceEpoch + ':' + n.observed + ':' + n.captureBinding + ':' + QString::number(n.observedRevision);
+            if (f.type == Type::Authorization) {
+                n.command = QString::fromStdString(hex(idValue(f, Tag::CommandId)));
+                n.attemptSequence = iv::attemptSequence(idValue(f, Tag::AttemptLink));
+                n.effectiveRevision = get(f, Tag::EffectiveRev); n.scope = quint8(get(f, Tag::ScopeKind));
+                n.durable = get(f, Tag::Durable) == 1; n.currentEffect = get(f, Tag::ProofState) == 2;
+                if (get(f, Tag::Decision) == 1) e.action = Data::Action::Block;
+                else if (get(f, Tag::Decision) == 2) e.action = Data::Action::Allow;
+            }
+            e.native = n;
+            if (!Data::validNativeEvent(e)) { fail("History evidence shape rejected"); return; }
+            emit nativeEvent(e);
+        }
+        if (!connected_ || !nativeSource_ || !subscribed_) return;
+        lastEvent_ = std::max(lastEvent_, sequence); historyGap_ = true;
+        if (!observationUpdateQueued_) {
+            observationUpdateQueued_ = true;
+            QTimer::singleShot(0, this, [this] { observationUpdateQueued_ = false; if (!stopping_ && status_.current) emit changed(); });
+        }
+        return;
+    }
     if (f.minor != minor_ || validate(f) != Error::Ok || f.connection != status_.connection ||
         idValue(f, Tag::ServiceEpoch) != status_.serviceEpoch ||
         get(f, Tag::ProfileGeneration) != profile_ || get(f, Tag::Source) != 1 ||

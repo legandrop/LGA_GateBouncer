@@ -2,6 +2,7 @@
 #include "../../common/wire_iv.h"
 #include "../../controller/session_qt.h"
 #include "EngineViewClient.h"
+#include "../data/contracts.h"
 #include <QElapsedTimer>
 #include <QTimer>
 #include <set>
@@ -29,8 +30,14 @@ class DecisionViewClient final : public QObject {
     bool historyGap() const { return historyGap_; }
     quint8 collector() const { return collector_; }
     std::uint16_t protocolMinor() const { return minor_; }
+    void rejectHistory(const QString &reason);
   signals:
     void changed();
+    void nativeSourceOpened(const Gate::Data::NativeSourceBinding &binding, quint64 baseline);
+    void nativeEvent(const Gate::Data::ActivityEvent &event);
+    void nativeGap(const Gate::Data::NativeSourceBinding &binding, quint64 after, quint64 resync,
+                   quint64 revision, quint8 reason, bool lostKnown, quint64 lost);
+    void nativeSourceLost(const Gate::Data::NativeSourceBinding &binding, const QString &reason);
 
   private:
     void opened(bool ok, gb::wire::Frame frame);
@@ -42,11 +49,14 @@ class DecisionViewClient final : public QObject {
     bool send(gb::wire::Type type);
     void startPages(bool rules);
     void page(const gb::wire::Frame &frame);
+    void endNativeSource(const QString &reason);
+    std::optional<Data::NativeSourceBinding> nativeBinding(const gb::wire::Frame &frame) const;
     bool blocked_;
     gb::controller::Session session_;
     EngineStatus status_;
     std::optional<gb::wire::iv::ServiceContext> serviceContext_;
     std::shared_ptr<const gb::ipc::ii::ReadPeerLease> readPeer_;
+    std::optional<Data::NativeSourceBinding> nativeSource_;
     QTimer poll_;
     QElapsedTimer pageAge_;
     bool stopping_ = false, connected_ = false, busy_ = false;

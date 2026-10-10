@@ -1,5 +1,6 @@
 #include "reviewstore.h"
 #include "qnamereviewcodec.h"
+#include "activityhistory.h"
 #include <QDir>
 #include <QFile>
 #include <QJsonArray>
@@ -10,6 +11,7 @@
 #include <QSet>
 #include <QUuid>
 #include <limits>
+#include <algorithm>
 
 namespace Gate::Data {
 namespace {
@@ -70,25 +72,25 @@ bool nodeRead(const QJsonValue &value, XmlNode &node, int depth, int &count) {
     return true;
 }
 QJsonObject factJson(const EventFact &fact) {
-    return {{"at", dateText(fact.atUtc)}, {"source", fact.sourceId},
+    return {{"at", fact.atUtc.isValid() ? QJsonValue(dateText(fact.atUtc)) : QJsonValue(QJsonValue::Null)}, {"source", fact.sourceId},
             {"epoch", fact.sourceEpoch}, {"sequence", fact.sequence}};
 }
-bool factRead(const QJsonValue &value, EventFact &fact) {
+bool factRead(const QJsonValue &value, EventFact &fact, bool unknown = false) {
     if (!value.isObject()) return false;
     const auto object = value.toObject();
     fact = {dateRead(object["at"]), object["source"].toString(),
             object["epoch"].toString(), object["sequence"].toString()};
-    return stringFields(object, {"at", "source", "epoch", "sequence"}) &&
-           fact.atUtc.isValid() && !fact.sourceId.isEmpty() && !fact.sourceEpoch.isEmpty() &&
+    return stringFields(object, {"source", "epoch", "sequence"}) &&
+           (fact.atUtc.isValid() || (unknown && object["at"].isNull())) && !fact.sourceId.isEmpty() && !fact.sourceEpoch.isEmpty() &&
            decimalUnsigned(fact.sequence) && fact.sequence != "0";
 }
 QJsonValue optionalFact(const std::optional<EventFact> &fact) {
     return fact ? QJsonValue(factJson(*fact)) : QJsonValue(QJsonValue::Null);
 }
-bool optionalFactRead(const QJsonValue &value, std::optional<EventFact> &fact) {
+bool optionalFactRead(const QJsonValue &value, std::optional<EventFact> &fact, bool unknown = false) {
     if (value.isNull()) return true;
     EventFact parsed;
-    if (!factRead(value, parsed)) return false;
+    if (!factRead(value, parsed, unknown)) return false;
     fact = parsed;
     return true;
 }
@@ -186,39 +188,101 @@ bool reportRead(const QJsonValue &value, ImportReport &report) {
         }
     return report.accepted || (report.candidates.isEmpty() && report.filters.isEmpty() && report.identities.isEmpty());
 }
-QJsonObject historyJson(const HistoryState &state) {
-    QJsonArray events, coverage;
-    QJsonObject subjects, hits;
-    for (const auto &event : state.events) {
+QJsonObject bindingJson(const NativeSourceBinding &b) {
+    return {{"service", b.serviceEpoch}, {"boot", b.boot}, {"engine", b.engineContext},
+        {"source", b.sourceEpoch}, {"generation", QString::number(b.generation)}, {"profile", QString::number(b.profile)}};
+}
+bool bindingRead(const QJsonValue &value, NativeSourceBinding &b) {
+    if (!value.isObject()) return false;
+    const auto o = value.toObject();
+    b.serviceEpoch = o["service"].toString(); b.boot = o["boot"].toString();
+    b.engineContext = o["engine"].toString(); b.sourceEpoch = o["source"].toString();
+    return o.size() == 6 && decimalUnsigned(o["generation"].toString(), &b.generation) &&
+        decimalUnsigned(o["profile"].toString(), &b.profile) && validNativeBinding(b);
+}
+QJsonObject evidenceJson(const NativeEvidence &n) {
+    return {{"connection", n.connection}, {"observed", n.observed}, {"binding", n.captureBinding}, {"command", n.command},
+        {"revision", QString::number(n.observedRevision)}, {"unixns", QString::number(n.unixNanoseconds)},
+        {"presence", QString::number(n.presence)}, {"attempt", QString::number(n.attemptSequence)},
+        {"effective", QString::number(n.effectiveRevision)}, {"source", int(n.source)},
+        {"direction", int(n.direction)}, {"protocol", int(n.protocol)}, {"scope", int(n.scope)},
+        {"durable", n.durable}, {"effect", n.currentEffect}, {"externalPartial", n.externalPartial}};
+}
+bool evidenceRead(const QJsonValue &value, NativeEvidence &n) {
+    if (!value.isObject()) return false;
+    const auto o = value.toObject();
+    if (o.size() != 16 || !stringFields(o, {"connection", "observed", "binding", "command"})) return false;
+    n.connection = o["connection"].toString(); n.observed = o["observed"].toString();
+    n.captureBinding = o["binding"].toString(); n.command = o["command"].toString();
+    for (const auto &field : {std::pair<const char *, quint64 *>{"revision", &n.observedRevision},
+        {"unixns", &n.unixNanoseconds}, {"presence", &n.presence}, {"attempt", &n.attemptSequence}, {"effective", &n.effectiveRevision}})
+        if (!decimalUnsigned(o[field.first].toString(), field.second)) return false;
+    for (const auto &field : {std::pair<const char *, quint8 *>{"source", &n.source},
+        {"direction", &n.direction}, {"protocol", &n.protocol}, {"scope", &n.scope}}) {
+        const auto v = o[field.first];
+        if (!v.isDouble() || v.toDouble() != v.toInt() || v.toInt() < 0 || v.toInt() > 255) return false;
+        *field.second = quint8(v.toInt());
+    }
+    for (const auto &field : {std::pair<const char *, bool *>{"durable", &n.durable},
+        {"effect", &n.currentEffect}, {"externalPartial", &n.externalPartial}}) {
+        if (!o[field.first].isBool()) return false;
+        *field.second = o[field.first].toBool();
+    }
+    return true;
+}
+QJsonObject eventJson(const ActivityEvent &event) {
         QJsonValue instance(QJsonValue::Null);
         if (event.instance) instance = QJsonObject{{"epoch", event.instance->sourceEpoch},
             {"pid", QString::number(event.instance->pid)}, {"creation", QString::number(event.instance->creationFiletime)}};
-        events.push_back(QJsonObject{{"source", event.sourceId}, {"epoch", event.sourceEpoch},
-            {"sequence", event.sequence}, {"kind", int(event.kind)}, {"observed", dateText(event.observedAtUtc)},
+        QJsonObject o{{"source", event.sourceId}, {"epoch", event.sourceEpoch},
+            {"sequence", event.sequence}, {"kind", int(event.kind)}, {"observed", event.observedAtUtc.isValid() ? QJsonValue(dateText(event.observedAtUtc)) : QJsonValue(QJsonValue::Null)},
             {"received", dateText(event.receivedAtUtc)}, {"subject", event.subjectId}, {"request", event.requestId},
             {"flow", event.flowId}, {"instance", instance}, {"action", optionalAction(event.action)},
             {"rule", event.winningRuleId}, {"ruleRevision", event.winningRuleRevision},
             {"endpoint", event.endpoint}, {"protocol", event.protocol}, {"synthetic", event.synthetic},
-            {"bytes", event.bytes ? QJsonValue(QString::number(*event.bytes)) : QJsonValue(QJsonValue::Null)}});
-    }
+            {"bytes", event.bytes ? QJsonValue(QString::number(*event.bytes)) : QJsonValue(QJsonValue::Null)}};
+        if (event.native) o["native"] = evidenceJson(*event.native);
+        return o;
+}
+QJsonObject historyJson(const HistoryState &state) {
+    QJsonArray events, coverage;
+    QJsonObject subjects, hits;
+    for (const auto &event : state.events) events.push_back(eventJson(event));
     for (auto it = state.subjects.begin(); it != state.subjects.end(); ++it)
         subjects.insert(it.key(), QJsonObject{{"attempt", optionalFact(it->lastAttempt)},
             {"authorized", optionalFact(it->lastAuthorized)}, {"traffic", optionalFact(it->lastTraffic)}});
     for (auto it = state.ruleHits.begin(); it != state.ruleHits.end(); ++it) hits.insert(it.key(), factJson(it.value()));
     for (const auto &source : state.coverage) {
         QJsonArray gaps;
-        for (const auto &gap : source.gaps) gaps.push_back(QJsonObject{{"at", dateText(gap.atUtc)},
-            {"reason", gap.reason}, {"lost", QString::number(gap.lost)}});
-        coverage.push_back(QJsonObject{{"source", source.sourceId}, {"epoch", source.sourceEpoch},
+        for (const auto &gap : source.gaps) {
+            QJsonObject g{{"at", dateText(gap.atUtc)}, {"reason", gap.reason}, {"lost", QString::number(gap.lost)}};
+            if (source.native) {
+                g["lostKnown"] = gap.lostKnown; g["remote"] = gap.remote;
+                g["after"] = QString::number(gap.after); g["resync"] = QString::number(gap.resync);
+                g["revision"] = QString::number(gap.revision); g["nativeReason"] = int(gap.nativeReason);
+            }
+            gaps.push_back(g);
+        }
+        QJsonObject c{{"source", source.sourceId}, {"epoch", source.sourceEpoch},
             {"scope", source.declaredScope}, {"synthetic", source.synthetic}, {"status", int(source.status)},
             {"lastSequence", QString::number(source.lastSequence)},
             {"lastObserved", source.lastObservedUtc.isValid() ? QJsonValue(dateText(source.lastObservedUtc)) : QJsonValue(QJsonValue::Null)},
             {"since", dateText(source.sinceUtc)}, {"checkpoint", source.checkpointUtc.isValid() ?
-             QJsonValue(dateText(source.checkpointUtc)) : QJsonValue(QJsonValue::Null)}, {"gaps", gaps}});
+             QJsonValue(dateText(source.checkpointUtc)) : QJsonValue(QJsonValue::Null)}, {"gaps", gaps}};
+        if (source.native) c["native"] = bindingJson(*source.native);
+        coverage.push_back(c);
     }
-    return {{"events", events}, {"subjects", subjects}, {"hits", hits}, {"coverage", coverage}};
+    QJsonObject result{{"events", events}, {"subjects", subjects}, {"hits", hits}, {"coverage", coverage}};
+    QJsonArray attempts, authorizations;
+    for (const auto &event : state.nativeAttempts) attempts.push_back(eventJson(event));
+    for (const auto &event : state.nativeAuthorizations) authorizations.push_back(eventJson(event));
+    if (!attempts.isEmpty() || !authorizations.isEmpty() ||
+        std::any_of(state.coverage.begin(), state.coverage.end(), [](const Coverage &c) { return bool(c.native); })) {
+        result["nativeAttempts"] = attempts; result["nativeAuthorizations"] = authorizations;
+    }
+    return result;
 }
-bool historyRead(const QJsonValue &value, HistoryState &state) {
+bool historyRead(const QJsonValue &value, HistoryState &state, bool nativeAllowed = false) {
     if (!value.isObject()) return false;
     const auto object = value.toObject();
     if (!object["events"].isArray() || object["events"].toArray().size() > 4096 ||
@@ -241,7 +305,13 @@ bool historyRead(const QJsonValue &value, HistoryState &state) {
             row["status"].toInt() > 2 || !row["gaps"].isArray() || row["gaps"].toArray().size() > 128) return false;
         sourceKeys.insert(key); source.synthetic = row["synthetic"].toBool();
         source.status = CoverageStatus(row["status"].toInt());
-        if (!source.synthetic && source.status != CoverageStatus::Unavailable) return false;
+        if (row.contains("native")) {
+            NativeSourceBinding binding;
+            if (!nativeAllowed || source.synthetic || !bindingRead(row["native"], binding) ||
+                source.sourceId != nativeSourceId(binding) || source.sourceEpoch != nativeEpochKey(binding)) return false;
+            source.native = binding;
+        }
+        if (!source.synthetic && !source.native && source.status != CoverageStatus::Unavailable) return false;
         if (!row["checkpoint"].isNull()) {
             source.checkpointUtc = dateRead(row["checkpoint"]);
             if (!source.checkpointUtc.isValid()) return false;
@@ -254,31 +324,51 @@ bool historyRead(const QJsonValue &value, HistoryState &state) {
             const auto parsed = item.toObject(); CoverageGap gap;
             gap.atUtc = dateRead(parsed["at"]); gap.reason = parsed["reason"].toString();
             if (!gap.atUtc.isValid() || gap.reason.isEmpty() || !decimalUnsigned(parsed["lost"].toString(), &gap.lost)) return false;
+            if (source.native) {
+                if (!parsed["lostKnown"].isBool() || !parsed["remote"].isBool() ||
+                    !decimalUnsigned(parsed["after"].toString(), &gap.after) ||
+                    !decimalUnsigned(parsed["resync"].toString(), &gap.resync) ||
+                    !decimalUnsigned(parsed["revision"].toString(), &gap.revision) ||
+                    !parsed["nativeReason"].isDouble() || parsed["nativeReason"].toDouble() != parsed["nativeReason"].toInt() ||
+                    parsed["nativeReason"].toInt() < 0 || parsed["nativeReason"].toInt() > 4) return false;
+                gap.lostKnown = parsed["lostKnown"].toBool(); gap.remote = parsed["remote"].toBool();
+                gap.nativeReason = quint8(parsed["nativeReason"].toInt());
+                if ((!gap.lostKnown && gap.lost) || gap.resync > source.lastSequence ||
+                    (gap.remote && (!gap.nativeReason || (gap.lostKnown &&
+                      (!gap.lost || gap.after >= gap.resync || gap.lost != gap.resync - gap.after)))) ||
+                    (!gap.remote && (gap.nativeReason || gap.after || gap.revision))) return false;
+            }
             source.gaps.push_back(gap);
         }
         state.coverage.push_back(source);
     }
-    const auto knownSource = [&](const QString &id, const QString &epoch) {
+    const auto knownSource = [&](const QString &id, const QString &epoch, bool native = false) {
         for (const auto &source : state.coverage)
-            if (source.sourceId == id && source.sourceEpoch == epoch && source.synthetic) return true;
+            if (source.sourceId == id && source.sourceEpoch == epoch &&
+                (native ? bool(source.native) : source.synthetic)) return true;
         return false;
     };
-    for (const auto &entry : object["events"].toArray()) {
+    const auto readEvent = [&](const QJsonValue &entry, ActivityEvent &event) {
         if (!entry.isObject()) return false;
-        const auto row = entry.toObject(); ActivityEvent event;
+        const auto row = entry.toObject();
         event.sourceId = row["source"].toString(); event.sourceEpoch = row["epoch"].toString();
         event.sequence = row["sequence"].toString(); event.observedAtUtc = dateRead(row["observed"]);
         event.receivedAtUtc = dateRead(row["received"]); event.subjectId = row["subject"].toString();
         event.requestId = row["request"].toString(); event.flowId = row["flow"].toString();
         event.winningRuleId = row["rule"].toString(); event.winningRuleRevision = row["ruleRevision"].toString();
         event.endpoint = row["endpoint"].toString(); event.protocol = row["protocol"].toString();
-        if (!stringFields(row, {"source", "epoch", "sequence", "observed", "received", "subject", "request", "flow", "rule", "ruleRevision", "endpoint", "protocol"}) ||
-            !knownSource(event.sourceId, event.sourceEpoch) || !decimalUnsigned(event.sequence) || event.sequence == "0" ||
-            !event.observedAtUtc.isValid() || !event.receivedAtUtc.isValid() || !row["kind"].isDouble() ||
+        if (row.contains("native")) {
+            NativeEvidence evidence;
+            if (!nativeAllowed || !evidenceRead(row["native"], evidence)) return false;
+            event.native = evidence;
+        }
+        if (!stringFields(row, {"source", "epoch", "sequence", "received", "subject", "request", "flow", "rule", "ruleRevision", "endpoint", "protocol"}) ||
+            !knownSource(event.sourceId, event.sourceEpoch, bool(event.native)) || !decimalUnsigned(event.sequence) || event.sequence == "0" ||
+            (!event.observedAtUtc.isValid() && !(event.native && row["observed"].isNull())) || !event.receivedAtUtc.isValid() || !row["kind"].isDouble() ||
             row["kind"].toDouble() != row["kind"].toInt() || row["kind"].toInt() < 0 || row["kind"].toInt() > 4 ||
-            !row["synthetic"].isBool() || !row["synthetic"].toBool() ||
+            !row["synthetic"].isBool() || row["synthetic"].toBool() == bool(event.native) ||
             !optionalActionRead(row["action"], event.action)) return false;
-        event.synthetic = true; event.kind = ActivityKind(row["kind"].toInt());
+        event.synthetic = row["synthetic"].toBool(); event.kind = ActivityKind(row["kind"].toInt());
         for (const auto &source : state.coverage)
             if (source.sourceId == event.sourceId && source.sourceEpoch == event.sourceEpoch &&
                 source.lastSequence < event.sequence.toULongLong()) return false;
@@ -297,17 +387,34 @@ bool historyRead(const QJsonValue &value, HistoryState &state) {
             if (event.kind != ActivityKind::Traffic || !decimalUnsigned(row["bytes"].toString(), &bytes)) return false;
             event.bytes = bytes;
         }
-        state.events.push_back(event);
+        return !event.native || validNativeEvent(event);
+    };
+    for (const auto &entry : object["events"].toArray()) {
+        ActivityEvent event;
+        if (!readEvent(entry, event)) return false;
+        state.events.push_back(std::move(event));
     }
+    if (nativeAllowed) {
+        for (const auto key : {"nativeAttempts", "nativeAuthorizations"}) {
+            if (!object[key].isArray() || object[key].toArray().size() > 20000) return false;
+            auto &map = QString::fromLatin1(key) == "nativeAttempts" ? state.nativeAttempts : state.nativeAuthorizations;
+            for (const auto &entry : object[key].toArray()) {
+                ActivityEvent event;
+                if (!readEvent(entry, event) || !event.native || map.contains(nativeEventKey(event))) return false;
+                map.insert(nativeEventKey(event), std::move(event));
+            }
+        }
+    } else if (object.contains("nativeAttempts") || object.contains("nativeAuthorizations")) return false;
     const auto subjects = object["subjects"].toObject();
     for (auto it = subjects.begin(); it != subjects.end(); ++it) {
         if (it.key().isEmpty() || !it.value().isObject()) return false;
         const auto row = it.value().toObject(); ActivityAggregate aggregate;
-        if (!optionalFactRead(row["attempt"], aggregate.lastAttempt) ||
-            !optionalFactRead(row["authorized"], aggregate.lastAuthorized) ||
-            !optionalFactRead(row["traffic"], aggregate.lastTraffic)) return false;
+        if (!optionalFactRead(row["attempt"], aggregate.lastAttempt, nativeAllowed) ||
+            !optionalFactRead(row["authorized"], aggregate.lastAuthorized, nativeAllowed) ||
+            !optionalFactRead(row["traffic"], aggregate.lastTraffic, nativeAllowed)) return false;
         for (const auto *fact : {&aggregate.lastAttempt, &aggregate.lastAuthorized, &aggregate.lastTraffic})
-            if (*fact && !knownSource((*fact)->sourceId, (*fact)->sourceEpoch)) return false;
+            if (*fact && !(knownSource((*fact)->sourceId, (*fact)->sourceEpoch, true) ||
+                ((*fact)->atUtc.isValid() && knownSource((*fact)->sourceId, (*fact)->sourceEpoch)))) return false;
         state.subjects.insert(it.key(), aggregate);
     }
     const auto hits = object["hits"].toObject();
@@ -316,7 +423,7 @@ bool historyRead(const QJsonValue &value, HistoryState &state) {
         if (it.key().isEmpty() || !factRead(it.value(), fact) || !knownSource(fact.sourceId, fact.sourceEpoch)) return false;
         state.ruleHits.insert(it.key(), fact);
     }
-    return true;
+    return validNativeHistory(state);
 }
 bool boundedJson(const QJsonValue &value, int depth, int &count) {
     if (++count > 2000000 || depth > 80) return false;
@@ -332,10 +439,11 @@ bool boundedJson(const QJsonValue &value, int depth, int &count) {
 }
 bool documentRead(const QJsonObject &object, ReviewDocument &document) {
     int count = 0;
-    const bool qname = object["schemaVersion"] == 2;
-    if (!(boundedJson(object, 0, count) && (object["schemaVersion"] == 1 || qname) &&
+    const bool native = object["schemaVersion"] == 3;
+    const bool qname = object["schemaVersion"] == 2 || (native && object.contains("qnameEvidence"));
+    if (!(boundedJson(object, 0, count) && (object["schemaVersion"] == 1 || qname || native) &&
            decimalUnsigned(object["storeRevision"].toString(), &document.revision) &&
-           reportRead(object["report"], document.report) && historyRead(object["history"], document.history))) return false;
+           reportRead(object["report"], document.report) && historyRead(object["history"], document.history, native))) return false;
     if (!qname) return true;
     QNameEvidence evidence;
     if (!qnameEvidenceRead(object["qnameEvidence"], evidence)) return false;
@@ -343,7 +451,9 @@ bool documentRead(const QJsonObject &object, ReviewDocument &document) {
     return rebuildQNameReport(document);
 }
 QJsonObject documentJson(const ReviewDocument &document) {
-    QJsonObject object{{"schemaVersion", document.qnameEvidence ? 2 : 1}, {"storeRevision", QString::number(document.revision)},
+    const bool native = std::any_of(document.history.coverage.begin(), document.history.coverage.end(),
+                                   [](const Coverage &c) { return bool(c.native); });
+    QJsonObject object{{"schemaVersion", native ? 3 : document.qnameEvidence ? 2 : 1}, {"storeRevision", QString::number(document.revision)},
             {"report", reportJson(document.report)}, {"history", historyJson(document.history)}};
     if (document.qnameEvidence) object["qnameEvidence"] = qnameEvidenceJson(*document.qnameEvidence);
     return object;
@@ -360,7 +470,8 @@ bool safeDocument(const ReviewDocument &document) {
     if (document.report.candidates.size() > 10000 ||
         document.report.filters.size() + document.report.identities.size() > 20000 ||
         document.history.events.size() > 4096 || document.history.coverage.size() > 128 ||
-        document.history.subjects.size() > 20000 || document.history.ruleHits.size() > 20000) return false;
+        document.history.subjects.size() > 20000 || document.history.ruleHits.size() > 20000 ||
+        !validNativeHistory(document.history)) return false;
     int count = 0;
     for (const auto &candidate : document.report.candidates) if (!safeNode(candidate.source, 1, count)) return false;
     for (const auto &node : document.report.filters) if (!safeNode(node, 1, count)) return false;
@@ -392,14 +503,14 @@ StoreResult ReviewStore::load() {
     if (file.error() != QFileDevice::NoError) return failure(StoreStatus::IoError, "Read did not complete");
     if (bytes.size() > storeByteLimit) return failure(StoreStatus::Corrupt, "Review exceeds the size limit");
     const auto preflight = scanReviewJson(bytes);
-    if (!preflight.syntax || (preflight.schema == 2 && !preflight.schema2Budget))
+    if (!preflight.syntax || ((preflight.schema == 2 || preflight.schema == 3) && !preflight.schema2Budget))
         return failure(StoreStatus::Corrupt, "Review failed preflight; the file has been preserved");
     QJsonParseError error;
     const auto parsed = QJsonDocument::fromJson(bytes, &error);
     if (error.error != QJsonParseError::NoError || !parsed.isObject())
         return failure(StoreStatus::Corrupt, "Review is corrupt; the file has been preserved");
     const auto object = parsed.object();
-    if (object["schemaVersion"].isDouble() && object["schemaVersion"].toDouble() > 2)
+    if (object["schemaVersion"].isDouble() && object["schemaVersion"].toDouble() > 3)
         return failure(StoreStatus::FutureSchema, "Review uses a newer format; the file has been preserved");
     ReviewDocument document;
     if (!documentRead(object, document)) return failure(StoreStatus::Corrupt, "Review is invalid; the file has been preserved");
@@ -426,6 +537,11 @@ StoreResult ReviewStore::save(const ReviewDocument &document, quint64 expectedRe
     ReviewDocument validated;
     if (!documentRead(object, validated)) return failure(StoreStatus::Invalid, "Invalid review data");
     const auto bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
+    if (object["schemaVersion"] == 3) {
+        const auto preflight = scanReviewJson(bytes);
+        if (!preflight.syntax || !preflight.schema2Budget)
+            return failure(StoreStatus::Invalid, "History exceeds the preflight limits");
+    }
     if (bytes.size() > storeByteLimit || bytes.size() > jsonBound) return failure(StoreStatus::Invalid, "Review exceeds the size limit");
     QSaveFile file(path_);
     file.setDirectWriteFallback(false);

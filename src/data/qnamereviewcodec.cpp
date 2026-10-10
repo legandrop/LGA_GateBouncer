@@ -199,10 +199,10 @@ bool factBudget(QNameBudget &b, const EventFact &f) {
 ReviewJsonPreflight scanReviewJson(const QByteArray &bytes) {
     if (bytes.size() > QNameBudget::byteLimit) return {};
     const int schema = dispatchSchema(bytes);
-    if (schema != 2) return {true, false, schema};
+    if (schema != 2 && schema != 3) return {true, false, schema};
     Scanner s{bytes};
     const bool syntax = s.value(0); s.space();
-    return {syntax && s.at == bytes.size() && s.versions == 1 && s.schema == 2, s.budget, s.schema};
+    return {syntax && s.at == bytes.size() && s.versions == 1 && s.schema == schema, s.budget, s.schema};
 }
 bool budgetQNameReview(const ReviewDocument &d, qint64 *bound) {
     if (!d.qnameEvidence) return false;
@@ -231,13 +231,20 @@ bool budgetQNameReview(const ReviewDocument &d, qint64 *bound) {
     }
     for (const auto &r : e.rows) if (!fixed(b, 15, 128) || !b.string(r.candidateId)) return false;
     if (!b.structure(e.roles.size() * 68ll)) return false;
-    for (const auto &event : d.history.events) {
+    const auto eventBudget = [&](const ActivityEvent &event) {
         if (!fixed(b, 256, 4096) || !strings(b, {event.sourceId, event.sourceEpoch, event.sequence, event.subjectId, event.requestId,
             event.flowId, event.winningRuleId, event.winningRuleRevision, event.endpoint, event.protocol,
             event.observedAtUtc.toUTC().toString(Qt::ISODateWithMs), event.receivedAtUtc.toUTC().toString(Qt::ISODateWithMs)})) return false;
         if (event.action && !b.string(actionName(*event.action))) return false;
         if (event.instance && (!fixed(b, 32, 512) || !b.string(event.instance->sourceEpoch))) return false;
-    }
+        if (event.native && (!fixed(b, 256, 2048) || !strings(b, {event.native->connection,
+            event.native->observed, event.native->captureBinding, event.native->command}))) return false;
+        return true;
+    };
+    for (const auto &event : d.history.events) if (!eventBudget(event)) return false;
+    if (d.history.nativeAttempts.size() > 20000 || d.history.nativeAuthorizations.size() > 20000) return false;
+    for (const auto &event : d.history.nativeAttempts) if (!eventBudget(event)) return false;
+    for (const auto &event : d.history.nativeAuthorizations) if (!eventBudget(event)) return false;
     for (auto it = d.history.subjects.begin(); it != d.history.subjects.end(); ++it) {
         if (!fixed(b, 64, 512) || !b.string(it.key())) return false;
         for (const auto *f : {&it->lastAttempt, &it->lastAuthorized, &it->lastTraffic}) if (*f && !factBudget(b, **f)) return false;
@@ -246,7 +253,10 @@ bool budgetQNameReview(const ReviewDocument &d, qint64 *bound) {
     for (const auto &c : d.history.coverage) {
         if (!fixed(b, 256, 4096) || !strings(b, {c.sourceId, c.sourceEpoch, c.declaredScope, c.sinceUtc.toUTC().toString(Qt::ISODateWithMs),
             c.checkpointUtc.toUTC().toString(Qt::ISODateWithMs), c.lastObservedUtc.toUTC().toString(Qt::ISODateWithMs)}) || c.gaps.size() > 128) return false;
-        for (const auto &gap : c.gaps) if (!fixed(b, 32, 512) || !strings(b, {gap.reason, gap.atUtc.toUTC().toString(Qt::ISODateWithMs)})) return false;
+        if (c.native && (!fixed(b, 96, 1024) || !strings(b, {c.native->serviceEpoch, c.native->boot,
+            c.native->engineContext, c.native->sourceEpoch}))) return false;
+        for (const auto &gap : c.gaps) if (!fixed(b, c.native ? 96 : 32, c.native ? 1024 : 512) ||
+            !strings(b, {gap.reason, gap.atUtc.toUTC().toString(Qt::ISODateWithMs)})) return false;
     }
     if (bound) *bound = b.jsonBound;
     return b.valid;

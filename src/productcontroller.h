@@ -1,6 +1,7 @@
 #pragma once
 #include "data/contracts.h"
 #include "data/reviewstore.h"
+#include "data/activityhistory.h"
 #include "data/netlimitersemantics.h"
 #include "data/netlimiterxmlprofile.h"
 #include "platform/ProcessCatalog.h"
@@ -9,6 +10,7 @@
 #include "engine/OrdinaryDecisionClient.h"
 #include <QObject>
 #include <QThread>
+#include <QTimer>
 #include <memory>
 #include <QUuid>
 #include <QHash>
@@ -41,6 +43,8 @@ class ProductController final : public QObject {
     const Data::ProcessObservation *process(const QString &id) const;
     QString processId(const Data::ProcessObservation &process) const;
     const Data::ReviewDocument &review() const { return review_; }
+    const Data::HistoryState &history() const { return history_.state(); }
+    QString historyError() const { return historyError_; }
     const Data::ImportReport &draft() const { return draft_; }
     const std::optional<Data::QNameEvidence> &importEvidence(bool draft) const { return draft ? draftEvidence_ : review_.qnameEvidence; }
     const ImportedReviewView &importedView(bool draft) const { return draft ? draftView_ : reviewView_; }
@@ -72,7 +76,7 @@ class ProductController final : public QObject {
     QString engineSummary() const;
     QString revisionSummary() const;
     quint64 generation() const { return generation_; }
-    void stop() { stopped_ = true; ++generation_; cancelImport(); semanticJob_ = QUuid{}; draftView_ = {}; reviewView_ = {}; engine_.invalidate(); records_.stop(); ordinary_.stop(); }
+    void stop();
     bool idle() const { return (!worker_ || !worker_->isRunning()) && (!semanticWorker_ || !semanticWorker_->isRunning()) && (!importWorker_ || !importWorker_->isRunning()) && engine_.idle() && records_.idle() && ordinary_.idle(); }
   signals:
     void changed();
@@ -83,6 +87,8 @@ class ProductController final : public QObject {
     void deriveImportedViews();
     void startImportedViews();
     void startImport();
+    bool flushHistory();
+    void historyChanged();
     bool isolatedQa_;
     UiMode mode_ = UiMode::LiveReadOnly;
     quint64 generation_ = 1;
@@ -106,6 +112,10 @@ class ProductController final : public QObject {
     quint64 lastProfile_ = 0;
     std::unique_ptr<Data::ReviewStore> store_;
     Data::ReviewDocument review_;
+    Data::ActivityHistory history_;
+    QTimer historyFlush_;
+    bool historyDirty_ = false, flushingHistory_ = false;
+    QString historyError_;
     Data::ImportReport draft_;
     bool reviewWritable_ = false;
     QString reviewError_, importError_;

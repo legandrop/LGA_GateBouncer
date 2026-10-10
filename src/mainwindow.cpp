@@ -19,6 +19,7 @@
 #include <QKeyEvent>
 #include <QLabel>
 #include <QLineEdit>
+#include <QLocale>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
@@ -808,7 +809,7 @@ void MainWindow::buildPage() {
         status_->setText("Read only · no administrator control\nNetwork collector unavailable");
         if (product_.recordsSelected() && product_.records()->recordsCurrent()) {
             status_->setText("Read only · decisions require administrator review\nCoverage not validated");
-            footer_->setText("View II snapshots · WFP attempts only when present · no authorization or traffic evidence");
+            footer_->setText("Read-only snapshots · attempts and applied decisions remain separate from traffic");
         }
         if (product_.ordinary()->current()) {
             status_->setText("Request review available\nCoverage not validated");
@@ -817,7 +818,7 @@ void MainWindow::buildPage() {
         const QMap<QString, QStringList> liveHeadings{
             {"processes", {"Processes", "Observed local processes · policy and network history are unknown."}},
             {"pending", {"Pending requests", "Review an application's request and choose how long your decision applies."}},
-            {"activity", {"Activity", "Observed attempts and gaps · authorization and traffic unavailable."}},
+            {"activity", {"Activity", "Retained attempts, causal applied decisions and history gaps · traffic unknown."}},
             {"rules", {"Rules", "Service policy records and inactive local review candidates."}},
             {"import", {"Import from NetLimiter", "Structural analysis only · compatibility not validated."}},
             {"settings", {"Settings", "Engine status and assistance configuration with separate consents."}}};
@@ -1174,6 +1175,44 @@ void MainWindow::refreshTable(bool newPage) {
                                     : p.flow == 2 ? "Outbound attempt · destination unknown" : "Inbound attempt · destination unknown", {}, {}},
                      {recordUtc(p.lastUtc, p.presence & 8), {}, qulonglong(p.lastUtc)},
                      {"Review in administrator window →", "action", {}}}});
+        else if (view_ == "activity" && std::any_of(product_.history().coverage.begin(), product_.history().coverage.end(),
+                                                 [](const Data::Coverage &c) { return bool(c.native); })) {
+            const auto &history = product_.history();
+            for (const auto &e : history.events) {
+                if (!e.native) continue;
+                const auto &n = *e.native;
+                const QString at = e.observedAtUtc.isValid()
+                    ? QLocale().toString(e.observedAtUtc.toLocalTime(), QLocale::ShortFormat)
+                    : "Observed time unknown";
+                const QString received = QLocale().toString(e.receivedAtUtc.toLocalTime(), QLocale::ShortFormat);
+                const QString kind = e.kind == Data::ActivityKind::Authorization
+                    ? (e.action == Data::Action::Allow ? "Applied Allow decision" : "Applied Block decision")
+                    : "Attempt observed";
+                const QString reason = n.externalPartial ? "Attempt link unavailable · partial evidence"
+                    : e.kind == Data::ActivityKind::Authorization ? "Causal applied decision · traffic unknown"
+                    : n.source == 2 ? "Retained classifier cause · traffic unknown" : "Copied SDK drop · subset only";
+                result.push_back({"history:" + Data::nativeEventKey(e),
+                    {{at + "\nReceived " + received, {}, qulonglong(e.sequence.toULongLong())},
+                     {"Observed " + n.observed.left(12) + "\nBinding " + n.captureBinding.left(12), {}, {}},
+                     {kind, n.externalPartial ? "warning" : "", {}},
+                     {(n.direction == 1 ? "Outbound" : "Inbound") + QString(" · ") +
+                        (e.protocol.isEmpty() ? "protocol unknown" : e.protocol) + "\nEndpoint unknown", {}, {}},
+                     {reason, {}, {}}}});
+            }
+            for (const auto &coverage : history.coverage) {
+                if (!coverage.native) continue;
+                int index = 0;
+                for (const auto &gap : coverage.gaps) {
+                    const QString loss = gap.lostKnown ? QString::number(gap.lost) + " history records omitted"
+                                                      : "Omitted record count unknown";
+                    result.push_back({"history-gap:" + coverage.sourceId + ':' + coverage.sourceEpoch + ':' + QString::number(index++),
+                        {{"Gap received\n" + QLocale().toString(gap.atUtc.toLocalTime(), QLocale::ShortFormat), {}, qulonglong(gap.resync)},
+                         {"Source " + coverage.native->sourceEpoch.left(12), {}, {}},
+                         {"Observation gap", "warning", {}}, {"Unknown", {}, {}},
+                         {gap.reason + "\n" + loss, {}, {}}}});
+                }
+            }
+        }
         else if (view_ == "activity" && product_.recordsSelected() && product_.engine().current)
             for (const auto &e : product_.records()->events()) {
                 const auto sequence = gb::wire::get(e, gb::wire::Tag::EventSeq);
@@ -1962,9 +2001,24 @@ void MainWindow::renderLive() {
                 : "No current request list. Refresh requests to check the connection; a running process is not an access request."));
         makeTable({"Application", "Destination", "Last request", "Decision"}, {32, 31, 14, 23}, 57);
     } else if (view_ == "activity") {
+        auto *bar = line(pageLayout_);
+        auto *connectHistory = button("Connect history", "connect-history");
+        connectHistory->setEnabled(product_.records()->idle() && !product_.records()->refreshing());
+        bar->addWidget(connectHistory, 0, Qt::AlignLeft); bar->addStretch();
+        connect(connectHistory, &QPushButton::clicked, &product_, &ProductController::selectDecisionRecords);
         makeTable({"Time", "Process", "Event", "Destination", "Reason"}, {19, 22, 19, 20, 20}, 42);
-        pageLayout_->addWidget(label("Coverage: Unavailable · a service heartbeat does not report traffic.", "faint", true));
-        pageLayout_->addWidget(label("History is incomplete: no observations before subscription, source gaps may occur, and only 4096 events are retained. No authorization or traffic events are supported.", "faint", true));
+        const auto &history = product_.history();
+        int liveSources = 0, nativeSources = 0, gaps = 0;
+        for (const auto &coverage : history.coverage) if (coverage.native) {
+            ++nativeSources; gaps += coverage.gaps.size();
+            if (coverage.status != Data::CoverageStatus::Unavailable) ++liveSources;
+        }
+        pageLayout_->addWidget(label(nativeSources
+            ? QString("Coverage: %1 · %2 historical sources · %3 recorded gaps. Archived records do not report current permissions.")
+                .arg(liveSources ? "Partial retained-cause subset" : "Unavailable; archived evidence retained").arg(nativeSources).arg(gaps)
+            : "Coverage: Unavailable · a service heartbeat does not report traffic.", "faint", true));
+        pageLayout_->addWidget(label("History starts at subscription and retains 4,096 detail events. Attempt, applied decision and traffic are separate facts. Authorization time can be unknown; traffic and process attribution remain unknown until their original sources are available. Silence does not establish inactivity.", "faint", true));
+        if (!product_.historyError().isEmpty()) pageLayout_->addWidget(note(product_.historyError()));
     } else if (view_ == "rules") {
         pageLayout_->addWidget(label("Engine rules: " + (product_.recordsSelected() && product_.records()->recordsCurrent()
             ? QString::number(product_.records()->rules().size()) + " read only" : "Unavailable") +
