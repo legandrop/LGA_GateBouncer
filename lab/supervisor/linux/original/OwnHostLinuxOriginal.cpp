@@ -385,10 +385,11 @@ OwnHostLinuxOriginal::Snapshot OwnHostLinuxOriginal::CloseOwn(){CancelOwn();std:
     if(closed)o.state=State::Closed;return {o.state,o.bootSubmitted,o.authenticated};
 }
 int RunOwnHostLinuxOriginal(int argc,wchar_t**argv) {
-    static std::mutex registryMutex;static std::map<OwnHostLinuxOriginal*,std::shared_ptr<OwnHostLinuxOriginal>>retained;
-    auto original=std::shared_ptr<OwnHostLinuxOriginal>(new OwnHostLinuxOriginal);{std::lock_guard<std::mutex>lock(registryMutex);retained.emplace(original.get(),original);}
+    // Sin destructor estático: ClosePending conserva Impl/OVERLAPPED hasta el teardown del proceso.
+    static std::mutex registryMutex;static auto*retained=new std::map<OwnHostLinuxOriginal*,std::shared_ptr<OwnHostLinuxOriginal>>;
+    auto original=std::shared_ptr<OwnHostLinuxOriginal>(new OwnHostLinuxOriginal);{std::lock_guard<std::mutex>lock(registryMutex);retained->emplace(original.get(),original);}
     bool succeeded=false;try{succeeded=original->PrepareOwn(argc,argv)&&original->RunOwn();}catch(...){original->CancelOwn();}
-    const auto terminal=original->CloseOwn();if(terminal.state==OwnHostLinuxOriginal::State::Closed){std::lock_guard<std::mutex>lock(registryMutex);retained.erase(original.get());}
+    const auto terminal=original->CloseOwn();if(terminal.state==OwnHostLinuxOriginal::State::Closed){std::lock_guard<std::mutex>lock(registryMutex);retained->erase(original.get());}
     return succeeded&&terminal.state==OwnHostLinuxOriginal::State::Closed?0:2;
 }
 }
