@@ -27,6 +27,11 @@ struct ImportedReviewView {
     std::optional<Data::QNameProfileView> qname;
     QHash<QString, int> candidates;
 };
+struct ImportedActivationView {
+    QString candidate, process, message;
+    quint64 token = 0;
+    bool busy = false, ready = false;
+};
 class ProductController final : public QObject {
     Q_OBJECT
   public:
@@ -63,6 +68,10 @@ class ProductController final : public QObject {
     bool saveCandidates();
     void clearDraft();
     bool updateCandidate(const QString &id, Data::Action action);
+    bool prepareImportedRule(const QString &candidate, const QString &process);
+    bool confirmImportedRule(quint64 token, bool consent);
+    void cancelImportedRule();
+    const ImportedActivationView &importedActivation() const { return activationView_; }
     // View no concede autoridad de control, aun si la GUI tiene token elevado.
     bool canMutatePolicy() const { return false; }
     bool decideReal(const QString &, int) { return false; }
@@ -99,6 +108,14 @@ class ProductController final : public QObject {
     void cancelNativeProcesses();
     void clearProcessHistory();
     void projectProcessHistory(Data::ProcessCatalogResult &);
+    void advanceImportedRule();
+    void finishImportedComparison(const NativeContextSnapshot &, const std::shared_ptr<Data::NativeOwnBatch> &,
+                                  const Data::ProcessCatalogResult &);
+    bool importedRuleCurrent() const;
+    struct ImportedActivation;
+    std::unique_ptr<ImportedActivation> activation_;
+    ImportedActivationView activationView_;
+    quint64 activationToken_ = 0;
     struct NativeProcessJob;
     std::unique_ptr<NativeProcessJob> nativeProcessJob_;
     QTimer nativeProcessTick_;

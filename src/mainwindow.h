@@ -68,6 +68,7 @@ class MainWindow final : public QMainWindow {
     void renderLive();
     void renderLiveDetail(const QString &id);
     void reviewCandidate(const QString &id, bool draft = false);
+    void prepareImportedRule(const QString &id);
     void restoreFocus();
     void modeSelector(QVBoxLayout *layout);
     void saveViewState();
@@ -81,7 +82,7 @@ class MainWindow final : public QMainWindow {
     void updateLifecycle();
     void openEngineRequest(const QString &rowId);
     void finishShutdownWhenIdle();
-    enum class ModalOwner { General, Simulation, Live, ImportedDraft, ImportedReview };
+    enum class ModalOwner { General, Simulation, Live, ImportedDraft, ImportedReview, ImportedActivation };
     QVBoxLayout *modal(const QString &title, ModalOwner owner = ModalOwner::General);
     void closeStaleModal();
     void closeModal();

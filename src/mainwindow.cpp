@@ -1446,6 +1446,7 @@ void MainWindow::renderOrdinaryNotice() {
     const QString focused = notice_ && notice_->isAncestorOf(QApplication::focusWidget())
         ? QApplication::focusWidget()->objectName() : QString{};
     if (notice_) { dispose(notice_); notice_.clear(); }
+    if (product_.importedActivation().busy || product_.importedActivation().ready) return;
     if (!client->visible() || !client->observed()) return;
     const auto row = *client->observed();
     const auto draft = client->draft();
@@ -2252,8 +2253,66 @@ void MainWindow::reviewCandidate(const QString &rowId, bool draft) {
             if (product_.simulation() || product_.importGeneration() != generation || product_.review().report.digest != digest || product_.review().revision != revision) return;
             const auto action = policy->currentIndex() == 0 ? Data::Action::Allow : policy->currentIndex() == 1 ? Data::Action::Block : Data::Action::Ask;
             if (product_.updateCandidate(id, action)) { closeModal(); message("Saving local review in the background…"); }
-        }); return;
+        });
+        if (!draft && product_.derivedQNameCandidate(false, c.id)) {
+            auto *prepare = button("Prepare matching source rule…", "prepare-imported-rule", "ghost");
+            l->addWidget(prepare, 0, Qt::AlignRight);
+            connect(prepare, &QPushButton::clicked, this, [this,id=c.id] { prepareImportedRule(id); });
+        }
+        return;
     }
+}
+void MainWindow::prepareImportedRule(const QString &candidate) {
+    const auto *source = product_.derivedQNameCandidate(false, candidate);
+    if (!source || product_.simulation()) return;
+    const QString policy = source->action.known() && source->action.value == Data::SourceFwAction::Allow ? "Allow" :
+        source->action.known() && source->action.value == Data::SourceFwAction::Deny ? "Block" : "Unknown";
+    auto *l = modal("Prepare a matching source rule", ModalOwner::ImportedActivation);
+    l->addWidget(label("Original policy: " + policy + " · " + Data::directionName(source->direction.value), "heading", true));
+    l->addWidget(note("This creates a new rule in GateBouncer after confirmation. The imported document stays inactive. Only an exact application and account scope can be represented; additional source conditions and unresolved priorities remain inactive.", true));
+    auto *processes = combo({}, "imported-rule-process");
+    processes->addItem("Choose an application with current original evidence", QString{});
+    for (const auto &p : product_.catalog().processes)
+        if (p.identityEvidence == "SourceRetainedImageAndOwnInstance" && p.sourceImage && !p.historyCauses.isEmpty())
+            processes->addItem(p.name + " · " + p.imagePath, product_.processId(p));
+    l->addWidget(processes);
+    auto *status = label("Connect history and refresh pending requests to obtain original process evidence. Saved history and a running process alone cannot activate a rule.", "muted", true);
+    status->setObjectName("imported-rule-status");
+    auto *scopeContent = new QWidget; auto *scopeLayout = new QVBoxLayout(scopeContent);
+    scopeLayout->setContentsMargins(0,0,0,0); scopeLayout->addWidget(status);
+    auto *scopeScroll = scrollArea(scopeContent); scopeScroll->setMinimumHeight(100); scopeScroll->setMaximumHeight(200); l->addWidget(scopeScroll);
+    auto *consent = new QCheckBox("I accept the scope shown above.");
+    consent->setObjectName("imported-rule-consent"); consent->setEnabled(false); l->addWidget(consent);
+    auto *actions = line(l);
+    auto *prepare = button("Check original evidence", "check-imported-rule", "ghost"); actions->addWidget(prepare);
+    auto *confirm = button("Activate " + policy + " rule", "confirm-imported-rule", "primary"); confirm->setEnabled(false); actions->addWidget(confirm);
+    auto token = std::make_shared<quint64>(0);
+    auto consentToken = std::make_shared<quint64>(0);
+    auto update = [this,status,consent,prepare,confirm,processes,token,consentToken] {
+        const auto &view = product_.importedActivation();
+        if (view.token != *token) { *token = view.token; *consentToken = 0; consent->setChecked(false); }
+        if (!view.message.isEmpty()) status->setText(view.message);
+        prepare->setEnabled(!view.busy && !view.ready && !processes->currentData().toString().isEmpty());
+        processes->setEnabled(!view.busy && !view.ready);
+        consent->setEnabled(view.ready);
+        if (!view.ready) { *consentToken = 0; consent->setChecked(false); }
+        confirm->setEnabled(view.ready && consent->isChecked() && *consentToken == view.token);
+    };
+    connect(&product_, &ProductController::changed, status, update);
+    connect(processes, &QComboBox::currentIndexChanged, status, [this,update](int) { product_.cancelImportedRule(); update(); });
+    connect(prepare, &QPushButton::clicked, status, [this,candidate,processes,update] {
+        product_.prepareImportedRule(candidate, processes->currentData().toString()); update();
+    });
+    connect(consent, &QCheckBox::toggled, status, [this,consentToken,confirm](bool checked) {
+        const auto &view = product_.importedActivation(); *consentToken = checked && view.ready ? view.token : 0;
+        confirm->setEnabled(checked && view.ready && *consentToken == view.token);
+    });
+    connect(confirm, &QPushButton::clicked, status, [this,consent,consentToken] {
+        if (product_.confirmImportedRule(*consentToken, consent->isChecked())) {
+            closeModal(); message("Decision submitted. The original request shows its result; imported candidates remain inactive.");
+        }
+    });
+    update();
 }
 QVBoxLayout *MainWindow::modal(const QString &title, ModalOwner owner) {
     closeModal();
@@ -2302,10 +2361,13 @@ void MainWindow::closeStaleModal() {
          modalDigest_ != (draft ? product_.draft().digest : product_.review().report.digest) ||
          (!draft && modalRevision_ != product_.review().revision))) ||
         (modalOwner_ == ModalOwner::Simulation && (!product_.simulation() || !model_.available())) ||
+        (modalOwner_ == ModalOwner::ImportedActivation && (product_.simulation() || product_.generation() != modalGeneration_)) ||
         (modalOwner_ == ModalOwner::Live && (product_.simulation() || product_.generation() != modalGeneration_ || !product_.engine().current))) closeModal();
 }
 void MainWindow::closeModal() {
-    if(modalOwner_==ModalOwner::Live&&assistance_)assistance_->cancel();
+    const auto owner = modalOwner_; modalOwner_ = ModalOwner::General;
+    if(owner==ModalOwner::Live&&assistance_)assistance_->cancel();
+    if (owner == ModalOwner::ImportedActivation) product_.cancelImportedRule();
     if (modalOverlay_) {
         dispose(modalOverlay_);
         modalOverlay_.clear();

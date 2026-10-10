@@ -8,6 +8,61 @@
 #include <algorithm>
 
 namespace Gate {
+namespace {
+QString importedId(const gb::wire::Id &id) {
+    return QString::fromLatin1(QByteArray(reinterpret_cast<const char *>(id.data()), int(id.size())).toHex());
+}
+bool importedObservedMatches(const gb::wire::iv::ObservedRecord &row, const Data::ActivityEvent &event) {
+    return event.native && row.state == 1 && row.package == 1 && row.display.package.empty() &&
+        importedId(row.observed) == event.native->observed && row.revision == event.native->observedRevision &&
+        importedId(row.binding) == event.native->captureBinding;
+}
+bool importedSameAttempt(const Data::ActivityEvent &a, const Data::ActivityEvent &b) {
+    if (!Data::validNativeEvent(a) || !Data::validNativeEvent(b) || a.kind != Data::ActivityKind::Attempt ||
+        b.kind != Data::ActivityKind::Attempt || Data::nativeEventKey(a) != Data::nativeEventKey(b)) return false;
+    const auto &x = *a.native; const auto &y = *b.native;
+    return a.subjectId == b.subjectId && x.connection == y.connection && x.observed == y.observed &&
+        x.observedRevision == y.observedRevision && x.captureBinding == y.captureBinding && x.source == y.source &&
+        x.direction == y.direction && x.protocol == y.protocol && x.presence == y.presence &&
+        x.routeMask == y.routeMask && x.unixNanoseconds == y.unixNanoseconds && x.process == y.process;
+}
+bool importedSameDraft(const gb::wire::iv::FutureDraftRecord &a, const gb::wire::iv::FutureDraftRecord &b) {
+    return a.draft == b.draft && a.observed == b.observed && a.source == b.source && a.binding == b.binding &&
+        a.selector == b.selector && a.challenge == b.challenge && a.version == b.version &&
+        a.observedRevision == b.observedRevision && a.targetRevision == b.targetRevision &&
+        a.expectedDesired == b.expectedDesired && a.profile == b.profile && a.target == b.target && a.migration == b.migration &&
+        a.ttl == b.ttl && a.durationMs == b.durationMs && a.state == b.state && a.package == b.package &&
+        a.direction == b.direction && a.scope == b.scope && a.accepted == b.accepted && a.proof == b.proof && a.reason == b.reason &&
+        a.display.name == b.display.name && a.display.path == b.display.path && a.display.principal == b.display.principal &&
+        a.display.package == b.display.package && a.display.projection == b.display.projection;
+}
+QString importedAccount(const QByteArray &sid) {
+    if (sid.size() < 12 || quint8(sid[0]) != 1 || sid.size() != 8 + 4 * quint8(sid[1])) return "Unknown";
+    quint64 authority = 0;
+    for (int i = 2; i < 8; ++i) authority = (authority << 8) | quint8(sid[i]);
+    QString text = "S-1-" + QString::number(authority);
+    for (int i = 8; i < sid.size(); i += 4) {
+        quint32 value = 0;
+        for (int b = 0; b < 4; ++b) value |= quint32(quint8(sid[i+b])) << (8*b);
+        text += '-' + QString::number(value);
+    }
+    return text;
+}
+}
+struct ProductController::ImportedActivation {
+    QString digest, processId;
+    quint64 importGeneration = 0, generation = 0;
+    int index = -1;
+    Data::QNameProfileView view;
+    Data::ActivityEvent attempt;
+    Data::QNameApplicationComparison comparison;
+    NativeContextSnapshot context;
+    std::shared_ptr<Data::NativeOwnBatch> batch;
+    quint64 selection = 0;
+    std::optional<gb::wire::iv::FutureDraftRecord> draft;
+    bool compared = false, selecting = false;
+    QElapsedTimer age;
+};
 struct ProductController::NativeProcessJob {
     enum Phase { StatusBefore, Acquire, ReadBefore, Validate, ReadAfter, StatusAfter, Finish };
     Phase phase = StatusBefore;
@@ -24,7 +79,7 @@ ProductController::ProductController(bool isolatedQa, const QString &qaRoot, QOb
                                      std::unique_ptr<gb::ipc::ii::SessionChannel> ordinaryChannel)
     : QObject(parent), isolatedQa_(isolatedQa), engine_(isolatedQa, this), records_(isolatedQa, this, std::move(decisionChannel)),
       ordinary_(isolatedQa, this, std::move(ordinaryChannel)) {
-    connect(&ordinary_, &OrdinaryDecisionClient::changed, this, &ProductController::changed);
+    connect(&ordinary_, &OrdinaryDecisionClient::changed, this, [this] { advanceImportedRule(); emit changed(); });
     if (!isolatedQa_) QTimer::singleShot(0, this, [this] { if (!simulation() && !stopped_) ordinary_.startAutomatic(); });
     if (isolatedQa && (qaRoot.isEmpty() || !QDir::isAbsolutePath(qaRoot)))
         reviewError_ = "Isolated QA requires an explicit review root";
@@ -152,6 +207,7 @@ bool ProductController::flushHistory() {
     storeWriteRequested_=true; startReviewWrite(); return true;
 }
 void ProductController::queueReview(Data::ReviewDocument document,const QString &notification) {
+    cancelImportedRule();
     pendingReview_=std::move(document); writeNotification_=notification;
     storeWriteRequested_=true; startReviewWrite(); emit changed();
 }
@@ -193,7 +249,7 @@ void ProductController::startReviewWrite() {
 }
 void ProductController::stop() {
     if (stopped_) return;
-    stopped_ = true; cancelNativeProcesses(); historyFlush_.stop(); ++generation_; cancelImport();
+    stopped_ = true; cancelImportedRule(); cancelNativeProcesses(); historyFlush_.stop(); ++generation_; cancelImport();
     semanticJob_ = QUuid{}; draftView_ = {}; reviewView_ = {};
     engine_.invalidate(); records_.stop(); ordinary_.stop();
     flushHistory();
@@ -225,6 +281,7 @@ void ProductController::loadReview(const QString &root) {
     thread->start();
 }
 void ProductController::deriveImportedViews() {
+    cancelImportedRule();
     ++importGeneration_;
     semanticJob_ = QUuid::createUuid();
     draftView_ = {}; reviewView_ = {};
@@ -442,6 +499,7 @@ void ProductController::clearProcessHistory() {
     }
 }
 void ProductController::cancelNativeProcesses() {
+    if (activation_) { activationView_.message = "Inactive: original source connection was lost"; cancelImportedRule(); }
     nativeProcessTick_.stop(); nativeProcessJob_.reset(); source_.revokeNative(); clearProcessHistory();
 }
 void ProductController::projectProcessHistory(Data::ProcessCatalogResult &result) {
@@ -489,17 +547,47 @@ void ProductController::runNativeWorker(int phase) {
     const auto generation=nativeProcessJob_->generation;
     const auto token=nativeProcessJob_->tag;
     const auto batch=nativeProcessJob_->batch;
+    const quint64 activationToken = activation_ ? activationView_.token : 0;
+    const auto activationAttempt = activation_ ? std::optional<Data::ActivityEvent>(activation_->attempt) : std::nullopt;
+    const auto activationProfile = activation_ ? std::optional<Data::QNameProfileView>(activation_->view) : std::nullopt;
+    const int activationIndex = activation_ ? activation_->index : -1;
     nativeProcessJob_->pending=true;
-    worker_=QThread::create([this,generation,token,phase,batch] {
+    worker_=QThread::create([this,generation,token,phase,batch,activationToken,activationAttempt,activationProfile,activationIndex] {
         std::shared_ptr<Data::NativeOwnBatch> acquired;
         Data::ProcessCatalogResult result;
         bool ok=false;
+        Data::QNameApplicationComparison comparison;
         try {
             if (phase==NativeProcessJob::Acquire) { acquired=source_.acquireNative(); ok=source_.batchCurrent(acquired); }
-            else if (phase==NativeProcessJob::Validate) ok=source_.validateNative(batch);
+            else if (phase==NativeProcessJob::Validate) {
+                ok=source_.validateNative(batch);
+                if (ok && activationAttempt && activationProfile) {
+                    const auto held = source_.nativeAttempt(batch, Data::nativeEventKey(*activationAttempt));
+                    if (held && importedSameAttempt(*held, *activationAttempt) && held->native->process) {
+                        QMap<int,QByteArray> canonical;
+                        if (activationIndex >= 0 && activationIndex < activationProfile->candidates.size()) {
+                            const auto &candidate = activationProfile->candidates[activationIndex];
+                            if (candidate.filterIndex >= 0 && candidate.filterIndex < activationProfile->filters.size()) {
+                                const auto &filter = activationProfile->filters[candidate.filterIndex];
+                                if (filter.predicates.size() == 1 && filter.predicates[0].applications.size() == 1) {
+                                    const auto &application = filter.predicates[0].applications[0];
+                                    // Un único pathname local/8KiB: físicamente dentro de ambas READs y own HANDLEs.
+                                    if (application.path.known() && application.path.value == held->native->process->image) {
+                                        const auto id = Data::canonicalLocalApplicationId(application.path.value);
+                                        if (id) canonical.insert(application.node, *id);
+                                    }
+                                }
+                            }
+                        }
+                        const auto &facts = *held->native->process;
+                        comparison = Data::compareQNameApplicationScope(*activationProfile, activationIndex,
+                            facts.appId, facts.accountSid, facts.image, canonical);
+                    }
+                }
+            }
             else { result=source_.finishNative(batch); ok=source_.batchCurrent(batch); }
         } catch (...) { ok=false; }
-        QMetaObject::invokeMethod(this,[this,generation,token,phase,acquired,batch,result,ok] {
+        QMetaObject::invokeMethod(this,[this,generation,token,phase,acquired,batch,result,ok,activationToken,comparison] {
             if (!nativeProcessJob_ || stopped_ || simulation() || nativeProcessJob_->generation!=generation ||
                 nativeProcessJob_->tag!=token || int(nativeProcessJob_->phase)!=phase) return;
             auto &job=*nativeProcessJob_;
@@ -509,6 +597,7 @@ void ProductController::runNativeWorker(int phase) {
                 job.batch=acquired; job.subjects=source_.nativeSubjects(acquired); job.cursor=0;
                 job.phase=NativeProcessJob::ReadBefore;
             } else if (phase==NativeProcessJob::Validate) {
+                if (activation_ && activationToken == activationView_.token) activation_->comparison = comparison;
                 job.subjects=source_.nativeSubjects(batch); job.cursor=0; job.phase=NativeProcessJob::ReadAfter;
             } else {
                 const auto current=records_.currentNativeContext();
@@ -517,11 +606,154 @@ void ProductController::runNativeWorker(int phase) {
                     cancelNativeProcesses(); emit changed(); return;
                 }
                 auto published=result; projectProcessHistory(published); catalog_=std::move(published);
+                finishImportedComparison(*current,batch,catalog_);
                 nativeProcessTick_.stop(); nativeProcessJob_.reset(); emit changed(); return;
             }
             advanceNativeProcesses();
         },Qt::QueuedConnection);
     });
     worker_->start();
+}
+} // namespace Gate
+
+namespace Gate {
+void ProductController::cancelImportedRule() {
+    const bool owned = activation_ && activation_->selecting && ordinary_.observed() &&
+        importedObservedMatches(*ordinary_.observed(), activation_->attempt);
+    activation_.reset(); activationView_.ready = activationView_.busy = false;
+    if (owned && ordinary_.state() != OrdinaryDecisionClient::State::Sending &&
+        ordinary_.state() != OrdinaryDecisionClient::State::Uncertain) ordinary_.closeNotice();
+}
+bool ProductController::prepareImportedRule(const QString &candidate, const QString &processIdValue) {
+    cancelImportedRule(); activationView_ = {}; activationView_.candidate = candidate; activationView_.process = processIdValue;
+    activationView_.message = "Inactive: current original process and request evidence are required";
+    const auto *p = process(processIdValue);
+    const auto *sourceCandidate = derivedQNameCandidate(false, candidate);
+    const auto context = records_.currentNativeContext();
+    if (stopped_ || simulation() || !reviewWritable() || pendingReview_ || !reviewView_.current || !reviewView_.qname ||
+        !sourceCandidate || !p || !p->sourceImage || p->identityEvidence != "SourceRetainedImageAndOwnInstance" ||
+        !context || !ordinary_.current() || !ordinary_.idle() || nativeProcessJob_ ||
+        (worker_ && worker_->isRunning()) || activationToken_ == UINT64_MAX) { emit changed(); return false; }
+    const Data::ActivityEvent *cause = nullptr;
+    for (const auto &event : p->historyCauses) if (event && event->native && event->native->process == p->sourceImage) {
+        const auto row = std::find_if(ordinary_.observations().begin(), ordinary_.observations().end(),
+            [&](const auto &r) { return importedObservedMatches(r, *event) && importedId(r.source) == context->binding.sourceEpoch; });
+        if (row != ordinary_.observations().end()) { cause = event.get(); break; }
+    }
+    if (!cause || !Data::validNativeEvent(*cause)) { emit changed(); return false; }
+    for (const auto &row : review_.report.candidates) if (row.id == candidate && row.reviewAction &&
+        (!sourceCandidate->action.known() || *row.reviewAction !=
+            (sourceCandidate->action.value == Data::SourceFwAction::Allow ? Data::Action::Allow : Data::Action::Block))) {
+        activationView_.message = "Inactive: the local review choice differs from the original source policy";
+        emit changed(); return false;
+    }
+    auto request = std::make_unique<ImportedActivation>();
+    request->digest = review_.report.digest; request->generation = generation_; request->importGeneration = importGeneration_;
+    request->processId = processIdValue; request->view = *reviewView_.qname; request->attempt = *cause; request->context = *context;
+    request->index = reviewView_.candidates.value(candidate, -1); request->age.start();
+    activation_ = std::move(request); activationView_.token = ++activationToken_;
+    activationView_.busy = true; activationView_.message = "Rechecking original process custody, AppId, SID and source precedence…";
+    if (!refreshProcesses() || !nativeProcessJob_) { cancelImportedRule(); emit changed(); return false; }
+    const auto token = activationView_.token;
+    QTimer::singleShot(10000, this, [this,token] {
+        if (activation_ && activationView_.token == token) {
+            activationView_.message = "Inactive: original comparison expired; prepare it again";
+            cancelImportedRule(); emit changed();
+        }
+    });
+    emit changed(); return true;
+}
+bool ProductController::importedRuleCurrent() const {
+    if (!activation_ || stopped_ || simulation() || activation_->age.elapsed() >= 10000 ||
+        activation_->generation != generation_ || activation_->importGeneration != importGeneration_ ||
+        activation_->digest != review_.report.digest || pendingReview_ || !reviewView_.current) return false;
+    const auto context = records_.currentNativeContext();
+    if (!context || !(context->binding == activation_->context.binding) ||
+        context->peer != activation_->context.peer || context->connection != activation_->context.connection) return false;
+    return !activation_->compared || source_.publicationCurrent(activation_->batch);
+}
+void ProductController::finishImportedComparison(const NativeContextSnapshot &context,
+    const std::shared_ptr<Data::NativeOwnBatch> &batch, const Data::ProcessCatalogResult &published) {
+    if (!activation_) return;
+    if (!importedRuleCurrent() || !(context.binding == activation_->context.binding) ||
+        context.peer != activation_->context.peer || context.connection != activation_->context.connection ||
+        !activation_->comparison.representable) {
+        activationView_.message = activation_->comparison.reason.isEmpty()
+            ? "Inactive: original identity or source context changed" : "Inactive: " + activation_->comparison.reason;
+        cancelImportedRule(); return;
+    }
+    bool admitted = false;
+    for (const auto &p : published.processes) for (const auto &cause : p.historyCauses)
+        admitted |= cause && importedSameAttempt(*cause, activation_->attempt);
+    if (!admitted) { activationView_.message = "Inactive: exact original cause was not admitted by both fresh reads"; cancelImportedRule(); return; }
+    activation_->batch = batch; activation_->context = context; activation_->compared = true;
+    const auto row = std::find_if(ordinary_.observations().begin(), ordinary_.observations().end(),
+        [&](const auto &r) { return importedObservedMatches(r, activation_->attempt) && importedId(r.source) == context.binding.sourceEpoch; });
+    const auto token = activationView_.token;
+    if (row == ordinary_.observations().end() || !ordinary_.select(row->observed)) {
+        activationView_.message = "Inactive: original request cannot prepare a selector"; cancelImportedRule(); return;
+    }
+    if (!activation_ || activationView_.token != token) return;
+    activation_->selecting = true; activationView_.message = "Preparing the original application/account selector…";
+    advanceImportedRule();
+}
+void ProductController::advanceImportedRule() {
+    if (!activation_) return;
+    if (!importedRuleCurrent()) { activationView_.message = "Inactive: original process, source or review expired"; cancelImportedRule(); return; }
+    if (!activation_->selecting) return;
+    if (ordinary_.state() == OrdinaryDecisionClient::State::Failed || ordinary_.state() == OrdinaryDecisionClient::State::Closed ||
+        ordinary_.state() == OrdinaryDecisionClient::State::Sending || ordinary_.state() == OrdinaryDecisionClient::State::Uncertain) {
+        activationView_.message = ordinary_.message(); cancelImportedRule(); return;
+    }
+    if (!ordinary_.ready()) return;
+    if (!ordinary_.idle()) {
+        QTimer::singleShot(50,this,[this] { if (activation_) { advanceImportedRule(); emit changed(); } });
+        return;
+    }
+    const auto observed = ordinary_.observed(); const auto ordinaryContext = ordinary_.observationContext();
+    const auto &binding = activation_->context.binding;
+    if (!observed || !importedObservedMatches(*observed, activation_->attempt) || !ordinaryContext ||
+        importedId(observed->source) != binding.sourceEpoch || importedId(ordinaryContext->service.serviceEpoch) != binding.serviceEpoch ||
+        importedId(ordinaryContext->service.boot) != binding.boot || importedId(ordinaryContext->service.engineContext) != binding.engineContext ||
+        ordinaryContext->service.engineBindingGeneration != binding.generation || ordinaryContext->profile != binding.profile) {
+        activationView_.message = "Inactive: original selector and native cause have different source contexts"; cancelImportedRule(); return;
+    }
+    if (activationView_.ready && (ordinary_.selection() != activation_->selection || !activation_->draft || !ordinary_.draft() ||
+        !importedSameDraft(*ordinary_.draft(), *activation_->draft))) {
+        activationView_.message = "Inactive: original selector or consent challenge changed"; cancelImportedRule(); return;
+    }
+    if (ordinary_.selectedScope() != 2) {
+        if (!ordinary_.scope(2)) { activationView_.message = "Inactive: original duration could not be prepared"; cancelImportedRule(); }
+        return;
+    }
+    const int direction = activation_->comparison.direction == Data::Direction::In ? 2 :
+        activation_->comparison.direction == Data::Direction::Both ? 3 : 1;
+    if (ordinary_.selectedDirection() != direction) {
+        if (!ordinary_.direction(direction)) { activationView_.message = "Inactive: original direction could not be prepared"; cancelImportedRule(); }
+        return;
+    }
+    const auto draft = ordinary_.draft();
+    if (!draft || draft->package != 1 || draft->scope != 2 || draft->direction != direction ||
+        !std::all_of(draft->migration.begin(), draft->migration.end(), [](auto byte) { return byte == 0; })) {
+        activationView_.message = "Inactive: original application scope is not representable"; cancelImportedRule(); return;
+    }
+    activation_->selection = ordinary_.selection(); activation_->draft = draft;
+    activationView_.ready = true; activationView_.busy = false;
+    activationView_.message = QString("Ready to confirm a new %1 rule.\nApplication: %2\nAccount: %3\nDirection: %4\nAll app instances and sessions; future connections only. The original attempt stays blocked. Source candidates stay inactive.")
+        .arg(activation_->comparison.action.value == Data::SourceFwAction::Allow ? "Allow" : "Block",
+             activation_->attempt.native->process->image, importedAccount(activation_->attempt.native->process->accountSid),
+             Data::directionName(activation_->comparison.direction));
+}
+bool ProductController::confirmImportedRule(quint64 token, bool consent) {
+    advanceImportedRule();
+    if (!consent || !activation_ || !activationView_.ready || token != activationView_.token ||
+        !importedRuleCurrent() || !ordinary_.ready() || ordinary_.selection() != activation_->selection) return false;
+    const bool allow = activation_->comparison.action.value == Data::SourceFwAction::Allow;
+    const auto selection = activation_->selection;
+    activation_.reset(); activationView_.ready = activationView_.busy = false;
+    const bool sent = ordinary_.decide(allow, true, selection);
+    activationView_.message = sent ? "Decision submitted to the original service; the imported archive remains inactive. Check the same command if its outcome is unknown."
+                                   : "Inactive: the original selector expired before confirmation";
+    emit changed(); return sent;
 }
 } // namespace Gate
