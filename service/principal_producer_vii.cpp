@@ -1221,6 +1221,12 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
             bool(admission->replacing) != (frame.type == Type::ReplacePrincipalRule) ||
             find(frame, Tag::MigrationDigest)->bytes != Bytes(32))
             return principalError(Error::Stale);
+        // El veto conocido se responde antes de reservar outcome o consumir draft.
+        // No transformar una operación ordinaria no soportada en Prepared/stop.
+        if(admission->scope==2 && !(admission->file && admission->file->originalSource &&
+            admission->file->originalSelection) &&
+            std::any_of(principalRead_.snapshot.rules.begin(),principalRead_.snapshot.rules.end(),
+                [](const auto &r){return r.kind==3;}))return principalError(Error::Unsupported);
         principal::Rule rule;
         rule.id = admission->replacing ? admission->replacing->id : frame.correlation;
         rule.selector = admission->selector; rule.targetRevision = admission->targetRevision;
@@ -1250,6 +1256,8 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
         principal::Target bound;
         if (rule == target.rules.end() || !originalRuleTarget(*rule,bound) ||
             !principalTargetSelected(frame,*peer,bound.user)) return principalError(Error::Unauthorized);
+        if(rule->kind!=3 && std::any_of(principalRead_.snapshot.rules.begin(),principalRead_.snapshot.rules.end(),
+            [](const auto &r){return r.kind==3;}))return principalError(Error::Unsupported);
         admission = std::make_shared<PrincipalAdmission>();
         admission->request = native::randomIdentity(); admission->binding = native::randomIdentity();
         admission->revision = 1; admission->profile = peer->profile;

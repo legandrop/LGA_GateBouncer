@@ -185,6 +185,12 @@ directional::Result NativeRuntime::writePrincipal(const principal::Snapshot &tar
         principalRead_.snapshot.desired == UINT64_MAX ||
         target.desired != principalRead_.snapshot.desired + 1 ||
         inventoryRevision_ == UINT64_MAX) return result;
+    if(std::any_of(principalRead_.snapshot.rules.begin(),principalRead_.snapshot.rules.end(),
+        [](const auto &r){return r.kind==3;}) &&
+        !(admission->file && admission->file->originalSource && admission->file->originalSelection) &&
+        !(admission->revocation && admission->revocation->kind==3)) {
+        result.error=Error::Unsupported;return result;
+    }
     admission->consumed = true; // Un resultado incierto nunca admite retransacción.
     const auto oldCatalog = principalCatalog_;
     const auto oldSource = principalSource_;
