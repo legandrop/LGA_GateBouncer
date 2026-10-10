@@ -80,6 +80,7 @@ bool readRetirement(HKEY key,DriverRetirement &out) {
     DWORD size = sizeof(out);
     return RegGetValueW(key,nullptr,L"DriverRetirement",RRF_RT_REG_BINARY,nullptr,&out,&size) == ERROR_SUCCESS &&
         size == sizeof(out) && out.version == 1 && out.state >= 1 && out.state <= 3 && out.restart <= 1 && out.provision <= 1 && out.userRemoval <= 1 &&
+        (out.state != 1 || (!out.restart && !out.userRemoval)) && (out.state == 3 || !out.userRemoval) &&
         wcsnlen(out.inf,MAX_PATH) < MAX_PATH && wcsnlen(out.published,MAX_PATH) < MAX_PATH &&
         wcsnlen(out.package,MAX_PATH) < MAX_PATH && wcsnlen(out.store,MAX_PATH) < MAX_PATH && wcsnlen(out.view,184) < 184 &&
         out.package[0] && out.store[0] && out.view[0] && out.inf[0] && out.published[0] &&
@@ -325,7 +326,9 @@ bool Deployment::retiredProductDriverCurrent(deployment_detail::AdministrativeLe
         _wcsicmp(published.parent_path().c_str(),(systemRoot/L"INF").c_str()) || name.size() < 8 ||
         _wcsnicmp(name.c_str(),L"oem",3) || _wcsicmp(name.c_str()+name.size()-4,L".inf") ||
         !std::all_of(name.begin()+3,name.end()-4,[](wchar_t c) { return c >= L'0' && c <= L'9'; })) return false;
-    if (receipt.restart && boot == receipt.boot) { reboot = true; return lease.ownsConfiguration(key) && current(); }
+    if (receipt.state != 1 && receipt.restart && boot == receipt.boot) {
+        reboot = true; return lease.ownsConfiguration(key) && current();
+    }
     DriverRegistration custody;
     // Retener todos los ancestros originales protegidos antes de consultar hojas ausentes.
     for (const auto &parent : {repository,published.parent_path()}) {
@@ -359,6 +362,11 @@ bool Deployment::retiredProductDriverCurrent(deployment_detail::AdministrativeLe
     }
     if (!absent(published) ||
         !pinsCurrent() || !lease.ownsConfiguration(key) || !current()) return false;
+    // El intent state1 puede sobrevivir al efecto Windows sin resultado durable.
+    // Ausencia total original no implica unload: resultado desconocido exige otro BootSession.
+    if (receipt.state == 1 && boot == receipt.boot) {
+        reboot = true; return pinsCurrent() && current() && lease.ownsConfiguration(key);
+    }
     if (receipt.state != 3) { receipt.state = 3; if (!writeRetirement(key,receipt,lease)) return false; }
     return current() && lease.ownsConfiguration(key); // No afirma FileID de imagen cargada ni CI.
 }
@@ -381,6 +389,9 @@ bool Deployment::retireProductDriver(deployment_detail::AdministrativeLease &lea
     if (prior == ERROR_SUCCESS) {
         if (!readRetirement(key,receipt)) return false;
         if (receipt.state >= 2) return retiredProductDriverCurrent(lease,key,reboot);
+        // Primero resolver el intent original ya completado. Si todavía están todos
+        // los outputs originales, sólo acquire + comparación íntegra permite retomar la API.
+        if (retiredProductDriverCurrent(lease,key,reboot)) return true;
     } else if (prior != ERROR_FILE_NOT_FOUND) return false;
     DriverRegistration original;
     if (!original.acquire(*this,true) || !admitted()) return false;
@@ -453,11 +464,6 @@ bool Deployment::retireProductDriver(deployment_detail::AdministrativeLease &lea
     reboot = expected.restart != 0;
     if (reboot) return admitted();
     return retiredProductDriverCurrent(lease,key,reboot);
-}
-bool Deployment::clearProductDriverRetirement(const deployment_detail::AdministrativeLease &lease,HKEY key) {
-    DriverRetirement receipt{};
-    return current() && lease.ownsConfiguration(key) && readRetirement(key,receipt) && receipt.state == 3 &&
-        RegDeleteValueW(key,L"DriverRetirement") == ERROR_SUCCESS && RegFlushKey(key) == ERROR_SUCCESS && lease.ownsConfiguration(key);
 }
 class GuestMaintenance {
     const DeploymentMode mode_;
@@ -752,8 +758,13 @@ class GuestMaintenance {
                 (!alreadyAbsent && RegDeleteValueW(key_,name) != ERROR_SUCCESS)) return false;
             DWORD bytes = 0; if (RegQueryValueExW(key_,name,nullptr,nullptr,nullptr,&bytes) != ERROR_FILE_NOT_FOUND) return false;
         }
-        if (cleanupReceipt_ && !package_->clearProductDriverRetirement(lease_,key_)) return false;
         if (RegFlushKey(key_) != ERROR_SUCCESS) return false;
+        if (cleanupReceipt_) {
+            // Conclusión terminal idempotente: conservar el receipt original driverGone/userRemoval.
+            // Quitar el último testigo antes de cerrar/borrar el contenedor perdería la recuperación.
+            bool reboot = false;
+            return current() && package_->retiredProductDriverCurrent(lease_,key_,reboot) && !reboot && current();
+        }
         DWORD subkeys = 0, values = 0;
         if (RegQueryInfoKeyW(key_,nullptr,nullptr,nullptr,&subkeys,nullptr,nullptr,&values,nullptr,nullptr,nullptr,nullptr) != ERROR_SUCCESS) return false;
         if (subkeys || values) return true; // Registro contenedor con datos extranjeros: no DeleteTree.

@@ -55,7 +55,6 @@ class Deployment {
     bool driverInstalledCurrent() noexcept;
     bool retireProductDriver(deployment_detail::AdministrativeLease &,HKEY,bool &reboot);
     bool retiredProductDriverCurrent(deployment_detail::AdministrativeLease &,HKEY,bool &reboot);
-    bool clearProductDriverRetirement(const deployment_detail::AdministrativeLease &,HKEY);
     DeploymentMode mode() const { return mode_; }
     bool prepareEnvironment();
     const std::filesystem::path &root() const { return root_; }
