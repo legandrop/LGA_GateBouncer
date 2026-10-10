@@ -2,7 +2,7 @@
 #include "deployment_prepare_win.h"
 #include "../common/token_ii_win.h"
 namespace gb::controller {
-enum class MaintenanceOutcome { Rejected, Recovery, Pending, UpdatedPrepared, UninstalledRetained };
+enum class MaintenanceOutcome { Rejected, Recovery, Pending, UpdatedPrepared, UninstalledRetained, PreparedFinalized };
 enum class MaintenancePhase { Admission, Package, Marker, Stop, Store, Inventory, Switch, Filters, Service, Configuration, Complete };
 struct MaintenanceResult {
     MaintenanceOutcome outcome = MaintenanceOutcome::Rejected;
@@ -13,6 +13,7 @@ struct MaintenanceResult {
 MaintenanceResult updateGuestDeployment(const std::filesystem::path &current,
     const std::filesystem::path &source, const std::filesystem::path &replacement);
 MaintenanceResult uninstallGuestDeployment(const std::filesystem::path &current);
+MaintenanceResult finalizeGuestDeployment(const std::filesystem::path &current);
 namespace deployment_detail {
 bool pinSource(const std::filesystem::path &, std::vector<native::Handle> &);
 bool stagePackage(const std::filesystem::path &, const std::filesystem::path &,

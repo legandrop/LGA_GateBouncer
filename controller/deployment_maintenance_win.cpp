@@ -121,6 +121,8 @@ class GuestMaintenance {
     std::wstring recoveryRoot_, recoveryOrdinary_;
     DWORD provision_ = 0, marker_ = 0, start_ = SERVICE_AUTO_START;
     bool hadMarker_ = false, mutated_ = false, closed_ = false;
+    bool finalizing_ = false;
+    std::unique_ptr<native::ProtectedDirectory> retainedStore_;
     native::ProcessEvidence process_;
     std::unique_ptr<decisions::MaintenanceRuntime> policy_;
     MaintenanceResult result_;
@@ -128,6 +130,7 @@ class GuestMaintenance {
         bool present = false; DWORD state = 0, initial = 0;
         std::wstring root, ordinary, store, view;
         return key_ && native::protectedRegistry(key_) && lease_.current() &&
+            (!finalizing_ || (lease_.ownsConfiguration(key_) && retainedStore_ && retainedStore_->acquire())) &&
             maintenanceState(key_,present,state) && present == hadMarker_ && state == marker_ &&
             readString(key_,L"PackageRoot",root) && root == active_.native() &&
             readString(key_,L"OrdinaryImage",ordinary) && ordinary == (active_/L"GateBouncer.exe").native() &&
@@ -168,26 +171,39 @@ class GuestMaintenance {
         }
         return result_;
     }
-    bool admit(const std::filesystem::path &root) {
+    bool admit(const std::filesystem::path &root,bool finalization = false) {
+        finalizing_ = finalization;
         if (!lease_.acquire() || !native::fixedPath(root) || !deployment_detail::disjoint(root,lease_.image().parent_path())) return false;
         active_ = original_ = root; recoveryRoot_ = root.native();
         recoveryOrdinary_ = (root/L"GateBouncer.exe").native(); package_ = std::make_shared<Deployment>(root);
         if (!package_->verify(root/L"GateBouncerService.exe",DeploymentRole::Service) || !package_->current() ||
-            RegOpenKeyExW(lease_.gate(),L"DeploymentVIII",0,KEY_QUERY_VALUE | KEY_SET_VALUE | READ_CONTROL,&key_) != ERROR_SUCCESS ||
-            !native::protectedRegistry(key_) || !maintenanceState(key_,hadMarker_,marker_) || marker_ != 0) return false;
+            RegOpenKeyExW(lease_.gate(),L"DeploymentVIII",0,KEY_QUERY_VALUE | READ_CONTROL |
+                (finalization ? 0 : KEY_SET_VALUE),&key_) != ERROR_SUCCESS ||
+            !native::protectedRegistry(key_) || !maintenanceState(key_,hadMarker_,marker_) || marker_ != 0 ||
+            (finalization && (!hadMarker_ || !lease_.ownsConfiguration(key_)))) return false;
         std::wstring store;
         if (!readString(key_,L"StoreRoot",store) || !readString(key_,L"ViewSid",view_) ||
             !readDword(key_,L"ProvisionPrincipal",provision_) || provision_ > 1) return false;
         store_ = store;
         native::ProtectedDirectory directory(store_);
         if (!deployment_detail::disjoint(root,store_) || !deployment_detail::disjoint(store_,lease_.image().parent_path()) || !directory.acquire()) return false;
+        if (finalization) {
+            retainedStore_ = std::make_unique<native::ProtectedDirectory>(store_);
+            if (!retainedStore_->acquire()) return false;
+        }
         PSID sid = nullptr; if (!ConvertStringSidToSidW(view_.c_str(),&sid)) return false;
         const auto valid = IsValidSid(sid) && native::sidString(wire::Bytes(static_cast<BYTE *>(sid),
             static_cast<BYTE *>(sid)+GetLengthSid(sid))) == view_; LocalFree(sid); if (!valid) return false;
         manager_ = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
         if (!manager_) return false;
         service_ = OpenServiceW(manager_,L"LGAGateBouncerLab",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS |
-            SERVICE_CHANGE_CONFIG | SERVICE_STOP | READ_CONTROL | DELETE);
+            SERVICE_CHANGE_CONFIG | READ_CONTROL | (finalization ? 0 : SERVICE_STOP | DELETE));
+        if (finalization) {
+            closed_ = true;
+            // Sólo esta operación explícita admite Disabled; Auto requiere el mismo readback íntegro.
+            start_ = serviceConfigurationPhase(service_,root/L"GateBouncerService.exe",SERVICE_DISABLED) ?
+                SERVICE_DISABLED : SERVICE_AUTO_START;
+        }
         return current(); // Legado sin marker sólo después del tuple/ACL/SCM/paquete completos.
     }
     bool begin(DWORD phase) {
@@ -268,6 +284,32 @@ class GuestMaintenance {
         policy_.reset(); if (service_) CloseServiceHandle(service_);
         if (manager_) CloseServiceHandle(manager_); if (key_) RegCloseKey(key_);
     }
+    MaintenanceResult finalize(const std::filesystem::path &root) {
+        // Un resultado incierto preserva marker0: nunca usar fail(), que registra otro marcador.
+        const auto recovery = [this](DWORD error = ERROR_INVALID_STATE) {
+            result_.outcome = MaintenanceOutcome::Recovery;
+            result_.error = error == ERROR_SUCCESS ? ERROR_INVALID_STATE : error;
+            return result_;
+        };
+        try {
+            if (!admit(root,true)) return recovery();
+            result_.phase = MaintenancePhase::Store;
+            if (!loadPolicy()) return recovery(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
+            result_.phase = MaintenancePhase::Inventory;
+            if (!current() || !policy_->current() || !policy_->inspect(false) || !current()) return recovery();
+            result_.phase = MaintenancePhase::Service;
+            if (start_ == SERVICE_DISABLED) {
+                if (!ChangeServiceConfigW(service_,SERVICE_NO_CHANGE,SERVICE_AUTO_START,SERVICE_NO_CHANGE,
+                    nullptr,nullptr,nullptr,nullptr,nullptr,nullptr,nullptr)) return recovery(GetLastError());
+                start_ = SERVICE_AUTO_START;
+            }
+            if (!current() || !policy_->current() || !policy_->inspect(false) ||
+                !current() || !policy_->current()) return recovery();
+            result_.phase = MaintenancePhase::Complete;
+            result_.outcome = MaintenanceOutcome::PreparedFinalized;
+            result_.error = ERROR_SUCCESS; return result_;
+        } catch (...) { return recovery(); }
+    }
     MaintenanceResult update(const std::filesystem::path &root,const std::filesystem::path &source,const std::filesystem::path &replacement) {
         try {
             if (!admit(root) || lease_.image() != source/L"GateBouncerService.exe" ||
@@ -340,5 +382,8 @@ MaintenanceResult updateGuestDeployment(const std::filesystem::path &root,const 
 }
 MaintenanceResult uninstallGuestDeployment(const std::filesystem::path &root) {
     GuestMaintenance owner; return owner.uninstall(root);
+}
+MaintenanceResult finalizeGuestDeployment(const std::filesystem::path &root) {
+    GuestMaintenance owner; return owner.finalize(root);
 }
 } // namespace gb::controller
