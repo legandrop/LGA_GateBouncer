@@ -333,6 +333,7 @@ bool command(const Entry &e, Frame &f) {
       f.minor != 3 ||
       (f.type != Type::CommitFuturePolicy &&
        f.type != Type::RevokePrincipalRule && f.type!=Type::ReplacePrincipalRule) ||
+      (find(f,Tag::AdministrativeMode) && f.type==Type::CommitFuturePolicy && get(f,Tag::ScopeKind)!=2) ||
       f.correlation != c.id || f.sequence != 1 ||
       f.connection != Id{1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1} ||
       idValue(f, Tag::ServiceEpoch) != c.commandEpoch ||

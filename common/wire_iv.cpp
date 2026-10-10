@@ -861,8 +861,6 @@ Error validate(const Frame &f) {
         return Error::Malformed;
     }
     if(f.type==Type::PrincipalRulesPage && !find(f,T::ServiceContext))return Error::Malformed;
-    if((f.type==Type::PrepareFuturePolicy || f.type==Type::CommitFuturePolicy) &&
-       (find(f,T::ScopeKind) ? get(f,T::ScopeKind) : 2)!=2)return Error::Malformed;
   }
   const bool activity=f.type==Type::Attempt || f.type==Type::Authorization || f.type==Type::Traffic;
   const bool stream=activity || f.type==Type::ObservationGap || f.type==Type::SubscriptionAck;
@@ -1040,6 +1038,10 @@ Error canonical(const Frame &f, Bytes &out) {
   auto error = iv::validate(f);
   if (error != Error::Ok)
     return error;
+  // Transporte reconoce los scopes originales; este comando administrativo
+  // durable sigue limitado a Future2, nunca a un permiso temporal archivado.
+  if(find(f,T::AdministrativeMode) && f.type==Type::CommitFuturePolicy && get(f,T::ScopeKind)!=2)
+    return Error::ScopeUnsupported;
   Frame c = f;
   c.connection.fill(1);
   c.sequence = 1;

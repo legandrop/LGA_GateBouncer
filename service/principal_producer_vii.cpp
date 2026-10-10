@@ -659,6 +659,8 @@ Frame NativeRuntime::dispatchFileFuture(const Frame &frame,const std::shared_ptr
     if(wire::iv::validate(frame)!=Error::Ok || !peer || peer->readonly || frame.connection!=peer->connection ||
        idValue(frame,Tag::ServiceEpoch)!=epoch_ || !principalPeerCurrent(*peer) ||
        (administrative && !peer->administrative))return principalError(Error::IdentityUnavailable);
+    if(administrative && frame.type==Type::CommitFuturePolicy && get(frame,Tag::ScopeKind)!=2)
+      return principalError(Error::ScopeUnsupported);
     // Retransmisión del receipt original no requiere volver a abrir un archivo.
     if(!prepare && frame.type!=Type::GetFutureDraft && principalOutcomes_.count(frame.correlation))
       return dispatchOrdinary(frame,peer);
@@ -887,6 +889,7 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
         return principalError(Error::Unauthorized);
     const auto scope = find(frame, Tag::ScopeKind) ? get(frame, Tag::ScopeKind) : 2;
     const auto duration = get(frame, Tag::ScopeDurationMs);
+    if(administrative && scope!=2)return principalError(Error::ScopeUnsupported);
     const bool held = observation.event && observation.event->classifier_;
     const auto causeDirection = observation.event ?
         (observation.event->owned().direction == gatebouncer::service::windows::allapps::Direction::Inbound ? 2u :
@@ -1125,6 +1128,9 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
     if (frame.type == Type::GetStatus) return ordinaryStatus(Type::Status, peer);
     if (frame.type == Type::GetNativeProcessContext) return readPrincipalProcess(frame,peer);
     if (idValue(frame, Tag::ServiceEpoch) != epoch_) return principalError(Error::Stale);
+    if(administrative && (frame.type==Type::PrepareFuturePolicy || frame.type==Type::CommitFuturePolicy) &&
+       (find(frame,Tag::ScopeKind) ? get(frame,Tag::ScopeKind) : 2)!=2)
+        return principalError(Error::ScopeUnsupported);
     if (frame.type == Type::SubscribeEvents) return subscribePrincipalEvents(frame, peer);
     const auto now = principalNow_();
     auto sameActor = [&](const PrincipalOutcome &outcome) {
