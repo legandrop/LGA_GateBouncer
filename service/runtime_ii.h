@@ -73,6 +73,7 @@ class NativeRuntime {
         bool readonly = false;
         bool administrative = false;
         std::uint32_t subscriptionMask=0;
+        bool subscriptionDestination=false;
         NativeActivityRing administrativeEvents;
         bool administrativeTraffic=false, administrativeProcesses=false;
         std::filesystem::path admittedImage;
@@ -145,6 +146,7 @@ class NativeRuntime {
     bool principalProcessCurrent(const PrincipalProcessRetainer &, GB_PROCESS_IMAGE_FACTS &) noexcept;
     bool processBudget(std::size_t extra, std::size_t prior=0) const noexcept;
     static std::size_t activityCauseBytes(const allnative::ClassifierCause &) noexcept;
+    wire::iv::DestinationContext principalDestinationContext(const PrincipalObservation &) const noexcept;
     void invalidatePrincipalObservations() noexcept;
     void stopPrincipalObservation() noexcept;
     bool ordinaryPeer(HANDLE, std::shared_ptr<PrincipalPeer> &, bool readonly = false,

@@ -26,6 +26,17 @@ inline bool remoteConditionValid(const RemoteCondition &c) noexcept {
   return c.kind == RemoteKind::Ipv4Range && c.first <= c.last &&
          c.sourceWeight <= 2147483647u && c.sourceRule != Id{} && c.sourceFilter != Id{};
 }
+// Tupla informativa del ALE original; no prueba autorización ni entrega en red.
+struct DestinationContext {
+  bool present=false;
+  std::uint8_t family=0, protocol=0, direction=0;
+  std::uint16_t localPort=0, remotePort=0;
+  std::uint32_t compartment=0;
+  std::array<std::uint8_t,16> localAddress{}, remoteAddress{};
+};
+bool valid(const DestinationContext &);
+Error packDestinationContext(const DestinationContext &, Bytes &);
+Error unpackDestinationContext(const Bytes &, DestinationContext &);
 // Archivo original custodiado por fuente; no es un HANDLE de imagen del caller.
 struct ProcessFacts {
   std::uint64_t pid=0, created=0, lastWrite=0;

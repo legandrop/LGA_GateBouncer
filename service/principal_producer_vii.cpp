@@ -1,3 +1,5 @@
+#include <winsock2.h>
+#include <fwpsu.h>
 #include "runtime_ii.h"
 #include "principal_actor_vi.h"
 #include "../src/appidentity/AppIdentity.h"
@@ -73,6 +75,35 @@ struct NativeRuntime::PrincipalObservation {
     std::uint64_t imageJob=0,imageDeadline=0;
     bool imageGap=false;
 };
+wire::iv::DestinationContext NativeRuntime::principalDestinationContext(const PrincipalObservation &observation) const noexcept {
+    wire::iv::DestinationContext result;
+    if(!observation.event || !observation.event->classifier_)return result;
+    const auto &record=observation.event->classifier_->record_;
+    if(record.version!=GB_CLASSIFIER_VERSION || record.bytes!=sizeof(record) ||
+       (record.protocol!=6 && record.protocol!=17))return result;
+    const bool outbound=record.layerId==FWPS_LAYER_ALE_AUTH_CONNECT_V4 || record.layerId==FWPS_LAYER_ALE_AUTH_CONNECT_V6;
+    const bool inbound=record.layerId==FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 || record.layerId==FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6;
+    if(!outbound && !inbound)return result;
+    const std::uint8_t family=record.layerId==FWPS_LAYER_ALE_AUTH_CONNECT_V4 || record.layerId==FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 ? 4 : 6;
+    const auto direction=outbound ? gatebouncer::service::windows::allapps::Direction::Outbound :
+        gatebouncer::service::windows::allapps::Direction::Inbound;
+    if(record.family!=family || observation.event->owned().direction!=direction)return result;
+    result.present=true;result.family=record.family;result.protocol=record.protocol;result.direction=outbound ? 1 : 2;
+    result.localPort=record.localPort;result.remotePort=record.remotePort;result.compartment=record.compartment;
+    if(record.family==4) {
+        // El driver conserva FWP_UINT32 en memoria del host, no bytes de red.
+        std::uint32_t local=0,remote=0;
+        std::memcpy(&local,record.localAddress,sizeof(local));std::memcpy(&remote,record.remoteAddress,sizeof(remote));
+        for(unsigned i=0;i<4;++i) {
+            result.localAddress[i]=std::uint8_t(local>>(24-8*i));
+            result.remoteAddress[i]=std::uint8_t(remote>>(24-8*i));
+        }
+    } else {
+        std::copy_n(record.localAddress,16,result.localAddress.begin());
+        std::copy_n(record.remoteAddress,16,result.remoteAddress.begin());
+    }
+    return result;
+}
 NativeActivityRing &NativeRuntime::principalEventsFor(PrincipalPeer *peer) noexcept {
     return peer && peer->administrative ? peer->administrativeEvents : principalEvents_;
 }
@@ -159,11 +190,14 @@ Frame NativeRuntime::subscribePrincipalEvents(const Frame &request, const std::s
     for (auto &field : ack.fields)
         if (field.tag == Tag::EventSeq) field = value(Tag::EventSeq, cursor ? cursor : events.latest());
     ack.fields.push_back(value(Tag::EventMask, mask, 4));
+    const bool destination=find(request,Tag::DestinationContext)!=nullptr;
+    if(destination)ack.fields.push_back(value(Tag::DestinationContext,1,1));
     if(!peer->administrative) {
         if(peer->subscriptionMask==3 && mask!=3 && principalMask3Subscribers_)--principalMask3Subscribers_;
         if(peer->subscriptionMask!=3 && mask==3)++principalMask3Subscribers_;
     }
     peer->subscriptionMask=mask; // Reservado antes del send; close libera incluso un ACK fallido.
+    peer->subscriptionDestination=destination;
     return ordered(std::move(ack));
 }
 void NativeRuntime::publishPrincipalAuthorization(PrincipalOutcome &outcome) noexcept {
@@ -435,6 +469,7 @@ void NativeRuntime::closeOrdinaryPeer(const std::shared_ptr<PrincipalPeer> &peer
     }
     if (!peer) return;
     peer->subscriptionMask=0;
+    peer->subscriptionDestination=false;
     peer->cancelled = true;
     if(peer->administrative)peer->administrativeEvents.lose();
     // Cerrar UI no revoca Applied: Once/instancia/duración pertenecen al motor.
@@ -1299,7 +1334,19 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
     if (frame.type == Type::GetObservedRecord || frame.type == Type::OpenReview) {
         auto found = principalObservations_.find(idValue(frame, Tag::ObservedId));
         if (found == principalObservations_.end()) return principalError(Error::NotFound);
-        const auto &observation=*found->second;
+        const auto held=found->second;
+        const auto &observation=*held;
+        const bool destination=frame.type==Type::GetObservedRecord && find(frame,Tag::DestinationContext);
+        const auto selectedSource=principalSource_;const auto selectedCatalog=principalCatalog_;
+        ServiceContext selectedContext{};
+        if(destination) {
+            selectedContext=readServiceContext();
+            if(selectedSource!=principalSource_ || selectedCatalog!=principalCatalog_ ||
+               !selectedSource || !selectedSource->binding_ || !principalPeerCurrent(*peer) ||
+               selectedContext.engineContext!=selectedSource->binding_->epoch ||
+               selectedContext.engineBindingGeneration!=selectedSource->binding_->generation ||
+               !causeCurrent(observation))return principalError(Error::Stale);
+        }
         if(observation.foreign && (!administrative || observation.administrativeOwner!=peer || !causeCurrent(observation)))
             return principalError(Error::Unauthorized);
         principal::Target selected;
@@ -1331,6 +1378,21 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
                 direction == gatebouncer::service::windows::allapps::Direction::Outbound)
                 response.fields.push_back(value(Tag::PolicyDirection,
                     direction == gatebouncer::service::windows::allapps::Direction::Inbound ? 2 : 1, 1));
+        }
+        if(destination) {
+            Bytes tuple,context;
+            if(wire::iv::packDestinationContext(principalDestinationContext(observation),tuple)!=Error::Ok ||
+               wire::iv::encodeServiceContext(selectedContext,context)!=Error::Ok)return principalError(Error::IdentityUnavailable);
+            const auto fresh=readServiceContext();
+            auto current=principalObservations_.find(presented.observed);
+            if(selectedSource!=principalSource_ || selectedCatalog!=principalCatalog_ ||
+               !NativeActivityRing::same(fresh,selectedContext) || !principalPeerCurrent(*peer) ||
+               current==principalObservations_.end() || current->second!=held ||
+               observation.row.revision!=presented.revision || observation.row.source!=presented.source ||
+               observation.row.binding!=presented.binding || observation.profile!=peer->profile ||
+               !causeCurrent(observation))return principalError(Error::Stale);
+            response.fields.insert(response.fields.end(),{{Tag::DestinationContext,true,std::move(tuple)},
+                {Tag::ServiceContext,true,std::move(context)},value(Tag::ProfileGeneration,peer->profile)});
         }
         return ordered(std::move(response));
     }
@@ -1888,6 +1950,11 @@ void NativeRuntime::collectPrincipalObservations() {
             value(Tag::ObservedId,observation->row.observed), value(Tag::ObservedRevision,observation->row.revision),
             value(Tag::CaptureBindingId,observation->row.binding)});
         if (protocol) history.fields.push_back(value(Tag::Protocol,observation->event->classifier_->record_.protocol,1));
+        Bytes destination;
+        if(wire::iv::packDestinationContext(principalDestinationContext(*observation),destination)!=Error::Ok) {
+            principalSource_->lose();invalidatePrincipalObservations();break;
+        }
+        history.fields.push_back({Tag::DestinationContext,true,std::move(destination)});
         history = ordered(std::move(history));
         observation->pendingAttempt=std::move(history);
         // El descriptor sin Records ya está cubierto por la reserva8KiB de la observación.

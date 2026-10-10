@@ -1077,6 +1077,9 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                                 // Descartar el lote viejo, revalidar y enviar ambos en orden.
                                 events=std::move(final);eventIndex=0;terminal=true;continue;
                             }
+                            if(!ordinaryPeer->subscriptionDestination)
+                                event.fields.erase(std::remove_if(event.fields.begin(),event.fields.end(),
+                                    [](const Field &field){return field.tag==Tag::DestinationContext;}),event.fields.end());
                         }
                         if (tx == UINT64_MAX) {
                             sent = false;

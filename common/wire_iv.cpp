@@ -501,6 +501,17 @@ Schema schemaBase(const Frame &f) {
 }
 Schema schema(const Frame &f) {
   auto s=schemaBase(f);
+  if(find(f,T::DestinationContext)) {
+    switch(f.type) {
+    case Type::GetObservedRecord: case Type::SubscribeEvents: case Type::SubscriptionAck:
+      s[T::DestinationContext]=1;break;
+    case Type::ObservedRecord:
+      s[T::DestinationContext]=48;s[T::ServiceContext]=56;s[T::ProfileGeneration]=8;break;
+    case Type::Attempt: case Type::Authorization: case Type::Traffic:
+      s[T::DestinationContext]=48;break;
+    default: break;
+    }
+  }
   if(!find(f,T::AdministrativeMode))return s;
   switch(f.type) {
   case Type::ListObserved: case Type::ObservedPage:
@@ -548,6 +559,38 @@ bool outcome(const Frame &f) {
   }
 }
 } // namespace
+bool valid(const DestinationContext &context) {
+  const auto empty=[](const auto &address) {
+    return std::all_of(address.begin(),address.end(),[](auto byte){return byte==0;});
+  };
+  if(!context.present)return !context.family && !context.protocol && !context.direction &&
+    !context.localPort && !context.remotePort && !context.compartment &&
+    empty(context.localAddress) && empty(context.remoteAddress);
+  if((context.family!=4 && context.family!=6) || (context.protocol!=6 && context.protocol!=17) ||
+     (context.direction!=1 && context.direction!=2))return false;
+  return context.family!=4 ||
+    (std::all_of(context.localAddress.begin()+4,context.localAddress.end(),[](auto byte){return byte==0;}) &&
+     std::all_of(context.remoteAddress.begin()+4,context.remoteAddress.end(),[](auto byte){return byte==0;}));
+}
+Error packDestinationContext(const DestinationContext &context,Bytes &out) {
+  if(!valid(context))return Error::Malformed;
+  Bytes result(48);result[0]=1;result[1]=context.present ? 1 : 0;
+  result[2]=context.family;result[3]=context.protocol;result[4]=context.direction;
+  put(result,8,context.localPort,2);put(result,10,context.remotePort,2);put(result,12,context.compartment,4);
+  put(result,16,context.localAddress);put(result,32,context.remoteAddress);
+  out=std::move(result);return Error::Ok;
+}
+Error unpackDestinationContext(const Bytes &bytes,DestinationContext &out) {
+  if(bytes.size()!=48 || bytes[0]!=1 || bytes[1]>1 || !zeros(bytes,5,3))return Error::Malformed;
+  DestinationContext result;
+  result.present=bytes[1]!=0;result.family=bytes[2];result.protocol=bytes[3];result.direction=bytes[4];
+  result.localPort=static_cast<std::uint16_t>(n(bytes,8,2));
+  result.remotePort=static_cast<std::uint16_t>(n(bytes,10,2));
+  result.compartment=static_cast<std::uint32_t>(n(bytes,12,4));
+  result.localAddress=array<16>(bytes,16);result.remoteAddress=array<16>(bytes,32);
+  if(!valid(result))return Error::Malformed;
+  out=std::move(result);return Error::Ok;
+}
 bool supported(Type t) {
   return t == Type::Hello || t == Type::HelloAck || t == Type::GetStatus ||
          t == Type::Status || t == Type::ProtocolError ||
@@ -585,7 +628,8 @@ Error decodeServiceContext(const Frame &frame, ServiceContext &out) {
        frame.type != Type::SubscriptionAck && frame.type != Type::Attempt &&
        frame.type != Type::Authorization && frame.type != Type::Traffic && frame.type != Type::ObservationGap &&
        frame.type != Type::GetNativeProcessContext && frame.type != Type::NativeProcessContext &&
-       frame.type != Type::FileFutureDraftRecord && frame.type != Type::PrincipalRulesPage))
+       frame.type != Type::FileFutureDraftRecord && frame.type != Type::PrincipalRulesPage &&
+       !(frame.type==Type::ObservedRecord && find(frame,T::DestinationContext))))
     return Error::Unsupported;
   const auto error = iv::validate(frame);
   if (error != Error::Ok) return error;
@@ -777,12 +821,13 @@ Error validate(const Frame &f) {
   unsigned previous = 0;
   for (const auto &v : f.fields) {
     auto tag = static_cast<unsigned>(v.tag);
-    if (tag < 1 || tag > static_cast<unsigned>(T::OriginalTarget) || tag == 57 ||
+    if (tag < 1 || tag > static_cast<unsigned>(T::DestinationContext) || tag == 57 ||
         (v.tag == T::ServiceContext && f.type != Type::HelloAck && f.type != Type::Status &&
          f.type != Type::SubscriptionAck && f.type != Type::Attempt &&
          f.type != Type::Authorization && f.type != Type::Traffic && f.type != Type::ObservationGap &&
          f.type != Type::GetNativeProcessContext && f.type != Type::NativeProcessContext &&
-         f.type != Type::FileFutureDraftRecord && f.type != Type::PrincipalRulesPage))
+         f.type != Type::FileFutureDraftRecord && f.type != Type::PrincipalRulesPage &&
+         !(f.type==Type::ObservedRecord && find(f,T::DestinationContext))))
       return Error::Unsupported;
     if (tag <= previous)
       return Error::Malformed;
@@ -867,11 +912,24 @@ Error validate(const Frame &f) {
   const bool processContext=f.type==Type::GetNativeProcessContext || f.type==Type::NativeProcessContext;
   const bool fileContext=f.type==Type::FileFutureDraftRecord ||
     (f.type==Type::PrincipalRulesPage && find(f,T::ServiceContext));
-  if(stream || processContext || fileContext) {
+  const bool destinationReply=f.type==Type::ObservedRecord && find(f,T::DestinationContext);
+  if(stream || processContext || fileContext || destinationReply) {
     const auto &b=find(f,T::ServiceContext)->bytes;
     if(array<16>(b,0)!=idValue(f,T::ServiceEpoch) || zero(array<16>(b,16)) ||
        array<16>(b,32)!=idValue(f,T::SourceEpoch) || !n(b,48,8) ||
        ((stream || f.type==Type::NativeProcessContext) && get(f,T::SourceCoverage)!=1)) return Error::Malformed;
+  }
+  if(const auto destination=find(f,T::DestinationContext)) {
+    if(f.type==Type::GetObservedRecord || f.type==Type::SubscribeEvents || f.type==Type::SubscriptionAck) {
+      if(number(*destination)!=1)return Error::Malformed;
+    } else {
+      DestinationContext context;
+      if(unpackDestinationContext(destination->bytes,context)!=Error::Ok ||
+         (context.present && activity && (get(f,T::Source)!=2 || std::uint64_t{context.direction}!=get(f,T::FlowDirection) ||
+           ((get(f,T::Presence)&2) && std::uint64_t{context.protocol}!=get(f,T::Protocol)))) ||
+         (context.present && destinationReply && find(f,T::PolicyDirection) &&
+           std::uint64_t{context.direction}!=get(f,T::PolicyDirection)))return Error::Malformed;
+    }
   }
   if(processContext) {
     if(!attemptSequence(idValue(f,T::AttemptLink)))return Error::Malformed;
@@ -1005,6 +1063,8 @@ Error validate(const Frame &f) {
     } else if (f.type == Type::ObservedPage || f.type == Type::ObservedRecord) {
       std::vector<ObservedRecord> rows;
       e = unpack(records->bytes, count, rows);
+      if(destinationReply && (e!=Error::Ok || rows.size()!=1 || rows.front().state!=1 || zero(rows.front().binding)))
+        return Error::Malformed;
       if (f.type == Type::ObservedRecord && find(f,T::PolicyDirection) &&
           (e != Error::Ok || rows.size()!=1 || rows.front().state!=1 || zero(rows.front().binding)))
         return Error::Malformed;
