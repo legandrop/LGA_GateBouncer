@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(GateBouncerLocalLinuxReader LANGUAGES CXX)
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "A Linux toolchain is required")
+endif()
+add_executable(linux_local_reader linux_local_reader.cpp LocalLinuxReaders.cpp)
+target_compile_features(linux_local_reader PRIVATE cxx_std_17)
+target_compile_options(linux_local_reader PRIVATE -Wall -Wextra -Werror)
