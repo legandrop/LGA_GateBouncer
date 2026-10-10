@@ -93,6 +93,13 @@ const wchar_t *deploymentConfiguration(DeploymentMode mode) {
 std::wstring deploymentCommand(const std::filesystem::path &image, DeploymentMode mode) {
     return L"\"" + image.native() + (mode == DeploymentMode::Product ? L"\" --service" : L"\" --service --guest-wfp");
 }
+namespace {
+const std::vector<std::wstring> &serviceRuntimeFiles() {
+    static const std::vector<std::wstring> files = {L"service-msvc\\Qt6Core.dll",L"msvcp140.dll",
+        L"msvcp140_1.dll",L"vcruntime140.dll",L"vcruntime140_1.dll"};
+    return files;
+}
+}
 const std::vector<std::wstring> &deploymentFiles(DeploymentRole role, DeploymentMode mode) {
     static const std::vector<std::wstring> decision = {
         L"GateBouncerDecisionBootstrap.exe", L"GateBouncerDecisionStage.dll", L"Qt6Core.dll",
@@ -103,6 +110,7 @@ const std::vector<std::wstring> &deploymentFiles(DeploymentRole role, Deployment
         auto result = decision;
         result.insert(result.end(), {L"GateBouncer.exe", L"GateBouncerGuiStage.dll",
             L"GateBouncerService.exe", L"GateBouncerAssistant.exe", L"GateBouncerSignatureHelper.exe"});
+        result.insert(result.end(),serviceRuntimeFiles().begin(),serviceRuntimeFiles().end());
         return result;
     }();
     static const std::vector<std::wstring> withDriver = [] {
@@ -113,6 +121,22 @@ const std::vector<std::wstring> &deploymentFiles(DeploymentRole role, Deployment
     }();
     return role == DeploymentRole::DecisionController ? decision :
         mode == DeploymentMode::Product ? withDriver : product;
+}
+namespace {
+const std::vector<std::wstring> &previousDeploymentFiles(DeploymentMode mode) {
+    // Versiones cerradas anteriores: permiten retirar/actualizar originales, nunca arrancar el parser.
+    static const std::vector<std::wstring> lab = [] {
+        auto files = deploymentFiles(DeploymentRole::Service,DeploymentMode::Laboratory);
+        for (const auto &runtime : serviceRuntimeFiles()) files.erase(std::find(files.begin(),files.end(),runtime));
+        return files;
+    }();
+    static const std::vector<std::wstring> product = [] {
+        auto files = lab;
+        files.insert(files.end(), {L"driver\\GateBouncerClassifier.sys",L"driver\\GateBouncerClassifier.inf",L"driver\\GateBouncerClassifier.cat"});
+        return files;
+    }();
+    return mode == DeploymentMode::Product ? product : lab;
+}
 }
 bool encodeInventory(const Inventory &inventory, wire::Bytes &out) {
     if (inventory.empty() || inventory.size() > 64) return false;
@@ -513,6 +537,40 @@ struct Deployment::DriverRegistration {
         SetLastError(ERROR_TIMEOUT); return false;
     }
 };
+struct Deployment::ServiceRuntime {
+    struct Module { HMODULE value = nullptr; std::filesystem::path path; bool pinned = false; };
+    std::vector<Module> modules;
+    ~ServiceRuntime() { for (auto &module : modules) if (module.value && !module.pinned) FreeLibrary(module.value); }
+    bool current(const Deployment &owner) const {
+        for (const auto &module : modules) {
+            wchar_t path[32768]{};
+            const auto length = GetModuleFileNameW(module.value,path,32768);
+            MEMORY_BASIC_INFORMATION mapping{};
+            if (!length || length >= 32768 || _wcsicmp(module.path.c_str(),path) ||
+                VirtualQuery(module.value,&mapping,sizeof(mapping)) != sizeof(mapping) ||
+                mapping.Type != MEM_IMAGE || mapping.AllocationBase != module.value) return false;
+            native::Handle file(CreateFileW(module.path.c_str(),GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr));
+            const auto original = std::find_if(owner.files_.begin(),owner.files_.end(),
+                [&](const auto &pin) { return owner.root_/pin.path == module.path; });
+            BY_HANDLE_FILE_INFORMATION reopened{},retained{};
+            if (!file || original == owner.files_.end() || original->handle >= owner.held_.size() ||
+                !native::protectedObject(file.value,false,false,true) ||
+                !native::protectedObject(owner.held_[original->handle].value,false,false,true) ||
+                !GetFileInformationByHandle(file.value,&reopened) ||
+                !GetFileInformationByHandle(owner.held_[original->handle].value,&retained)) return false;
+            const auto same = [&](const BY_HANDLE_FILE_INFORMATION &identity) {
+                const auto &birth = original->identity;
+                return identity.dwVolumeSerialNumber == birth.dwVolumeSerialNumber &&
+                    identity.nFileIndexHigh == birth.nFileIndexHigh && identity.nFileIndexLow == birth.nFileIndexLow &&
+                    identity.nFileSizeHigh == birth.nFileSizeHigh && identity.nFileSizeLow == birth.nFileSizeLow &&
+                    CompareFileTime(&identity.ftLastWriteTime,&birth.ftLastWriteTime) == 0;
+            };
+            if (!same(reopened) || !same(retained)) return false;
+        }
+        return modules.size() == 5;
+    }
+};
 Deployment::Deployment(std::filesystem::path root, DeploymentMode mode) : root_(std::move(root)), mode_(mode), directory_(root_, true) {}
 Deployment::~Deployment() = default;
 bool parseInventory(const wire::Bytes &b, Inventory &out) {
@@ -631,16 +689,18 @@ bool Deployment::verify(const std::filesystem::path &own, DeploymentRole role) {
     if (!readFile(L"deployment.gbd", manifest, 32768) || !parseInventory(manifest, inventory_))
         return false;
     // Los lectores ordinarios admiten los conjuntos cerrados; el servicio Product exige driver.
+    const bool productFiles = mode_ == DeploymentMode::Product || (role != DeploymentRole::Service &&
+        (inventory_.size() == deploymentFiles(DeploymentRole::Service,DeploymentMode::Product).size() ||
+         inventory_.size() == previousDeploymentFiles(DeploymentMode::Product).size()));
+    const auto packageMode = productFiles ? DeploymentMode::Product : DeploymentMode::Laboratory;
     const auto &expectedFiles = role == DeploymentRole::DecisionController &&
         inventory_.size() == deploymentFiles(role).size() ? deploymentFiles(role) :
-        deploymentFiles(DeploymentRole::Service, mode_ == DeploymentMode::Product ||
-            (role != DeploymentRole::Service && inventory_.size() == deploymentFiles(DeploymentRole::Service,DeploymentMode::Product).size()) ?
-            DeploymentMode::Product : DeploymentMode::Laboratory);
+        inventory_.size() == previousDeploymentFiles(packageMode).size() ? previousDeploymentFiles(packageMode) :
+        deploymentFiles(DeploymentRole::Service,packageMode);
     if (inventory_.size() != expectedFiles.size()) return false;
     for (const auto &file : expectedFiles) if (!inventory_.count(file)) return false;
-    for (const auto &file : deploymentFiles(role,mode_))
-        if (!inventory_.count(file))
-            return false;
+    if (role == DeploymentRole::DecisionController)
+        for (const auto &file : deploymentFiles(role,mode_)) if (!inventory_.count(file)) return false;
     std::vector<std::wstring> files;
     if (!enumerate({}, 0, files) || files.size() != inventory_.size())
         return false;
@@ -711,9 +771,71 @@ bool Deployment::current() noexcept {
         for (const auto &n : names) if (!inventory_.count(n)) ok = false;
         if (registration_ && !registration_->current()) ok = false;
         if (driver_ && !driver_->current()) ok = false;
+        if (serviceRuntime_ && !serviceRuntime_->current(*this)) ok = false;
         if (!ok) revoked_ = true;
         return ok;
     } catch (...) { revoked_ = true; return false; }
+}
+bool Deployment::loadServiceRuntime(const std::shared_ptr<Deployment> &original) {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+    // Un único grafo del servicio; el CRT /MD ya fue resuelto desde ApplicationDir|System32.
+    // La custodia administrativa protege el filesystem; no implica identidad del archivo cargado ni CI.
+    static std::mutex lifetimeMutex;
+    const std::lock_guard<std::mutex> lifetimeLock(lifetimeMutex);
+    static auto *lifetime = new std::shared_ptr<Deployment>();
+    if (!original || original.get() != this || *lifetime || serviceRuntime_ ||
+        role_ != DeploymentRole::Service || !serviceAdmittedCurrent()) return false;
+    for (const auto &file : serviceRuntimeFiles()) if (!inventory_.count(file)) return false;
+    auto modules = std::make_unique<ServiceRuntime>();
+    for (const auto *name : {L"msvcp140.dll",L"msvcp140_1.dll",L"vcruntime140.dll",L"vcruntime140_1.dll"}) {
+        HMODULE module = nullptr;
+        if (!GetModuleHandleExW(0,name,&module)) {
+            // Algunos CRT no tienen imports estáticos en el EXE; sólo se admite su original cerrado.
+            if (GetLastError() != ERROR_MOD_NOT_FOUND || !serviceAdmittedCurrent()) return false;
+            module = LoadLibraryExW((root_/name).c_str(),nullptr,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+            if (!module) return false;
+        }
+        modules->modules.push_back({module,root_/name,false});
+        // No se adopta un CRT preexistente de System32, PATH u otro paquete.
+        const auto &loaded = modules->modules.back(); wchar_t path[32768]{};
+        const auto length = GetModuleFileNameW(loaded.value,path,32768);
+        native::Handle file(length && length < 32768 && !_wcsicmp(loaded.path.c_str(),path) ?
+            CreateFileW(loaded.path.c_str(),GENERIC_READ | READ_CONTROL | FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr) : INVALID_HANDLE_VALUE);
+        if (!file || !matchesCreatedFile(loaded.path,file.value) || !serviceAdmittedCurrent()) return false;
+    }
+    // QtCore de la raíz es MinGW: ni el delay helper ni una carga anterior pueden seleccionarlo.
+    if (GetModuleHandleW(L"Qt6Core.dll") || GetModuleHandleW(L"Qt6Cored.dll") || !serviceAdmittedCurrent()) return false;
+    const auto qtPath = root_/L"service-msvc"/L"Qt6Core.dll";
+    const auto qt = LoadLibraryExW(qtPath.c_str(),nullptr,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!qt) return false;
+    modules->modules.push_back({qt,qtPath,false});
+    if (!modules->current(*this) || !serviceAdmittedCurrent()) return false;
+    // PIN también conserva QtCore para el QRegularExpression estático destruido después del runtime.
+    // Se retienen Deployment y sus handles originales, incluso si falla un PIN posterior.
+    serviceRuntime_ = std::move(modules); *lifetime = original;
+    for (auto &module : serviceRuntime_->modules) {
+        HMODULE pinned = nullptr;
+        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(module.value),&pinned) || pinned != module.value) {
+            revoked_ = true; return false;
+        }
+        module.pinned = true;
+    }
+    return serviceAdmittedCurrent();
+}
+HMODULE Deployment::serviceQtModule() noexcept {
+    try {
+        const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+        // Binding del módulo retenido para destructores tras STOPPED; no autoriza parser ni tráfico.
+        // Las operaciones del runtime siguen exigiendo serviceAdmittedCurrent original.
+        if (role_ != DeploymentRole::Service || !serviceRuntime_ || !directory_.acquire() ||
+            !serviceRuntime_->current(*this)) return nullptr;
+        for (const auto &module : serviceRuntime_->modules) if (!module.pinned) return nullptr;
+        return serviceRuntime_->modules.back().value;
+    } catch (...) { return nullptr; }
 }
 bool Deployment::signatureHelperInventory(std::filesystem::path &path, wire::Digest &hash) {
     const std::lock_guard<std::recursive_mutex> lock(currentMutex_);

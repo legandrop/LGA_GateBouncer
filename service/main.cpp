@@ -7,12 +7,32 @@
 #include <memory>
 #include <string>
 #include <sddl.h>
+#ifdef _MSC_VER
+#include <delayimp.h>
+#include <cstring>
+#endif
 
 namespace {
 using namespace gb;
 SERVICE_STATUS_HANDLE statusHandle=nullptr;
 HANDLE stopEvent=nullptr;
 controller::DeploymentMode deploymentMode = controller::DeploymentMode::Laboratory;
+#ifdef _MSC_VER
+// La retención tiene vida de proceso, igual que QtCore y los destructores estáticos del parser.
+std::shared_ptr<controller::Deployment> *serviceRuntimeOwner = nullptr;
+FARPROC WINAPI serviceQtDelayHook(unsigned notification,PDelayLoadInfo information) {
+    if (!information || !information->szDll) throw std::runtime_error("Delay import invalido");
+    if (std::strcmp(information->szDll,"Qt6Cored.dll") == 0)
+        throw std::runtime_error("El paquete del servicio requiere Qt MSVC Release");
+    if (std::strcmp(information->szDll,"Qt6Core.dll") != 0) return nullptr;
+    const auto module = serviceRuntimeOwner && *serviceRuntimeOwner ? (*serviceRuntimeOwner)->serviceQtModule() : nullptr;
+    if (!module) throw std::runtime_error("Qt MSVC original no admitido");
+    if (notification == dliNotePreLoadLibrary) return reinterpret_cast<FARPROC>(module);
+    if (notification == dliNotePreGetProcAddress && information->hmodCur != module)
+        throw std::runtime_error("Delay import de otro modulo Qt");
+    return nullptr;
+}
+#endif
 void report(DWORD state,DWORD error=NO_ERROR){SERVICE_STATUS status{};status.dwServiceType=SERVICE_WIN32_OWN_PROCESS;status.dwCurrentState=state;status.dwControlsAccepted=state==SERVICE_RUNNING?SERVICE_ACCEPT_STOP|SERVICE_ACCEPT_SHUTDOWN:0;status.dwWin32ExitCode=error;if(state==SERVICE_START_PENDING||state==SERVICE_STOP_PENDING){status.dwCheckPoint=1;status.dwWaitHint=10000;}if(statusHandle)SetServiceStatus(statusHandle,&status);}
 DWORD WINAPI handler(DWORD control,DWORD,void*,void*){if((control==SERVICE_CONTROL_STOP||control==SERVICE_CONTROL_SHUTDOWN)&&stopEvent){report(SERVICE_STOP_PENDING);SetEvent(stopEvent);}return NO_ERROR;}
 Id bootIdentity(){
@@ -43,6 +63,10 @@ void WINAPI serviceMain(DWORD,wchar_t**){
         if(!deployment->verify(own,controller::DeploymentRole::Service)||
             !deployment->admitServiceConfiguration(account,root,provision)||!deployment->current())
             throw std::runtime_error("Deployment no admitido");
+#ifdef _MSC_VER
+        if (!deployment->loadServiceRuntime(deployment)) throw std::runtime_error("Runtime MSVC del servicio no admitido");
+        serviceRuntimeOwner = new std::shared_ptr<controller::Deployment>(deployment);
+#endif
         const auto boot=bootIdentity();
         SelectorRegistry registry; WfpBackend backend(registry);
         if(!deployment->current()||!(deploymentMode == controller::DeploymentMode::Product ? backend.connectProduct(deployment) : backend.connectGuest())) throw std::runtime_error("Backend no conectado");
@@ -57,6 +81,10 @@ void WINAPI serviceMain(DWORD,wchar_t**){
 bool ownAdmin(){HANDLE token=nullptr;if(!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))return false;bool ok=elevatedAdministrator(token);CloseHandle(token);return ok;}
 std::string narrow(const wchar_t* s){std::string out;for(;*s;++s){if(*s>127)throw std::runtime_error("Argumento invalido");out+=static_cast<char>(*s);}return out;}
 }
+#ifdef _MSC_VER
+// Símbolo documentado de delayimp: nunca deja resolver QtCore por basename/PATH.
+extern "C" const PfnDliHook __pfnDliNotifyHook2 = serviceQtDelayHook;
+#endif
 int wmain(int argc,wchar_t** argv){
     try{
         if(argc==6 && std::wstring(argv[1])==L"--prepare-deployment")

@@ -44,6 +44,10 @@ class Deployment {
     bool admitServiceConfiguration(wire::Bytes &account, std::filesystem::path &store,
                                    bool &provision);
     bool serviceAdmittedCurrent() noexcept;
+    // Qt MSVC del servicio, distinto al Qt MinGW de la interfaz; dueño original retenido hasta exit.
+    bool loadServiceRuntime(const std::shared_ptr<Deployment> &original);
+    // Sólo binding retenido para delayimp/destructores; no sustituye serviceAdmittedCurrent.
+    HMODULE serviceQtModule() noexcept;
     bool driverPackageSigned();
     // Operación del actor administrativo original; no acepta rutas/digests como autoridad.
     bool installProductDriver(const deployment_detail::AdministrativeLease &, HKEY originalConfiguration);
@@ -59,6 +63,7 @@ class Deployment {
                    std::vector<std::wstring> &files, bool retain = true);
     struct Registration;
     struct DriverRegistration;
+    struct ServiceRuntime;
     struct FilePin { std::filesystem::path path; BY_HANDLE_FILE_INFORMATION identity{};
                      std::size_t handle = 0; };
     std::filesystem::path root_;
@@ -67,6 +72,7 @@ class Deployment {
     std::vector<native::Handle> held_;
     std::vector<FilePin> files_;
     std::unique_ptr<Registration> registration_;
+    std::unique_ptr<ServiceRuntime> serviceRuntime_;
     std::unique_ptr<DriverRegistration> driver_;
     Inventory inventory_;
     DeploymentRole role_ = DeploymentRole::DecisionController;

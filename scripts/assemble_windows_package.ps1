@@ -2,6 +2,9 @@ param(
     [Parameter(Mandatory=$true)][string]$QtBuild,
     [Parameter(Mandatory=$true)][string]$SdkBuild,
     [Parameter(Mandatory=$true)][string]$QtRoot,
+    [Parameter(Mandatory=$true)][string]$QtMsvcRoot,
+    [Parameter(Mandatory=$true)][string]$VcRedistRoot,
+    [Parameter(Mandatory=$true)][string]$VcNoticesRoot,
     [Parameter(Mandatory=$true)][string]$MinGwRoot,
     [Parameter(Mandatory=$true)][string]$QtDocsRoot,
     [Parameter(Mandatory=$true)][string]$StandardLicensesRoot,
@@ -233,6 +236,12 @@ try {
     $QtBuild=[GateBouncer.Package.Native]::Fixed($QtBuild)
     $SdkBuild=[GateBouncer.Package.Native]::Fixed($SdkBuild)
     $QtRoot=[GateBouncer.Package.Native]::Fixed($QtRoot)
+    $QtMsvcRoot=[GateBouncer.Package.Native]::Fixed($QtMsvcRoot)
+    $VcRedistRoot=[GateBouncer.Package.Native]::Fixed($VcRedistRoot)
+    $VcNoticesRoot=[GateBouncer.Package.Native]::Fixed($VcNoticesRoot)
+    $systemDirectory=[GateBouncer.Package.Native]::Fixed([System.Environment]::SystemDirectory)
+    if ($VcRedistRoot.Equals($systemDirectory,[System.StringComparison]::OrdinalIgnoreCase) -or
+        $VcRedistRoot.StartsWith($systemDirectory+'\',[System.StringComparison]::OrdinalIgnoreCase)) { throw 'VC runtime inputs must come from licensed redistributable material, not installed System32 files' }
     $MinGwRoot=[GateBouncer.Package.Native]::Fixed($MinGwRoot)
     $QtDocsRoot=[GateBouncer.Package.Native]::Fixed($QtDocsRoot)
     $StandardLicensesRoot=[GateBouncer.Package.Native]::Fixed($StandardLicensesRoot)
@@ -244,7 +253,8 @@ try {
         $DriverPackageRoot=[GateBouncer.Package.Native]::Fixed($DriverPackageRoot)
     }
     $repo=[GateBouncer.Package.Native]::Fixed([System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')))
-    $inputRoots=@($QtBuild,$SdkBuild,$QtRoot,$MinGwRoot,$QtDocsRoot,$StandardLicensesRoot,$repo)
+    if ($QtMsvcRoot.Equals($QtRoot,[System.StringComparison]::OrdinalIgnoreCase)) { throw 'The service requires a separate MSVC Qt input, not the GUI MinGW Qt root' }
+    $inputRoots=@($QtBuild,$SdkBuild,$QtRoot,$QtMsvcRoot,$VcRedistRoot,$VcNoticesRoot,$MinGwRoot,$QtDocsRoot,$StandardLicensesRoot,$repo)
     if (-not $Laboratory) { $inputRoots+=@($DriverPackageRoot) }
     foreach ($root in $inputRoots) {
         if ($OutputRoot.Equals($root,[System.StringComparison]::OrdinalIgnoreCase) -or
@@ -257,6 +267,9 @@ try {
     foreach ($name in @('GateBouncerDecisionBootstrap.exe','GateBouncerDecisionStage.dll','GateBouncerGuiStage.dll','GateBouncerAssistant.exe','GateBouncerSignatureHelper.exe')) { $source[$name]=Join-Path $QtBuild $name }
     foreach ($name in @('GateBouncer.exe','GateBouncerService.exe')) { $source[$name]=Join-Path $SdkBuild $name }
     foreach ($name in @('Qt6Core.dll','Qt6Gui.dll','Qt6Widgets.dll')) { $source[$name]=Join-Path $QtRoot ('bin\'+$name) }
+    $source['service-msvc\Qt6Core.dll']=Join-Path $QtMsvcRoot 'bin\Qt6Core.dll'
+    # App-local CRT /MD: originals de VC/Redist, no DLLs copiadas del Windows instalado.
+    foreach ($name in @('msvcp140.dll','msvcp140_1.dll','vcruntime140.dll','vcruntime140_1.dll')) { $source[$name]=Join-Path $VcRedistRoot $name }
     foreach ($name in @('libgcc_s_seh-1.dll','libstdc++-6.dll','libwinpthread-1.dll')) { $source[$name]=Join-Path $MinGwRoot ('bin\'+$name) }
     $source['plugins\platforms\qwindows.dll']=Join-Path $QtRoot 'plugins\platforms\qwindows.dll'
     foreach ($name in @('Inter-Regular.ttf','Inter-Medium.ttf','Inter-SemiBold.ttf')) { $source['fonts\'+$name]=Join-Path $repo ('resources\fonts\'+$name) }
@@ -264,7 +277,7 @@ try {
     if (-not $Laboratory) {
         foreach ($name in @('GateBouncerClassifier.sys','GateBouncerClassifier.inf','GateBouncerClassifier.cat')) { $source['driver\'+$name]=Join-Path $DriverPackageRoot $name }
     }
-    $sourceCount=if ($Laboratory) { 18 } else { 21 }
+    $sourceCount=if ($Laboratory) { 23 } else { 26 }
     if ($source.Count -ne $sourceCount) { throw 'Administrative inventory count is inconsistent' }
     $notices=[ordered]@{
         'Inter-LICENSE.txt'=Join-Path $repo 'resources\fonts\LICENSE.txt'
@@ -277,6 +290,9 @@ try {
         'Standard-GPL-2.0.txt'=Join-Path $StandardLicensesRoot 'GPL-2.0-only.txt'
         'Standard-Qt-GPL-exception-1.0.txt'=Join-Path $StandardLicensesRoot 'Qt-GPL-exception-1.0.txt'
         'Qt-qtbase-6.8.2.spdx.json'=Join-Path $QtRoot 'sbom\qtbase-6.8.2.spdx.json'
+        'Qt-MSVC-qtbase-6.8.2.spdx.json'=Join-Path $QtMsvcRoot 'sbom\qtbase-6.8.2.spdx.json'
+        'VC-Redist.txt'=Join-Path $VcNoticesRoot 'Redist.txt'
+        'VC-ThirdPartyNotices.txt'=Join-Path $VcNoticesRoot 'ThirdPartyNotices.txt'
     }
     # Páginas originales instaladas de Qt 6.8.2: lista cerrada, no glob ni notices fabricados.
     $coreAttributions=@('android-gradle-wrapper','blake2','doubleconversion','easing','sha1','rfc6234','qeventdispatcher-cf','pcre2','pcre2-sljit','md5','md4','kwin','forkfd','extra-cmake-modules','unicode-character-database','tinycbor','tika-mimetypes','siphash','sha3-keccak','sha3-endian','unicode-cldr','zlib')
@@ -285,9 +301,12 @@ try {
     foreach ($suffix in $guiAttributions) { $name='qtgui-attribution-'+$suffix+'.html'; $notices[$name]=Join-Path $QtDocsRoot ('qtgui\'+$name) }
     foreach ($module in @('qtcore','qtgui','qtwidgets')) { $name=$module+'-index.html'; $notices[$name]=Join-Path $QtDocsRoot ($module+'\'+$name) }
     foreach ($name in @('licensing.html','licenses-used-in-qt.html','qtentrypoint.html')) { $notices[$name]=Join-Path $QtDocsRoot ('qtdoc\'+$name) }
-    if ($notices.Count -ne 65) { throw 'Notice input set must contain exactly 65 original files' }
+    if ($notices.Count -ne 68) { throw 'Notice input set must contain exactly 68 original files' }
     $readers=[ordered]@{}
     foreach ($name in $source.Keys) { if ($null -ne $source[$name]) { $readers[$name]=Hold-File $source[$name] } }
+    $guiCoreHash=[System.BitConverter]::ToString([GateBouncer.Package.Native]::Hash([GateBouncer.Package.Native]::Read($readers['Qt6Core.dll'])))
+    $serviceCoreHash=[System.BitConverter]::ToString([GateBouncer.Package.Native]::Hash([GateBouncer.Package.Native]::Read($readers['service-msvc\Qt6Core.dll'])))
+    if ($guiCoreHash -ceq $serviceCoreHash) { throw 'The MSVC service QtCore cannot be the GUI MinGW QtCore input' }
     if (-not $Laboratory) {
         # Recurso propio retenido de esta versión, nunca un digest del paquete suministrado.
         $identityReader=Hold-File (Join-Path $repo 'driver\package_identity.h')
@@ -311,7 +330,7 @@ try {
     New-OwnDirectory $OutputRoot
     $payload=Join-Path $OutputRoot 'source'
     $noticeOutput=Join-Path $OutputRoot 'notices'
-    foreach ($path in @($payload,$noticeOutput,(Join-Path $payload 'plugins'),(Join-Path $payload 'plugins\platforms'),(Join-Path $payload 'fonts'))) { New-OwnDirectory $path }
+    foreach ($path in @($payload,$noticeOutput,(Join-Path $payload 'plugins'),(Join-Path $payload 'plugins\platforms'),(Join-Path $payload 'fonts'),(Join-Path $payload 'service-msvc'))) { New-OwnDirectory $path }
     if (-not $Laboratory) { New-OwnDirectory (Join-Path $payload 'driver') }
     $names=[string[]]@($source.Keys)
     for ($i=0; $i -lt $names.Length; ++$i) {
@@ -323,7 +342,7 @@ try {
     }
     foreach ($name in $notices.Keys) { Write-OwnFile (Join-Path $noticeOutput $name) ([GateBouncer.Package.Native]::Read($noticeReaders[$name])) }
     $driverInformation=if ($Laboratory) { 'Explicit laboratory bundle: no product driver is included.' } else { 'Product driver inputs are copied from DriverPackageRoot. Assembly does not verify signing, install the catalog or load the driver; administrative admission must verify the original signed inputs. A CAT filename or a successful copy is not signing evidence.' }
-    $information="Transport bundle only. source contains the closed administrative input set. Administrative preparation computes its own inventory from retained source files. This bundle is not installed or publisher signed and does not establish network protection. $driverInformation notices contains original Qt 6.8.2 module/attribution documentation and qtbase SBOM, supplied standard license texts (not Qt 6.8.2 source), GCC and winpthreads materials, and the Inter license. The HTML files retain their original bytes; external assets and relative navigation are not bundled. These materials do not certify complete redistribution obligations or identify every compiled third-party component.`n"
+    $information="Transport bundle only. source contains the closed administrative input set. Administrative preparation computes its own inventory from retained source files. This bundle is not installed or publisher signed and does not establish network protection. $driverInformation service-msvc contains the separate Release MSVC QtCore; the four root VC CRT DLLs are explicit app-local redistributable inputs, never copies from System32. Their version must support the MSVC toolset used to build the service. notices contains original Qt 6.8.2 module/attribution documentation and both qtbase SBOMs, supplied standard license texts (not Qt 6.8.2 source), VC Redist/third-party notices, GCC and winpthreads materials, and the Inter license. The HTML files retain their original bytes; external assets and relative navigation are not bundled. These materials do not certify redistribution rights, complete license obligations or identify every compiled third-party component.`n"
     Write-OwnFile (Join-Path $OutputRoot 'BUNDLE.txt') ([System.Text.Encoding]::UTF8.GetBytes($information))
     [GateBouncer.Package.Native]::Closed($payload,$names)
     [GateBouncer.Package.Native]::Flat($noticeOutput,[string[]]@($notices.Keys))
