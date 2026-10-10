@@ -1,0 +1,27 @@
+name: Linux local readers build
+
+on:
+  push:
+    branches:
+      - lga/linux-local-readers-build-xii
+    paths:
+      - lab/supervisor/linux/localreaders/**
+      - .github/workflows/linux-localreaders.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+          sparse-checkout: lab/supervisor/linux/localreaders
+      - name: Configure local readers
+        run: cmake -S lab/supervisor/linux/localreaders -B build/linux-localreaders -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=g++
+      - name: Build local readers
+        run: cmake --build build/linux-localreaders --target linux_local_reader --parallel 1
