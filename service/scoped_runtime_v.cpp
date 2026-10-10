@@ -22,6 +22,20 @@ directional::Result NativeRuntime::writeScoped(const principal::Entry &command,
     auto cause = admission->event->classifier_;
     if (cause->owner_ != principalClassifier_ || !cause->current() ||
         !principalClassifier_->filterCurrent(*cause, backend_.engine_)) return result;
+    const auto administrativeCurrent=[&]() {
+        if(!admission->administrative)return true;
+        const auto source=principalSource_;const auto catalog=principalCatalog_;
+        const auto context=readServiceContext();wire::iv::ServiceContext original;
+        principal::Target target;
+        return admission->activityPeer==admission->owner && principalPeerCurrent(*admission->owner) &&
+            source==principalSource_ && catalog==principalCatalog_ && admission->source==source &&
+            principal::parseTarget(admission->fullTarget,target) && target.user==principal::ByteView(admission->selectedSid) &&
+            cause->token_.account==admission->selectedSid &&
+            admission->event->owned().identity.userSid.bytes==admission->selectedSid &&
+            wire::iv::decodeServiceContext(admission->activityAttempt,original)==Error::Ok &&
+            NativeActivityRing::same(original,context);
+    };
+    if(!administrativeCurrent())return result;
     ScopedEntry entry;
     entry.command = command.command.id; entry.epoch = epoch_; entry.boot = boot_;
     entry.payload = command.command.payload; entry.account = admission->identity.account;
@@ -51,7 +65,7 @@ directional::Result NativeRuntime::writeScoped(const principal::Entry &command,
     result.state = State::Prepared; result.observed = directional::Observed::Prepared;
     result.durable = true; result.error = Error::Ok;
     profile_.refresh();
-    if (!principalAdmissionCurrent(*admission, command) || !cause->current() ||
+    if (!administrativeCurrent() || !principalAdmissionCurrent(*admission, command) || !cause->current() ||
         !principalClassifier_->filterCurrent(*cause, backend_.engine_)) return result;
     admission->consumed = true;
     GB_SCOPE_RECEIPT dispatched{};

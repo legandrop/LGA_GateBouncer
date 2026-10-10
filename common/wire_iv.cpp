@@ -1038,10 +1038,8 @@ Error canonical(const Frame &f, Bytes &out) {
   auto error = iv::validate(f);
   if (error != Error::Ok)
     return error;
-  // Transporte reconoce los scopes originales; este comando administrativo
-  // durable sigue limitado a Future2, nunca a un permiso temporal archivado.
-  if(find(f,T::AdministrativeMode) && f.type==Type::CommitFuturePolicy && get(f,T::ScopeKind)!=2)
-    return Error::ScopeUnsupported;
+  // El payload de scopes temporales sólo se conserva en ScopedJournal;
+  // Snapshot durable sigue rechazándolo en su command/bind propios.
   Frame c = f;
   c.connection.fill(1);
   c.sequence = 1;

@@ -73,7 +73,12 @@ bool NativeRuntime::principalAdmissionCurrent(const PrincipalAdmission &admissio
         const auto selection=find(frame,Tag::SelectedPrincipalSid);
         if(administrative!=admission.administrative ||
            (administrative && (!admission.owner || !admission.owner->administrative || !selection ||
-               selection->bytes!=admission.selectedSid || admission.scope!=2)))return false;
+               selection->bytes!=admission.selectedSid ||
+               (admission.scope!=2 && (admission.scope<3 || admission.scope>5 || admission.file ||
+                 admission.revocation || admission.replacing || admission.activityPeer!=admission.owner ||
+                 !principalEventsReady(admission.activityPeer.get()) || admission.activityAttempt.type!=Type::Attempt ||
+                 admission.activityAttempt.connection!=admission.owner->connection ||
+                 !get(admission.activityAttempt,Tag::EventSeq))))))return false;
         const auto &targetSid=administrative ? admission.selectedSid : current.account;
         if (frame.type == Type::RevokePrincipalRule) {
             if (!admission.revocation) return false;
@@ -364,7 +369,10 @@ ServiceContext NativeRuntime::serviceContext() const {
 }
 ServiceContext NativeRuntime::readServiceContext() const noexcept {
     ServiceContext unavailable{epoch_, boot_, {}, 0};
-    if (deployment_ && !deploymentCurrent()) return unavailable;
+    if (deployment_ && !deploymentCurrent()) {
+        if(principalSource_)principalSource_->lose(); // Pérdida real de owner del motor, no close de un GUI.
+        return unavailable;
+    }
     const auto source = principalSource_;
     const auto catalog = principalCatalog_;
     const auto engine = observationEngine_;
@@ -576,6 +584,8 @@ void NativeRuntime::tick() {
                 refreshScoped(outcome->second);
         }
         pollPrincipalTraffic();
+        if(std::any_of(principalAdministrativePeers_.begin(),principalAdministrativePeers_.end(),
+            [](const auto &p){return p && p->cancelled;}))pruneScopedOutcomes();
         const auto now = principalNow_();
         for (auto entry = principalAdmissions_.begin(); entry != principalAdmissions_.end();) {
             auto &admission = *entry->second;
@@ -587,6 +597,8 @@ void NativeRuntime::tick() {
                 entry = principalAdmissions_.erase(entry);
             } else ++entry;
         }
+        for(auto &peer:principalAdministrativePeers_)
+            if(peer && peer->cancelled && peer.use_count()==1)peer.reset();
         return;
     }
     if (coordinator_.recovery() || !directions_.ready())
@@ -1003,10 +1015,12 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                         std::lock_guard<std::mutex> lock(runtime_.mutex);
                         if (ordinary || principalReader) {
                             runtime_.tick();
+                            auto &activity=runtime_.principalEventsFor(ordinaryPeer.get());
                             usable = runtime_.profileGeneration() == profile && ordinaryPeer &&
                                 runtime_.ordinaryPeer(pipe.value,ordinaryPeer,principalReader,administrative) &&
-                                (!runtime_.principalEventsReady() || mask==(runtime_.principalTrafficReady() ? 7u : 3u)) &&
-                                NativeActivityRing::same(runtime_.principalEvents_.context(),subscriptionContext);
+                                (!runtime_.principalEventsReady(ordinaryPeer.get()) ||
+                                  (administrative && mask==3) || mask==(runtime_.principalTrafficReady(ordinaryPeer.get()) ? 7u : 3u)) &&
+                                NativeActivityRing::same(activity.context(),subscriptionContext);
                             if (usable) {
                                 // También cuando no llegaron causas: Ready cacheado no acredita catálogo actual.
                                 const auto source=runtime_.principalSource_;
@@ -1014,10 +1028,11 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                                 const auto current=runtime_.readServiceContext();
                                 terminal=source!=runtime_.principalSource_ || catalog!=runtime_.principalCatalog_ ||
                                     !NativeActivityRing::same(current,subscriptionContext) ||
-                                    !runtime_.principalEventsReady();
-                                if (terminal) runtime_.principalEvents_.lose();
+                                    !runtime_.principalEventsReady(ordinaryPeer.get());
+                                if(zero(current.engineContext))runtime_.invalidatePrincipalObservations();
+                                if (terminal) activity.lose();
                                 usable=runtime_.principalPeerCurrent(*ordinaryPeer) &&
-                                    runtime_.principalEvents_.after(after,events)==Error::Ok;
+                                    activity.after(after,events)==Error::Ok;
                             }
                         } else {
                             usable = runtime_.profileGeneration() == profile &&
@@ -1041,10 +1056,21 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                             std::lock_guard<std::mutex> lock(runtime_.mutex);
                             // Revalidación individual; el wait/cancel/drain posterior no retiene mutex.
                             if (!ordinaryPeer ||
-                                (runtime_.principalEventsReady() && mask!=(runtime_.principalTrafficReady() ? 7u : 3u)) ||
-                                !NativeActivityRing::same(runtime_.principalEvents_.context(),subscriptionContext) ||
-                                !runtime_.principalEventCurrent(*ordinaryPeer,event)) {
+                                (runtime_.principalEventsReady(ordinaryPeer.get()) && !(administrative && mask==3) &&
+                                  mask!=(runtime_.principalTrafficReady(ordinaryPeer.get()) ? 7u : 3u)) ||
+                                !NativeActivityRing::same(runtime_.principalEventsFor(ordinaryPeer.get()).context(),subscriptionContext)) {
                                 sent=false; break;
+                            }
+                            if(!runtime_.principalEventCurrent(*ordinaryPeer,event)) {
+                                auto &activity=runtime_.principalEventsFor(ordinaryPeer.get());
+                                std::vector<Frame> final;
+                                if(activity.ready() || !runtime_.principalPeerCurrent(*ordinaryPeer) ||
+                                   activity.after(after,final)!=Error::Ok || final.empty() ||
+                                   final.front().type!=Type::ObservationGap ||
+                                   !runtime_.principalEventCurrent(*ordinaryPeer,final.front())) {
+                                    sent=false;break;
+                                }
+                                event=std::move(final.front());terminal=true;
                             }
                         }
                         if (tx == UINT64_MAX) {
@@ -1058,6 +1084,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                             break;
                         }
                         after = get(event, Tag::EventSeq);
+                        if(terminal)break; // Sólo el Gap original final; no enviar el resto del lote antiguo.
                     }
                     if (!sent || terminal)
                         break;

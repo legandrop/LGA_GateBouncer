@@ -73,6 +73,8 @@ class NativeRuntime {
         bool readonly = false;
         bool administrative = false;
         std::uint32_t subscriptionMask=0;
+        NativeActivityRing administrativeEvents;
+        bool administrativeTraffic=false, administrativeProcesses=false;
         std::filesystem::path admittedImage;
     };
     struct PrincipalObservation;
@@ -119,18 +121,21 @@ class NativeRuntime {
         std::uint32_t durationMs = 0;
         GB_SCOPE_DECISION cancelledDecision{};
         Frame activityAttempt;
+        std::shared_ptr<PrincipalPeer> activityPeer;
         std::uint64_t activitySession = 0, activityCause = 0;
         bool cancelSealed = false;
         bool consumed = false, cancelled = false;
     };
     void collectPrincipalObservations();
-    bool principalEventsReady() const noexcept;
-    bool principalEventCurrent(const PrincipalPeer &, const Frame &) noexcept;
+    NativeActivityRing &principalEventsFor(PrincipalPeer *) noexcept;
+    const NativeActivityRing &principalEventsFor(const PrincipalPeer *) const noexcept;
+    bool principalEventsReady(const PrincipalPeer * = nullptr) const noexcept;
+    bool principalEventCurrent(PrincipalPeer &, const Frame &) noexcept;
     Frame subscribePrincipalEvents(const Frame &, const std::shared_ptr<PrincipalPeer> &);
     void publishPrincipalAuthorization(PrincipalOutcome &) noexcept;
     void pollPrincipalTraffic() noexcept;
-    bool principalTrafficReady() const noexcept;
-    bool principalProcessReady() const noexcept;
+    bool principalTrafficReady(const PrincipalPeer * = nullptr) const noexcept;
+    bool principalProcessReady(const PrincipalPeer * = nullptr) const noexcept;
     void publishPrincipalAttempt(PrincipalObservation &, const GB_PROCESS_IMAGE_FACTS * = nullptr) noexcept;
     void pollPrincipalImages() noexcept;
     void pollPrincipalPendingApp() noexcept;
@@ -174,7 +179,8 @@ class NativeRuntime {
     decltype(&GetTickCount64) principalNow_ = &GetTickCount64;
     allnative::SdkApi (*principalSdk_)() = &allnative::systemSdk;
     std::map<Id, std::shared_ptr<PrincipalObservation>> principalObservations_;
-    std::array<std::weak_ptr<PrincipalPeer>,64> principalAdministrativePeers_{};
+    // Cobrar cada ring completo hasta que su último descriptor original se retire.
+    std::array<std::shared_ptr<PrincipalPeer>,64> principalAdministrativePeers_{};
     std::uint64_t principalObservedRevision_ = 0;
     std::size_t principalPendingBytes_ = 0;
     std::unique_ptr<allnative::NativeImageWorker> principalImageWorker_;
@@ -186,6 +192,7 @@ class NativeRuntime {
     bool principalAppCapacityGap_=false;
     bool principalProcessAcquired_=false;
     struct PrincipalProcessRetainer {
+        std::shared_ptr<PrincipalPeer> activityPeer;
         Frame attempt;
         std::shared_ptr<allnative::NativeSource> source;
         std::shared_ptr<const allnative::CatalogSnapshot> catalog;
@@ -202,6 +209,7 @@ class NativeRuntime {
     bool principalTrafficAcquired_ = false;
     std::size_t principalMask3Subscribers_=0;
     struct PrincipalTrafficWatcher {
+        std::shared_ptr<PrincipalPeer> activityPeer;
         Frame attempt;
         std::shared_ptr<allnative::NativeSource> source;
         std::shared_ptr<const allnative::CatalogSnapshot> catalog;
@@ -214,6 +222,7 @@ class NativeRuntime {
     Id principalTrafficCursor_{};
     std::size_t principalTrafficBytes_=0;
     struct PrincipalOutcome {
+        std::shared_ptr<PrincipalPeer> activityPeer;
         Bytes payload;
         directional::Result result;
         native::TokenEvidence identity;
