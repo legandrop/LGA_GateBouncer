@@ -167,7 +167,7 @@ class GuestMaintenance {
     std::wstring recoveryRoot_, recoveryOrdinary_;
     DWORD provision_ = 0, marker_ = 0, start_ = SERVICE_AUTO_START;
     bool hadMarker_ = false, mutated_ = false, closed_ = false;
-    bool finalizing_ = false;
+    bool finalizing_ = false, pendingRemoval_ = false;
     std::unique_ptr<native::ProtectedDirectory> retainedStore_;
     native::ProcessEvidence process_;
     std::unique_ptr<decisions::MaintenanceRuntime> policy_;
@@ -177,7 +177,7 @@ class GuestMaintenance {
         std::wstring root, ordinary, store, view;
         return key_ && native::protectedRegistry(key_) && lease_.current() &&
             (!(finalizing_ || mode_ == DeploymentMode::Product) || lease_.ownsConfiguration(key_)) &&
-            (!finalizing_ || (retainedStore_ && retainedStore_->acquire())) &&
+            (!(finalizing_ || pendingRemoval_) || (retainedStore_ && retainedStore_->acquire())) &&
             maintenanceState(key_,present,state) && present == hadMarker_ && state == marker_ &&
             readString(key_,L"PackageRoot",root) && root == active_.native() &&
             readString(key_,L"OrdinaryImage",ordinary) && ordinary == (active_/L"GateBouncer.exe").native() &&
@@ -218,7 +218,8 @@ class GuestMaintenance {
         }
         return result_;
     }
-    bool admit(const std::filesystem::path &root,bool finalization = false) {
+    bool admit(const std::filesystem::path &root,bool finalization = false,bool uninstallOnly = false) {
+        if (finalization && uninstallOnly) return false;
         finalizing_ = finalization;
         if (!lease_.acquire() || !native::fixedPath(root) || !deployment_detail::disjoint(root,lease_.image().parent_path())) return false;
         active_ = original_ = root; recoveryRoot_ = root.native();
@@ -226,16 +227,20 @@ class GuestMaintenance {
         if (!package_->verify(root/L"GateBouncerService.exe",DeploymentRole::Service) || !package_->current() ||
             RegOpenKeyExW(lease_.gate(),deploymentConfiguration(mode_),0,KEY_QUERY_VALUE | READ_CONTROL |
                 (finalization ? 0 : KEY_SET_VALUE),&key_) != ERROR_SUCCESS ||
-            !native::protectedRegistry(key_) || !maintenanceState(key_,hadMarker_,marker_) || marker_ != 0 ||
+            !native::protectedRegistry(key_) || !maintenanceState(key_,hadMarker_,marker_) ||
             (mode_ == DeploymentMode::Product && !hadMarker_) ||
             (finalization && (!hadMarker_ || !lease_.ownsConfiguration(key_)))) return false;
+        // Sólo desmontaje del tuple Product íntegro retenido antes de instalar el driver.
+        pendingRemoval_ = uninstallOnly && mode_ == DeploymentMode::Product && hadMarker_ && marker_ == 1;
+        if (marker_ != 0 && !pendingRemoval_) return false;
         std::wstring store;
         if (!readString(key_,L"StoreRoot",store) || !readString(key_,L"ViewSid",view_) ||
-            !readDword(key_,L"ProvisionPrincipal",provision_) || provision_ > 1) return false;
+            !readDword(key_,L"ProvisionPrincipal",provision_) || provision_ > 1 ||
+            (pendingRemoval_ && provision_ != 1)) return false;
         store_ = store;
         native::ProtectedDirectory directory(store_);
         if (!deployment_detail::disjoint(root,store_) || !deployment_detail::disjoint(store_,lease_.image().parent_path()) || !directory.acquire()) return false;
-        if (finalization) {
+        if (finalization || pendingRemoval_) {
             retainedStore_ = std::make_unique<native::ProtectedDirectory>(store_);
             if (!retainedStore_->acquire()) return false;
         }
@@ -246,7 +251,11 @@ class GuestMaintenance {
         if (!manager_) return false;
         service_ = OpenServiceW(manager_,deploymentService(mode_),SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS |
             SERVICE_CHANGE_CONFIG | READ_CONTROL | (finalization ? 0 : SERVICE_STOP | DELETE));
-        if (finalization) {
+        if (pendingRemoval_) {
+            // No admite Running/AutoStart ni otro marcador; current exige STOPPED y PID0.
+            closed_ = true;
+            start_ = SERVICE_DISABLED;
+        } else if (finalization) {
             closed_ = true;
             // Sólo esta operación explícita admite Disabled; Auto requiere el mismo readback íntegro.
             start_ = serviceConfigurationPhase(service_,root/L"GateBouncerService.exe",SERVICE_DISABLED,0,mode_) ?
@@ -414,10 +423,18 @@ class GuestMaintenance {
     }
     MaintenanceResult uninstall(const std::filesystem::path &root) {
         try {
-            if (!admit(root)) return fail();
+            if (!admit(root,false,true)) return fail();
+            if (pendingRemoval_) {
+                // Store físicamente Missing y catálogo ausente, leídos por el owner original.
+                // Un marker1 con snapshot o filtros no corresponde a esta preparación pendiente.
+                result_.phase = MaintenancePhase::Store;
+                if (!loadPolicy() || !policy_->missing()) return fail(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
+            }
             result_.phase = MaintenancePhase::Marker; if (!begin(3)) return fail(GetLastError());
             result_.phase = MaintenancePhase::Stop; if (!stop()) return fail(GetLastError());
-            result_.phase = MaintenancePhase::Store; if (!loadPolicy()) return fail(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
+            result_.phase = MaintenancePhase::Store;
+            if ((!policy_ && !loadPolicy()) || !policy_ || !policy_->current())
+                return fail(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
             result_.phase = MaintenancePhase::Filters;
             if (!policy_->remove()) return fail(policy_->error_);
             result_.phase = MaintenancePhase::Service;
