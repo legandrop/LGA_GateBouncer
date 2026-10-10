@@ -73,7 +73,7 @@ typedef struct GB_ENTRY {
     GB_IMAGE_ORIGIN *imageOrigin;
     GB_PROCESS_IMAGE_FACTS imageFacts;
     BOOLEAN imageFactsValid;
-    UINT64 pendingDeadline, parent;
+    UINT64 pendingDeadline, parent, udpAuthorizationFlow;
     BOOLEAN delivered, revoked, closed, associated, completing, consumed, deadFlow;
     BOOLEAN cancelPin, futureRetired;
     BOOLEAN listener, injectQueued, injectActive, injectSeen;
@@ -515,17 +515,43 @@ static BOOLEAN sameTuple(const GB_ENTRY *e,const GB_TUPLE *t) {
         e->record.localPort==t->localPort && e->record.remotePort==t->remotePort &&
         RtlCompareMemory(e->record.localAddress,t->local,16)==16 && RtlCompareMemory(e->record.remoteAddress,t->remote,16)==16;
 }
+// La generación vieja sigue retenida: idle no acredita cierre del endpoint.
+static BOOLEAN udpIdleGeneration(const GB_ENTRY *e) {
+    return e && e->record.protocol==IPPROTO_UDP && e->deadFlow && !e->closed && !e->revoked &&
+        !e->associated && !e->associationPins && !e->completion && !e->completing && !e->cancelPin &&
+        !e->packet && !e->packetCharged && !e->injectQueued && !e->injectActive && !e->injectPins &&
+        e->consumed && e->receipt.applied && e->receipt.flow && gbFile && !gbFault &&
+        e->record.session==gbSession && e->record.loss==gbLoss;
+}
+static BOOLEAN udpFlowUnused(UINT64 id) {
+    ULONG i;
+    if(!id)return FALSE;
+    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)if(gbEntries[i] &&
+        (gbEntries[i]->receipt.flow==id || gbEntries[i]->udpAuthorizationFlow==id))return FALSE;
+    return TRUE;
+}
 static ULONG slotFor(GB_ENTRY *e,const GB_TUPLE *t,BOOLEAN *duplicate) {
-    ULONG i,empty=GB_CLASSIFIER_CAPACITY;*duplicate=FALSE;
+    ULONG i,empty=GB_CLASSIFIER_CAPACITY;BOOLEAN freshUdpFlow;
+    freshUdpFlow=e->record.protocol==IPPROTO_UDP && udpFlowUnused(e->udpAuthorizationFlow);
+    *duplicate=FALSE;
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
         GB_ENTRY *p=gbEntries[i];
         if(!p){if(empty==GB_CLASSIFIER_CAPACITY)empty=i;continue;}
-        if((!p->closed || p->record.protocol==IPPROTO_UDP) && p->record.endpoint==e->record.endpoint && sameTuple(p,t))*duplicate=TRUE;
+        if((!p->closed || p->record.protocol==IPPROTO_UDP) && p->record.endpoint==e->record.endpoint && sameTuple(p,t)) {
+            if(p->record.protocol!=IPPROTO_UDP || !udpIdleGeneration(p) || !sameAuthorization(p,e) ||
+                !sameInstance(p,e) || !freshUdpFlow)*duplicate=TRUE;
+        }
     }
     return empty;
 }
 static GB_ENTRY *endpoint(const FWPS_INCOMING_METADATA_VALUES0 *m,const GB_TUPLE *t,BOOLEAN fieldCompartment,BOOLEAN closingCompletion,BOOLEAN *ambiguous) {
-    GB_ENTRY *found=NULL; ULONG i; *ambiguous=FALSE;
+    GB_ENTRY *found=NULL; ULONG i,generations=0; *ambiguous=FALSE;
+    if(t->protocol==IPPROTO_UDP && (m->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE))
+        for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)if(gbEntries[i] && sameTuple(gbEntries[i],t) &&
+            gbEntries[i]->record.endpoint==m->transportEndpointHandle)++generations;
+    if(generations>1 && (!(m->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) || !m->flowHandle)) {
+        *ambiguous=TRUE;return NULL;
+    }
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
         GB_ENTRY *e=gbEntries[i];
         if(!e || (e->closed && e->record.protocol!=IPPROTO_UDP && !(closingCompletion && e->completing)) || !sameTuple(e,t)) continue;
@@ -536,9 +562,34 @@ static GB_ENTRY *endpoint(const FWPS_INCOMING_METADATA_VALUES0 *m,const GB_TUPLE
             *ambiguous=TRUE; continue;
         }
         if(e->record.endpoint!=m->transportEndpointHandle) continue;
+        if(generations>1 && e->receipt.flow!=m->flowHandle && e->udpAuthorizationFlow!=m->flowHandle)continue;
+        if(e->udpAuthorizationFlow && (!(m->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) ||
+            e->udpAuthorizationFlow!=m->flowHandle)) {*ambiguous=TRUE;continue;}
         if(found) *ambiguous=TRUE; else found=e;
     }
+    if(generations>1 && !found)*ambiguous=TRUE;
     return found;
+}
+// El guard sólo deja llegar una initial nueva al capturador original PASSIVE.
+// No concede Permit ni reconstruye TOKEN/EPROCESS desde PID/AppId.
+static BOOLEAN udpInitialGeneration(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA_VALUES0 *m,
+    const GB_TUPLE *t,ULONG appField) {
+    ULONG i,matched=0;FWP_BYTE_BLOB *app;
+    if(t->protocol!=IPPROTO_UDP || !(m->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) ||
+       !(m->currentMetadataValues & FWPS_METADATA_FIELD_TRANSPORT_ENDPOINT_HANDLE) ||
+       !(m->currentMetadataValues & FWPS_METADATA_FIELD_PROCESS_ID) || !m->processId ||
+       !udpFlowUnused(m->flowHandle) || v->valueCount<=appField ||
+       v->incomingValue[appField].value.type!=FWP_BYTE_BLOB_TYPE)return FALSE;
+    app=v->incomingValue[appField].value.byteBlob;
+    if(!app || !app->data)return FALSE;
+    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
+        GB_ENTRY *e=gbEntries[i];
+        if(!e || e->record.endpoint!=m->transportEndpointHandle || !sameTuple(e,t))continue;
+        if(!udpIdleGeneration(e) || inboundLayer(e->record.layerId) || e->record.pid!=m->processId ||
+            app->size!=e->record.appBytes || RtlCompareMemory(app->data,e->record.app,app->size)!=app->size)return FALSE;
+        ++matched;
+    }
+    return matched!=0;
 }
 static void NTAPI processExit(PEPROCESS process,HANDLE pid,PPS_CREATE_NOTIFY_INFO info) {
     KIRQL irql; ULONG i; UNREFERENCED_PARAMETER(pid);
@@ -1299,6 +1350,7 @@ static void NTAPI classify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_ME
     }
     KeAcquireSpinLock(&gbLock,&irql);now=KeQueryInterruptTime();
     if(!gbFile || gbFault || gbLoss==GB_MAX64 || gbSequence==GB_MAX64) goto deny;
+    if(udpInitialGeneration(v,m,&t,appField))e->udpAuthorizationFlow=m->flowHandle;
     empty=slotFor(e,&t,&ambiguous);
     if(ambiguous)goto deny;
     grant=futureRoot(e,now,&ambiguous);
@@ -1349,6 +1401,14 @@ static void NTAPI heldGuardClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_IN
             if(!outboundInjectionBound(e,data,&t,m,KeQueryInterruptTime()))block(out);
             KeReleaseSpinLock(&gbLock,irql);return;
         }
+    }
+    if(!(v->incomingValue[flags].value.uint32 & FWP_CONDITION_FLAG_IS_REAUTHORIZE)) {
+        KeAcquireSpinLock(&gbLock,&irql);
+        if(udpInitialGeneration(v,m,&t,0)) {
+            // CONTINUE inicial; la captura inferior revalida objeto de proceso/TOKEN.
+            KeReleaseSpinLock(&gbLock,irql);return;
+        }
+        KeReleaseSpinLock(&gbLock,irql);
     }
     completion=(v->incomingValue[flags].value.uint32 & FWP_CONDITION_FLAG_IS_REAUTHORIZE) && v->valueCount>reason &&
         v->incomingValue[reason].value.type==FWP_UINT32 && v->incomingValue[reason].value.uint32==FWP_CONDITION_REAUTHORIZE_REASON_CLASSIFY_COMPLETION;

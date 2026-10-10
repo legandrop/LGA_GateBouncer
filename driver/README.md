@@ -125,21 +125,36 @@ the same UDP transport enforcement, without inspecting QUIC application data.
 Inbound UDP retains an owned packet with an exact eight-byte UDP header and
 length; fragments, IPv6 extension headers and jumbograms are excluded.
 
-UDP flow deletion after idle does not close its socket. A previously scoped
-socket and peer tuple is denied on reuse; UDP tombstones remain for the driver
-lifetime, including after endpoint closure, RESET, session loss or cleanup.
-Different peers can receive their own causes while registry capacity remains.
-Safe same-peer regeneration and sustained operation beyond retained capacity
-are not implemented. Applied acknowledges the exact authorization, not packet
+UDP flow deletion after idle does not close its socket. An outbound initial
+authorization can create a new cause for the same open socket and peer only
+when every previous generation has a drained, idle flow and the same original
+process, token and application identity. It also requires an OS-provided,
+nonzero flow handle that has never appeared in the retained registry. The new
+cause retains that handle; reauthorization and establishment must match it.
+Callbacks for an older flow keep their original cause and are denied after
+idle. A callback without a distinguishable generation is denied. Flow-handle
+availability at initial authorization is not guaranteed by this source;
+regeneration outside this metadata subset remains unsupported. UDP tombstones
+remain for the driver lifetime, including after endpoint closure, RESET,
+session loss or cleanup. They are neither revived nor removed to make capacity.
+Different peers and distinguishable same-peer generations can receive their
+own causes while registry capacity remains. Sustained operation beyond retained
+capacity is not implemented. Applied acknowledges the exact authorization, not packet
 delivery or successful flow association. Flow association without an immediate
 PASSIVE token proof is denied, including callbacks reached at DISPATCH_LEVEL.
-Completing a pended outbound UDP authorization creates state and flushes the
-original packet. The application must retransmit it; reliable buffering and
-outbound reinjection of that first datagram are not implemented. This source
-does not establish that QUIC will recover or that the original send is delivered.
+The driver buffers a supported first outbound UDP datagram before pending its
+authorization. An exact successful reauthorization queues its owned copy for
+transport-send reinjection; the flushed original does not require application
+retransmission for that path. The copy, MDL, control data and injection pin remain
+owned through the actual completion callback. The subset is one NBL with one
+NB, at most 65535 bytes and at most 1024 bytes of control data; raw packets,
+unsupported segmentation/checksum metadata and missing IPv6 scope are denied.
+An injection result alone never creates a traffic counter: counters require the
+actual, bound DATAGRAM_DATA callback. This source does not establish that QUIC
+will recover or that the original send is delivered by the OS.
 
 This source does not establish platform-wide protection. UDP/QUIC OS delivery,
-same-peer regeneration, sustained capacity, ICMP,
+same-peer metadata availability and regeneration, sustained capacity, ICMP,
 inbound callbacks outside the admitted PASSIVE owner subset, boot coverage,
 socket transfer, provider precedence
 and driver lifecycle require separate guest validation. Token replacement is
