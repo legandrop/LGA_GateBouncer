@@ -84,8 +84,11 @@ void CALLBACK callback(HINTERNET, DWORD_PTR opaque, DWORD status, void *data, DW
         break;
     }
     case WINHTTP_CALLBACK_STATUS_SECURE_FAILURE: {
-        if(data && size==sizeof(DWORD) && !state->response.diagnostic.failureObserved){DWORD flags=0;std::memcpy(&flags,data,sizeof(flags));
-            state->response.diagnostic.secureFailure=flags;}
+        if(!state->response.diagnostic.failureObserved){
+            state->response.diagnostic.stage=HttpStage::Unknown;
+            if(data && size==sizeof(DWORD)){DWORD flags=0;std::memcpy(&flags,data,sizeof(flags));state->response.diagnostic.secureFailure=flags;}
+            state->response.diagnostic.failureObserved=true;
+        }
         break;
     }
     default: break;
