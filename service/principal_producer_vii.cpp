@@ -2,6 +2,7 @@
 #include "principal_actor_vi.h"
 #include "../src/appidentity/AppIdentity.h"
 #include <algorithm>
+#include <cstring>
 
 namespace gb::decisions {
 namespace {
@@ -40,6 +41,9 @@ struct NativeRuntime::PrincipalObservation {
     std::uint64_t profile = 0;
     std::size_t charged = 0;
     Frame activityAttempt;
+    Frame pendingAttempt;
+    std::uint64_t imageJob=0,imageDeadline=0;
+    bool imageGap=false;
 };
 bool NativeRuntime::principalEventsReady() const noexcept {
     return principalEvents_.ready() && principalMode_ && !principalWriteFault_ &&
@@ -53,6 +57,19 @@ bool NativeRuntime::principalEventsReady() const noexcept {
 }
 bool NativeRuntime::principalTrafficReady() const noexcept {
     return principalTrafficAcquired_ && principalEventsReady();
+}
+bool NativeRuntime::principalProcessReady() const noexcept {
+    return principalProcessAcquired_ && principalEventsReady();
+}
+bool NativeRuntime::processBudget(std::size_t extra,std::size_t prior) const noexcept {
+    if(prior>principalPendingBytes_)return false;
+    const auto pending=principalPendingBytes_-prior;
+    // Reservar íntegra la cuota legacy de outcomes: evidencia de imagen no consume la admisión causal.
+    const std::size_t charges[]={pending,principalTrafficBytes_,principalProcessBytes_,principalRetiredBytes_,
+        principalImageBaseCharge_,principalImageJobCharge_,principalPendingAppBytes_,512*1024,extra};
+    std::size_t total=0;
+    for(const auto charge:charges) {if(charge>PendingBytesLimit-total)return false;total+=charge;}
+    return true;
 }
 std::size_t NativeRuntime::activityCauseBytes(const allnative::ClassifierCause &cause) noexcept {
     return sizeof(cause)+128+cause.process_.image.native().capacity()*sizeof(wchar_t)+
@@ -156,16 +173,14 @@ void NativeRuntime::publishPrincipalAuthorization(PrincipalOutcome &outcome) noe
     if(activity.flags & GB_ACTIVITY_INCOMPLETE) {principalEvents_.discontinuity();return;}
     try {
     const auto charged=sizeof(PrincipalTrafficWatcher)+128+NativeActivityRing::bytes(outcome.activityAttempt)+outcome.activityCharge;
-    if(principalTraffic_.size()>=64 || charged>PendingBytesLimit ||
-       principalPendingBytes_>PendingBytesLimit-charged || principalTrafficBytes_>PendingBytesLimit-charged-principalPendingBytes_) {
+    if(principalTraffic_.size()>=64 || !processBudget(charged)) {
         principalEvents_.discontinuity();return;
     }
     auto watcher=std::make_shared<PrincipalTrafficWatcher>();
     watcher->attempt=outcome.activityAttempt;watcher->source=source;watcher->catalog=catalog;
     watcher->cause=outcome.activityOwner;watcher->decision=outcome.scoped;
     watcher->charged=sizeof(PrincipalTrafficWatcher)+128+NativeActivityRing::bytes(watcher->attempt)+outcome.activityCharge;
-    if(watcher->charged>PendingBytesLimit || principalPendingBytes_>PendingBytesLimit-watcher->charged ||
-       principalTrafficBytes_>PendingBytesLimit-watcher->charged-principalPendingBytes_) {principalEvents_.discontinuity();return;}
+    if(!processBudget(watcher->charged)) {principalEvents_.discontinuity();return;}
     const auto retainedCharge=watcher->charged;
     if(!principalTraffic_.emplace(command,std::move(watcher)).second) {principalEvents_.discontinuity();return;}
     principalTrafficBytes_+=retainedCharge;
@@ -229,7 +244,7 @@ void NativeRuntime::pollPrincipalTraffic() noexcept {
             auto event=watcher->attempt;event.type=Type::Traffic;
             for(auto &field:event.fields) {
                 if(field.tag==Tag::Timestamp)field=value(Tag::Timestamp,unixUtc);
-                if(field.tag==Tag::Presence)field=value(Tag::Presence,3);
+                if(field.tag==Tag::Presence)field=value(Tag::Presence,3|(get(watcher->attempt,Tag::Presence)&4));
             }
             event.fields.insert(event.fields.end(),{value(Tag::CommandId,command),
                 value(Tag::AttemptLink,wire::iv::attemptLink(get(watcher->attempt,Tag::EventSeq))),
@@ -350,6 +365,7 @@ Frame NativeRuntime::ordinaryStatus(Type type, const std::shared_ptr<PrincipalPe
         if (field.tag == Tag::Capabilities) field = value(Tag::Capabilities,
             ReadStatus | (admitted ? ObservedRead | (principalEventsReady() ? wire::iv::NativeEvents : 0) |
                 (principalTrafficReady() ? wire::iv::NativeTraffic : 0) |
+                (principalProcessReady() ? wire::iv::NativeProcessFacts : 0) |
                 (!peer->readonly && principalPolicyReady() ? FuturePolicyControl : 0) : 0));
         if (field.tag == Tag::IVProfile) field = value(Tag::IVProfile, admitted && !peer->readonly && principalPolicyReady() ? 1 : 0, 1);
     }
@@ -396,6 +412,8 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
         get(frame, Tag::ProfileGeneration) != peer->profile ||
         !principalSource_->retainedCause(*observation.event, *observation.proof,
             allnative::CatalogReceipt(principalCatalog_), allnative::Stage::Active)) return principalError(Error::Stale);
+    // Ninguna mutación/receipt puede adelantarse al Attempt original pendiente.
+    if(observation.pendingAttempt.type==Type::Attempt)publishPrincipalAttempt(observation);
     for (auto entry = principalAdmissions_.begin(); entry != principalAdmissions_.end();) {
         if (entry->second->owner == peer || entry->second->binding == observation.row.binding) {
             entry->second->cancelled = true; entry = principalAdmissions_.erase(entry);
@@ -569,7 +587,8 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
 }
 Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<PrincipalPeer> &peer) {
     if (peer && peer->readonly && frame.type != Type::GetStatus && frame.type != Type::ListObserved &&
-        frame.type != Type::GetObservedRecord && frame.type != Type::SubscribeEvents) return principalError(Error::Unauthorized);
+        frame.type != Type::GetObservedRecord && frame.type != Type::SubscribeEvents &&
+        frame.type != Type::GetNativeProcessContext) return principalError(Error::Unauthorized);
     tick();
     if (frame.minor != 3 || wire::iv::validate(frame) != Error::Ok) return principalError(Error::Malformed);
     if (!peer || frame.connection != peer->connection || !principalPeerCurrent(*peer)) {
@@ -577,6 +596,7 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
         return principalError(Error::IdentityUnavailable);
     }
     if (frame.type == Type::GetStatus) return ordinaryStatus(Type::Status, peer);
+    if (frame.type == Type::GetNativeProcessContext) return readPrincipalProcess(frame,peer);
     if (idValue(frame, Tag::ServiceEpoch) != epoch_) return principalError(Error::Stale);
     if (frame.type == Type::SubscribeEvents) return subscribePrincipalEvents(frame, peer);
     const auto now = principalNow_();
@@ -763,12 +783,17 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
 }
 void NativeRuntime::invalidatePrincipalObservations() noexcept {
     principalEvents_.lose();
+    principalProcessAcquired_=false;
+    principalAppCapacityGap_=false;
+    if(principalImageWorker_ && principalImageJobId_)principalImageWorker_->abandon(principalImageJobId_);
+    for(auto &entry:principalProcesses_)entry.second->retired=true;
     principalTrafficAcquired_=false;principalTraffic_.clear();principalTrafficBytes_=0;
     for (auto &entry : principalAdmissions_) entry.second->cancelled = true;
     principalAdmissions_.clear();
     principalPendingBytes_ = 0;
     for (auto &entry : principalObservations_) {
         auto &o = *entry.second;
+        o.pendingAttempt={};o.imageJob=0;o.imageDeadline=0;
         if (o.row.state == 1 && principalObservedRevision_ != UINT64_MAX)
             o.row.revision = ++principalObservedRevision_;
         o.row.state = 2; o.row.binding = {}; o.row.reason = Error::Stale;
@@ -778,6 +803,272 @@ void NativeRuntime::invalidatePrincipalObservations() noexcept {
             NativeActivityRing::bytes(o.activityAttempt) + 128;
         principalPendingBytes_ += o.charged;
     }
+}
+void NativeRuntime::publishPrincipalAttempt(PrincipalObservation &o,const GB_PROCESS_IMAGE_FACTS *facts) noexcept {
+  try {
+    if(o.activityAttempt.type==Type::Attempt || o.pendingAttempt.type!=Type::Attempt)return;
+    if(principalImageWorker_ && o.imageJob)principalImageWorker_->abandon(o.imageJob);
+    o.imageJob=0;o.imageDeadline=0;
+    const auto priorCharge=NativeActivityRing::bytes(o.pendingAttempt);
+    auto history=std::move(o.pendingAttempt);o.pendingAttempt={};
+    wire::iv::ServiceContext context;
+    if(wire::iv::decodeServiceContext(history,context)!=Error::Ok || !principalEventsReady() ||
+       !NativeActivityRing::same(context,principalEvents_.context()) || o.source!=principalSource_ ||
+       o.profile!=principalEvents_.profile() || get(history,Tag::ObservedRevision)!=o.row.revision ||
+       idValue(history,Tag::CaptureBindingId)!=o.row.binding) {principalEvents_.lose();return;}
+    std::shared_ptr<PrincipalProcessRetainer> retained;
+    std::map<Id,std::shared_ptr<PrincipalProcessRetainer>>::node_type preparedNode;
+    if(facts && o.event && o.proof && o.event->classifier_) {
+      try {
+        const auto cause=o.event->classifier_;
+        wire::iv::ProcessFacts record;
+        record.pid=facts->pid;record.created=facts->created;record.volumeSerial=facts->volumeSerialNumber;
+        record.fileIndexHigh=facts->fileIndexHigh;record.fileIndexLow=facts->fileIndexLow;
+        record.fileSizeHigh=facts->fileSizeHigh;record.fileSizeLow=facts->fileSizeLow;record.lastWrite=facts->lastWrite;
+        record.tokenSession=cause->token_.session;
+        record.appId=Bytes(cause->record_.app,cause->record_.app+cause->record_.appBytes);
+        record.image=displayText(cause->process_.image.u16string(),4096);
+        record.accountSid=cause->token_.account;record.logonSid=cause->token_.logon;
+        Bytes records;
+        if(wire::iv::pack(std::vector<wire::iv::ProcessFacts>{record},records)==Error::Ok && principalProcessPhysical_<64 &&
+           principalProcesses_.find(o.row.observed)==principalProcesses_.end()) {
+            auto candidate=history;
+            for(auto &field:candidate.fields)if(field.tag==Tag::Presence)field=value(Tag::Presence,get(history,Tag::Presence)|4);
+            candidate.fields.push_back({Tag::Records,true,std::move(records)});candidate=ordered(std::move(candidate));
+            retained=std::make_shared<PrincipalProcessRetainer>();retained->attempt=candidate;
+            retained->source=o.source;retained->catalog=principalCatalog_;retained->cause=cause;
+            retained->event=o.event;retained->proof=o.proof;retained->original=*facts;
+            retained->charged=sizeof(PrincipalProcessRetainer)+128+NativeActivityRing::bytes(retained->attempt)+
+                gatebouncer::service::windows::allapps::chargedBytes(o.event->owned())+activityCauseBytes(*cause)+512;
+            // Cobrar también la copia del descriptor conservada en la observación.
+            const auto extra=NativeActivityRing::bytes(candidate)-NativeActivityRing::bytes(history);
+            if(processBudget(retained->charged+extra)) {
+                std::map<Id,std::shared_ptr<PrincipalProcessRetainer>> prepared;
+                prepared.emplace(o.row.observed,retained);preparedNode=prepared.extract(o.row.observed);
+                history=std::move(candidate);
+            }
+            else retained.reset();
+        }
+      } catch(...) {retained.reset();}
+    }
+    const bool known=retained!=nullptr;
+    // La fuente íntegra no depende de adquirir imagen ni de cupos de evidencia.
+    if(principalEvents_.latest()==UINT64_MAX) {principalEvents_.fail();return;}
+    for(auto &field:history.fields)if(field.tag==Tag::EventSeq)field=value(Tag::EventSeq,principalEvents_.latest()+1);
+    if(principalEvents_.append(history)!=Error::Ok) {principalEvents_.lose();return;}
+    const auto actualCharge=NativeActivityRing::bytes(history);
+    if(actualCharge>=priorCharge) {o.charged+=actualCharge-priorCharge;principalPendingBytes_+=actualCharge-priorCharge;}
+    o.activityAttempt=history;
+    if(retained) {
+        retained->attempt=history;
+        if(principalProcesses_.insert(std::move(preparedNode)).inserted) {
+            principalProcessBytes_+=retained->charged;++principalProcessPhysical_;principalProcessAcquired_=true;
+        } else retained.reset();
+    }
+    if(get(history,Tag::Source)==2 && (!known || !retained) && !o.imageGap) {
+        o.imageGap=true;principalEvents_.discontinuity(); // Cobertura Unknown, pérdida numérica desconocida.
+    }
+  } catch(...) {principalEvents_.fail();o.pendingAttempt={};}
+}
+void NativeRuntime::pollPrincipalImages() noexcept {
+  try {
+    if(!principalImageWorker_)return;
+    std::size_t releasedProcesses=0;
+    const auto released=principalImageWorker_->releasedCharge(releasedProcesses);
+    if(releasedProcesses<=principalProcessPhysical_)principalProcessPhysical_-=releasedProcesses;
+    else {principalEvents_.fail();principalProcessPhysical_=0;}
+    if(released<=principalRetiredBytes_)principalRetiredBytes_-=released;
+    else {principalEvents_.fail();principalRetiredBytes_=0;}
+    GB_PROCESS_IMAGE_FACTS facts{};bool valid=false,done=false;
+    const auto physical=principalImageJobId_;
+    if(physical)done=principalImageWorker_->result(physical,facts,valid);
+    for(auto &item:principalObservations_) {
+        const auto observation=item.second;auto &o=*observation;
+        if(o.pendingAttempt.type!=Type::Attempt)continue;
+        const bool completed=o.imageJob==physical && done;
+        const bool beforeDeadline=principalNow_()<o.imageDeadline;
+        if(!completed && beforeDeadline)continue;
+        bool accept=completed && valid && beforeDeadline && o.row.state==1 && o.event && o.proof &&
+            o.source==principalSource_ && o.profile==profile_.value().generation && o.event->classifier_;
+        if(accept) {
+            const auto source=o.source;const auto catalog=principalCatalog_;
+            wire::iv::ServiceContext original;
+            const auto before=readServiceContext();
+            accept=wire::iv::decodeServiceContext(o.pendingAttempt,original)==Error::Ok &&
+                source==principalSource_ && catalog==principalCatalog_ && principalEventsReady() &&
+                NativeActivityRing::same(before,original) && source->valid(*o.event) &&
+                get(o.pendingAttempt,Tag::ObservedRevision)==o.row.revision &&
+                idValue(o.pendingAttempt,Tag::CaptureBindingId)==o.row.binding;
+            if(accept) {
+                auto proof=source->readCurrentProof(*o.event,allnative::CatalogReceipt(catalog));
+                accept=proof.proof && source->retainedCause(*o.event,*proof.proof,
+                    allnative::CatalogReceipt(catalog),allnative::Stage::Active);
+                GB_PROCESS_IMAGE_FACTS live{};
+                accept=accept && principalClassifier_ && o.event->classifier_->owner_==principalClassifier_ &&
+                    principalClassifier_->imageCurrent(*o.event->classifier_,backend_.engine_,live) &&
+                    std::memcmp(&live,&facts,sizeof(facts))==0;
+            }
+            const auto after=readServiceContext();
+            accept=accept && source==principalSource_ && catalog==principalCatalog_ && principalEventsReady() &&
+                NativeActivityRing::same(after,original) && o.row.state==1 && o.event && source->valid(*o.event) &&
+                principalNow_()<o.imageDeadline;
+        }
+        publishPrincipalAttempt(o,accept ? &facts : nullptr);
+    }
+    if(done) {
+        bool waiting=false;
+        if(principalClassifier_) {
+            std::lock_guard<std::mutex> lock(principalClassifier_->mutex_);
+            const auto &raw=principalClassifier_->pendingApp_;
+            waiting=raw && raw->record_.session==principalImageSession_ && raw->record_.cause==principalImageCause_ && raw->appState_.load()==1;
+        }
+        principalImageJobCharge_=0;
+        if(!waiting)principalImageJobId_=0;
+    }
+  } catch(...) {principalEvents_.fail();}
+}
+void NativeRuntime::pollPrincipalPendingApp() noexcept {
+  try {
+    if(!principalClassifier_ || !principalImageWorker_)return;
+    std::shared_ptr<allnative::ClassifierCause> raw;
+    {std::lock_guard<std::mutex> lock(principalClassifier_->mutex_);raw=principalClassifier_->pendingApp_;}
+    if(!raw) {principalPendingAppBytes_=0;return;}
+    const auto charge=activityCauseBytes(*raw)+128;
+    if(!principalPendingAppBytes_) {
+        if(!processBudget(charge))raw->appState_.store(2);
+        principalPendingAppBytes_=charge; // Retenido aun al fallar la admisión.
+    }
+    auto state=raw->appState_.load();
+    if(state==0 && principalImageJobId_ && (raw->record_.session!=principalImageSession_ ||
+       raw->record_.cause!=principalImageCause_) && !raw->appGap_) {
+        raw->appGap_=true;principalEvents_.discontinuity();
+    }
+    if(state==0 && (!principalMode_ || !principalSource_ || !principalCatalog_ || principalWriteFault_ ||
+       profile_.value().state!=1 || principalSource_->stage()!=allnative::Stage::Active ||
+       principalSource_->source_.health().health!=gatebouncer::service::windows::allapps::Health::Ready)) {
+        raw->appState_.store(2);state=2;
+    }
+    if(state==0 && principalImageJobId_ && raw->record_.session==principalImageSession_ &&
+       raw->record_.cause==principalImageCause_ && principalNow_()>=principalAppDeadline_) {
+        raw->appState_.store(2);principalImageWorker_->abandon(principalImageJobId_);state=2;
+    }
+    if(state==0 && !principalImageJobId_) {
+        const auto source=principalSource_;const auto catalog=principalCatalog_;
+        const auto before=readServiceContext();
+        if(source!=principalSource_ || catalog!=principalCatalog_ || !principalEventsReady() ||
+           before.engineContext!=source->binding_->epoch || before.engineBindingGeneration!=source->binding_->generation) {
+            raw->appState_.store(2);state=2;
+        }
+        const auto jobCharge=sizeof(allnative::NativeImageWorker::Operation)+sizeof(allnative::NativeImageWorker::Job)+charge;
+        if(state==0 && processBudget(jobCharge)) {
+            const auto job=principalImageWorker_->submit(raw);
+            if(job) {
+                principalImageJobId_=job;principalImageJobCharge_=jobCharge;
+                principalImageSession_=raw->record_.session;principalImageCause_=raw->record_.cause;
+                principalAppDeadline_=principalNow_()+250;
+            } else {raw->appState_.store(2);state=2;}
+        } else {raw->appState_.store(2);state=2;}
+    }
+    if(state==2) {
+        if(principalSource_)principalSource_->lose(); // Mismo rechazo/loss del take anterior.
+        {std::lock_guard<std::mutex> lock(principalClassifier_->mutex_);
+            if(principalClassifier_->pendingApp_==raw)principalClassifier_->pendingApp_.reset();}
+        std::shared_ptr<void> retired=std::move(raw);
+        if(principalImageWorker_->retire(retired,charge)) {
+            principalPendingAppBytes_=0;principalRetiredBytes_+=charge;
+        } else {
+            std::lock_guard<std::mutex> lock(principalClassifier_->mutex_);
+            principalClassifier_->pendingApp_=std::static_pointer_cast<allnative::ClassifierCause>(retired);
+        }
+    }
+  } catch(...) {if(principalSource_)principalSource_->lose();}
+}
+void NativeRuntime::finishPrincipalImages() noexcept {
+    if(principalImageWorker_)principalImageWorker_->stop();
+    // Cancel no acredita drain. Un FS que no retorna conserva STOP_PENDING.
+    principalImageWorker_.reset(); // Join fuera de Runtime/Classifier/state mutex.
+    std::shared_ptr<allnative::ClassifierCause> pending;
+    if(principalClassifier_) {
+        std::lock_guard<std::mutex> lock(principalClassifier_->mutex_);
+        pending=std::move(principalClassifier_->pendingApp_);
+    }
+    pending.reset();principalProcesses_.clear(); // Últimas refs también fuera de todos los mutex.
+    principalProcessBytes_=principalRetiredBytes_=principalProcessPhysical_=0;
+    principalImageJobId_=principalImageJobCharge_=principalPendingAppBytes_=0;
+    principalProcessAcquired_=false;
+}
+bool NativeRuntime::principalProcessCurrent(const PrincipalProcessRetainer &r,GB_PROCESS_IMAGE_FACTS &facts) noexcept {
+  try {
+    wire::iv::ServiceContext original;
+    if(r.retired || !r.event || !r.proof || !r.cause || !r.source || !r.catalog || !principalClassifier_ ||
+       wire::iv::decodeServiceContext(r.attempt,original)!=Error::Ok)return false;
+    const auto before=readServiceContext();
+    const auto &metadata=r.event->owned();
+    const auto matches=[&] {
+        return !r.retired && principalEventsReady() && r.source==principalSource_ && r.catalog==principalCatalog_ &&
+            get(r.attempt,Tag::ProfileGeneration)==profile_.value().generation && r.event->binding_==r.source->binding_ &&
+            r.event->snapshot_==r.catalog && r.event->classifier_==r.cause && r.cause->owner_==principalClassifier_ &&
+            r.source->source_.current(metadata.acquired) &&
+            r.source->source_.health().lossRevision==metadata.acquiredLossRevision;
+    };
+    if(!matches() || !NativeActivityRing::same(before,original) ||
+       !principalClassifier_->imageCurrent(*r.cause,backend_.engine_,facts) ||
+       std::memcmp(&facts,&r.original,sizeof(facts))!=0)return false;
+    const auto after=readServiceContext();
+    // El current postApplied procede de EPROCESS/custodian y catálogo real; jamás del CURRENT pending-only.
+    return matches() && NativeActivityRing::same(after,original);
+  } catch(...) {return false;}
+}
+void NativeRuntime::prunePrincipalProcesses() noexcept {
+  try {
+    if(!principalImageWorker_)return;
+    const auto limit=std::min<std::size_t>(8,principalProcesses_.size());
+    for(std::size_t n=0;n<limit && !principalProcesses_.empty();++n) {
+        auto it=principalProcesses_.upper_bound(principalProcessCursor_);
+        if(it==principalProcesses_.end())it=principalProcesses_.begin();
+        auto retained=it->second;principalProcessCursor_=it->first;GB_PROCESS_IMAGE_FACTS live{};
+        if(!retained->retired && principalProcessCurrent(*retained,live))continue;
+        retained->retired=true;
+        const auto charge=retained->charged;retained.reset();
+        auto node=principalProcesses_.extract(it);std::shared_ptr<void> owner=std::move(node.mapped());
+        if(principalImageWorker_->retire(owner,charge,true)) {
+            principalProcessBytes_-=charge;principalRetiredBytes_+=charge;
+        } else {
+            node.mapped()=std::static_pointer_cast<PrincipalProcessRetainer>(owner);
+            principalProcesses_.insert(std::move(node));
+        } // Ocupado: sigue cargado/retired, nunca current ni eviction heurística.
+    }
+  } catch(...) {principalEvents_.fail();}
+}
+Frame NativeRuntime::readPrincipalProcess(const Frame &request,const std::shared_ptr<PrincipalPeer> &peer) {
+    Frame response=request;response.type=Type::NativeProcessContext;
+    const auto finish=[&](Error error,const Bytes *records=nullptr) {
+        response.fields.push_back(value(Tag::ErrorCode,static_cast<unsigned>(error),2));
+        response.fields.push_back(value(Tag::Count,records ? 1 : 0,4));
+        response.fields.push_back(value(Tag::Source,2,1));response.fields.push_back(value(Tag::SourceCoverage,1,1));
+        if(records)response.fields.push_back({Tag::Records,true,*records});
+        return ordered(std::move(response));
+    };
+    if(!peer || !peer->readonly || !principalPeerCurrent(*peer))return finish(Error::Unauthorized);
+    if(idValue(request,Tag::ServiceEpoch)!=epoch_ || get(request,Tag::ProfileGeneration)!=peer->profile)
+        return finish(Error::Stale);
+    const auto found=principalProcesses_.find(idValue(request,Tag::ObservedId));
+    if(found==principalProcesses_.end())return finish(Error::NotFound);
+    const auto retained=found->second;
+    const Tag sameFields[]={Tag::ServiceEpoch,Tag::SourceEpoch,Tag::ServiceContext,Tag::ProfileGeneration,
+        Tag::ObservedId,Tag::ObservedRevision,Tag::CaptureBindingId};
+    for(const auto tag:sameFields) {
+        const auto a=find(request,tag),b=find(retained->attempt,tag);
+        if(!a || !b || a->bytes!=b->bytes)return finish(Error::Stale);
+    }
+    if(idValue(request,Tag::AttemptLink)!=wire::iv::attemptLink(get(retained->attempt,Tag::EventSeq)))return finish(Error::Stale);
+    GB_PROCESS_IMAGE_FACTS live{};
+    if(!principalProcessReady() || !principalProcessCurrent(*retained,live) || !principalPeerCurrent(*peer)) {
+        retained->retired=true;return finish(Error::IdentityUnavailable);
+    }
+    const auto records=find(retained->attempt,Tag::Records);
+    if(!records)return finish(Error::IdentityUnavailable);
+    return finish(Error::Ok,&records->bytes);
 }
 void NativeRuntime::collectPrincipalObservations() {
     using namespace gatebouncer::service::windows::allapps;
@@ -790,6 +1081,7 @@ void NativeRuntime::collectPrincipalObservations() {
     for (auto &item : principalObservations_) {
         auto &o = *item.second;
         if (o.row.state == 1 && o.event && o.event->classifier_ && !o.event->classifier_->current()) {
+            if(o.pendingAttempt.type==Type::Attempt)publishPrincipalAttempt(o);
             o.row.state = 2; o.row.binding = {}; o.row.reason = Error::Stale;
             if (principalObservedRevision_ != UINT64_MAX) o.row.revision = ++principalObservedRevision_;
             o.target = {}; o.event.reset(); o.proof.reset(); o.source.reset();
@@ -797,8 +1089,19 @@ void NativeRuntime::collectPrincipalObservations() {
     }
     // Trabajo acotado por tick: no drenar indefinidamente ante un productor ocupado.
     for (unsigned work = 0; work < 8; ++work) {
+        if(principalClassifier_) {
+            bool pending=false;
+            {std::lock_guard<std::mutex> lock(principalClassifier_->mutex_);pending=principalClassifier_->pendingApp_!=nullptr;}
+            // Reservar rawcause/path máximo antes de adquirir el HANDLE nuevo.
+            const auto reserve=sizeof(allnative::ClassifierCause)+128+32768*4*sizeof(wchar_t)+2*68;
+            if(!pending && !processBudget(reserve)) {
+                if(!principalAppCapacityGap_) {principalAppCapacityGap_=true;principalEvents_.discontinuity();}
+                break;
+            }
+            principalAppCapacityGap_=false;
+        }
         auto event = principalSource_->takeCopied();
-        if (!event) break;
+        if (!event) {pollPrincipalPendingApp();break;}
         auto acquired = principalSource_->readCurrentProof(*event, allnative::CatalogReceipt(principalCatalog_));
         if (!acquired.proof || !principalSource_->retainedCause(*event, *acquired.proof,
             allnative::CatalogReceipt(principalCatalog_), allnative::Stage::Active)) continue;
@@ -841,7 +1144,8 @@ void NativeRuntime::collectPrincipalObservations() {
         // No es una afirmación del heap integral del allocator o del proceso.
         const auto charged = 2 * chargedBytes(metadata) + target.ownedCapacityBytes() +
             displayCharge(projected) + displayCharge(full) + sizeof(PrincipalObservation) + sizeof(PrincipalAdmission) +
-            2 * gatebouncer::appidentity::MaximumSidBytes + 512 + 8192;
+            2 * gatebouncer::appidentity::MaximumSidBytes + 512 + 8192 +
+            (event->classifier_ ? activityCauseBytes(*event->classifier_) : 0);
         const auto prior = same == principalObservations_.end() ? 0 : same->second->charged;
         if (same == principalObservations_.end() && principalObservations_.size() >= PendingLimit) {
             auto oldest = principalObservations_.end();
@@ -853,8 +1157,7 @@ void NativeRuntime::collectPrincipalObservations() {
                 principalPendingBytes_ -= oldest->second->charged; principalObservations_.erase(oldest);
             }
         }
-        if (charged > PendingBytesLimit || principalPendingBytes_ - prior > PendingBytesLimit - charged ||
-            principalTrafficBytes_>PendingBytesLimit-charged-(principalPendingBytes_-prior) ||
+        if (!processBudget(charged,prior) ||
             (same == principalObservations_.end() && principalObservations_.size() >= PendingLimit)) {
             principalSource_->lose(); invalidatePrincipalObservations(); break;
         }
@@ -904,8 +1207,28 @@ void NativeRuntime::collectPrincipalObservations() {
             value(Tag::CaptureBindingId,observation->row.binding)});
         if (protocol) history.fields.push_back(value(Tag::Protocol,observation->event->classifier_->record_.protocol,1));
         history = ordered(std::move(history));
-        if (principalEvents_.append(history) == Error::Ok) observation->activityAttempt = std::move(history);
-        else { principalEvents_.lose(); observation->activityAttempt = {}; }
+        observation->pendingAttempt=std::move(history);
+        // El descriptor sin Records ya está cubierto por la reserva8KiB de la observación.
+        if(protocol && principalImageWorker_ && principalImageJobId_ &&
+           observation->event->classifier_->record_.session==principalImageSession_ &&
+           observation->event->classifier_->record_.cause==principalImageCause_) {
+            observation->imageJob=principalImageJobId_;observation->imageDeadline=principalAppDeadline_;
+            principalPendingAppBytes_=0;
+        } else if(protocol && principalImageWorker_ && !principalImageJobId_) {
+            const auto cause=observation->event->classifier_;
+            const auto charge=sizeof(allnative::NativeImageWorker::Operation)+sizeof(allnative::NativeImageWorker::Job)+
+                activityCauseBytes(*cause)+128;
+            if(processBudget(charge)) {
+                const auto job=principalImageWorker_->submit(cause);
+                if(job) {
+                    observation->imageJob=job;observation->imageDeadline=principalNow_()+250;
+                    principalImageJobId_=job;principalImageJobCharge_=charge;
+                    principalImageSession_=cause->record_.session;principalImageCause_=cause->record_.cause;
+                    principalAppDeadline_=observation->imageDeadline;
+                }
+            }
+        }
+        if(!observation->imageJob)publishPrincipalAttempt(*observation);
       } catch (...) { principalEvents_.fail(); observation->activityAttempt = {}; }
     }
 }

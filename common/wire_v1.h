@@ -19,7 +19,8 @@ enum class Type : std::uint16_t { Hello=1, HelloAck=2, GetStatus=3, Status=4,
     OpenReview=28, PrepareFuturePolicy=29, FutureDraftRecord=30, CommitFuturePolicy=31,
     FuturePolicyAck=32, GetFutureCommandStatus=33, FutureCommandStatus=34,
     ListPrincipalRules=35, PrincipalRulesPage=36, RevokePrincipalRule=37,
-    GetFutureDraft=38, ReviewQueued=39 };
+    GetFutureDraft=38, ReviewQueued=39, GetNativeProcessContext=40,
+    NativeProcessContext=41 };
 enum class Error : std::uint16_t { Ok=0, Unsupported=1, Unauthorized=2, Stale=3,
     Malformed=4, VersionMismatch=5, Conflict=6, Capacity=7, StoreFailure=8,
     WfpFailure=9, RecoveryRequired=10, IdentityUnavailable=11, Timeout=12,

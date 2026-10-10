@@ -149,6 +149,33 @@ Bytes payload(const PrincipalRuleRecord &r) {
   tail(b, 120, r.display);
   return b;
 }
+Bytes payload(const ProcessFacts &r) {
+  Bytes b(60);
+  put(b,0,r.pid,8); put(b,8,r.created,8); put(b,16,r.volumeSerial,4);
+  put(b,20,r.fileIndexHigh,4); put(b,24,r.fileIndexLow,4);
+  put(b,28,r.fileSizeHigh,4); put(b,32,r.fileSizeLow,4); put(b,36,r.lastWrite,8);
+  put(b,44,r.appId.size(),2); put(b,46,r.image.size(),2); put(b,48,r.accountSid.size(),2);
+  put(b,52,r.tokenSession,4); put(b,56,r.logonSid.size(),2);
+  for(const auto *part:{&r.appId,&r.image,&r.accountSid,&r.logonSid})
+    b.insert(b.end(),part->begin(),part->end());
+  return b;
+}
+bool parse(const Bytes &b, ProcessFacts &r) {
+  if(b.size()<60 || !zeros(b,50,2) || !zeros(b,58,2)) return false;
+  r.pid=n(b,0,8);r.created=n(b,8,8);r.volumeSerial=std::uint32_t(n(b,16,4));
+  r.fileIndexHigh=std::uint32_t(n(b,20,4));r.fileIndexLow=std::uint32_t(n(b,24,4));
+  r.fileSizeHigh=std::uint32_t(n(b,28,4));r.fileSizeLow=std::uint32_t(n(b,32,4));
+  r.lastWrite=n(b,36,8);r.tokenSession=std::uint32_t(n(b,52,4));
+  Bytes *parts[]={&r.appId,&r.image,&r.accountSid,&r.logonSid};
+  const std::size_t positions[]={44,46,48,56},caps[]={8192,4096,68,68};
+  std::size_t at=60;
+  for(unsigned i=0;i<4;++i) {
+    const auto size=std::size_t(n(b,positions[i],2));
+    if(size>caps[i] || size>b.size()-at) return false;
+    parts[i]->assign(b.begin()+at,b.begin()+at+size);at+=size;
+  }
+  return at==b.size() && valid(r);
+}
 bool parse(const Bytes &b, ObservedRecord &r) {
   if (b.size() < 96 || !zeros(b, 90, 6))
     return false;
@@ -281,6 +308,17 @@ Schema schema(const Frame &f) {
                    {T::KnownAppliedUnrecorded, 1},
                    {T::Durable, 1}};
   switch (f.type) {
+  case Type::GetNativeProcessContext:
+  case Type::NativeProcessContext: {
+    Schema s={{T::ServiceEpoch,16},{T::SourceEpoch,16},{T::ServiceContext,56},
+              {T::ProfileGeneration,8},{T::ObservedId,16},{T::ObservedRevision,8},
+              {T::CaptureBindingId,16},{T::AttemptLink,16}};
+    if(f.type==Type::NativeProcessContext) {
+      s[T::ErrorCode]=2;s[T::Count]=4;s[T::Source]=1;s[T::SourceCoverage]=1;
+      if(get(f,T::ErrorCode)==0)s[T::Records]=Variable;
+    }
+    return s;
+  }
   case Type::SubscribeEvents:
     return {{T::ServiceEpoch,16},{T::EventMask,4},{T::AfterEventSeq,8},
             {T::ProfileGeneration,8},{T::SourceEpoch,16}};
@@ -301,6 +339,7 @@ Schema schema(const Frame &f) {
               {T::ProfileGeneration,8},{T::ObservedId,16},{T::ObservedRevision,8},
               {T::SourceEpoch,16},{T::CaptureBindingId,16},{T::ServiceContext,56}};
     if(get(f,T::Presence)&2) s[T::Protocol]=1;
+    if(get(f,T::Presence)&4) s[T::Records]=Variable;
     if(f.type==Type::Authorization) {
       s[T::CommandId]=16; s[T::AttemptLink]=16; s[T::EffectiveRev]=8;
       s[T::Decision]=1; s[T::ScopeKind]=1; s[T::Durable]=1; s[T::ProofState]=1;
@@ -424,7 +463,7 @@ bool supported(Type t) {
          t == Type::Status || t == Type::ProtocolError ||
          t == Type::SubscribeEvents || t == Type::SubscriptionAck ||
          t == Type::Attempt || t == Type::Authorization || t == Type::Traffic || t == Type::ObservationGap ||
-         (t >= Type::ListObserved && t <= Type::ReviewQueued);
+         (t >= Type::ListObserved && t <= Type::NativeProcessContext);
 }
 Id attemptLink(std::uint64_t sequence) {
   Id id{};
@@ -454,7 +493,8 @@ Error decodeServiceContext(const Frame &frame, ServiceContext &out) {
   if (frame.minor != 3 ||
       (frame.type != Type::HelloAck && frame.type != Type::Status &&
        frame.type != Type::SubscriptionAck && frame.type != Type::Attempt &&
-       frame.type != Type::Authorization && frame.type != Type::Traffic && frame.type != Type::ObservationGap))
+       frame.type != Type::Authorization && frame.type != Type::Traffic && frame.type != Type::ObservationGap &&
+       frame.type != Type::GetNativeProcessContext && frame.type != Type::NativeProcessContext))
     return Error::Unsupported;
   const auto error = iv::validate(frame);
   if (error != Error::Ok) return error;
@@ -473,6 +513,27 @@ bool valid(const ObservedRecord &r) {
          (r.state == 1 ? !zero(r.binding) && reason <= 18
                        : zero(r.binding) && reason >= 1 && reason <= 18) &&
          display(r.display);
+}
+bool valid(const ProcessFacts &r) {
+  auto sid=[](const Bytes &b) { return b.size()>=8 && b.size()<=68 && b[0]==1 &&
+    b[1]<=15 && b.size()==8+std::size_t(b[1])*4; };
+  if(!r.pid || r.pid>UINT32_MAX || !r.created || r.created>INT64_MAX || !r.lastWrite || r.lastWrite>INT64_MAX ||
+     (!r.fileIndexHigh && !r.fileIndexLow) || r.appId.size()<4 || r.appId.size()>8192 ||
+     (r.appId.size()&1) || r.appId[r.appId.size()-1] || r.appId[r.appId.size()-2] ||
+     r.image.empty() || r.image.size()>4096 || !text(r.image) || !sid(r.accountSid) || !sid(r.logonSid))
+    return false;
+  // El AppId conserva UTF16 del ALE original; rechazar NUL interior y surrogates rotos.
+  for(std::size_t i=0;i+2<r.appId.size();i+=2) {
+    auto c=n(r.appId,i,2);
+    if(!c || (c>=0xdc00 && c<=0xdfff)) return false;
+    if(c>=0xd800 && c<=0xdbff) {
+      if(i+4>=r.appId.size()) return false;
+      const auto low=n(r.appId,i+2,2);
+      if(low<0xdc00 || low>0xdfff) return false;
+      i+=2;
+    }
+  }
+  return true;
 }
 bool valid(const FutureDraftRecord &r) {
   if (zero(r.draft) || !r.version || zero(r.observed) || !r.observedRevision ||
@@ -523,6 +584,9 @@ Error pack(const std::vector<FutureDraftRecord> &r, Bytes &b) {
 Error pack(const std::vector<PrincipalRuleRecord> &r, Bytes &b) {
   return packRecords(r, b, 5);
 }
+Error pack(const std::vector<ProcessFacts> &r, Bytes &b) {
+  return r.size()==1 ? packRecords(r,b,6) : Error::Malformed;
+}
 Error unpack(const Bytes &b, std::size_t c, std::vector<ObservedRecord> &r) {
   return unpackRecords(b, c, r, 3, 4960);
 }
@@ -532,6 +596,9 @@ Error unpack(const Bytes &b, std::size_t c, std::vector<FutureDraftRecord> &r) {
 Error unpack(const Bytes &b, std::size_t c,
              std::vector<PrincipalRuleRecord> &r) {
   return unpackRecords(b, c, r, 5, 5024);
+}
+Error unpack(const Bytes &b,std::size_t c,std::vector<ProcessFacts> &r) {
+  return c==1 ? unpackRecords(b,c,r,6,60+8192+4096+136) : Error::Malformed;
 }
 Error validate(const Frame &f) {
   if (f.minor != 3)
@@ -556,7 +623,8 @@ Error validate(const Frame &f) {
     if (tag < 1 || tag > static_cast<unsigned>(T::ScopeDurationMs) || tag == 57 ||
         (v.tag == T::ServiceContext && f.type != Type::HelloAck && f.type != Type::Status &&
          f.type != Type::SubscriptionAck && f.type != Type::Attempt &&
-         f.type != Type::Authorization && f.type != Type::Traffic && f.type != Type::ObservationGap))
+         f.type != Type::Authorization && f.type != Type::Traffic && f.type != Type::ObservationGap &&
+         f.type != Type::GetNativeProcessContext && f.type != Type::NativeProcessContext))
       return Error::Unsupported;
     if (tag <= previous)
       return Error::Malformed;
@@ -585,9 +653,10 @@ Error validate(const Frame &f) {
           boot != idValue(f, T::BootId) || engine != idValue(f, T::SourceEpoch) ||
           zero(engine) != (generation == 0)) return Error::Malformed;
       auto c = number(*caps);
-      if ((c >> 27) || (c & ((0x3full << 6) | (1ull << 16))) ||
+      if ((c >> 28) || (c & ((0x3full << 6) | (1ull << 16))) ||
           ((c & NativeEvents) && (!(c & ObservedRead) || zero(engine) || get(f,T::ReviewProfileState)!=1)) ||
           ((c & NativeTraffic) && !(c & NativeEvents)) ||
+          ((c & NativeProcessFacts) && !(c & NativeEvents)) ||
           ((c & FuturePolicyControl) && !number(*profile)))
         return Error::Malformed;
       base.fields.erase(std::remove_if(base.fields.begin(), base.fields.end(),
@@ -599,7 +668,7 @@ Error validate(const Frame &f) {
                         base.fields.end());
       for (auto &v : base.fields)
         if (v.tag == T::Capabilities)
-          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents | NativeTraffic), 8);
+          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents | NativeTraffic | NativeProcessFacts), 8);
     }
     if (f.type == Type::ProtocolError && get(f, T::ErrorCode) == 18)
       for (auto &v : base.fields)
@@ -621,19 +690,27 @@ Error validate(const Frame &f) {
   }
   const bool activity=f.type==Type::Attempt || f.type==Type::Authorization || f.type==Type::Traffic;
   const bool stream=activity || f.type==Type::ObservationGap || f.type==Type::SubscriptionAck;
-  if(stream) {
+  const bool processContext=f.type==Type::GetNativeProcessContext || f.type==Type::NativeProcessContext;
+  if(stream || processContext) {
     const auto &b=find(f,T::ServiceContext)->bytes;
     if(array<16>(b,0)!=idValue(f,T::ServiceEpoch) || zero(array<16>(b,16)) ||
        array<16>(b,32)!=idValue(f,T::SourceEpoch) || !n(b,48,8) ||
-       get(f,T::SourceCoverage)!=1) return Error::Malformed;
+       ((stream || f.type==Type::NativeProcessContext) && get(f,T::SourceCoverage)!=1)) return Error::Malformed;
+  }
+  if(processContext) {
+    if(!attemptSequence(idValue(f,T::AttemptLink)))return Error::Malformed;
+    if(f.type==Type::NativeProcessContext &&
+       (get(f,T::Source)!=2 || get(f,T::ErrorCode)>18 ||
+        (get(f,T::ErrorCode)==0 ? get(f,T::Count)!=1 : get(f,T::Count)!=0)))return Error::Malformed;
   }
   if(f.type==Type::SubscribeEvents || f.type==Type::SubscriptionAck)
     if(get(f,T::EventMask)!=3 && get(f,T::EventMask)!=7) return Error::Malformed;
   if(activity) {
     auto p=get(f,T::Presence), stamp=get(f,T::Timestamp), origin=get(f,T::Source);
-    if(!get(f,T::EventSeq) || p>3 || ((p&1) ? !stamp : stamp!=0) ||
+    if(!get(f,T::EventSeq) || p>7 || ((p&1) ? !stamp : stamp!=0) ||
        origin<1 || origin>2 || get(f,T::FlowDirection)<1 || get(f,T::FlowDirection)>2 ||
-       ((p&2) && (origin!=2 || (get(f,T::Protocol)!=6 && get(f,T::Protocol)!=17))))
+       ((p&2) && (origin!=2 || (get(f,T::Protocol)!=6 && get(f,T::Protocol)!=17))) ||
+       ((p&4) && origin!=2))
       return Error::Malformed;
     if(f.type==Type::Authorization) {
       const auto link=attemptSequence(idValue(f,T::AttemptLink));
@@ -644,7 +721,7 @@ Error validate(const Frame &f) {
     }
     if(f.type==Type::Traffic) {
       const auto link=attemptSequence(idValue(f,T::AttemptLink));
-      if(origin!=2 || p!=3 || !link || link>=get(f,T::EventSeq) || !get(f,T::PacketCount) ||
+      if(origin!=2 || (p!=3 && p!=7) || !link || link>=get(f,T::EventSeq) || !get(f,T::PacketCount) ||
          get(f,T::PacketDirection)<1 || get(f,T::PacketDirection)>2 || !get(f,T::EffectiveRev) ||
          get(f,T::ScopeKind)<3 || get(f,T::ScopeKind)>5 || get(f,T::Durable)!=1 || get(f,T::ProofState)!=2)
         return Error::Malformed;
@@ -732,7 +809,10 @@ Error validate(const Frame &f) {
         return Error::Malformed;
     }
     Error e;
-    if (f.type == Type::ObservedPage || f.type == Type::ObservedRecord) {
+    if(activity || f.type==Type::NativeProcessContext) {
+      std::vector<ProcessFacts> rows;
+      e=unpack(records->bytes,1,rows);
+    } else if (f.type == Type::ObservedPage || f.type == Type::ObservedRecord) {
       std::vector<ObservedRecord> rows;
       e = unpack(records->bytes, count, rows);
       if (f.type == Type::ObservedRecord && find(f,T::PolicyDirection) &&

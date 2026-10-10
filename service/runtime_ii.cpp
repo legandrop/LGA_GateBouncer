@@ -275,6 +275,7 @@ NativeRuntime::NativeRuntime(WfpBackend &b, SelectorRegistry &r,
     backend_.attachCollector(&collector_);
 }
 NativeRuntime::~NativeRuntime() {
+    finishPrincipalImages();
     invalidatePrincipalObservations();
     retirePrincipalObservation();
     backend_.attachCollector(nullptr);
@@ -504,6 +505,8 @@ void NativeRuntime::retirePrincipalObservation() noexcept {
         retainedEngineFault_.reset();
 }
 void NativeRuntime::tick() {
+    pollPrincipalImages();
+    pollPrincipalPendingApp();
     auto prior = profile_.value().generation;
     profile_.refresh();
     if (prior != profile_.value().generation) {
@@ -517,7 +520,8 @@ void NativeRuntime::tick() {
         if (!principalSource_ || principalSource_->stage() != allnative::Stage::Active ||
             principalSource_->source_.health().health != gatebouncer::service::windows::allapps::Health::Ready ||
             principalWriteFault_) { if (principalClassifier_) principalClassifier_->reset(); invalidatePrincipalObservations(); }
-        else collectPrincipalObservations();
+        else { pollPrincipalImages(); collectPrincipalObservations(); pollPrincipalImages(); }
+        prunePrincipalProcesses();
         // READBACK acotado y circular: conserva la causa histórica precompletion.
         for (std::size_t work=0, limit=std::min<std::size_t>(8,principalOutcomes_.size()); work<limit; ++work) {
             auto outcome=principalOutcomes_.upper_bound(principalOutcomeCursor_);
@@ -825,16 +829,32 @@ Error NativeRuntime::events(std::uint64_t after, std::uint32_t mask, std::vector
     return ring_.after(after, mask, rows, gap);
 }
 bool NativeServer::run(HANDLE stop) {
+    try {
+        runtime_.principalImageWorker_.reset(new allnative::NativeImageWorker());
+        runtime_.principalImageBaseCharge_=sizeof(allnative::NativeImageWorker)+sizeof(allnative::NativeImageWorker::State)+128;
+    }
+    catch (...) { return false; }
     std::thread view([&] { channel(false, stop); }), control([&] { channel(true, stop); }),
         ordinary([&] { channel(false, stop, true); });
-    while (WaitForSingleObject(stop, 250) == WAIT_TIMEOUT) {
+    HANDLE waits[]={stop,runtime_.principalImageWorker_->state_->wake.value};
+    bool waited=true;
+    for(;;) {
+        const auto ready=WaitForMultipleObjects(2,waits,FALSE,250);
+        if(ready==WAIT_OBJECT_0)break;
+        if(ready!=WAIT_TIMEOUT && ready!=WAIT_OBJECT_0+1) {SetEvent(stop);waited=false;break;}
         std::lock_guard<std::mutex> lock(runtime_.mutex);
         runtime_.tick();
     }
     view.join();
     control.join();
     ordinary.join();
-    return true;
+    {
+        std::lock_guard<std::mutex> lock(runtime_.mutex);
+        runtime_.invalidatePrincipalObservations();
+        if(runtime_.principalClassifier_)runtime_.principalClassifier_->reset();
+    }
+    runtime_.finishPrincipalImages();
+    return waited;
 }
 void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
     const std::wstring name = ordinary ? ipc::iii::OrdinaryPipe : control ? L"\\\\.\\pipe\\LGA.GateBouncer.Control.v1"

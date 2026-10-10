@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstring>
 #include <cstddef>
+#include <stdexcept>
 static_assert(sizeof(GB_ACTIVITY_SNAPSHOT)==168);
 static_assert(sizeof(GB_SCOPE_DECISION)==64 && sizeof(GB_SCOPE_RECEIPT)==104);
 static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,decision)==8 && offsetof(GB_ACTIVITY_SNAPSHOT,loss)==72);
@@ -16,6 +17,14 @@ static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,outboundPackets)==104 && offsetof(GB
 static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,inboundPackets)==136 && offsetof(GB_ACTIVITY_SNAPSHOT,inboundUtc)==144 &&
     offsetof(GB_ACTIVITY_SNAPSHOT,inboundRevision)==152);
 static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,flags)==160 && offsetof(GB_ACTIVITY_SNAPSHOT,reserved)==164);
+static_assert(sizeof(GB_PROCESS_IMAGE_FACTS)==88);
+static_assert(offsetof(GB_PROCESS_IMAGE_FACTS,session)==8 && offsetof(GB_PROCESS_IMAGE_FACTS,cause)==16 &&
+    offsetof(GB_PROCESS_IMAGE_FACTS,loss)==24 && offsetof(GB_PROCESS_IMAGE_FACTS,created)==32 &&
+    offsetof(GB_PROCESS_IMAGE_FACTS,pid)==40 && offsetof(GB_PROCESS_IMAGE_FACTS,volumeSerialNumber)==48 &&
+    offsetof(GB_PROCESS_IMAGE_FACTS,fileIndexHigh)==52 && offsetof(GB_PROCESS_IMAGE_FACTS,fileIndexLow)==56 &&
+    offsetof(GB_PROCESS_IMAGE_FACTS,fileSizeHigh)==60 && offsetof(GB_PROCESS_IMAGE_FACTS,fileSizeLow)==64 &&
+    offsetof(GB_PROCESS_IMAGE_FACTS,reserved0)==68 && offsetof(GB_PROCESS_IMAGE_FACTS,lastWrite)==72 &&
+    offsetof(GB_PROCESS_IMAGE_FACTS,flags)==80 && offsetof(GB_PROCESS_IMAGE_FACTS,reserved1)==84);
 
 namespace gatebouncer::service::windows::allapps::native {
 namespace {
@@ -26,20 +35,42 @@ bool serviceCaller() noexcept {
 }
 bool equal(const GUID &a, const GUID &b) noexcept { return std::memcmp(&a, &b, sizeof(a)) == 0; }
 struct Memory { void *p = nullptr; ~Memory() { if (p) FwpmFreeMemory0(&p); } };
+BOOL classifierIo(HANDLE device,DWORD code,LPVOID input,DWORD inputBytes,LPVOID output,DWORD outputBytes,
+    LPDWORD returned,LPOVERLAPPED) noexcept {
+    gb::native::Handle event(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+    if(!event)return FALSE;
+    OVERLAPPED operation{};operation.hEvent=event.value;
+    const auto immediate=DeviceIoControl(device,code,input,inputBytes,output,outputBytes,nullptr,&operation);
+    auto error=immediate ? ERROR_SUCCESS : GetLastError();
+    BOOL finished=FALSE;
+    if(immediate || error==ERROR_IO_PENDING) {
+        finished=GetOverlappedResult(device,&operation,returned,TRUE);
+        error=finished ? ERROR_SUCCESS : GetLastError();
+    }
+    event.reset();SetLastError(error);return finished;
+}
+bool validImage(const GB_PROCESS_IMAGE_FACTS &facts,const GB_CLASSIFIER_RECORD &record) noexcept {
+    return facts.version==GB_PROCESS_IMAGE_VERSION && facts.bytes==sizeof(facts) &&
+        facts.flags==GB_PROCESS_IMAGE_ORIGINAL && !facts.reserved0 && !facts.reserved1 &&
+        facts.session==record.session && facts.cause==record.cause && facts.loss==record.loss &&
+        facts.pid==record.pid && facts.created==record.created &&
+        (facts.fileIndexHigh || facts.fileIndexLow) && facts.lastWrite && facts.lastWrite<=INT64_MAX;
+}
 }
 std::shared_ptr<NativeClassifier> NativeClassifier::open() noexcept {
     try {
         if (!serviceCaller()) return {};
         auto owner = std::shared_ptr<NativeClassifier>(new NativeClassifier);
         owner->device_.reset(CreateFileW(GB_CLASSIFIER_DEVICE, GENERIC_READ | GENERIC_WRITE,
-            0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
+            0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED |
+                SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
         if (!owner->device_) return {};
         return owner;
     } catch (...) { return {}; }
 }
 bool NativeClassifier::start() noexcept {
     std::lock_guard<std::mutex> lock(mutex_); DWORD bytes = 0;
-    return device_ && serviceCaller() && DeviceIoControl(device_.value, GB_CLASSIFIER_START,
+    return device_ && serviceCaller() && classifierIo(device_.value, GB_CLASSIFIER_START,
         nullptr, 0, nullptr, 0, &bytes, nullptr);
 }
 bool NativeClassifier::scopeIoctl(DWORD code, const GB_SCOPE_DECISION &decision, GB_SCOPE_RECEIPT &receipt) noexcept {
@@ -48,7 +79,7 @@ bool NativeClassifier::scopeIoctl(DWORD code, const GB_SCOPE_DECISION &decision,
     auto copy = decision; DWORD bytes = 0;
     return device_ && serviceCaller() && decision.version == GB_CLASSIFIER_VERSION &&
         decision.bytes == sizeof(decision) && decision.session == session_ &&
-        DeviceIoControl(device_.value, code, &copy, sizeof(copy), &receipt, sizeof(receipt), &bytes, nullptr) &&
+        classifierIo(device_.value, code, &copy, sizeof(copy), &receipt, sizeof(receipt), &bytes, nullptr) &&
         bytes == sizeof(receipt) && std::memcmp(&receipt.decision, &decision, sizeof(decision)) == 0 &&
         receipt.state >= GB_SCOPE_COMPLETING && receipt.state <= GB_SCOPE_CLOSED &&
         receipt.applied <= 1 && receipt.current <= 1 && !receipt.reserved &&
@@ -81,7 +112,7 @@ bool NativeClassifier::activity(const ClassifierCause &cause,const GB_SCOPE_DECI
         };
         if(!original() || !catalogCurrent(cause,engine))return false;
         auto copy=decision;DWORD bytes=0;GB_ACTIVITY_SNAPSHOT observed{};
-        if(!DeviceIoControl(device_.value,GB_CLASSIFIER_ACTIVITY,&copy,sizeof(copy),&observed,sizeof(observed),&bytes,nullptr) ||
+        if(!classifierIo(device_.value,GB_CLASSIFIER_ACTIVITY,&copy,sizeof(copy),&observed,sizeof(observed),&bytes,nullptr) ||
            bytes!=sizeof(observed) || observed.version!=GB_ACTIVITY_VERSION || observed.bytes!=sizeof(observed) ||
            observed.reserved || (observed.flags & ~15u) || observed.loss!=cause.record_.loss ||
            std::memcmp(&observed.decision,&decision,sizeof(decision))!=0 ||
@@ -101,7 +132,7 @@ bool NativeClassifier::cancelIoctl(DWORD code, const GB_SCOPE_DECISION &decision
     auto copy = decision; DWORD bytes = 0;
     return device_ && serviceCaller() && decision.version == GB_CLASSIFIER_VERSION && decision.bytes == sizeof(decision) &&
         decision.session == session_ && decision.scope == 2 && !decision.durationMs &&
-        DeviceIoControl(device_.value, code, &copy, sizeof(copy), &receipt, sizeof(receipt), &bytes, nullptr) &&
+        classifierIo(device_.value, code, &copy, sizeof(copy), &receipt, sizeof(receipt), &bytes, nullptr) &&
         bytes == sizeof(receipt) && std::memcmp(&receipt.decision, &decision, sizeof(decision)) == 0 &&
         receipt.guarded == 1 && receipt.closed <= 1 && receipt.reauthDenied <= 1 && !receipt.reserved &&
         (receipt.reauthDenied ? receipt.deniedAt != 0 : receipt.deniedAt == 0);
@@ -119,8 +150,9 @@ bool NativeClassifier::cancelledCurrent(const ClassifierCause &cause, const GB_S
 }
 bool NativeClassifier::reset() noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
+    if(pendingApp_)pendingApp_->appState_.store(2);
     GB_CLASSIFIER_STATE state{}; DWORD bytes = 0;
-    if (!device_ || !serviceCaller() || !DeviceIoControl(device_.value, GB_CLASSIFIER_RESET, nullptr, 0,
+    if (!device_ || !serviceCaller() || !classifierIo(device_.value, GB_CLASSIFIER_RESET, nullptr, 0,
         &state, sizeof(state), &bytes, nullptr) || bytes != sizeof(state) || !state.session || state.loss) return false;
     session_ = state.session; loss_ = state.loss; return true;
 }
@@ -133,16 +165,26 @@ std::shared_ptr<ClassifierCause> NativeClassifier::take(bool &lost) noexcept {
     lost = false;
     try {
         std::unique_lock<std::mutex> lock(mutex_);
+        if(pendingApp_) {
+            const auto state=pendingApp_->appState_.load();
+            if(state==0)return {};
+            if(state!=1) {lost=true;return {};}
+            auto accepted=std::move(pendingApp_);lock.unlock();
+            if(!accepted->current()) {
+                accepted->appState_.store(2);lock.lock();pendingApp_=std::move(accepted);lost=true;return {};
+            }
+            return accepted;
+        }
         GB_CLASSIFIER_RECORD record{}; DWORD bytes = 0;
         if (!device_ || !serviceCaller()) { lost = true; return {}; }
-        if (!DeviceIoControl(device_.value, GB_CLASSIFIER_NEXT, nullptr, 0, &record, sizeof(record), &bytes, nullptr)) {
+        if (!classifierIo(device_.value, GB_CLASSIFIER_NEXT, nullptr, 0, &record, sizeof(record), &bytes, nullptr)) {
             lost = GetLastError() != ERROR_NO_MORE_ITEMS; return {};
         }
         gb::native::ProcessEvidence process;
         process.process.reset(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(record.processHandle)));
         GB_CLASSIFIER_QUERY query{record.session, record.cause};
         auto discard = [&] { DWORD ignored = 0;
-            DeviceIoControl(device_.value, GB_CLASSIFIER_RELEASE, &query, sizeof(query), nullptr, 0, &ignored, nullptr); };
+            classifierIo(device_.value, GB_CLASSIFIER_RELEASE, &query, sizeof(query), nullptr, 0, &ignored, nullptr); };
         struct Delivery {
             decltype(discard) &drop;
             bool transferred = false;
@@ -174,17 +216,12 @@ std::shared_ptr<ClassifierCause> NativeClassifier::take(bool &lost) noexcept {
             lost = true; return {};
         }
         token.reset(raw);
-        FWP_BYTE_BLOB *app = nullptr;
-        const auto appResult = FwpmGetAppIdFromFileName0(process.image.c_str(), &app);
-        const bool sameApp = appResult == ERROR_SUCCESS && app && app->size == record.appBytes &&
-            app->data && std::equal(record.app, record.app + record.appBytes, app->data);
-        if (app) FwpmFreeMemory0(reinterpret_cast<void **>(&app));
-        if (!sameApp || !gb::native::tokenEvidence(token.value, identity) ||
+        if (!gb::native::tokenEvidence(token.value, identity) ||
             identity.account != gb::wire::Bytes(record.user, record.user + record.userBytes) || !process.current()) {
             lost = true; return {};
         }
         DWORD ignored = 0;
-        if (!DeviceIoControl(device_.value, GB_CLASSIFIER_CURRENT, &query, sizeof(query), nullptr, 0, &ignored, nullptr)) {
+        if (!classifierIo(device_.value, GB_CLASSIFIER_CURRENT, &query, sizeof(query), nullptr, 0, &ignored, nullptr)) {
             lost = true; return {};
         }
         // Si falla el controlblock, shared_ptr destruye la causa y libera el
@@ -193,18 +230,23 @@ std::shared_ptr<ClassifierCause> NativeClassifier::take(bool &lost) noexcept {
         auto accepted = std::shared_ptr<ClassifierCause>(new ClassifierCause(shared_from_this(), record,
             std::move(process), std::move(identity)));
         delivery.transferred = true;
-        return accepted;
+        lock.lock();
+        if(pendingApp_ || !device_ || record.session!=session_ || record.loss!=loss_) {
+            lock.unlock();lost=true;return {};
+        }
+        pendingApp_=std::move(accepted);
+        return {}; // Ninguna metadata/proof/fila se deriva de PendingAppId.
     } catch (...) { lost = true; return {}; }
 }
 void NativeClassifier::release(const GB_CLASSIFIER_QUERY &q) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     auto copy = q; DWORD bytes = 0;
-    if (device_) DeviceIoControl(device_.value, GB_CLASSIFIER_RELEASE, &copy, sizeof(copy), nullptr, 0, &bytes, nullptr);
+    if (device_) classifierIo(device_.value, GB_CLASSIFIER_RELEASE, &copy, sizeof(copy), nullptr, 0, &bytes, nullptr);
 }
 bool NativeClassifier::current(const ClassifierCause &cause) const noexcept {
     try {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (cause.owner_.get() != this || cause.record_.session != session_ || cause.record_.loss != loss_ ||
+        if (cause.appState_.load()!=1 || cause.owner_.get() != this || cause.record_.session != session_ || cause.record_.loss != loss_ ||
             !device_ || !serviceCaller() || !cause.process_.current()) return false;
         gb::native::Handle token; HANDLE raw = nullptr; gb::native::TokenEvidence fresh;
         if (!OpenProcessToken(cause.process_.process.value, TOKEN_QUERY, &raw)) return false;
@@ -215,7 +257,7 @@ bool NativeClassifier::current(const ClassifierCause &cause) const noexcept {
         if (!QueryFullProcessImageNameW(cause.process_.process.value, 0, path, &n) || !n || n >= 32768 ||
             std::filesystem::path(std::wstring(path, n)) != cause.process_.image) return false;
         GB_CLASSIFIER_QUERY query{cause.record_.session, cause.record_.cause}; DWORD bytes = 0;
-        return DeviceIoControl(device_.value, GB_CLASSIFIER_CURRENT, &query, sizeof(query), nullptr, 0, &bytes, nullptr) &&
+        return classifierIo(device_.value, GB_CLASSIFIER_CURRENT, &query, sizeof(query), nullptr, 0, &bytes, nullptr) &&
             cause.process_.current();
     } catch (...) { return false; }
 }
@@ -333,5 +375,176 @@ bool NativeClassifier::catalogCurrent(const ClassifierCause &cause, HANDLE engin
             nc.flags != FWPM_CALLOUT_FLAG_REGISTERED) return false;
     }
     return true;
+}
+bool NativeClassifier::originalProcess(const ClassifierCause &cause) const noexcept {
+    try {
+        if(cause.owner_.get()!=this || !serviceCaller() || !cause.process_.current())return false;
+        gb::native::Handle token;HANDLE raw=nullptr;gb::native::TokenEvidence identity;
+        if(!OpenProcessToken(cause.process_.process.value,TOKEN_QUERY,&raw))return false;
+        token.reset(raw);wchar_t path[32768]{};DWORD n=32768;
+        return gb::native::tokenEvidence(token.value,identity) && identity.account==cause.token_.account &&
+            identity.logon==cause.token_.logon && identity.session==cause.token_.session &&
+            QueryFullProcessImageNameW(cause.process_.process.value,0,path,&n) && n && n<32768 &&
+            std::filesystem::path(std::wstring(path,n))==cause.process_.image && cause.process_.current();
+    } catch(...) {return false;}
+}
+bool NativeClassifier::imageCurrent(const ClassifierCause &cause,HANDLE engine,GB_PROCESS_IMAGE_FACTS &facts) const noexcept {
+    facts={};
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(cause.appState_.load()!=1 || !device_ || cause.owner_.get()!=this || cause.record_.session!=session_ || cause.record_.loss!=loss_ ||
+           !originalProcess(cause) || !catalogCurrent(cause,engine))return false;
+        auto query=GB_CLASSIFIER_QUERY{cause.record_.session,cause.record_.cause};DWORD bytes=0;GB_PROCESS_IMAGE_FACTS observed{};
+        if(!classifierIo(device_.value,GB_CLASSIFIER_IMAGE_CURRENT,&query,sizeof(query),&observed,sizeof(observed),&bytes,nullptr) ||
+           bytes!=sizeof(observed) || !validImage(observed,cause.record_) || !originalProcess(cause) ||
+           !catalogCurrent(cause,engine))return false;
+        facts=observed;return true;
+    } catch(...) {return false;}
+}
+NativeImageWorker::NativeImageWorker():state_(std::make_shared<State>()) {
+    state_->wake.reset(CreateEventW(nullptr,FALSE,FALSE,nullptr));
+    if(!state_->wake)throw std::runtime_error("No se pudo crear el evento del productor de imagen");
+    thread_=std::thread([state=state_]{run(state);});
+}
+NativeImageWorker::~NativeImageWorker() {stop();if(thread_.joinable())thread_.join();}
+std::uint64_t NativeImageWorker::submit(const std::shared_ptr<ClassifierCause> &cause) noexcept {
+    try {
+        if(!cause || !cause->owner_)return 0;
+        std::uint64_t submitted=0;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if(state_->stop || state_->physical || state_->finishing || state_->queued || state_->sequence==UINT64_MAX)return 0;
+        }
+        auto operation=std::make_shared<Operation>();auto owner=cause->owner_;
+        {
+            std::lock_guard<std::mutex> lock(owner->mutex_);HANDLE duplicate=nullptr;
+            if(!owner->device_ || !serviceCaller() || cause->record_.session!=owner->session_ || cause->record_.loss!=owner->loss_ ||
+               !DuplicateHandle(GetCurrentProcess(),owner->device_.value,GetCurrentProcess(),&duplicate,0,FALSE,DUPLICATE_SAME_ACCESS))return 0;
+            operation->device.reset(duplicate);
+        }
+        operation->event.reset(CreateEventW(nullptr,TRUE,FALSE,nullptr));if(!operation->event)return 0;
+        operation->overlap.hEvent=operation->event.value;operation->query={cause->record_.session,cause->record_.cause};
+        auto job=std::make_unique<Job>();job->cause=cause;job->operation=operation;
+        {
+            std::lock_guard<std::mutex> lock(state_->mutex);
+            if(state_->stop || state_->physical || state_->finishing || state_->queued || state_->sequence==UINT64_MAX)return 0;
+            job->id=++state_->sequence;submitted=job->id;state_->id=job->id;state_->eligible=true;state_->completed=false;state_->valid=false;
+            state_->result={};state_->physical=operation;state_->queued=std::move(job);
+        }
+        state_->changed.notify_one();return submitted;
+    } catch(...) {return 0;}
+}
+void NativeImageWorker::run(std::shared_ptr<State> state) noexcept {
+    for(;;) {
+        std::unique_ptr<Job> job;std::array<State::Retired,64> retired{};std::size_t count=0;
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->changed.wait(lock,[&]{return state->stop || state->queued || state->retiredCount;});
+            count=state->retiredCount;state->retiredCount=0;
+            for(std::size_t i=0;i<count;++i)retired[i]=std::move(state->retired[i]);
+            if(state->queued)job=std::move(state->queued);
+            else if(state->stop && !count)break;
+        }
+        std::size_t released=0,releasedProcesses=0;
+        for(std::size_t i=0;i<count;++i){released+=retired[i].charge;releasedProcesses+=retired[i].process;retired[i].owner.reset();}
+        if(released) {
+            {std::lock_guard<std::mutex> lock(state->mutex);state->releasedCharge+=released;state->releasedProcesses+=releasedProcesses;}
+            SetEvent(state->wake.value);
+        }
+        if(!job)continue;
+        bool eligible=false,valid=false;DWORD bytes=0;
+        {std::lock_guard<std::mutex> lock(state->mutex);eligible=!state->stop && state->eligible && state->id==job->id;}
+        const auto owner=job->cause->owner_;
+        if(eligible && owner->originalProcess(*job->cause)) {
+            FWP_BYTE_BLOB *app=nullptr;
+            const auto answer=FwpmGetAppIdFromFileName0(job->cause->process_.image.c_str(),&app);
+            bool sameApp=answer==ERROR_SUCCESS && app && app->data && app->size==job->cause->record_.appBytes &&
+                std::equal(job->cause->record_.app,job->cause->record_.app+job->cause->record_.appBytes,app->data);
+            if(app)FwpmFreeMemory0(reinterpret_cast<void **>(&app));
+            sameApp=sameApp && owner->originalProcess(*job->cause);
+            if(sameApp) {
+                std::lock_guard<std::mutex> lock(owner->mutex_);DWORD ignored=0;
+                sameApp=owner->device_ && owner->session_==job->cause->record_.session && owner->loss_==job->cause->record_.loss &&
+                    classifierIo(owner->device_.value,GB_CLASSIFIER_CURRENT,&job->operation->query,
+                        sizeof(job->operation->query),nullptr,0,&ignored,nullptr);
+            }
+            {
+                std::lock_guard<std::mutex> lock(state->mutex);
+                unsigned pending=0;
+                const bool admitted=sameApp && !state->stop && state->eligible && state->id==job->id;
+                job->cause->appState_.compare_exchange_strong(pending,admitted ? 1u : 2u);
+            }
+            SetEvent(state->wake.value); // Pull del AppId requerido, previo a IMAGE FS.
+            // La precondición AppId se publica antes de IMAGE FS opcional.
+            if(job->cause->appState_.load()!=1)sameApp=false;
+            if(sameApp) {
+            auto &operation=*job->operation;
+            const auto immediate=DeviceIoControl(operation.device.value,GB_CLASSIFIER_IMAGE_FACTS,&operation.query,sizeof(operation.query),
+                &operation.facts,sizeof(operation.facts),nullptr,&operation.overlap);
+            const auto error=immediate ? ERROR_SUCCESS : GetLastError();
+            bool abandoned=false;
+            {std::lock_guard<std::mutex> lock(state->mutex);abandoned=state->stop || !state->eligible || state->id!=job->id;}
+            // Cerrar también la carrera de cancel antes del submit OS real.
+            if(abandoned && (immediate || error==ERROR_IO_PENDING))CancelIoEx(operation.device.value,&operation.overlap);
+            if(immediate || error==ERROR_IO_PENDING)
+                valid=GetOverlappedResult(operation.device.value,&operation.overlap,&bytes,TRUE) && bytes==sizeof(operation.facts) &&
+                    validImage(operation.facts,job->cause->record_) && owner->originalProcess(*job->cause);
+            if(valid){std::lock_guard<std::mutex> lock(owner->mutex_);
+                valid=owner->device_ && owner->session_==job->cause->record_.session && owner->loss_==job->cause->record_.loss;}
+            }
+        } else {
+            unsigned pending=0;job->cause->appState_.compare_exchange_strong(pending,2u);
+        }
+        const auto id=job->id;const auto observed=job->operation->facts;std::shared_ptr<Operation> completed;
+        {
+            std::unique_lock<std::mutex> lock(state->mutex);
+            state->changed.wait(lock,[&]{return state->cancelBorrows==0;});
+            state->finishing=true;completed=std::move(state->physical);
+        }
+        // La destrucción final de cause y los préstamos físicos ocurre sin mutex.
+        job.reset();completed.reset();
+        {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            state->completed=true;state->finishing=false;
+            state->valid=valid && !state->stop && state->eligible && state->id==id;
+            state->result=state->valid ? observed : GB_PROCESS_IMAGE_FACTS{};
+        }
+        SetEvent(state->wake.value); // Completion física, sin callback/puntero Runtime.
+    }
+}
+bool NativeImageWorker::result(std::uint64_t id,GB_PROCESS_IMAGE_FACTS &facts,bool &valid) noexcept {
+    facts={};valid=false;std::lock_guard<std::mutex> lock(state_->mutex);
+    if(state_->id!=id || !state_->completed)return false;
+    valid=state_->valid;if(valid)facts=state_->result;return true;
+}
+void NativeImageWorker::abandon(std::uint64_t id) noexcept {
+    std::shared_ptr<Operation> operation;
+    {std::lock_guard<std::mutex> lock(state_->mutex);if(state_->id!=id)return;
+        state_->eligible=false;operation=state_->physical;if(operation)++state_->cancelBorrows;}
+    if(operation) {
+        CancelIoEx(operation->device.value,&operation->overlap);operation.reset();
+        {std::lock_guard<std::mutex> lock(state_->mutex);--state_->cancelBorrows;}
+        state_->changed.notify_one();
+    }
+}
+void NativeImageWorker::stop() noexcept {
+    std::shared_ptr<Operation> operation;
+    {std::lock_guard<std::mutex> lock(state_->mutex);state_->stop=true;state_->eligible=false;operation=state_->physical;
+        if(operation)++state_->cancelBorrows;}
+    if(operation) {
+        CancelIoEx(operation->device.value,&operation->overlap);operation.reset();
+        {std::lock_guard<std::mutex> lock(state_->mutex);--state_->cancelBorrows;}
+    }
+    state_->changed.notify_one();
+}
+bool NativeImageWorker::retire(std::shared_ptr<void> &owner,std::size_t charge,bool process) noexcept {
+    {std::lock_guard<std::mutex> lock(state_->mutex);
+        if(state_->stop || state_->retiredCount==state_->retired.size())return false;
+        state_->retired[state_->retiredCount++]={std::move(owner),charge,process};}
+    state_->changed.notify_one();return true;
+}
+std::size_t NativeImageWorker::releasedCharge(std::size_t &processes) noexcept {
+    std::lock_guard<std::mutex> lock(state_->mutex);const auto charge=state_->releasedCharge;state_->releasedCharge=0;
+    processes=state_->releasedProcesses;state_->releasedProcesses=0;return charge;
 }
 } // namespace gatebouncer::service::windows::allapps::native

@@ -32,6 +32,35 @@ C_ASSERT(FIELD_OFFSET(GB_ACTIVITY_SNAPSHOT,inboundUtc)==144);
 C_ASSERT(FIELD_OFFSET(GB_ACTIVITY_SNAPSHOT,inboundRevision)==152);
 C_ASSERT(FIELD_OFFSET(GB_ACTIVITY_SNAPSHOT,flags)==160);
 C_ASSERT(FIELD_OFFSET(GB_ACTIVITY_SNAPSHOT,reserved)==164);
+C_ASSERT(sizeof(GB_PROCESS_IMAGE_FACTS)==88);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,session)==8);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,cause)==16);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,loss)==24);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,created)==32);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,pid)==40);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,volumeSerialNumber)==48);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,fileIndexHigh)==52);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,fileIndexLow)==56);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,fileSizeHigh)==60);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,fileSizeLow)==64);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,reserved0)==68);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,lastWrite)==72);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,flags)==80);
+C_ASSERT(FIELD_OFFSET(GB_PROCESS_IMAGE_FACTS,reserved1)==84);
+typedef struct GB_IMAGE_ORIGIN {
+    PEPROCESS process;
+    PACCESS_TOKEN token;
+    PFILE_OBJECT file;
+    HANDLE handle;
+    UINT64 created;
+    ULONG slot, refs;
+    BOOLEAN registry;
+} GB_IMAGE_ORIGIN;
+typedef struct GB_IMAGE_SLOT { GB_IMAGE_ORIGIN *origin; ULONG state; } GB_IMAGE_SLOT;
+#define GB_IMAGE_OPENING 1u
+#define GB_IMAGE_ACTIVE 2u
+#define GB_IMAGE_RETIRED 3u
+#define GB_IMAGE_CLOSING 4u
 typedef struct GB_ENTRY {
     GB_CLASSIFIER_RECORD record;
     PEPROCESS process;
@@ -40,6 +69,9 @@ typedef struct GB_ENTRY {
     GB_SCOPE_RECEIPT receipt;
     GB_ACTIVITY_SNAPSHOT activity;
     GB_CANCEL_RECEIPT cancel;
+    GB_IMAGE_ORIGIN *imageOrigin;
+    GB_PROCESS_IMAGE_FACTS imageFacts;
+    BOOLEAN imageFactsValid;
     UINT64 pendingDeadline, parent;
     BOOLEAN delivered, revoked, closed, associated, completing, consumed, deadFlow;
     BOOLEAN cancelPin, futureRetired;
@@ -67,6 +99,9 @@ static PEPROCESS gbOwner;
 static PDEVICE_OBJECT gbDevice;
 static HANDLE gbEngine;
 static BOOLEAN gbStarted, gbFault;
+static BOOLEAN gbImageAdmission;
+static ULONG gbImageQuery;
+static GB_IMAGE_SLOT gbImages[GB_CLASSIFIER_CAPACITY];
 static KTIMER gbTimer;
 static KDPC gbDpc;
 static WORK_QUEUE_ITEM gbWork;
@@ -84,6 +119,84 @@ static BOOLEAN sameAuthorization(const GB_ENTRY *a,const GB_ENTRY *b) {
 }
 static void controlEnter(void) { KeEnterCriticalRegion(); ExAcquirePushLockExclusive(&gbControl); }
 static void controlLeave(void) { ExReleasePushLockExclusive(&gbControl); KeLeaveCriticalRegion(); }
+static void imageDropLocked(GB_IMAGE_ORIGIN *origin) {
+    if(origin && origin->refs && --origin->refs==0)gbImages[origin->slot].state=GB_IMAGE_RETIRED;
+}
+static void imageDrop(GB_IMAGE_ORIGIN *origin) {
+    KIRQL irql;if(!origin)return;
+    KeAcquireSpinLock(&gbLock,&irql);imageDropLocked(origin);KeReleaseSpinLock(&gbLock,irql);
+}
+// Ningún caller conserva gbControl; un slot Closing no se recicla por tiempo lógico.
+static void imageDrain(void) {
+    GB_IMAGE_ORIGIN *closing[GB_CLASSIFIER_CAPACITY];ULONG count=0,i;KIRQL irql;
+    if(KeGetCurrentIrql()!=PASSIVE_LEVEL || KeAreAllApcsDisabled())return;
+    KeAcquireSpinLock(&gbLock,&irql);
+    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)if(gbImages[i].state==GB_IMAGE_RETIRED) {
+        gbImages[i].state=GB_IMAGE_CLOSING;closing[count++]=gbImages[i].origin;
+    }
+    KeReleaseSpinLock(&gbLock,irql);
+    for(i=0;i<count;++i) {
+        GB_IMAGE_ORIGIN *origin=closing[i];ULONG slot=origin->slot;
+        if(origin->handle && ZwClose(origin->handle)!=STATUS_SUCCESS)continue;
+        origin->handle=NULL;
+        if(origin->file)ObDereferenceObject(origin->file);
+        if(origin->token)PsDereferencePrimaryToken(origin->token);
+        if(origin->process)ObDereferenceObject(origin->process);
+        ExFreePoolWithTag(origin,GB_TAG);
+        KeAcquireSpinLock(&gbLock,&irql);gbImages[slot].origin=NULL;gbImages[slot].state=0;
+        KeReleaseSpinLock(&gbLock,irql);
+    }
+}
+static void imageRegistryFaultLocked(void) {
+    ULONG i;gbImageAdmission=FALSE;
+    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)if(gbImages[i].state==GB_IMAGE_ACTIVE &&
+       gbImages[i].origin->registry) {
+        gbImages[i].origin->registry=FALSE;imageDropLocked(gbImages[i].origin);
+    }
+}
+static void imageAttach(GB_ENTRY *entry) {
+    KIRQL irql;ULONG i;KeAcquireSpinLock(&gbLock,&irql);
+    if(gbImageAdmission && !gbFault)for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
+        GB_IMAGE_ORIGIN *origin=gbImages[i].origin;
+        if(gbImages[i].state==GB_IMAGE_ACTIVE && origin->registry &&
+           origin->process==entry->process && origin->token==entry->token && origin->created==entry->record.created) {
+            ++origin->refs;entry->imageOrigin=origin;break;
+        }
+    }
+    KeReleaseSpinLock(&gbLock,irql);
+}
+static void imageCreate(PEPROCESS process,PPS_CREATE_NOTIFY_INFO info) {
+    GB_IMAGE_ORIGIN *origin;ULONG slot,i;KIRQL irql;NTSTATUS status;
+    if(!info || info->Size!=sizeof(*info) || info->IsSubsystemProcess ||
+       info->CreationStatus!=STATUS_SUCCESS || !info->FileObject ||
+       (info->FileObject->Flags & (FO_HANDLE_CREATED|FO_SYNCHRONOUS_IO))!=(FO_HANDLE_CREATED|FO_SYNCHRONOUS_IO) ||
+       (info->FileObject->Flags & (FO_CLEANUP_COMPLETE|FO_ALERTABLE_IO)) ||
+       KeGetCurrentIrql()!=PASSIVE_LEVEL || KeAreAllApcsDisabled())return;
+    KeAcquireSpinLock(&gbLock,&irql);slot=GB_CLASSIFIER_CAPACITY;
+    if(gbImageAdmission && !gbFault)for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)
+        if(!gbImages[i].state){slot=i;gbImages[i].state=GB_IMAGE_OPENING;break;}
+    KeReleaseSpinLock(&gbLock,irql);if(slot==GB_CLASSIFIER_CAPACITY)return;
+    origin=ExAllocatePool2(POOL_FLAG_NON_PAGED,sizeof(*origin),GB_TAG);
+    if(!origin) {
+        KeAcquireSpinLock(&gbLock,&irql);gbImages[slot].state=0;KeReleaseSpinLock(&gbLock,irql);return;
+    }
+    RtlZeroMemory(origin,sizeof(*origin));origin->slot=slot;origin->refs=1;
+    origin->process=process;ObReferenceObject(process);origin->created=(UINT64)PsGetProcessCreateTimeQuadPart(process);
+    origin->token=PsReferencePrimaryToken(process);origin->file=info->FileObject;ObReferenceObject(origin->file);
+    status=ObOpenObjectByPointer(origin->file,OBJ_KERNEL_HANDLE,NULL,FILE_READ_ATTRIBUTES|SYNCHRONIZE,
+        *IoFileObjectType,KernelMode,&origin->handle);
+    KeAcquireSpinLock(&gbLock,&irql);gbImages[slot].origin=origin;
+    if(status==STATUS_SUCCESS && origin->handle && gbImageAdmission && !gbFault && origin->created &&
+       !(origin->file->Flags & FO_CLEANUP_COMPLETE)) {
+        BOOLEAN duplicate=FALSE;
+        for(i=0;i<GB_CLASSIFIER_CAPACITY;++i)if(i!=slot && gbImages[i].state==GB_IMAGE_ACTIVE &&
+           gbImages[i].origin->registry && gbImages[i].origin->process==process &&
+           gbImages[i].origin->created==origin->created)duplicate=TRUE;
+        if(!duplicate){origin->registry=TRUE;gbImages[slot].state=GB_IMAGE_ACTIVE;}
+        else {origin->refs=0;gbImages[slot].state=GB_IMAGE_RETIRED;}
+    } else {origin->refs=0;gbImages[slot].state=GB_IMAGE_RETIRED;}
+    KeReleaseSpinLock(&gbLock,irql);
+}
 static void block(FWPS_CLASSIFY_OUT0 *out) {
     // Veto WFP permitido ante Permit ajeno aun sin ACTION_WRITE.
     if((out->rights & FWPS_RIGHT_ACTION_WRITE) || out->actionType==FWP_ACTION_PERMIT) {
@@ -104,6 +217,108 @@ static BOOLEAN currentEntry(GB_ENTRY *e) {
        (UINT64)PsGetProcessCreateTimeQuadPart(e->process)!=e->record.created) return FALSE;
     fresh=PsReferencePrimaryToken(e->process); same=fresh==e->token;
     PsDereferencePrimaryToken(fresh); return same;
+}
+typedef struct GB_FILE_IMAGE_STAMP {
+    FILE_INTERNAL_INFORMATION identity;
+    FILE_STANDARD_INFORMATION standard;
+    FILE_BASIC_INFORMATION basic;
+    UINT32 serial;
+} GB_FILE_IMAGE_STAMP;
+static BOOLEAN imageFileStamp(GB_IMAGE_ORIGIN *origin,GB_FILE_IMAGE_STAMP *stamp) {
+    IO_STATUS_BLOCK io;NTSTATUS status;
+    union { ULONGLONG alignment; UCHAR bytes[512]; } volume,attributes;
+    FILE_FS_VOLUME_INFORMATION *v=(FILE_FS_VOLUME_INFORMATION *)volume.bytes;
+    FILE_FS_ATTRIBUTE_INFORMATION *a=(FILE_FS_ATTRIBUTE_INFORMATION *)attributes.bytes;
+    if(KeGetCurrentIrql()!=PASSIVE_LEVEL || KeAreAllApcsDisabled() || !origin->handle ||
+       (origin->file->Flags & (FO_HANDLE_CREATED|FO_SYNCHRONOUS_IO))!=(FO_HANDLE_CREATED|FO_SYNCHRONOUS_IO) ||
+       (origin->file->Flags & (FO_ALERTABLE_IO|FO_CLEANUP_COMPLETE)))return FALSE;
+    RtlZeroMemory(stamp,sizeof(*stamp));RtlZeroMemory(&io,sizeof(io));
+    status=ZwQueryInformationFile(origin->handle,&io,&stamp->identity,sizeof(stamp->identity),FileInternalInformation);
+    if(status!=STATUS_SUCCESS || io.Status!=STATUS_SUCCESS || io.Information!=sizeof(stamp->identity) ||
+       !stamp->identity.IndexNumber.QuadPart)return FALSE;
+    RtlZeroMemory(&io,sizeof(io));
+    status=ZwQueryInformationFile(origin->handle,&io,&stamp->standard,sizeof(stamp->standard),FileStandardInformation);
+    if(status!=STATUS_SUCCESS || io.Status!=STATUS_SUCCESS || io.Information!=sizeof(stamp->standard) ||
+       stamp->standard.Directory || stamp->standard.EndOfFile.QuadPart<0)return FALSE;
+    RtlZeroMemory(&io,sizeof(io));
+    status=ZwQueryInformationFile(origin->handle,&io,&stamp->basic,sizeof(stamp->basic),FileBasicInformation);
+    if(status!=STATUS_SUCCESS || io.Status!=STATUS_SUCCESS || io.Information!=sizeof(stamp->basic) ||
+       stamp->basic.LastWriteTime.QuadPart<=0 ||
+       (stamp->basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)))return FALSE;
+    RtlZeroMemory(&attributes,sizeof(attributes));RtlZeroMemory(&io,sizeof(io));
+    status=ZwQueryVolumeInformationFile(origin->handle,&io,attributes.bytes,sizeof(attributes.bytes),FileFsAttributeInformation);
+    if(status!=STATUS_SUCCESS || io.Status!=STATUS_SUCCESS || io.Information>sizeof(attributes.bytes) ||
+       io.Information<FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION,FileSystemName)+8 || a->FileSystemNameLength!=8 ||
+       RtlCompareMemory(a->FileSystemName,L"NTFS",8)!=8)return FALSE;
+    RtlZeroMemory(&volume,sizeof(volume));RtlZeroMemory(&io,sizeof(io));
+    status=ZwQueryVolumeInformationFile(origin->handle,&io,volume.bytes,sizeof(volume.bytes),FileFsVolumeInformation);
+    if(status!=STATUS_SUCCESS || io.Status!=STATUS_SUCCESS || io.Information>sizeof(volume.bytes) ||
+       io.Information<FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION,VolumeLabel) ||
+       v->VolumeLabelLength>io.Information-FIELD_OFFSET(FILE_FS_VOLUME_INFORMATION,VolumeLabel))return FALSE;
+    stamp->serial=v->VolumeSerialNumber;return TRUE;
+}
+static BOOLEAN imageEntryLocked(GB_ENTRY *e,GB_IMAGE_ORIGIN *origin,const GB_PROCESS_IMAGE_FACTS *stamp) {
+    return gbStarted && !gbFault && gbFile && gbOwner && e && e->delivered && !e->revoked && !e->closed &&
+        !e->parent && (e->completion || e->receipt.applied) && origin && e->imageOrigin==origin && origin->registry && origin->handle &&
+        origin->file && (origin->file->Flags & (FO_HANDLE_CREATED|FO_SYNCHRONOUS_IO))==(FO_HANDLE_CREATED|FO_SYNCHRONOUS_IO) &&
+        !(origin->file->Flags & (FO_CLEANUP_COMPLETE|FO_ALERTABLE_IO)) &&
+        gbImages[origin->slot].state==GB_IMAGE_ACTIVE && origin->process==e->process && origin->token==e->token &&
+        origin->created==e->record.created && e->record.session==gbSession && e->record.loss==gbLoss &&
+        (!stamp || (e->record.session==stamp->session && e->record.cause==stamp->cause &&
+                    e->record.loss==stamp->loss && e->record.pid==stamp->pid && e->record.created==stamp->created));
+}
+// Devuelve con gbControl retenido; sólo la consulta FS y su drain lo sueltan.
+static NTSTATUS imageRead(PIRP irp,PIO_STACK_LOCATION stack,BOOLEAN fast,ULONG_PTR *bytes) {
+    GB_CLASSIFIER_QUERY query;GB_ENTRY *e;GB_IMAGE_ORIGIN *origin=NULL;
+    GB_PROCESS_IMAGE_FACTS facts={0};GB_FILE_IMAGE_STAMP before,after;
+    PEPROCESS owner=NULL;KIRQL irql;BOOLEAN identity,valid=FALSE;NTSTATUS status=STATUS_NOT_FOUND;
+    if(stack->Parameters.DeviceIoControl.InputBufferLength!=sizeof(query) ||
+       stack->Parameters.DeviceIoControl.OutputBufferLength!=sizeof(facts))return STATUS_INVALID_PARAMETER;
+    if(irp->Cancel)return STATUS_CANCELLED;
+    RtlCopyMemory(&query,irp->AssociatedIrp.SystemBuffer,sizeof(query));
+    KeAcquireSpinLock(&gbLock,&irql);e=byCause(query.session,query.cause);KeReleaseSpinLock(&gbLock,irql);
+    if(!e)return status;
+    identity=currentEntry(e);
+    KeAcquireSpinLock(&gbLock,&irql);
+    if(identity && imageEntryLocked(e,e->imageOrigin,NULL)) {
+        if(e->imageFactsValid) {
+            facts=e->imageFacts;valid=TRUE;
+        } else if(!fast && !gbImageQuery) {
+            origin=e->imageOrigin;++origin->refs;gbImageQuery=1;
+            owner=gbOwner;ObReferenceObject(owner);
+            facts.version=GB_PROCESS_IMAGE_VERSION;facts.bytes=sizeof(facts);facts.flags=GB_PROCESS_IMAGE_ORIGINAL;
+            facts.session=e->record.session;facts.cause=e->record.cause;facts.loss=e->record.loss;
+            facts.created=e->record.created;facts.pid=e->record.pid;
+        } else status=!fast && gbImageQuery ? STATUS_DEVICE_BUSY : STATUS_NOT_FOUND;
+    } else status=STATUS_INVALID_CID;
+    KeReleaseSpinLock(&gbLock,irql);
+    if(valid) {
+        if(irp->Cancel)return STATUS_CANCELLED;
+        RtlCopyMemory(irp->AssociatedIrp.SystemBuffer,&facts,sizeof(facts));*bytes=sizeof(facts);return STATUS_SUCCESS;
+    }
+    if(!origin)return status;
+    // No GB_ENTRY cruza esta ventana; maintenance puede retirar el original.
+    e=NULL;controlLeave();
+    valid=imageFileStamp(origin,&before) && imageFileStamp(origin,&after) &&
+        RtlCompareMemory(&before,&after,sizeof(before))==sizeof(before);
+    if(valid) {
+        facts.volumeSerialNumber=before.serial;facts.fileIndexHigh=before.identity.IndexNumber.HighPart;
+        facts.fileIndexLow=before.identity.IndexNumber.LowPart;facts.fileSizeHigh=before.standard.EndOfFile.HighPart;
+        facts.fileSizeLow=before.standard.EndOfFile.LowPart;facts.lastWrite=(UINT64)before.basic.LastWriteTime.QuadPart;
+    }
+    controlEnter();
+    KeAcquireSpinLock(&gbLock,&irql);e=byCause(query.session,query.cause);KeReleaseSpinLock(&gbLock,irql);
+    identity=e && currentEntry(e);status=irp->Cancel ? STATUS_CANCELLED : STATUS_INVALID_CID;
+    KeAcquireSpinLock(&gbLock,&irql);
+    if(!irp->Cancel && valid && identity && stack->FileObject==gbFile && owner==gbOwner && imageEntryLocked(e,origin,&facts)) {
+        if(!e->imageFactsValid){e->imageFacts=facts;e->imageFactsValid=TRUE;}
+        if(RtlCompareMemory(&e->imageFacts,&facts,sizeof(facts))==sizeof(facts)) {
+            RtlCopyMemory(irp->AssociatedIrp.SystemBuffer,&facts,sizeof(facts));*bytes=sizeof(facts);status=STATUS_SUCCESS;
+        }
+    }
+    gbImageQuery=0;imageDropLocked(origin);KeReleaseSpinLock(&gbLock,irql);
+    controlLeave();ObDereferenceObject(owner);imageDrain();controlEnter();
+    return status;
 }
 static BOOLEAN grantLive(GB_ENTRY *e,UINT64 now) {
     return gbFile && !gbFault && !e->revoked && e->record.session==gbSession && e->record.loss==gbLoss &&
@@ -178,6 +393,7 @@ static void loss(void) {
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) if(gbEntries[i]) revoke(gbEntries[i]);
 }
 static void freeEntry(GB_ENTRY *e) {
+    imageDrop(e->imageOrigin);
     PsDereferencePrimaryToken(e->token); ObDereferenceObject(e->process); ExFreePoolWithTag(e,GB_TAG);
 }
 static BOOLEAN serviceOwner(void) {
@@ -286,10 +502,21 @@ static GB_ENTRY *endpoint(const FWPS_INCOMING_METADATA_VALUES0 *m,const GB_TUPLE
 }
 static void NTAPI processExit(PEPROCESS process,HANDLE pid,PPS_CREATE_NOTIFY_INFO info) {
     KIRQL irql; ULONG i; UNREFERENCED_PARAMETER(pid);
-    if(info) return;
+    if(info) { imageDrain();imageCreate(process,info);imageDrain();return; }
     KeAcquireSpinLock(&gbLock,&irql);
-    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) if(gbEntries[i] && gbEntries[i]->process==process) revoke(gbEntries[i]);
+    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
+        if(gbEntries[i] && gbEntries[i]->process==process) {
+            GB_IMAGE_ORIGIN *origin=gbEntries[i]->imageOrigin;
+            gbEntries[i]->imageOrigin=NULL;gbEntries[i]->imageFactsValid=FALSE;
+            imageDropLocked(origin);revoke(gbEntries[i]);
+        }
+        if(gbImages[i].state==GB_IMAGE_ACTIVE && gbImages[i].origin->registry &&
+           gbImages[i].origin->process==process) {
+            gbImages[i].origin->registry=FALSE;imageDropLocked(gbImages[i].origin);
+        }
+    }
     KeReleaseSpinLock(&gbLock,irql);
+    imageDrain();
 }
 static void NTAPI flowDelete(UINT16 layer,UINT32 callout,UINT64 context) {
     KIRQL irql; ULONG i; UNREFERENCED_PARAMETER(layer); UNREFERENCED_PARAMETER(callout);
@@ -598,7 +825,7 @@ static GB_ENTRY *capture(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_META
     e->record.appBytes=app->size; RtlCopyMemory(e->record.app,app->data,app->size);
     e->record.userBytes=RtlLengthSid(user->User.Sid); RtlCopyMemory(e->record.user,user->User.Sid,e->record.userBytes);
     KeQuerySystemTimePrecise(&utc); e->record.timestamp=(UINT64)utc.QuadPart;
-    ExFreePool(user); return e;
+    imageAttach(e);ExFreePool(user); return e;
 fail:
     if(endpointToken) ObDereferenceObject(endpointToken);
     if(container) ExFreePool(container);
@@ -988,11 +1215,34 @@ static void NTAPI heldGuardClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_IN
     }
     KeReleaseSpinLock(&gbLock,irql);
 }
+static void imageSweep(void) {
+    ULONG i,j;KIRQL irql;
+    for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
+        GB_IMAGE_ORIGIN *origin=NULL;
+        KeAcquireSpinLock(&gbLock,&irql);
+        if(gbImages[i].state==GB_IMAGE_ACTIVE && gbImages[i].origin->registry) {
+            origin=gbImages[i].origin;++origin->refs;
+        }
+        KeReleaseSpinLock(&gbLock,irql);
+        if(!origin)continue;
+        if(PsGetProcessExitStatus(origin->process)!=STATUS_PENDING) {
+            KeAcquireSpinLock(&gbLock,&irql);
+            if(origin->registry){origin->registry=FALSE;imageDropLocked(origin);}
+            for(j=0;j<GB_CLASSIFIER_CAPACITY;++j)if(gbEntries[j] && gbEntries[j]->imageOrigin==origin) {
+                gbEntries[j]->imageOrigin=NULL;gbEntries[j]->imageFactsValid=FALSE;
+                imageDropLocked(origin);
+            }
+            KeReleaseSpinLock(&gbLock,irql);
+        }
+        imageDrop(origin);
+    }
+    // Sólo retiro lógico: el worker IMAGE/processNotify drena sin gbControl.
+}
 static void maintenance(void *ignored) {
     HANDLE completions[GB_CLASSIFIER_CAPACITY]; UINT64 aborts[GB_CLASSIFIER_CAPACITY];
     GB_ENTRY *packets[GB_CLASSIFIER_CAPACITY]; ULONG np=0;
     GB_ENTRY *discard[GB_CLASSIFIER_CAPACITY]; ULONG nc=0,na=0,nd=0,i; KIRQL irql; UINT64 now=KeQueryInterruptTime();
-    UNREFERENCED_PARAMETER(ignored); controlEnter();
+    UNREFERENCED_PARAMETER(ignored); controlEnter();imageSweep();
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
         GB_ENTRY *e;
         KeAcquireSpinLock(&gbLock,&irql); e=gbEntries[i]; KeReleaseSpinLock(&gbLock,irql);
@@ -1080,6 +1330,8 @@ static NTSTATUS NTAPI dispatch(PDEVICE_OBJECT device,PIRP irp) {
             for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) if(gbEntries[i]) revoke(gbEntries[i]);
             state->session=gbSession; state->loss=gbLoss; KeReleaseSpinLock(&gbLock,irql);
             bytes=sizeof(*state); status=STATUS_SUCCESS;
+        } else if(code==GB_CLASSIFIER_IMAGE_FACTS || code==GB_CLASSIFIER_IMAGE_CURRENT) {
+            status=imageRead(irp,s,code==GB_CLASSIFIER_IMAGE_CURRENT,&bytes);
         } else if(code==GB_CLASSIFIER_NEXT && !s->Parameters.DeviceIoControl.InputBufferLength &&
             s->Parameters.DeviceIoControl.OutputBufferLength==sizeof(GB_CLASSIFIER_RECORD)) {
             status=STATUS_NO_MORE_ENTRIES;
@@ -1250,6 +1502,7 @@ static NTSTATUS startClassifier(void) {
         if(NT_SUCCESS(status))status=FwpsInjectionHandleCreate0(AF_INET6,FWPS_INJECTION_TYPE_TRANSPORT,&gbInjection[1]);
         if(!NT_SUCCESS(status))goto fail;
     }
+    { KIRQL irql;KeAcquireSpinLock(&gbLock,&irql);gbImageAdmission=TRUE;KeReleaseSpinLock(&gbLock,irql); }
     status=PsSetCreateProcessNotifyRoutineEx(processExit,FALSE); if(!NT_SUCCESS(status)) goto fail;
     status=FwpmTransactionBegin0(gbEngine,0); if(!NT_SUCCESS(status)) goto fail;
     provider.providerKey=GbClassifierProvider; provider.displayData.name=L"LGA GateBouncer scoped classifier";
@@ -1290,7 +1543,8 @@ fail:
         for(i=0;i<2;++i)if(gbInjection[i]){FwpsInjectionHandleDestroy0(gbInjection[i]);gbInjection[i]=NULL;}
         if(gbPacketPool){NdisFreeNetBufferListPool(gbPacketPool);gbPacketPool=NULL;}
     }
-    gbFault=TRUE; return status;
+    { KIRQL irql;KeAcquireSpinLock(&gbLock,&irql);gbFault=TRUE;imageRegistryFaultLocked();KeReleaseSpinLock(&gbLock,irql); }
+    return status;
 }
 NTSTATUS DriverEntry(PDRIVER_OBJECT driver,PUNICODE_STRING registry) {
     UNICODE_STRING deviceName=RTL_CONSTANT_STRING(L"\\Device\\LgaGateBouncerClassifier");

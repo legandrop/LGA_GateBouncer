@@ -62,6 +62,7 @@ class NativeRuntime {
     };
     struct PrincipalObservation;
     struct PrincipalOutcome;
+    struct PrincipalProcessRetainer;
     struct PrincipalAdmission {
         Id request{}, binding{};
         std::uint64_t revision = 0, profile = 0;
@@ -92,6 +93,15 @@ class NativeRuntime {
     void publishPrincipalAuthorization(PrincipalOutcome &) noexcept;
     void pollPrincipalTraffic() noexcept;
     bool principalTrafficReady() const noexcept;
+    bool principalProcessReady() const noexcept;
+    void publishPrincipalAttempt(PrincipalObservation &, const GB_PROCESS_IMAGE_FACTS * = nullptr) noexcept;
+    void pollPrincipalImages() noexcept;
+    void pollPrincipalPendingApp() noexcept;
+    void finishPrincipalImages() noexcept;
+    void prunePrincipalProcesses() noexcept;
+    Frame readPrincipalProcess(const Frame &, const std::shared_ptr<PrincipalPeer> &);
+    bool principalProcessCurrent(const PrincipalProcessRetainer &, GB_PROCESS_IMAGE_FACTS &) noexcept;
+    bool processBudget(std::size_t extra, std::size_t prior=0) const noexcept;
     static std::size_t activityCauseBytes(const allnative::ClassifierCause &) noexcept;
     void invalidatePrincipalObservations() noexcept;
     bool ordinaryPeer(HANDLE, std::shared_ptr<PrincipalPeer> &, bool readonly = false);
@@ -117,6 +127,27 @@ class NativeRuntime {
     std::map<Id, std::shared_ptr<PrincipalObservation>> principalObservations_;
     std::uint64_t principalObservedRevision_ = 0;
     std::size_t principalPendingBytes_ = 0;
+    std::unique_ptr<allnative::NativeImageWorker> principalImageWorker_;
+    std::size_t principalImageBaseCharge_=0,principalImageJobCharge_=0,principalProcessBytes_=0,principalRetiredBytes_=0;
+    std::uint64_t principalImageJobId_=0;
+    std::uint64_t principalImageSession_=0,principalImageCause_=0,principalAppDeadline_=0;
+    std::size_t principalPendingAppBytes_=0;
+    std::size_t principalProcessPhysical_=0;
+    bool principalAppCapacityGap_=false;
+    bool principalProcessAcquired_=false;
+    struct PrincipalProcessRetainer {
+        Frame attempt;
+        std::shared_ptr<allnative::NativeSource> source;
+        std::shared_ptr<const allnative::CatalogSnapshot> catalog;
+        std::shared_ptr<allnative::ClassifierCause> cause;
+        std::optional<allnative::NativeCopiedMetadata> event;
+        std::optional<allnative::NativeProof> proof;
+        GB_PROCESS_IMAGE_FACTS original{};
+        std::size_t charged=0;
+        bool retired=false;
+    };
+    std::map<Id,std::shared_ptr<PrincipalProcessRetainer>> principalProcesses_;
+    Id principalProcessCursor_{};
     NativeActivityRing principalEvents_;
     bool principalTrafficAcquired_ = false;
     std::size_t principalMask3Subscribers_=0;

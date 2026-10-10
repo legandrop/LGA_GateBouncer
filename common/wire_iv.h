@@ -5,6 +5,14 @@ namespace gb::wire::iv {
 constexpr std::size_t MaxRecordsBytes = 57344;
 constexpr std::uint64_t NativeEvents = 1ull << 25;
 constexpr std::uint64_t NativeTraffic = 1ull << 26;
+constexpr std::uint64_t NativeProcessFacts = 1ull << 27;
+// Archivo original custodiado por fuente; no es un HANDLE de imagen del caller.
+struct ProcessFacts {
+  std::uint64_t pid=0, created=0, lastWrite=0;
+  std::uint32_t volumeSerial=0, fileIndexHigh=0, fileIndexLow=0,
+                fileSizeHigh=0, fileSizeLow=0, tokenSession=0;
+  Bytes appId, image, accountSid, logonSid;
+};
 // Enlace histórico a secuencia; no es un identificador de autorización.
 Id attemptLink(std::uint64_t sequence);
 std::uint64_t attemptSequence(const Id &link);
@@ -60,15 +68,19 @@ bool supported(Type type);
 bool valid(const ObservedRecord &record);
 bool valid(const FutureDraftRecord &record);
 bool valid(const PrincipalRuleRecord &record);
+bool valid(const ProcessFacts &record);
 Error pack(const std::vector<ObservedRecord> &records, Bytes &out);
 Error pack(const std::vector<FutureDraftRecord> &records, Bytes &out);
 Error pack(const std::vector<PrincipalRuleRecord> &records, Bytes &out);
+Error pack(const std::vector<ProcessFacts> &records, Bytes &out);
 Error unpack(const Bytes &bytes, std::size_t count,
              std::vector<ObservedRecord> &out);
 Error unpack(const Bytes &bytes, std::size_t count,
              std::vector<FutureDraftRecord> &out);
 Error unpack(const Bytes &bytes, std::size_t count,
              std::vector<PrincipalRuleRecord> &out);
+Error unpack(const Bytes &bytes, std::size_t count,
+             std::vector<ProcessFacts> &out);
 Error validate(const Frame &frame);
 // Sólo canoniza un comando de formato; no adquiere actor, target ni
 // consentimiento.
