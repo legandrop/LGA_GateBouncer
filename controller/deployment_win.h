@@ -4,7 +4,7 @@
 #include <memory>
 #include <mutex>
 namespace gb::controller {
-namespace deployment_detail { class AdministrativeLease; }
+namespace deployment_detail { class AdministrativeLease; bool productDriverPlatform(); }
 // Inventory nativo cerrado, provisto por despliegue administrativo protegido.
 using Inventory = std::map<std::wstring, wire::Digest>;
 bool parseInventory(const wire::Bytes &bytes, Inventory &inventory);

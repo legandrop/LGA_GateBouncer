@@ -4,8 +4,17 @@
 #include <set>
 #include <sddl.h>
 #include <cstddef>
+#include <newdev.h>
 namespace gb::controller {
 namespace {
+struct DriverInstallModule {
+    HMODULE value = LoadLibraryExW(L"newdev.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    ~DriverInstallModule() { if (value) FreeLibrary(value); }
+    bool close() { const auto original = value; value = nullptr; return original && FreeLibrary(original); }
+    DriverInstallModule() = default;
+    DriverInstallModule(const DriverInstallModule &) = delete;
+    DriverInstallModule &operator=(const DriverInstallModule &) = delete;
+};
 struct Descriptor {
     PSECURITY_DESCRIPTOR value = nullptr;
     explicit Descriptor(const wchar_t *text) {
@@ -301,6 +310,54 @@ bool stagePackage(const std::filesystem::path &source,const std::filesystem::pat
     OutputPins held;
     return stagePackageRetained(source,package,owner,held,mode);
 }
+}
+bool Deployment::installProductDriver(const deployment_detail::AdministrativeLease &lease,HKEY configuration) {
+    const std::lock_guard<std::recursive_mutex> lock(currentMutex_);
+    const auto admitted = [&]() {
+        bool present = false; DWORD state = 0, initial = 0, size = sizeof(initial);
+        wchar_t root[32768]{}, ordinary[32768]{}; DWORD rootSize = sizeof(root), ordinarySize = sizeof(ordinary);
+        return mode_ == DeploymentMode::Product && role_ == DeploymentRole::Service && current() &&
+            lease.ownsConfiguration(configuration) && maintenanceState(configuration,present,state) && present && state == 1 &&
+            RegGetValueW(configuration,nullptr,L"ProvisionPrincipal",RRF_RT_REG_DWORD,nullptr,&initial,&size) == ERROR_SUCCESS &&
+            size == sizeof(initial) && initial == 1 &&
+            RegGetValueW(configuration,nullptr,L"PackageRoot",RRF_RT_REG_SZ,nullptr,root,&rootSize) == ERROR_SUCCESS &&
+            rootSize == (root_.native().size()+1)*sizeof(wchar_t) && root_.native() == root &&
+            RegGetValueW(configuration,nullptr,L"OrdinaryImage",RRF_RT_REG_SZ,nullptr,ordinary,&ordinarySize) == ERROR_SUCCESS &&
+            ordinarySize == ((root_/L"GateBouncer.exe").native().size()+1)*sizeof(wchar_t) && (root_/L"GateBouncer.exe").native() == ordinary;
+    };
+    if (driver_ || !admitted() || !driverPackageSigned() || !admitted()) return false;
+    SC_HANDLE manager = OpenSCManagerW(nullptr,nullptr,SC_MANAGER_CONNECT);
+    if (!manager) return false;
+    SC_HANDLE prior = OpenServiceW(manager,L"LGAGateBouncerClassifier",SERVICE_QUERY_CONFIG | SERVICE_QUERY_STATUS | READ_CONTROL);
+    const auto priorError = prior ? ERROR_SERVICE_EXISTS : GetLastError();
+    const auto absent = !prior && priorError == ERROR_SERVICE_DOES_NOT_EXIST;
+    if (prior) CloseServiceHandle(prior);
+    CloseServiceHandle(manager);
+    if (!absent) { SetLastError(priorError); return false; }
+    if (!deployment_detail::productDriverPlatform()) return false;
+    DriverInstallModule api;
+    if (!api.value) return false;
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable:4191)
+#endif
+    const auto install = reinterpret_cast<decltype(&DiInstallDriverW)>(GetProcAddress(api.value,"DiInstallDriverW"));
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    BOOL reboot = FALSE;
+    // Custodia: el staging NT-relative nació con ACL protegida, sólo SY/BA pueden mutar.
+    // Sus handles/FileIDs permanecen retenidos durante el reopen Windows. SY/BA/TI son
+    // TCB de instalación, no actores exentos de la política de tráfico. No se garantiza
+    // continuidad contra un administrador/TCB comprometido; ShareRead no bloquea atributos.
+    const bool installed = install && admitted() && install(nullptr,(root_/L"driver"/L"GateBouncerClassifier.inf").c_str(),0,&reboot);
+    const auto error = GetLastError();
+    const bool unloaded = api.close();
+    if (!installed || !unloaded) { SetLastError(error ? error : ERROR_INVALID_STATE); return false; }
+    if (!admitted() || !admitProductDriver() || !driverInstalledCurrent() || !admitted()) return false;
+    if (reboot) { SetLastError(ERROR_SUCCESS_REBOOT_REQUIRED); return false; }
+    // El resultado sólo admite registro/archivos DriverStore originales; no ReadyOS/CI.
+    return true;
 }
 static bool prepareDeployment(DeploymentMode mode, const std::filesystem::path &source,const std::filesystem::path &package,
     const std::filesystem::path &store,const std::wstring &accountSid) {
