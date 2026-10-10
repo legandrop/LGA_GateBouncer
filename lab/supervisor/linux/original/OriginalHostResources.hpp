@@ -58,8 +58,37 @@ inline std::wstring Quote(const std::wstring&s) {
 }
 inline bool SameFile(const BY_HANDLE_FILE_INFORMATION&a,const BY_HANDLE_FILE_INFORMATION&b,bool mutableLeaf=false) {
     return a.dwVolumeSerialNumber==b.dwVolumeSerialNumber&&a.nFileIndexHigh==b.nFileIndexHigh&&a.nFileIndexLow==b.nFileIndexLow&&a.dwFileAttributes==b.dwFileAttributes&&
-        (mutableLeaf||(a.nFileSizeHigh==b.nFileSizeHigh&&a.nFileSizeLow==b.nFileSizeLow&&CompareFileTime(&a.ftLastWriteTime,&b.ftLastWriteTime)==0));
+        (mutableLeaf||(a.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)||(a.nFileSizeHigh==b.nFileSizeHigh&&a.nFileSizeLow==b.nFileSizeLow&&CompareFileTime(&a.ftLastWriteTime,&b.ftLastWriteTime)==0));
 }
+inline bool ClosedAbsolutePath(const std::wstring&path) {
+    if(path.size()<4||path[0]<L'A'||path[0]>L'Z'||path[1]!=L':'||path[2]!=L'\\'||path.back()==L'\\')return false;
+    std::size_t start=3;
+    for(std::size_t i=3;i<=path.size();++i)if(i==path.size()||path[i]==L'\\') {
+        const auto leaf=path.substr(start,i-start);if(leaf.empty()||leaf==L"."||leaf==L".."||leaf.back()==L'.'||leaf.back()==L' ')return false;
+        for(wchar_t c:leaf)if(c<32||std::wstring(L"/:*?\"<>|").find(c)!=std::wstring::npos)return false;start=i+1;
+    }return true;
+}
+inline Handle RelativeFile(HANDLE parent,const std::wstring&leaf,bool directory,bool create,DWORD share,ACCESS_MASK access) {
+    if(!parent||leaf.empty()||leaf.size()>255||leaf==L"."||leaf==L".."||leaf.find_first_of(L"\\/:")!=std::wstring::npos)return {};
+    const auto call=reinterpret_cast<NTSTATUS(NTAPI*)(PHANDLE,ACCESS_MASK,POBJECT_ATTRIBUTES,PIO_STATUS_BLOCK,PLARGE_INTEGER,ULONG,ULONG,ULONG,ULONG,PVOID,ULONG)>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"),"NtCreateFile"));
+    if(!call)return {};UNICODE_STRING name{};name.Buffer=const_cast<PWSTR>(leaf.data());name.Length=static_cast<USHORT>(leaf.size()*sizeof(wchar_t));name.MaximumLength=name.Length;
+    OBJECT_ATTRIBUTES attrs{};attrs.Length=sizeof(attrs);attrs.RootDirectory=parent;attrs.ObjectName=&name;attrs.Attributes=0x40|0x1000; // CASE_INSENSITIVE | DONT_REPARSE
+    IO_STATUS_BLOCK status{};HANDLE handle=nullptr;
+    const ULONG options=(directory?1u:0x40u)|0x20u|0x200000u; // DIRECTORY/NON_DIRECTORY, SYNCHRONOUS, OPEN_REPARSE_POINT
+    const auto result=call(&handle,access|SYNCHRONIZE,&attrs,&status,nullptr,directory?FILE_ATTRIBUTE_DIRECTORY:FILE_ATTRIBUTE_NORMAL,share,create?2u:1u,options,nullptr,0);
+    return result==0?Handle(handle):Handle();
+}
+struct PipeTransfer final {
+    OVERLAPPED io{};Handle event;std::array<BYTE,MaximumChunk>bytes{};DWORD size=0;bool pending=false;
+    bool Drain(HANDLE pipe) {
+        if(!pending)return true;
+        CancelIoEx(pipe,&io);DWORD count=0;
+        if(GetOverlappedResult(pipe,&io,&count,FALSE)){pending=false;return true;}
+        const DWORD error=GetLastError();
+        if(error==ERROR_OPERATION_ABORTED||error==ERROR_BROKEN_PIPE||error==ERROR_NO_DATA){pending=false;return true;}
+        return false; // Owner, pipe, evento y buffer continúan retenidos, aun si CancelIoEx falla.
+    }
+};
 // Cada enlace se vuelve a abrir y comparar contra su padre retenido; sin reparse ni DELETE share.
 class File final {
 public:
@@ -75,12 +104,27 @@ public:
         return nodes_.size()>1&&Current();
     }
     bool Current()const {
+        Handle parent;
         for(std::size_t i=0;i<nodes_.size();++i) {
             BY_HANDLE_FILE_INFORMATION held{},now{};
             if(!GetFileInformationByHandle(nodes_[i].handle.h,&held)||!SameFile(nodes_[i].id,held,mutable_&&i+1==nodes_.size()))return false;
-            Handle again(CreateFileW(nodes_[i].path.c_str(),FILE_READ_ATTRIBUTES,FILE_SHARE_READ|((mutable_||writerBacked_)&&i+1==nodes_.size()?FILE_SHARE_WRITE:0),nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,nullptr));
+            const DWORD share=FILE_SHARE_READ|((mutable_||writerBacked_)&&i+1==nodes_.size()?FILE_SHARE_WRITE:0);
+            const bool directory=(nodes_[i].id.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+            const ACCESS_MASK access=FILE_READ_ATTRIBUTES|(directory?FILE_TRAVERSE:0);
+            Handle again=i?RelativeFile(parent.h,std::filesystem::path(nodes_[i].path).filename().wstring(),directory,false,share,access):Handle(CreateFileW(nodes_[i].path.c_str(),access|SYNCHRONIZE,share,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|FILE_FLAG_BACKUP_SEMANTICS,nullptr));
             if(!again.h||!GetFileInformationByHandle(again.h,&now)||now.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT||!SameFile(nodes_[i].id,now,mutable_&&i+1==nodes_.size()))return false;
+            parent=std::move(again);
         }return true;
+    }
+    bool CreateDirectoryChild(const File&parent,const std::wstring&leaf) {
+        if(!nodes_.empty()||!parent.Current()||!parent.Raw())return false;
+        // Retiene la cadena original antes del único efecto; FILE_CREATE no adopta una carpeta existente.
+        for(const auto&old:parent.nodes_) {HANDLE h=nullptr;if(!DuplicateHandle(GetCurrentProcess(),old.handle.h,GetCurrentProcess(),&h,0,FALSE,DUPLICATE_SAME_ACCESS))return false;
+            Node n;n.handle=Handle(h);n.id=old.id;n.path=old.path;nodes_.push_back(std::move(n));}
+        if(!parent.Current())return false;
+        Node n;n.path=(std::filesystem::path(parent.Path())/leaf).wstring();n.handle=RelativeFile(parent.Raw(),leaf,true,true,FILE_SHARE_READ,GENERIC_READ);
+        if(!n.handle.h||!GetFileInformationByHandle(n.handle.h,&n.id)||(n.id.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT)||!(n.id.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY))return false;
+        path_=n.path;nodes_.push_back(std::move(n));return parent.Current()&&Current();
     }
     HANDLE Raw()const{return nodes_.empty()?nullptr:nodes_.back().handle.h;}
     const std::wstring& Path()const{return path_;}
@@ -90,6 +134,15 @@ public:
         nodes_.back().handle=Handle(duplicate);return Current();
     }
     std::uint64_t Size()const {LARGE_INTEGER n{};return GetFileSizeEx(Raw(),&n)&&n.QuadPart>=0?static_cast<std::uint64_t>(n.QuadPart):UINT64_MAX;}
+    bool QcowWithinCap()const {
+        constexpr std::uint64_t cap=64ull*1024*1024*1024;const ULONGLONG before=GetTickCount64();FILE_STANDARD_INFO standard{};
+        if(!Current()||!GetFileInformationByHandleEx(Raw(),FileStandardInfo,&standard,sizeof(standard))||standard.Directory||standard.EndOfFile.QuadPart<104||standard.AllocationSize.QuadPart<0||
+           static_cast<std::uint64_t>(standard.EndOfFile.QuadPart)>cap||static_cast<std::uint64_t>(standard.AllocationSize.QuadPart)>cap)return false;
+        LARGE_INTEGER zero{};std::array<BYTE,104>header{};DWORD count=0;
+        if(!SetFilePointerEx(Raw(),zero,nullptr,FILE_BEGIN)||!ReadFile(Raw(),header.data(),static_cast<DWORD>(header.size()),&count,nullptr)||count!=header.size())return false;
+        auto be=[&](unsigned p,unsigned n){std::uint64_t v=0;while(n--)v=(v<<8)|header[p++];return v;};
+        return header[0]=='Q'&&header[1]=='F'&&header[2]=='I'&&header[3]==0xfb&&be(4,4)==3&&be(24,8)&&be(24,8)<=cap&&Current()&&GetTickCount64()-before<=1000;
+    }
     bool Read(Bytes& bytes,std::size_t cap)const {
         if(!Current()||Size()>cap)return false;LARGE_INTEGER zero{};if(!SetFilePointerEx(Raw(),zero,nullptr,FILE_BEGIN))return false;
         bytes.resize(static_cast<std::size_t>(Size()));std::size_t at=0;
@@ -111,7 +164,8 @@ public:
 private:
     struct Node {Handle handle;BY_HANDLE_FILE_INFORMATION id{};std::wstring path;};std::vector<Node>nodes_;std::wstring path_;bool mutable_=false,writerBacked_=false;
     bool Add(const std::wstring&p,bool dir,bool mutableLeaf) {
-        Node n;n.path=p;n.handle=Handle(CreateFileW(p.c_str(),GENERIC_READ,FILE_SHARE_READ|(mutableLeaf?FILE_SHARE_WRITE:0),nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|(dir?FILE_FLAG_BACKUP_SEMANTICS:0),nullptr));
+        Node n;n.path=p;const DWORD share=FILE_SHARE_READ|(mutableLeaf?FILE_SHARE_WRITE:0);
+        n.handle=nodes_.empty()?Handle(CreateFileW(p.c_str(),GENERIC_READ,share,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT|(dir?FILE_FLAG_BACKUP_SEMANTICS:0),nullptr)):RelativeFile(nodes_.back().handle.h,std::filesystem::path(p).filename().wstring(),dir,false,share,GENERIC_READ);
         if(!n.handle.h||!GetFileInformationByHandle(n.handle.h,&n.id)||n.id.dwFileAttributes&FILE_ATTRIBUTE_REPARSE_POINT||static_cast<bool>(n.id.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)!=dir)return false;
         nodes_.push_back(std::move(n));return true;
     }

@@ -92,10 +92,16 @@ struct OwnHostLinuxOriginal::Impl {
     State state=State::Reserved;DWORD thread=GetCurrentThreadId(),pid=GetCurrentProcessId();Handle self;std::uint64_t created=0;native::TokenEvidence token;std::wstring image,desktop,media,work,agentName,proxyName,uuid,mac;
     ULONGLONG acquisitionEnd=GetTickCount64()+180000,bootEnd=0;bool bootSubmitted=false,authenticated=false,linuxReady=false,modulesConfirmed=false,closing=false,sshCredit=true,guestEof=false;
     std::uint64_t request=0,generation=0,sendSequence=1,receiveSequence=1;std::string hostLine,clientLine,bootId;std::uint64_t guestStart=0,uid=0,gid=0;
-    File selfFile,root,source,archive,sums,signature,keyring,guest,capture,sshImage,proxyImage;
+    File selfFile,outputParent,root,source,archive,sums,signature,keyring,guest,capture,sshImage,proxyImage;
     std::vector<std::unique_ptr<File>>pins;std::map<std::string,File*>bundle;File*disk=nullptr,*seed=nullptr,*config=nullptr,*knownHosts=nullptr;
     Child qemu,ssh;std::vector<std::unique_ptr<Child>>tools;Handle qemuInput,qemuOutput,qemuError,sshInput,sshOutput,sshError,proxyPipe,proxyProcess,stop;
     std::uint64_t proxyCreated=0;DWORD proxyPid=0;OVERLAPPED proxyConnect{};Handle proxyEvent;bool connectPending=false;
+    PipeTransfer proxyRead,proxyWrite;mutable ULONGLONG diskChecked=0;
+    bool DiskCurrent()const {
+        const ULONGLONG now=GetTickCount64();
+        if(!disk||(diskChecked&&now-diskChecked>1000)||!disk->QcowWithinCap())return false;
+        diskChecked=GetTickCount64();return true;
+    }
     std::shared_ptr<OwnMemorySshCredential> credential;Bytes pendingQemu,sshCapture,sshDiagnostics;std::deque<Bytes>toProxy;std::string line;std::vector<Handle>consumed;
 };
 OwnHostLinuxOriginal::OwnHostLinuxOriginal():own_(new Impl){}
@@ -105,13 +111,14 @@ bool OwnHostLinuxOriginal::OriginalCurrentOwn()const {
     if(cancelled_.load()||GetCurrentThreadId()!=o.thread||!o.self.h||Created(o.self.h)!=o.created||GetProcessId(o.self.h)!=o.pid||Image(o.self.h)!=o.image||
        !Token(o.self.h,token)||!EqualToken(o.token,token)||!InOriginalBase(o.self.h,o.pid)||Desktop(o.thread)!=o.desktop||!o.selfFile.Current())return false;
     if(GetTickCount64()>=(o.bootSubmitted?o.bootEnd:o.acquisitionEnd))return false;
-    for(const auto*f:{&o.root,&o.source,&o.archive,&o.sums,&o.signature,&o.keyring,&o.guest,&o.capture,&o.sshImage,&o.proxyImage})if(f->Raw()&&!f->Current())return false;
+    for(const auto*f:{&o.outputParent,&o.root,&o.source,&o.archive,&o.sums,&o.signature,&o.keyring,&o.guest,&o.capture,&o.sshImage,&o.proxyImage})if(f->Raw()&&!f->Current())return false;
     for(const auto&p:o.pins)if(!p->Current())return false;
     if(!o.bootSubmitted)return true;
+    if(!o.DiskCurrent())return false;
     const auto qemu=o.bundle.find("qemu-system-x86_64.exe");
     if(qemu==o.bundle.end()||!o.qemu.Current()||(o.modulesConfirmed&&!LoadedOwn(o.qemu,o.pins,*qemu->second)))return false;
-    if(o.ssh.process.h){DWORD terminal=0;if(!o.ssh.Current())return o.ssh.Terminal(terminal);if(o.proxyProcess.h&&!LoadedOwn(o.ssh,o.pins,o.sshImage))return false;}
-    return true;
+    if(o.ssh.process.h){DWORD terminal=0;if(!o.ssh.Current()&&!o.ssh.Terminal(terminal))return false;if(o.ssh.Current()&&o.proxyProcess.h&&!LoadedOwn(o.ssh,o.pins,o.sshImage))return false;}
+    return o.DiskCurrent();
 }
 std::wstring OwnHostLinuxOriginal::AgentNameOwn()const{return own_->agentName;}
 bool OwnHostLinuxOriginal::AgentPeerOwn(HANDLE process,DWORD pid,std::uint64_t created)const {
@@ -133,9 +140,11 @@ bool OwnHostLinuxOriginal::PrepareOwn(int argc,wchar_t**argv) {
     HANDLE self=nullptr;if(!DuplicateHandle(GetCurrentProcess(),GetCurrentProcess(),GetCurrentProcess(),&self,PROCESS_QUERY_INFORMATION|PROCESS_VM_READ|SYNCHRONIZE,FALSE,0))return false;
     o.self=Handle(self);o.created=Created(self);o.image=Image(self);o.desktop=Desktop(o.thread);
     if(!o.created||o.desktop.empty()||o.desktop==L"Default"||!Token(self,o.token)||o.token.uiAccess||!o.selfFile.Open(o.image)||!OriginalCurrentOwn())return false;
-    o.media=std::filesystem::absolute(argv[1]).lexically_normal().wstring();o.work=std::filesystem::absolute(argv[2]).lexically_normal().wstring();
-    if(o.work.size()<4||o.work.compare(0,3,L"T:\\"))return false;
-    File media;if(!media.Open(o.media,true)||GetFileAttributesW(o.work.c_str())!=INVALID_FILE_ATTRIBUTES||!CreateDirectoryW(o.work.c_str(),nullptr)||!o.root.Open(o.work,true))return false;
+    o.media=argv[1];o.work=argv[2];
+    if(!ClosedAbsolutePath(o.media)||!ClosedAbsolutePath(o.work)||o.work.compare(0,3,L"T:\\"))return false;
+    const auto output=std::filesystem::path(o.work);File media;
+    if(!media.Open(o.media,true)||!o.outputParent.Open(output.parent_path().wstring(),true)||!OriginalCurrentOwn()||
+       !o.root.CreateDirectoryChild(o.outputParent,output.filename().wstring())||!OriginalCurrentOwn())return false;
     auto fresh=[this]{return OriginalCurrentOwn();};
     auto input=[&](File&f,const wchar_t*name,const char*pin,const wchar_t*alg=BCRYPT_SHA256_ALGORITHM) {
         return f.Open((std::filesystem::path(o.media)/name).wstring())&&f.Hash(alg,pin,fresh);
@@ -276,8 +285,8 @@ bool OwnHostLinuxOriginal::RunOwn() {
         L"-netdev",L"user,id=gbnet,restrict=on",L"-device",L"virtio-net-pci,netdev=gbnet,romfile=,mac="+o.mac,
         L"-chardev",L"stdio,id=gbchannel,signal=off,mux=off",L"-device",L"virtio-serial-pci",L"-device",L"virtserialport,chardev=gbchannel,nr=1,name=gatebouncer.bootstrap"};
     // La llamada original cuenta el único intento antes del primer efecto CreateProcess/Resume.
-    o.bootSubmitted=true;o.bootEnd=GetTickCount64()+300000;o.state=State::BootSubmitted;
-    auto before=[&]{const bool submitted=o.bootSubmitted;o.bootSubmitted=false;const bool current=OriginalCurrentOwn();o.bootSubmitted=submitted;return current&&GetTickCount64()<o.bootEnd;};
+    o.bootSubmitted=true;o.diskChecked=GetTickCount64();o.bootEnd=o.diskChecked+300000;o.state=State::BootSubmitted;
+    auto before=[&]{const bool submitted=o.bootSubmitted;o.bootSubmitted=false;const bool current=OriginalCurrentOwn();o.bootSubmitted=submitted;return current&&o.DiskCurrent()&&GetTickCount64()<o.bootEnd;};
     if(!o.qemu.Start(*o.bundle.at("qemu-system-x86_64.exe"),args,o.work,{inR.h,outW.h,errW.h},before))return false;
     inR.Close();outW.Close();errW.Close();
     auto send=[&](Op op,const Bytes&body)->bool {std::string encoded;return Encode({op,o.request,o.generation,o.sendSequence++,body},encoded)&&WriteAll(o.qemuInput.h,Text(encoded),fresh);};
@@ -321,17 +330,14 @@ bool OwnHostLinuxOriginal::RunOwn() {
     o.sshInput=std::move(sshInW);o.sshOutput=std::move(sshOutR);o.sshError=std::move(sshErrR);
     if(!FreshLinuxOwn()||!o.ssh.Start(o.sshImage,{L"-F",o.config->Path(),L"-T",L"gatebouncer"},o.work,{sshInR.h,sshOutW.h,sshErrW.h},fresh))return false;
     sshInR.Close();sshOutW.Close();sshErrW.Close();o.sshInput.Close();o.state=State::SshRunning;
-    struct Transfer {OVERLAPPED io{};Handle event;std::array<BYTE,MaximumChunk>bytes{};DWORD size=0;bool pending=false;};
-    auto read=std::make_unique<Transfer>(),write=std::make_unique<Transfer>();read->event=Handle(CreateEventW(nullptr,TRUE,FALSE,nullptr));write->event=Handle(CreateEventW(nullptr,TRUE,FALSE,nullptr));
+    auto*read=&o.proxyRead;auto*write=&o.proxyWrite;read->event=Handle(CreateEventW(nullptr,TRUE,FALSE,nullptr));write->event=Handle(CreateEventW(nullptr,TRUE,FALSE,nullptr));
     if(!read->event.h||!write->event.h)return false;
     bool connected=false,acceptedProxy=false,bridgeClosed=false,proxyReadEof=false;ULONGLONG nextCheck=GetTickCount64();
     auto proxyCurrent=[&]()->bool {
         native::TokenEvidence token;return connected&&o.proxyProcess.h&&GetProcessId(o.proxyProcess.h)==o.proxyPid&&Created(o.proxyProcess.h)==o.proxyCreated&&WaitForSingleObject(o.proxyProcess.h,0)==WAIT_TIMEOUT&&ParentPid(o.proxyProcess.h)==o.ssh.pid&&o.proxyCreated>=o.ssh.created&&Image(o.proxyProcess.h)==o.proxyImage.Path()&&Token(o.proxyProcess.h,token)&&EqualToken(o.token,token)&&InOriginalBase(o.proxyProcess.h,o.proxyPid)&&o.ssh.Current()&&fresh();
     };
     auto cancelTransfers=[&]()->bool {
-        bool okay=true;for(auto*t:{read.get(),write.get()})if(t->pending){if(!CancelIoEx(o.proxyPipe.h,&t->io)&&GetLastError()!=ERROR_NOT_FOUND)okay=false;DWORD done=0;
-            if(GetOverlappedResult(o.proxyPipe.h,&t->io,&done,FALSE))t->pending=false;else if(GetLastError()==ERROR_OPERATION_ABORTED||GetLastError()==ERROR_BROKEN_PIPE)t->pending=false;else okay=false;}
-        return okay;
+        const bool a=read->Drain(o.proxyPipe.h),b=write->Drain(o.proxyPipe.h);return a&&b;
     };
     bool okay=false;while(GetTickCount64()<o.bootEnd&&fresh()) {
         bool eof=false;if(!ReadAvailable(o.sshOutput.h,o.sshCapture,4096,eof)||!ReadAvailable(o.sshError.h,o.sshDiagnostics,65536,eof))break;
@@ -358,26 +364,24 @@ bool OwnHostLinuxOriginal::RunOwn() {
         if(o.guestEof&&o.toProxy.empty()&&!write->pending){if(!cancelTransfers()||!o.proxyPipe.Close())break;connected=false;bridgeClosed=true;}
         Sleep(2);
     }
-    if(!cancelTransfers()) {
-        // Conserva los dos OVERLAPPED y buffers si el kernel aún no confirmó cancellation.
-        static std::vector<std::unique_ptr<Transfer>>pending;pending.push_back(std::move(read));pending.push_back(std::move(write));return false;
-    }
+    if(!cancelTransfers())return false; // Impl conserva todos los transfers hasta CloseOwn confirmado.
     if(!okay||!fresh())return false;o.authenticated=true;
     if(!send(Op::Close,{})||!receive(frame,std::min(o.bootEnd,GetTickCount64()+500))||frame.op!=Op::Closed||!frame.body.empty())return false;
     o.linuxReady=false;o.closing=true;DWORD qemuCode=0;
-    while(GetTickCount64()<o.bootEnd){if(o.qemu.Terminal(qemuCode))return qemuCode==0;Sleep(5);}return false;
+    while(GetTickCount64()<o.bootEnd&&!cancelled_.load()){if(!o.DiskCurrent())return false;if(o.qemu.Terminal(qemuCode))return qemuCode==0&&o.DiskCurrent();Sleep(5);}return false;
 }
 OwnHostLinuxOriginal::Snapshot OwnHostLinuxOriginal::InspectOwn(){std::lock_guard<std::recursive_mutex>lock(mutex_);if(own_->state!=State::Closed&&!OriginalCurrentOwn())own_->state=State::ClosePending;return {own_->state,own_->bootSubmitted,own_->authenticated};}
 OwnHostLinuxOriginal::Snapshot OwnHostLinuxOriginal::CancelOwn(){cancelled_.store(true);std::lock_guard<std::recursive_mutex>lock(mutex_);own_->linuxReady=false;own_->state=State::ClosePending;if(own_->credential)own_->credential->CancelOwn();return {own_->state,own_->bootSubmitted,own_->authenticated};}
 OwnHostLinuxOriginal::Snapshot OwnHostLinuxOriginal::CloseOwn(){CancelOwn();std::lock_guard<std::recursive_mutex>lock(mutex_);auto&o=*own_;bool closed=true;
+    const bool readDrained=o.proxyRead.Drain(o.proxyPipe.h),writeDrained=o.proxyWrite.Drain(o.proxyPipe.h);closed=readDrained&&writeDrained;
     if(o.connectPending){if(!CancelIoEx(o.proxyPipe.h,&o.proxyConnect)&&GetLastError()!=ERROR_NOT_FOUND)closed=false;DWORD n=0;if(GetOverlappedResult(o.proxyPipe.h,&o.proxyConnect,&n,FALSE))o.connectPending=false;else if(GetLastError()==ERROR_OPERATION_ABORTED||GetLastError()==ERROR_BROKEN_PIPE)o.connectPending=false;else closed=false;}
     if(o.credential&&o.credential->CloseOwn().state!=OwnMemorySshCredential::State::Closed)closed=false;
     closed=o.ssh.Close()&&closed;closed=o.qemu.Close()&&closed;for(auto&tool:o.tools)closed=tool->Close()&&closed;
     if(!closed)return {o.state,o.bootSubmitted,o.authenticated};
     for(auto&h:o.consumed)closed=h.Close()&&closed;
-    for(auto*h:{&o.qemuInput,&o.qemuOutput,&o.qemuError,&o.sshInput,&o.sshOutput,&o.sshError,&o.proxyPipe,&o.proxyEvent,&o.proxyProcess,&o.self})closed=h->Close()&&closed;
+    for(auto*h:{&o.qemuInput,&o.qemuOutput,&o.qemuError,&o.sshInput,&o.sshOutput,&o.sshError,&o.proxyPipe,&o.proxyEvent,&o.proxyRead.event,&o.proxyWrite.event,&o.proxyProcess,&o.self})closed=h->Close()&&closed;
     for(auto&f:o.pins)closed=f->Close()&&closed;
-    for(auto*f:{&o.selfFile,&o.root,&o.source,&o.archive,&o.sums,&o.signature,&o.keyring,&o.guest,&o.capture,&o.sshImage,&o.proxyImage})closed=f->Close()&&closed;
+    for(auto*f:{&o.selfFile,&o.root,&o.outputParent,&o.source,&o.archive,&o.sums,&o.signature,&o.keyring,&o.guest,&o.capture,&o.sshImage,&o.proxyImage})closed=f->Close()&&closed;
     if(closed)o.state=State::Closed;return {o.state,o.bootSubmitted,o.authenticated};
 }
 int RunOwnHostLinuxOriginal(int argc,wchar_t**argv) {

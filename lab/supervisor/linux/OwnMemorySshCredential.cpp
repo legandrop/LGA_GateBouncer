@@ -214,7 +214,17 @@ bool OwnMemorySshCredential::PollOwn() {
         auto host=host_.lock();
         if(!host||!host->AgentPeerOwn(peer.process.value,peer.pid,original::Created(peer.process.value))||!host->FreshLinuxOwn()||!CurrentOwn())return false;
         std::vector<BYTE> packet(io_->bytes.begin(),io_->bytes.begin()+io_->target),reply;
-        if(packet.size()==1&&packet[0]==11) {
+        if(!sessionBindRejected_&&!signConsumed_&&!packet.empty()&&packet[0]==27) {
+            std::size_t p=1;std::string extension;std::uint64_t n=0;
+            if(!original::GetText(packet,p,extension,64)||extension!="session-bind@openssh.com")return false;
+            for(unsigned i=0;i<3;++i) {
+                if(!original::Get(packet,p,n,4)||!n||n>(i==1?64u:1024u)||n>packet.size()-p)return false;
+                p+=static_cast<std::size_t>(n);
+            }
+            if(p+1!=packet.size()||packet[p]!=0)return false;
+            // Extensión no soportada: failure acotado, sin instalar binding ni cambiar autoridad.
+            sessionBindRejected_=true;reply.push_back(5);
+        }else if(packet.size()==1&&packet[0]==11) {
             reply.push_back(12);memoryssh::U32(reply,1);
             memoryssh::String(reply,publicBlob_.data(),static_cast<DWORD>(publicBlob_.size()));memoryssh::Text(reply,"GateBouncer ephemeral session");
         }else if(!signConsumed_&&!packet.empty()&&packet[0]==13) {

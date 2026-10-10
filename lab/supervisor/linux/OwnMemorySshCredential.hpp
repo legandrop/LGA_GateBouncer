@@ -50,7 +50,7 @@ private:
     std::shared_ptr<IoOwn> io_;
     std::shared_ptr<BrokerAdmission> admission_;
     std::weak_ptr<OwnHostLinuxOriginal> host_;
-    bool hostRoute_=false,signConsumed_=false;
+    bool hostRoute_=false,signConsumed_=false,sessionBindRejected_=false;
     std::recursive_mutex mutex_;
     std::mutex signalMutex_;
     std::atomic<bool> cancelled_{false};
