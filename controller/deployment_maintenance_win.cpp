@@ -122,7 +122,7 @@ bool AdministrativeLease::current() const {
     HKEY repeated = nullptr;
     const auto opened = RegOpenKeyExW(HKEY_LOCAL_MACHINE,deploymentRegistry(mode_),0,
         KEY_QUERY_VALUE | READ_CONTROL,&repeated);
-    const bool sameGate = opened == ERROR_SUCCESS && CompareObjectHandles(gate_,repeated);
+    const bool sameGate = opened == ERROR_SUCCESS && compareObjectHandles(gate_,repeated);
     if (repeated) RegCloseKey(repeated);
     if (!sameGate) return false;
     if (mode_ == DeploymentMode::Product) {
@@ -130,7 +130,7 @@ bool AdministrativeLease::current() const {
         const bool original = parent_ && native::protectedRegistry(parent_) &&
             RegQueryValueExW(parent_,L"SymbolicLinkValue",nullptr,nullptr,nullptr,&bytes) == ERROR_FILE_NOT_FOUND &&
             RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA",REG_OPTION_OPEN_LINK,
-                KEY_QUERY_VALUE | READ_CONTROL,&repeatedParent) == ERROR_SUCCESS && CompareObjectHandles(parent_,repeatedParent);
+                KEY_QUERY_VALUE | READ_CONTROL,&repeatedParent) == ERROR_SUCCESS && compareObjectHandles(parent_,repeatedParent);
         if (repeatedParent) RegCloseKey(repeatedParent);
         if (!original) return false;
     }
@@ -148,9 +148,9 @@ bool AdministrativeLease::ownsConfiguration(HKEY key) const {
     HKEY gate = nullptr, configuration = nullptr;
     const auto opened = RegOpenKeyExW(HKEY_LOCAL_MACHINE,deploymentRegistry(mode_),0,
         KEY_QUERY_VALUE | READ_CONTROL,&gate);
-    bool ok = opened == ERROR_SUCCESS && CompareObjectHandles(gate_,gate) &&
+    bool ok = opened == ERROR_SUCCESS && compareObjectHandles(gate_,gate) &&
         RegOpenKeyExW(gate,deploymentConfiguration(mode_),0,KEY_QUERY_VALUE | READ_CONTROL,&configuration) == ERROR_SUCCESS &&
-        CompareObjectHandles(key,configuration) && native::protectedRegistry(configuration);
+        compareObjectHandles(key,configuration) && native::protectedRegistry(configuration);
     if (configuration) RegCloseKey(configuration);
     if (gate) RegCloseKey(gate);
     return ok && current(); // El handle retenido debe seguir siendo el mismo objeto bajo el mismo gate.

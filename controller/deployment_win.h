@@ -22,6 +22,8 @@ bool serviceConfiguration(SC_HANDLE, const std::filesystem::path &, DWORD expect
 bool serviceConfigurationPhase(SC_HANDLE, const std::filesystem::path &, DWORD startType,
                                DWORD expectedPid = 0, DeploymentMode = DeploymentMode::Laboratory);
 bool maintenanceState(HKEY, bool &present, DWORD &state);
+// Misma comparación nativa, resuelta desde KernelBase de System32; sin equivalencias alternativas.
+bool compareObjectHandles(HANDLE, HANDLE);
 class Deployment {
   public:
     explicit Deployment(std::filesystem::path root, DeploymentMode = DeploymentMode::Laboratory);

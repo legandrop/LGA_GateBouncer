@@ -29,6 +29,24 @@ std::uint64_t number(const wire::Bytes &b, std::size_t at, unsigned n) {
     return value;
 }
 } // namespace
+bool compareObjectHandles(HANDLE first, HANDLE second) {
+    const auto module = LoadLibraryExW(L"KernelBase.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!module) return false;
+    // El tipo conserva exactamente el ABI declarado por handleapi.h.
+#ifdef _MSC_VER
+#pragma warning(push)
+#pragma warning(disable: 4191)
+#endif
+    const auto compare = reinterpret_cast<decltype(&CompareObjectHandles)>(GetProcAddress(module,"CompareObjectHandles"));
+#ifdef _MSC_VER
+#pragma warning(pop)
+#endif
+    const BOOL result = compare ? compare(first,second) : FALSE;
+    const auto error = GetLastError();
+    if (!FreeLibrary(module)) return false;
+    SetLastError(error);
+    return result != FALSE;
+}
 const wchar_t *deploymentService(DeploymentMode mode) {
     return mode == DeploymentMode::Product ? L"LGAGateBouncer" : L"LGAGateBouncerLab";
 }
@@ -179,16 +197,16 @@ struct Deployment::Registration {
             const bool originalParent = parent && native::protectedRegistry(parent) &&
                 RegQueryValueExW(parent,L"SymbolicLinkValue",nullptr,nullptr,nullptr,&bytes) == ERROR_FILE_NOT_FOUND &&
                 RegOpenKeyExW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA",REG_OPTION_OPEN_LINK,
-                    KEY_QUERY_VALUE | READ_CONTROL,&repeated) == ERROR_SUCCESS && CompareObjectHandles(parent,repeated);
+                    KEY_QUERY_VALUE | READ_CONTROL,&repeated) == ERROR_SUCCESS && compareObjectHandles(parent,repeated);
             if (repeated) RegCloseKey(repeated);
             if (!originalParent) return false;
         }
         HKEY reopenedGate = nullptr, reopenedKey = nullptr;
         const bool original = RegOpenKeyExW(HKEY_LOCAL_MACHINE,deploymentRegistry(mode),0,
             KEY_QUERY_VALUE | READ_CONTROL,&reopenedGate) == ERROR_SUCCESS &&
-            CompareObjectHandles(gate,reopenedGate) &&
+            compareObjectHandles(gate,reopenedGate) &&
             RegOpenKeyExW(reopenedGate,deploymentConfiguration(mode),0,
-                KEY_QUERY_VALUE | READ_CONTROL,&reopenedKey) == ERROR_SUCCESS && CompareObjectHandles(key,reopenedKey);
+                KEY_QUERY_VALUE | READ_CONTROL,&reopenedKey) == ERROR_SUCCESS && compareObjectHandles(key,reopenedKey);
         if (reopenedKey) RegCloseKey(reopenedKey);
         if (reopenedGate) RegCloseKey(reopenedGate);
         if (!original) return false;
