@@ -347,7 +347,7 @@ static void accumulateActivity(GB_ENTRY *e,UINT32 direction,GB_PACKET_OBSERVATIO
 }
 static void NTAPI packetClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOMING_METADATA_VALUES0 *m,
     void *data,const void *context,const FWPS_FILTER3 *filter,UINT64 flow,FWPS_CLASSIFY_OUT0 *out) {
-    GB_TUPLE t; GB_ENTRY *e; BOOLEAN ambiguous; KIRQL irql; UINT64 now=KeQueryInterruptTime();
+    GB_TUPLE t; GB_ENTRY *e; BOOLEAN ambiguous; KIRQL irql; UINT64 now;
     GB_PACKET_OBSERVATION packet=packetObservation(data);ULONG direction,flags;BOOLEAN fieldsValid;
     UNREFERENCED_PARAMETER(context); UNREFERENCED_PARAMETER(filter);
     if(!tuple(v,m,&t)) { block(out); return; }
@@ -358,6 +358,7 @@ static void NTAPI packetClassify(const FWPS_INCOMING_VALUES0 *v,const FWPS_INCOM
         !(v->incomingValue[flags].value.uint32 & (FWP_CONDITION_FLAG_IS_RAW_ENDPOINT | FWP_CONDITION_FLAG_IS_FRAGMENT |
           FWP_CONDITION_FLAG_IS_FRAGMENT_GROUP | FWP_CONDITION_FLAG_IS_IPSEC_SECURED));
     KeAcquireSpinLock(&gbLock,&irql); e=endpoint(m,&t,FALSE,FALSE,&ambiguous);
+    now=KeQueryInterruptTime(); // Tras scan y espera: Duration no usa el instante anterior al trabajo.
     if(flow && (!e || e->record.cause!=flow || !e->associated ||
        !(m->currentMetadataValues & FWPS_METADATA_FIELD_FLOW_HANDLE) || m->flowHandle!=e->receipt.flow)) ambiguous=TRUE;
     if(ambiguous || (e && (!live(e,now) || e->receipt.decision.action!=2))) block(out);

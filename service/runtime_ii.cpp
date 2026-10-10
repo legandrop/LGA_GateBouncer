@@ -924,7 +924,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                             runtime_.tick();
                             usable = runtime_.profileGeneration() == profile && ordinaryPeer &&
                                 runtime_.ordinaryPeer(pipe.value,ordinaryPeer,principalReader) &&
-                                mask==(runtime_.principalTrafficReady() ? 7u : 3u) &&
+                                (!runtime_.principalEventsReady() || mask==(runtime_.principalTrafficReady() ? 7u : 3u)) &&
                                 NativeActivityRing::same(runtime_.principalEvents_.context(),subscriptionContext);
                             if (usable) {
                                 // También cuando no llegaron causas: Ready cacheado no acredita catálogo actual.
@@ -960,7 +960,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                             std::lock_guard<std::mutex> lock(runtime_.mutex);
                             // Revalidación individual; el wait/cancel/drain posterior no retiene mutex.
                             if (!ordinaryPeer ||
-                                mask!=(runtime_.principalTrafficReady() ? 7u : 3u) ||
+                                (runtime_.principalEventsReady() && mask!=(runtime_.principalTrafficReady() ? 7u : 3u)) ||
                                 !NativeActivityRing::same(runtime_.principalEvents_.context(),subscriptionContext) ||
                                 !runtime_.principalEventCurrent(*ordinaryPeer,event)) {
                                 sent=false; break;
