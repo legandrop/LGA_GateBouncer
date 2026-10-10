@@ -1481,7 +1481,11 @@ void MainWindow::renderOrdinaryNotice() {
             const QSignalBlocker guard(direction); direction->setCurrentIndex(client->selectedDirection() - 1);
         }
     });
-    const QString network = scopeValue >= 3 ? "TCP connections started by this app, with packets in both directions. UDP, QUIC, ICMP and startup coverage have not been validated."
+    const QString network = scopeValue >= 3 ?
+        QString(directionValue == 1 ? "TCP connections started by this app, with packets in both directions. "
+            : directionValue == 2 ? "TCP connections accepted by this app, with packets in both directions. "
+            : "TCP connection direction unavailable; decisions are not ready. ") +
+        "UDP, QUIC, ICMP and startup coverage have not been validated."
         : directionValue == 1 ? "Outbound · Allow covers unicast destinations only"
         : directionValue == 2 ? "Inbound · all destinations and protocols" : "Both · inbound and outbound; Allow includes non-unicast destinations";
     l->addWidget(label(QString(client->state() == OrdinaryDecisionClient::State::Recorded ? "Recorded connections: " : submitted ? "Submitted connections: " : "Will cover: ") + network, "muted", true));

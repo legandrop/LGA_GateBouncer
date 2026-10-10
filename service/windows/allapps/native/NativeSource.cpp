@@ -1,3 +1,7 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <fwpsu.h>
 #include "NativeSource.h"
 #include <algorithm>
 #include <stdexcept>
@@ -257,7 +261,9 @@ std::optional<NativeCopiedMetadata> NativeSource::takeClassifier() noexcept {
         if (lost) { classifier_->reset(); lose(); return {}; }
         if (!cause) return {};
         const auto &r = cause->record_;
-        const auto layer = r.family == 4 ? NativeLayer8::Connect4 : NativeLayer8::Connect6;
+        const bool inbound = r.layerId == FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 || r.layerId == FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6;
+        const auto layer = inbound ? (r.family == 4 ? NativeLayer8::Receive4 : NativeLayer8::Receive6) :
+            (r.family == 4 ? NativeLayer8::Connect4 : NativeLayer8::Connect6);
         // Sólo el baseline runtime, jamás un permiso ni filtro boot como causa actual.
         const auto slot = std::find_if(snapshot->slots_.begin(), snapshot->slots_.end(), [&](const auto &s) {
             return s.ruleIndex == BaselineRuleIndex && s.slot == static_cast<unsigned>(layer) &&
@@ -267,7 +273,7 @@ std::optional<NativeCopiedMetadata> NativeSource::takeClassifier() noexcept {
         NetEventView view;
         view.type = view.classifyType = 3; view.classifyPresent = true;
         view.flags = AppSet | UserSet | IpVersionSet; view.ipVersion = r.family == 4 ? 0 : 1;
-        view.rawDirection = 0x3901; view.filterId = slot->id; view.layerId = slot->layerId;
+        view.rawDirection = inbound ? 0x3900 : 0x3901; view.filterId = slot->id; view.layerId = slot->layerId;
         view.app = {r.app, r.appBytes, r.appBytes}; view.user = {r.user, r.userBytes, r.userBytes};
         view.timestamp = r.timestamp; view.receivedMonotonic = GetTickCount64();
         auto copied = copyMetadata(view, source_);
@@ -291,7 +297,8 @@ bool NativeSource::classifierCurrent(const NativeCopiedMetadata &event, HANDLE e
     // esa premisa. No inferir bloqueo observado ni cobertura de otros providers.
     for (std::size_t i = 0; i < event.snapshot_->rules_.size(); ++i) {
         const auto rule = event.snapshot_->ruleView(i);
-        if (rule.action == 2 && (rule.direction == 1 || rule.direction == 3) && exact(rule.app, identity.appId.bytes) &&
+        const auto direction = event.event_.direction == Direction::Inbound ? 2u : 1u;
+        if (rule.action == 2 && (rule.direction == direction || rule.direction == 3) && exact(rule.app, identity.appId.bytes) &&
             (rule.targetKind == 2 || exact(rule.user, identity.userSid.bytes))) return false;
     }
     return event.classifier_->current();

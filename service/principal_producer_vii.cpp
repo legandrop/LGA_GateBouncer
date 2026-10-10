@@ -166,8 +166,12 @@ Frame NativeRuntime::preparePrincipal(const Frame &frame, const std::shared_ptr<
     const auto scope = find(frame, Tag::ScopeKind) ? get(frame, Tag::ScopeKind) : 2;
     const auto duration = get(frame, Tag::ScopeDurationMs);
     const bool held = observation.event && observation.event->classifier_;
+    const auto causeDirection = observation.event ?
+        (observation.event->owned().direction == gatebouncer::service::windows::allapps::Direction::Inbound ? 2u :
+         observation.event->owned().direction == gatebouncer::service::windows::allapps::Direction::Outbound ? 1u : 0u) : 0u;
     if ((!held && scope != 2) ||
-        (scope >= 3 && (observation.row.package != 1 || get(frame, Tag::PolicyDirection) != 1)) ||
+        (scope >= 3 && (observation.row.package != 1 ||
+            get(frame, Tag::PolicyDirection) != causeDirection || !causeDirection)) ||
         (scope == 5 && (!duration || duration > GB_SCOPE_MAX_MS)))
         return principalError(Error::ScopeUnsupported);
     if (observation.row.state != 1 || observation.row.revision != get(frame, Tag::ObservedRevision) ||
@@ -452,6 +456,13 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
             return principalError(Error::IdentityUnavailable);
         Frame response; response.minor = 3; response.type = Type::ObservedRecord;
         response.fields = {value(Tag::ServiceEpoch, epoch_), {Tag::Records, true, std::move(records)}, value(Tag::SourceEpoch, row.source)};
+        if (row.state == 1 && causeCurrent(*found->second) && found->second->event) {
+            const auto direction = found->second->event->owned().direction;
+            if (direction == gatebouncer::service::windows::allapps::Direction::Inbound ||
+                direction == gatebouncer::service::windows::allapps::Direction::Outbound)
+                response.fields.push_back(value(Tag::PolicyDirection,
+                    direction == gatebouncer::service::windows::allapps::Direction::Inbound ? 2 : 1, 1));
+        }
         return ordered(std::move(response));
     }
     if (frame.type == Type::ListObserved) {

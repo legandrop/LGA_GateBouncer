@@ -1,3 +1,7 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <fwpsu.h>
 #include "NativeClassifier.h"
 #include <algorithm>
 #include <cstring>
@@ -102,6 +106,8 @@ std::shared_ptr<ClassifierCause> NativeClassifier::take(bool &lost) noexcept {
             record.session != session_ || record.loss != loss_ || !record.cause || !process.process ||
             !record.endpoint || !record.filterId || !record.pid || record.pid > MAXDWORD || !record.created ||
             !record.timestamp || (record.family != 4 && record.family != 6) || record.protocol != 6 ||
+            (record.family == 4 ? record.layerId != FWPS_LAYER_ALE_AUTH_CONNECT_V4 && record.layerId != FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 :
+                record.layerId != FWPS_LAYER_ALE_AUTH_CONNECT_V6 && record.layerId != FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6) ||
             (record.flags & FWP_CONDITION_FLAG_IS_REAUTHORIZE) || record.appBytes < 4 ||
             record.appBytes > GB_CLASSIFIER_APP_BYTES || (record.appBytes & 1) || record.userBytes < 8 ||
             record.userBytes > GB_CLASSIFIER_SID_BYTES || record.user[0] != 1 || record.user[1] > 15 ||
@@ -175,22 +181,28 @@ bool NativeClassifier::catalogCurrent(const ClassifierCause &cause, HANDLE engin
     Memory filter, callout;
     FWPM_FILTER0 f{}; FWPM_CALLOUT0 c{}; GUID provider{};
     const auto i = cause.record_.family == 4 ? 0 : 1;
-    const auto &layer = i == 0 ? FWPM_LAYER_ALE_AUTH_CONNECT_V4 : FWPM_LAYER_ALE_AUTH_CONNECT_V6;
+    const bool inbound = cause.record_.layerId == FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 || cause.record_.layerId == FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6;
+    const auto &layer = inbound ? (i == 0 ? FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4 : FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6) :
+        (i == 0 ? FWPM_LAYER_ALE_AUTH_CONNECT_V4 : FWPM_LAYER_ALE_AUTH_CONNECT_V6);
+    const auto &key = inbound ? GbInboundCallouts[i] : GbClassifierCallouts[i];
+    const auto &filterKey = inbound ? GbInboundCallouts[i] : GbClassifierFilters[i];
+    if (cause.record_.layerId != (inbound ? (i == 0 ? FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 : FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6) :
+        (i == 0 ? FWPS_LAYER_ALE_AUTH_CONNECT_V4 : FWPS_LAYER_ALE_AUTH_CONNECT_V6))) return false;
     if (FwpmFilterGetById0(engine, cause.record_.filterId, reinterpret_cast<FWPM_FILTER0 **>(&filter.p)) != ERROR_SUCCESS ||
         !guardedRead(&f, filter.p, sizeof(f)) || !f.providerKey ||
         !guardedRead(&provider, f.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
-        !equal(f.filterKey, GbClassifierFilters[i]) || !equal(f.subLayerKey, GbPolicySublayer) ||
+        !equal(f.filterKey, filterKey) || !equal(f.subLayerKey, GbPolicySublayer) ||
         !equal(f.layerKey, layer) || f.flags || f.action.type != FWP_ACTION_CALLOUT_UNKNOWN ||
-        !equal(f.action.calloutKey, GbClassifierCallouts[i]) || f.rawContext || f.numFilterConditions ||
+        !equal(f.action.calloutKey, key) || f.rawContext || f.numFilterConditions ||
         f.providerData.size || f.weight.type != FWP_UINT64 || !f.weight.uint64) return false;
     UINT64 weight = 0;
     if (!guardedRead(&weight, f.weight.uint64, sizeof(weight)) || weight != 50 ||
         f.effectiveWeight.type != FWP_UINT64 || !f.effectiveWeight.uint64 ||
         !guardedRead(&weight, f.effectiveWeight.uint64, sizeof(weight)) || weight != 50) return false;
-    if (FwpmCalloutGetByKey0(engine, &GbClassifierCallouts[i], reinterpret_cast<FWPM_CALLOUT0 **>(&callout.p)) != ERROR_SUCCESS ||
+    if (FwpmCalloutGetByKey0(engine, &key, reinterpret_cast<FWPM_CALLOUT0 **>(&callout.p)) != ERROR_SUCCESS ||
         !guardedRead(&c, callout.p, sizeof(c)) || !c.providerKey ||
         !guardedRead(&provider, c.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
-        !equal(c.calloutKey, GbClassifierCallouts[i]) || !equal(c.applicableLayer, layer) ||
+        !equal(c.calloutKey, key) || !equal(c.applicableLayer, layer) ||
         c.flags != FWPM_CALLOUT_FLAG_REGISTERED) return false;
     const GUID *layers[6] = {&FWPM_LAYER_STREAM_PACKET_V4, &FWPM_LAYER_STREAM_PACKET_V6,
         &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4, &FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6,
@@ -232,6 +244,29 @@ bool NativeClassifier::catalogCurrent(const ClassifierCause &cause, HANDLE engin
             !guardedRead(&provider, gc.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
             !equal(gc.calloutKey, GbHeldGuardCallouts[n]) || !equal(gc.applicableLayer, guardLayer) ||
             gc.flags != FWPM_CALLOUT_FLAG_REGISTERED) return false;
+    }
+    const GUID *inboundLayers[6] = {&FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+        &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6,
+        &FWPM_LAYER_ALE_AUTH_LISTEN_V4, &FWPM_LAYER_ALE_AUTH_LISTEN_V6};
+    for (unsigned n = 0; n < 6; ++n) {
+        Memory fm, cm; FWPM_FILTER0 nf{}; FWPM_CALLOUT0 nc{}; UINT64 w = 0;
+        const auto &sub = n < 4 ? GbPolicySublayer : GbClassifierSublayer;
+        const auto wanted = n >= 2 && n < 4 ? 1000u : 50u;
+        if (FwpmFilterGetByKey0(engine, &GbInboundCallouts[n], reinterpret_cast<FWPM_FILTER0 **>(&fm.p)) != ERROR_SUCCESS ||
+            !guardedRead(&nf, fm.p, sizeof(nf)) || !nf.providerKey ||
+            !guardedRead(&provider, nf.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
+            !equal(nf.filterKey, GbInboundCallouts[n]) || !equal(nf.layerKey, *inboundLayers[n]) || !equal(nf.subLayerKey, sub) ||
+            nf.flags || nf.rawContext || nf.numFilterConditions || nf.providerData.size ||
+            nf.action.type != (n < 4 ? FWP_ACTION_CALLOUT_UNKNOWN : FWP_ACTION_CALLOUT_INSPECTION) ||
+            !equal(nf.action.calloutKey, GbInboundCallouts[n]) || nf.weight.type != FWP_UINT64 || !nf.weight.uint64 ||
+            !guardedRead(&w, nf.weight.uint64, sizeof(w)) || w != wanted ||
+            nf.effectiveWeight.type != FWP_UINT64 || !nf.effectiveWeight.uint64 ||
+            !guardedRead(&w, nf.effectiveWeight.uint64, sizeof(w)) || w != wanted ||
+            FwpmCalloutGetByKey0(engine, &GbInboundCallouts[n], reinterpret_cast<FWPM_CALLOUT0 **>(&cm.p)) != ERROR_SUCCESS ||
+            !guardedRead(&nc, cm.p, sizeof(nc)) || !nc.providerKey ||
+            !guardedRead(&provider, nc.providerKey, sizeof(provider)) || !equal(provider, GbClassifierProvider) ||
+            !equal(nc.calloutKey, GbInboundCallouts[n]) || !equal(nc.applicableLayer, *inboundLayers[n]) ||
+            nc.flags != FWPM_CALLOUT_FLAG_REGISTERED) return false;
     }
     return true;
 }

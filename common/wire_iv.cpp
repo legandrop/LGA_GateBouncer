@@ -297,6 +297,9 @@ Schema schema(const Frame &f) {
   case Type::ReviewQueued:
     return ref;
   case Type::ObservedRecord:
+    if (find(f, T::PolicyDirection))
+      return {{T::ServiceEpoch, 16}, {T::Records, Variable}, {T::SourceEpoch, 16}, {T::PolicyDirection, 1}};
+    return {{T::ServiceEpoch, 16}, {T::Records, Variable}, {T::SourceEpoch, 16}};
   case Type::FutureDraftRecord:
     return {
         {T::ServiceEpoch, 16}, {T::Records, Variable}, {T::SourceEpoch, 16}};
@@ -437,7 +440,7 @@ bool valid(const FutureDraftRecord &r) {
            !zero(r.challenge) && r.ttl >= 1 && r.ttl <= 120000 &&
            r.package >= 1 && r.proof == Proof::CurrentShapeUnproven &&
            reason == 0 && (r.scope == 2 ? !r.durationMs && r.accepted == (r.package == 1 ? 3 : 1) :
-             r.package == 1 && r.direction == 1 && r.accepted == (1u << r.scope) &&
+             r.package == 1 && (r.direction == 1 || r.direction == 2) && r.accepted == (std::uint64_t{1} << r.scope) &&
              (r.scope == 5 ? r.durationMs >= 1 && r.durationMs <= 900000 : !r.durationMs));
   return zero(r.selector) && !r.targetRevision && r.target == Digest{} &&
          zero(r.challenge) && !r.ttl && r.proof == Proof::Unknown &&
@@ -576,6 +579,8 @@ Error validate(const Frame &f) {
   if (find(f, T::PolicyDirection) &&
       (get(f, T::PolicyDirection) < 1 || get(f, T::PolicyDirection) > 3))
     return Error::Malformed;
+  if (f.type == Type::ObservedRecord && find(f,T::PolicyDirection) && get(f,T::PolicyDirection)>2)
+    return Error::Malformed;
   if (find(f, T::ExpectedDesiredRev) &&
       get(f, T::ExpectedDesiredRev) == UINT64_MAX)
     return Error::Malformed;
@@ -591,12 +596,12 @@ Error validate(const Frame &f) {
     if (a < 1 || a > 2 || p < 1 || p > 2 || scope < 2 || scope > 5 ||
         (scope == 2 ? get(f, T::AcceptedScope) !=
             (1u | (p == 1 ? 2u : 0u) | (a == 2 && d == 3 ? 4u : 0u)) :
-            p != 1 || d != 1 || get(f,T::AcceptedScope) != (std::uint64_t{1} << scope)))
+            p != 1 || (d != 1 && d != 2) || get(f,T::AcceptedScope) != (std::uint64_t{1} << scope)))
       return Error::Malformed;
   }
   if (f.type == Type::PrepareFuturePolicy || f.type == Type::CommitFuturePolicy) {
     const auto scope = find(f,T::ScopeKind) ? get(f,T::ScopeKind) : 2;
-    if (scope < 2 || scope > 5 || (scope >= 3 && get(f,T::PolicyDirection) != 1) ||
+    if (scope < 2 || scope > 5 || (scope >= 3 && get(f,T::PolicyDirection) != 1 && get(f,T::PolicyDirection) != 2) ||
         (scope == 5 && (!get(f,T::ScopeDurationMs) || get(f,T::ScopeDurationMs) > 900000)))
       return Error::Malformed;
   }
@@ -642,6 +647,9 @@ Error validate(const Frame &f) {
     if (f.type == Type::ObservedPage || f.type == Type::ObservedRecord) {
       std::vector<ObservedRecord> rows;
       e = unpack(records->bytes, count, rows);
+      if (f.type == Type::ObservedRecord && find(f,T::PolicyDirection) &&
+          (e != Error::Ok || rows.size()!=1 || rows.front().state!=1 || zero(rows.front().binding)))
+        return Error::Malformed;
       if (e == Error::Ok)
         for (const auto &r : rows)
           if (r.source != idValue(f, T::SourceEpoch))

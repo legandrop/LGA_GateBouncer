@@ -1,11 +1,36 @@
 # Scoped TCP classifier
 
-The WDM driver retains initial outbound TCP operations at ALE connect for IPv4
-and IPv6. An authenticated service can deliver a reviewed Once, process-instance
+The WDM driver retains initial outbound TCP operations at ALE connect and
+eligible inbound TCP SYN operations at ALE receive/accept for IPv4 and IPv6.
+An authenticated service can deliver a reviewed Once, process-instance
 or timed process-instance decision after recording it durably. CompleteOperation
 causes reauthorization; only the matching operation and classify-completion
 reason consume that decision. Readback records the driver's classification
 decision, rather than claiming that traffic passed every firewall provider.
+
+Inbound acquisition requires PASSIVE_LEVEL with the metadata process ID equal
+to the current attached EPROCESS ID and the metadata endpoint token equal to
+that process's immediately referenced primary token. Other callbacks deny the
+new operation. Listener records retain their own endpoint and identity as
+negative evidence; they never lend authority to an accepted child or transferred
+socket. The direction of the retained ALE layer reaches the authenticated single
+observation response and must match temporal consent. Instance roots and their
+replacement stay separate for inbound and outbound TCP.
+
+Receive/accept completion does not produce connect reauthorization. Before
+pending, the driver copies one NBL with one net buffer into its own bounded
+nonpaged storage and MDL. Its temporary shallow clone is freed before the
+callback returns. It accepts only an exact unfragmented TCP SYN with matching
+addresses, ports and header lengths, at most 65535 bytes. IPv6 extension headers,
+IPsec, raw endpoints, packet chains and unavailable owner evidence are excluded.
+After durable consent, that same owned NBL completes the operation and is
+injected from a DPC. An opaque monotonic cause identifies the pinned registry
+entry; unrecognized or stale injection contexts deny. Only its exact scope
+classification can record Applied. Applied records authorization, not delivery:
+an injection failure before or after that classification revokes current
+authority without rewriting a historical Applied receipt. Storage, NBL and MDL
+are released once after completion; closure cannot retire an entry with queued
+work, a packet, an injection pin, or a dependent flow.
 
 The device admits LocalSystem with the enabled LGAGateBouncerLab service SID,
 one retained caller process and one file object. Initial acquisition requires
@@ -78,7 +103,8 @@ is no production signing, INF, unattended repair or deployment admission yet.
 When the device is absent, the service retains its legacy netevent producer.
 
 This source does not establish platform-wide protection. UDP, QUIC, ICMP,
-inbound initial authorization, boot coverage, socket transfer, provider precedence
+inbound callbacks outside the admitted PASSIVE owner subset, boot coverage,
+socket transfer, provider precedence
 and driver lifecycle require separate guest validation. Token replacement is
 detected by a kernel worker at a 100 ms interval, not instantaneously. The kernel
 registry supports at most 64 simultaneous retained operations, grants and

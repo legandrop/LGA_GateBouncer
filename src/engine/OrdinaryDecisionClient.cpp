@@ -114,7 +114,7 @@ bool OrdinaryDecisionClient::select(const Id &id) {
     if (!current_ || !session_.idle() || state_ == State::Sending || state_ == State::Uncertain) return false;
     auto row = std::find_if(rows_.begin(), rows_.end(), [&](const auto &r) { return r.observed == id && r.state == 1; });
     if (row == rows_.end()) return false;
-    closeNotice(); observed_ = *row; visible_ = true; direction_ = 1; scope_ = row->temporal == 2 ? 3 : 2;
+    closeNotice(); observed_ = *row; visible_ = true; direction_ = row->temporal == 2 ? 0 : 1; scope_ = row->temporal == 2 ? 3 : 2;
     shown_[row->observed] = ShownKey{epoch_, boot_, source_, profile_, row->revision};
     state_ = State::Preparing; message_ = "Rechecking this request…"; emit changed();
     return send(Type::GetObservedRecord, {value(Tag::ObservedId, row->observed),
@@ -123,7 +123,7 @@ bool OrdinaryDecisionClient::select(const Id &id) {
 bool OrdinaryDecisionClient::direction(int direction) {
     if (!visible_ || !current_ || !observed_ || !session_.idle() || direction < 1 || direction > 3 ||
         state_ == State::Sending || state_ == State::Uncertain) return false;
-    if (scope_ >= 3 && direction != 1) return false;
+    if (scope_ >= 3 && direction != direction_) return false;
     ++generation_; draftExpiry_.stop(); draft_.reset(); direction_ = direction;
     state_ = State::Preparing; message_ = "Checking which connections this rule will cover…"; emit changed(); prepare(); return true;
 }
@@ -132,8 +132,13 @@ bool OrdinaryDecisionClient::scope(int scope) {
         (observed_->temporal != 2 && scope != 2)) return false;
     ++generation_; draftExpiry_.stop(); draft_.reset(); scope_ = scope;
     observedGeneration_ = generation_;
-    if (scope >= 3) direction_ = 1;
-    state_ = State::Preparing; message_ = "Checking how long this decision will apply…"; emit changed(); prepare(); return true;
+    state_ = State::Preparing; message_ = "Checking how long this decision will apply…";
+    if (scope >= 3) {
+        direction_ = 0; emit changed();
+        return send(Type::GetObservedRecord, {value(Tag::ObservedId, observed_->observed),
+            value(Tag::ObservedRevision, observed_->revision), value(Tag::SourceEpoch, observed_->source)});
+    }
+    emit changed(); prepare(); return true;
 }
 void OrdinaryDecisionClient::prepare() {
     std::vector<Field> fields{value(Tag::ExpectedDesiredRev, desired_), value(Tag::PolicyDirection, direction_, 1),
@@ -268,6 +273,13 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
         if (f.type != Type::ObservedRecord || iv::unpack(find(f, Tag::Records)->bytes, 1, rows) != Error::Ok ||
             rows[0].observed != observed_->observed || rows[0].revision != observed_->revision || rows[0].source != source_ ||
             rows[0].binding != observed_->binding || rows[0].state != 1) { fail("This request is no longer current."); return; }
+        if (scope_ >= 3) {
+            const auto direction = get(f, Tag::PolicyDirection);
+            if (rows[0].temporal != 2 || direction < 1 || direction > 2) {
+                fail("The current connection direction is unavailable. Refresh this request before deciding."); return;
+            }
+            direction_ = int(direction);
+        }
         observed_ = rows[0]; observedGeneration_ = generation_; prepare(); return;
     }
     if (expectedType_ == Type::PrepareFuturePolicy || expectedType_ == Type::GetFutureDraft) {

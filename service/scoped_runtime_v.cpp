@@ -1,3 +1,7 @@
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <fwpsu.h>
 #include "runtime_ii.h"
 #include <algorithm>
 #include <cstring>
@@ -34,6 +38,11 @@ directional::Result NativeRuntime::writeScoped(const principal::Entry &command,
     decision.scope = admission->scope; decision.durationMs = admission->durationMs;
     Frame frame;
     if (decode(entry.payload, frame) != Error::Ok) return result;
+    const auto layer = cause->record_.layerId;
+    const auto direction = layer == FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4 || layer == FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6 ? 2u :
+        layer == FWPS_LAYER_ALE_AUTH_CONNECT_V4 || layer == FWPS_LAYER_ALE_AUTH_CONNECT_V6 ? 1u : 0u;
+    if (!direction || cause->record_.protocol != 6 || get(frame, Tag::PolicyDirection) != direction ||
+        admission->direction != direction) return result;
     decision.action = static_cast<UINT32>(get(frame, Tag::Decision));
     entry.kernel.state = GB_SCOPE_PENDING;
     retained = decision; result.desired = decision.revision;

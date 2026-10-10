@@ -19,11 +19,11 @@ target_include_directories(GateBouncerClassifier PRIVATE
   "${GATEBOUNCER_WDK_ROOT}/Include/${GATEBOUNCER_WDK_VERSION}/km/crt"
   "${GATEBOUNCER_SDK_ROOT}/Include/${GATEBOUNCER_WDK_VERSION}/shared")
 target_compile_definitions(GateBouncerClassifier PRIVATE _AMD64_ AMD64 _WIN64
-  UNICODE _UNICODE _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A00000B)
+  UNICODE _UNICODE NDIS_WDM=1 _WIN32_WINNT=0x0A00 NTDDI_VERSION=0x0A00000B)
 target_compile_options(GateBouncerClassifier PRIVATE /W4 /WX /GS /kernel /Zl /utf-8)
 target_link_directories(GateBouncerClassifier PRIVATE
   "${GATEBOUNCER_WDK_ROOT}/Lib/${GATEBOUNCER_WDK_VERSION}/km/x64")
-target_link_libraries(GateBouncerClassifier PRIVATE ntoskrnl hal fwpkclnt wdmsec BufferOverflowFastFailK)
+target_link_libraries(GateBouncerClassifier PRIVATE ntoskrnl hal fwpkclnt ndis wdmsec BufferOverflowFastFailK)
 # El wrapper WDK inicializa la cookie antes de entrar al DriverEntry propio.
 target_link_options(GateBouncerClassifier PRIVATE /DRIVER /SUBSYSTEM:NATIVE /ENTRY:GsDriverEntry
   /NODEFAULTLIB /INCREMENTAL:NO /MANIFEST:NO /DYNAMICBASE /NXCOMPAT /INTEGRITYCHECK)
