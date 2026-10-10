@@ -215,7 +215,9 @@ bool NativeClassifier::cancelledCurrent(const ClassifierCause &cause, const GB_S
     return cancelReadback(decision,before) && catalogCurrent(cause,engine) && cancelReadback(decision,after);
 }
 bool NativeClassifier::reset() noexcept {
-    if (!registrationCurrent()) return false;
+    const bool registered = registrationCurrent();
+    // Revocación negativa sobre device/TOKEN originales aun sin Registration vigente.
+    // El resultado no habilita una nueva fuente si la admisión original perdió corriente.
     const bool accepted = [&]() noexcept {
         std::lock_guard<std::mutex> lock(mutex_);
         if(pendingApp_)pendingApp_->appState_.store(2);
@@ -224,7 +226,7 @@ bool NativeClassifier::reset() noexcept {
             &state, sizeof(state), &bytes, nullptr) || bytes != sizeof(state) || !state.session || state.loss) return false;
         session_ = state.session; loss_ = state.loss; return true;
     }();
-    return accepted && serviceCaller() && registrationCurrent();
+    return accepted && registered && serviceCaller() && registrationCurrent();
 }
 ClassifierCause::ClassifierCause(std::shared_ptr<NativeClassifier> owner, GB_CLASSIFIER_RECORD record,
     gb::native::ProcessEvidence process, gb::native::TokenEvidence token)
