@@ -376,6 +376,13 @@ static bool prepareDeployment(DeploymentMode mode, const std::filesystem::path &
             repeated == 1 && repeatedSize == sizeof(repeated) && native::protectedRegistry(configuration.value) &&
             packageOwner->current() && lease.current() && outputsCurrent(held);
         DWORD marker = 1;
+        if (recorded && mode == DeploymentMode::Product) {
+            // Tuple original durable y servicio Disabled: falta instalación/admisión DriverStore.
+            // DiInstallDriverW reabre InfPath, sin RootDirectory/HANDLE ni FileID de salida.
+            // El binding original debe resolverse aquí antes de publicar marker0/AutoStart.
+            SetLastError(ERROR_NOT_SUPPORTED);
+            return false;
+        }
         if (recorded && deployment_detail::mark(configuration.value,0,marker,lease)) marker = 0;
         else return false; // Flush/readback incierto: no escribir otro marker ni reintentar.
         if (!outputsCurrent(held) || !ChangeServiceConfigW(service.value,SERVICE_NO_CHANGE,SERVICE_AUTO_START,SERVICE_NO_CHANGE,

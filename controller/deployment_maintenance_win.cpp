@@ -343,6 +343,14 @@ class GuestMaintenance {
         };
         try {
             if (!admit(root,true)) return recovery();
+            if (mode_ == DeploymentMode::Product) {
+                // El inventario firmado no admite por sí solo un driver original en DriverStore.
+                // Resolver ese binding antes de Runtime/store o de habilitar AutoStart.
+                result_.phase = MaintenancePhase::Service;
+                result_.outcome = MaintenanceOutcome::Pending;
+                result_.error = ERROR_NOT_SUPPORTED;
+                return result_;
+            }
             result_.phase = MaintenancePhase::Store;
             if (!loadPolicy()) return recovery(policy_ ? policy_->error_ : ERROR_INVALID_STATE);
             result_.phase = MaintenancePhase::Inventory;
@@ -364,6 +372,13 @@ class GuestMaintenance {
         try {
             if (!admit(root) || lease_.image() != source/L"GateBouncerService.exe" ||
                 !deployment_detail::disjoint(root,replacement) || !deployment_detail::disjoint(store_,replacement)) return fail();
+            if (mode_ == DeploymentMode::Product) {
+                // La instalación/admisión DriverStore de la versión nueva precede al switch.
+                result_.phase = MaintenancePhase::Package;
+                result_.outcome = MaintenanceOutcome::Pending;
+                result_.error = ERROR_NOT_SUPPORTED;
+                return result_;
+            }
             result_.phase = MaintenancePhase::Package;
             if (!deployment_detail::stagePackage(source,replacement,replacement_,mode_) || !current()) return fail();
             result_.phase = MaintenancePhase::Marker; if (!begin(2)) return fail(GetLastError());
