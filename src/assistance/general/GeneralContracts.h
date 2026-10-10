@@ -38,6 +38,7 @@ struct Destination {
     std::uint8_t protocol=0;
     std::uint64_t observedAtMs=0;
     bool operator==(const Destination&) const;
+    bool operator!=(const Destination& d) const {return !(*this==d);}
 };
 bool validDestination(const Destination&,bool external=false);
 struct PublicFields {

@@ -1,5 +1,9 @@
 #include "ObservationReader.h"
 #include <QElapsedTimer>
+#include <QUuid>
+#include <QStringList>
+#include <cstring>
+#include "websearch/DestinationEvidence.h"
 #include <algorithm>
 #include <set>
 
@@ -18,6 +22,15 @@ bool status(const W::Frame& frame,ObservationRead& out){
 }
 bool sameContext(const ObservationRead& a,const ObservationRead& b){
     return a.service==b.service&&a.connection==b.connection&&a.profile==b.profile&&a.desired==b.desired;
+}
+std::optional<Destination> outbound(const W::iv::DestinationContext& tuple,std::uint64_t utcNanos){
+    if(!tuple.present||tuple.direction!=1||!W::iv::valid(tuple)||!utcNanos)return {};
+    const auto& bytes=tuple.remoteAddress;QString literal;
+    if(tuple.family==4)literal=QString("%1.%2.%3.%4").arg(bytes[0]).arg(bytes[1]).arg(bytes[2]).arg(bytes[3]);
+    else{QStringList groups;for(unsigned n=0;n<16;n+=2)groups<<QString::number((unsigned(bytes[n])<<8)|bytes[n+1],16);literal=groups.join(':');}
+    const auto canonical=gatebouncer::websearch::canonicalAddress(literal);if(!canonical)return {};
+    Destination d{canonical->toStdString(),tuple.remotePort,tuple.protocol,utcNanos/1000000};
+    return validDestination(d)?std::optional<Destination>(std::move(d)):std::nullopt;
 }
 }
 bool ObservationReader::sameRecord(const W::iv::ObservedRecord& a,const W::iv::ObservedRecord& b,bool projected){
@@ -47,9 +60,10 @@ std::optional<ObservationRead> ObservationReader::observe(gb::ipc::ii::SessionCh
     const auto prior=expected?std::optional<ObservationRead>(*expected):std::nullopt;
     auto ready=[&]{const auto elapsed=age();return elapsed>=0&&elapsed<5000&&live();};
     auto transact=[&](W::Frame query,W::Frame& reply,W::Type type){
+        const auto random=QUuid::createUuid().toRfc4122();Id128 correlation{};std::memcpy(correlation.data(),random.data(),16);query.correlation=correlation;
         query.minor=3;query.connection=connection;
         return ready()&&source.transact(std::move(query),reply)&&ready()&&reply.type==type&&
-            reply.minor==3&&reply.connection==connection&&W::iv::validate(reply)==W::Error::Ok;
+            reply.minor==3&&reply.connection==connection&&reply.correlation==correlation&&W::iv::validate(reply)==W::Error::Ok;
     };
     ObservationRead initial;initial.connection=connection;
     W::Frame query,before;query.type=W::Type::GetStatus;
@@ -87,13 +101,24 @@ std::optional<ObservationRead> ObservationReader::observe(gb::ipc::ii::SessionCh
     }
     W::Frame row;query.type=W::Type::GetObservedRecord;
     query.fields={W::value(W::Tag::ServiceEpoch,initial.service.serviceEpoch),W::value(W::Tag::ObservedId,request),
-        W::value(W::Tag::ObservedRevision,selected.revision),W::value(W::Tag::SourceEpoch,initial.service.engineContext)};
+        W::value(W::Tag::ObservedRevision,selected.revision),W::value(W::Tag::SourceEpoch,initial.service.engineContext),
+        W::value(W::Tag::DestinationContext,1,1)};
     if(!transact(query,row,W::Type::ObservedRecord)||W::idValue(row,W::Tag::ServiceEpoch)!=initial.service.serviceEpoch||
         W::idValue(row,W::Tag::SourceEpoch)!=initial.service.engineContext)return {};
     const auto bytes=W::find(row,W::Tag::Records);std::vector<W::iv::ObservedRecord> records;
     if(!bytes||W::iv::unpack(bytes->bytes,1,records)!=W::Error::Ok||records[0].state!=1||
         records[0].display.projection!=2||records[0].display.path.empty()||
         !sameRecord(records[0],selected,!prior))return {};
+    W::iv::ServiceContext context;W::iv::DestinationContext tuple;
+    const auto original=W::find(row,W::Tag::DestinationContext);
+    if(!original||W::iv::decodeServiceContext(row,context)!=W::Error::Ok||
+        !(PendingServiceContext{context.serviceEpoch,context.boot,context.engineContext,context.engineBindingGeneration}==initial.service)||
+        W::get(row,W::Tag::ProfileGeneration)!=initial.profile||
+        W::iv::unpackDestinationContext(original->bytes,tuple)!=W::Error::Ok)return {};
+    initial.destinationContext=original->bytes;
+    initial.destination=outbound(tuple,records[0].lastUtc);
+    if(tuple.present&&tuple.direction==1&&!initial.destination)return {};
+    if(prior&&(initial.destinationContext!=prior->destinationContext||initial.destination!=prior->destination))return {};
     initial.record=std::move(records[0]);
     W::Frame after;query.type=W::Type::GetStatus;query.fields.clear();ObservationRead final;final.connection=connection;
     if(!transact(query,after,W::Type::Status)||!status(after,final)||!sameContext(initial,final)||!ready())return {};

@@ -14,6 +14,7 @@ struct Destination {
     quint8 protocol=0;
     quint64 observedAtMs=0;
     bool operator==(const Destination& other) const;
+    bool operator!=(const Destination& other) const {return !(*this==other);}
 };
 enum class Resource : quint8 { Search=0, Bootstrap4, Bootstrap6, Registry, AdobeEndpoints };
 std::optional<QString> canonicalAddress(const QString&);

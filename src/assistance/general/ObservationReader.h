@@ -11,6 +11,8 @@ struct ObservationRead {
     std::shared_ptr<const gb::ipc::ii::ReadPeerLease> peer;
     gb::wire::iv::ObservedRecord record;
     std::uint64_t profile=0,desired=0;
+    gb::wire::Bytes destinationContext;
+    std::optional<Destination> destination;
 };
 class PrivateObservationReaderTest;
 class ObservationReader final {
