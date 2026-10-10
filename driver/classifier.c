@@ -75,7 +75,7 @@ typedef struct GB_ENTRY {
     BOOLEAN imageFactsValid;
     UINT64 pendingDeadline, parent, udpAuthorizationFlow;
     BOOLEAN delivered, revoked, closed, associated, completing, consumed, deadFlow;
-    BOOLEAN cancelPin, futureRetired, udpFlowDrained;
+    BOOLEAN cancelPin, futureRetired, udpFlowDrained, udpProcessExited;
     BOOLEAN listener, injectQueued, injectActive, injectSeen;
     ULONG injectPins;
     ULONG associationPins;
@@ -417,7 +417,7 @@ static BOOLEAN retireable(GB_ENTRY *e) {
     // retirar únicamente generaciones con flow exacto y anchor negativo retenido.
     if(e->record.protocol==IPPROTO_UDP && (!e->udpAuthorizationFlow || !e->udpFlowDrained ||
        e->receipt.flow!=e->udpAuthorizationFlow || !e->revoked ||
-       PsGetProcessExitStatus(e->process)==STATUS_PENDING || !udpRetainedAnchor(e)))return FALSE;
+       !e->udpProcessExited || !udpRetainedAnchor(e)))return FALSE;
     if(!e->closed || e->completion || e->completing || e->associated || e->cancelPin ||
         e->packet || (e->record.protocol==IPPROTO_UDP && e->packetCharged) ||
         e->injectQueued || e->injectActive || e->injectPins)return FALSE;
@@ -1500,10 +1500,23 @@ static void maintenance(void *ignored) {
         KeAcquireSpinLock(&gbLock,&irql);gbFault=TRUE;loss();KeReleaseSpinLock(&gbLock,irql);
     }
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
-        GB_ENTRY *e;
-        KeAcquireSpinLock(&gbLock,&irql); e=gbEntries[i]; KeReleaseSpinLock(&gbLock,irql);
+        GB_ENTRY *e;PEPROCESS originalProcess=NULL;UINT64 originalCause=0,originalSession=0;
+        BOOLEAN identity,exited=FALSE;
+        KeAcquireSpinLock(&gbLock,&irql); e=gbEntries[i];
+        if(e) {originalProcess=e->process;originalCause=e->record.cause;originalSession=e->record.session;}
+        KeReleaseSpinLock(&gbLock,irql);
         if(!e) continue;
-        if(!currentEntry(e)) { KeAcquireSpinLock(&gbLock,&irql); revoke(e); KeReleaseSpinLock(&gbLock,irql); }
+        // gbControl conserva la entrada y su referencia EPROCESS en esta ventana.
+        // Consultar a PASSIVE, no desde retireable bajo el spinlock a DISPATCH.
+        if(e->record.protocol==IPPROTO_UDP)exited=PsGetProcessExitStatus(originalProcess)!=STATUS_PENDING;
+        identity=currentEntry(e);
+        KeAcquireSpinLock(&gbLock,&irql);
+        if(gbEntries[i]==e && e->process==originalProcess && e->record.cause==originalCause &&
+           e->record.session==originalSession) {
+            if(exited)e->udpProcessExited=TRUE;
+            if(!identity)revoke(e);
+        }
+        KeReleaseSpinLock(&gbLock,irql);
     }
     KeAcquireSpinLock(&gbLock,&irql);
     for(i=0;i<GB_CLASSIFIER_CAPACITY;++i) {
