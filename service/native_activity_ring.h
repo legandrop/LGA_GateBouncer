@@ -58,6 +58,8 @@ public:
     }
     wire::Error append(wire::Frame event) noexcept {
       try {
+        if (event.type!=wire::Type::Attempt && event.type!=wire::Type::Authorization &&
+            event.type!=wire::Type::ObservationGap) return wire::Error::Unsupported;
         if (!ready() || sequence_ == UINT64_MAX) { exhausted_ = true; ready_ = false; return wire::Error::Capacity; }
         for (auto &field : event.fields)
             if (field.tag == wire::Tag::EventSeq) field = wire::value(wire::Tag::EventSeq, sequence_ + 1);
