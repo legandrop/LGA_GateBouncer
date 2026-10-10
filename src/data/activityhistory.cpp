@@ -239,12 +239,15 @@ QVector<RuleHistoryReview> nativeRuleHistoryReview(const HistoryState &state, co
         const auto &dates = *found;
         row.dates = {dates.request.at,dates.allowed.at,dates.traffic.at};
         row.lastRecorded = dates.activity.at;
-        if (!row.lastRecorded.isValid() || clockGap || row.lastRecorded > nowUtc) {
+        if (!row.lastRecorded.isValid() || clockGap) {
             row.reason = "Recorded activity time is Unknown or inconsistent; age cannot be determined."; continue;
         }
         // Fechas OS sólo dentro del mismo namespace; ni receivedAt ni silencio acreditan edad/inactividad.
         for (const auto &at : {row.dates.attempt,row.dates.authorization,row.dates.traffic})
             if (at.isValid() && row.lastRecorded < at) row.lastRecorded = at;
+        if (row.lastRecorded > nowUtc) {
+            row.reason = "Recorded activity time is Unknown or inconsistent; age cannot be determined."; continue;
+        }
         row.age = row.lastRecorded < nowUtc.addDays(-days) ? RuleHistoryAge::Before : RuleHistoryAge::Recent;
         row.reason = coverage->status == CoverageStatus::Unavailable
             ? "Saved activity only; monitoring history is unavailable. No record does not prove inactivity."
