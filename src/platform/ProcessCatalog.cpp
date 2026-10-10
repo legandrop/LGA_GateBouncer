@@ -88,7 +88,7 @@ ProcessCatalogResult ProcessCatalog::refresh() {
 namespace Gate::Data {
 namespace {
 struct OwnBudget {
-    std::atomic<unsigned> slots{0};
+    std::atomic<unsigned> occupiedHandleCount{0};
     std::atomic<quint64> bytes{32768}; // Quarantine física y contenedores compartidos.
 #ifdef Q_OS_WIN
     std::mutex closingMutex;
@@ -109,8 +109,8 @@ struct OwnBudget {
         return false;
     }
     bool reserve() {
-        auto used = slots.load();
-        while (used < 64) if (slots.compare_exchange_weak(used, used + 1)) return true;
+        auto used = occupiedHandleCount.load();
+        while (used < 64) if (occupiedHandleCount.compare_exchange_weak(used, used + 1)) return true;
         return false;
     }
 };
@@ -128,7 +128,7 @@ struct OwnInstance {
         if (!closed && budget) budget->quarantine(failedProcess,failedToken);
 #endif
         // Un fallo físico de cierre no recicla disponibilidad por un contador.
-        if (closed && budget) --budget->slots;
+        if (closed && budget) --budget->occupiedHandleCount;
     }
 };
 struct OwnEntry {
@@ -278,7 +278,7 @@ std::shared_ptr<NativeOwnBatch> ProcessCatalog::acquireNative() {
         if (batchCurrent(batch) && native_->budget->reserve()) {
             std::shared_ptr<OwnInstance> own;
             try { own = std::make_shared<OwnInstance>(); }
-            catch (...) { --native_->budget->slots; }
+            catch (...) { --native_->budget->occupiedHandleCount; }
             if (own) {
                 own->budget = native_->budget;
                 const auto &f = *p.second->attempt.native->process;
