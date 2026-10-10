@@ -294,7 +294,8 @@ Schema schema(const Frame &f) {
             {T::LostCount,8},{T::LostCountKnown,1},{T::GapReason,1},
             {T::ProfileGeneration,8},{T::SourceEpoch,16},{T::ServiceContext,56}};
   case Type::Attempt:
-  case Type::Authorization: {
+  case Type::Authorization:
+  case Type::Traffic: {
     Schema s={{T::ServiceEpoch,16},{T::EventSeq,8},{T::Timestamp,8},{T::Presence,8},
               {T::Source,1},{T::FlowDirection,1},{T::SourceCoverage,1},
               {T::ProfileGeneration,8},{T::ObservedId,16},{T::ObservedRevision,8},
@@ -303,6 +304,11 @@ Schema schema(const Frame &f) {
     if(f.type==Type::Authorization) {
       s[T::CommandId]=16; s[T::AttemptLink]=16; s[T::EffectiveRev]=8;
       s[T::Decision]=1; s[T::ScopeKind]=1; s[T::Durable]=1; s[T::ProofState]=1;
+    }
+    if(f.type==Type::Traffic) {
+      s[T::CommandId]=16;s[T::AttemptLink]=16;s[T::EffectiveRev]=8;
+      s[T::ByteCount]=8;s[T::PacketCount]=8;s[T::PacketDirection]=1;
+      s[T::ScopeKind]=1;s[T::Durable]=1;s[T::ProofState]=1;
     }
     return s;
   }
@@ -417,7 +423,7 @@ bool supported(Type t) {
   return t == Type::Hello || t == Type::HelloAck || t == Type::GetStatus ||
          t == Type::Status || t == Type::ProtocolError ||
          t == Type::SubscribeEvents || t == Type::SubscriptionAck ||
-         t == Type::Attempt || t == Type::Authorization || t == Type::ObservationGap ||
+         t == Type::Attempt || t == Type::Authorization || t == Type::Traffic || t == Type::ObservationGap ||
          (t >= Type::ListObserved && t <= Type::ReviewQueued);
 }
 Id attemptLink(std::uint64_t sequence) {
@@ -448,7 +454,7 @@ Error decodeServiceContext(const Frame &frame, ServiceContext &out) {
   if (frame.minor != 3 ||
       (frame.type != Type::HelloAck && frame.type != Type::Status &&
        frame.type != Type::SubscriptionAck && frame.type != Type::Attempt &&
-       frame.type != Type::Authorization && frame.type != Type::ObservationGap))
+       frame.type != Type::Authorization && frame.type != Type::Traffic && frame.type != Type::ObservationGap))
     return Error::Unsupported;
   const auto error = iv::validate(frame);
   if (error != Error::Ok) return error;
@@ -550,7 +556,7 @@ Error validate(const Frame &f) {
     if (tag < 1 || tag > static_cast<unsigned>(T::ScopeDurationMs) || tag == 57 ||
         (v.tag == T::ServiceContext && f.type != Type::HelloAck && f.type != Type::Status &&
          f.type != Type::SubscriptionAck && f.type != Type::Attempt &&
-         f.type != Type::Authorization && f.type != Type::ObservationGap))
+         f.type != Type::Authorization && f.type != Type::Traffic && f.type != Type::ObservationGap))
       return Error::Unsupported;
     if (tag <= previous)
       return Error::Malformed;
@@ -579,8 +585,9 @@ Error validate(const Frame &f) {
           boot != idValue(f, T::BootId) || engine != idValue(f, T::SourceEpoch) ||
           zero(engine) != (generation == 0)) return Error::Malformed;
       auto c = number(*caps);
-      if ((c >> 26) || (c & ((0x3full << 6) | (1ull << 16))) ||
+      if ((c >> 27) || (c & ((0x3full << 6) | (1ull << 16))) ||
           ((c & NativeEvents) && (!(c & ObservedRead) || zero(engine) || get(f,T::ReviewProfileState)!=1)) ||
+          ((c & NativeTraffic) && !(c & NativeEvents)) ||
           ((c & FuturePolicyControl) && !number(*profile)))
         return Error::Malformed;
       base.fields.erase(std::remove_if(base.fields.begin(), base.fields.end(),
@@ -592,7 +599,7 @@ Error validate(const Frame &f) {
                         base.fields.end());
       for (auto &v : base.fields)
         if (v.tag == T::Capabilities)
-          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents), 8);
+          v.bytes = integer(c & ~(ObservedRead | FuturePolicyControl | NativeEvents | NativeTraffic), 8);
     }
     if (f.type == Type::ProtocolError && get(f, T::ErrorCode) == 18)
       for (auto &v : base.fields)
@@ -612,7 +619,7 @@ Error validate(const Frame &f) {
     if (it->second == 16 && v.tag != T::SnapshotId && zero(idValue(f, v.tag)))
       return Error::Malformed;
   }
-  const bool activity=f.type==Type::Attempt || f.type==Type::Authorization;
+  const bool activity=f.type==Type::Attempt || f.type==Type::Authorization || f.type==Type::Traffic;
   const bool stream=activity || f.type==Type::ObservationGap || f.type==Type::SubscriptionAck;
   if(stream) {
     const auto &b=find(f,T::ServiceContext)->bytes;
@@ -621,7 +628,7 @@ Error validate(const Frame &f) {
        get(f,T::SourceCoverage)!=1) return Error::Malformed;
   }
   if(f.type==Type::SubscribeEvents || f.type==Type::SubscriptionAck)
-    if(get(f,T::EventMask)!=3) return Error::Malformed;
+    if(get(f,T::EventMask)!=3 && get(f,T::EventMask)!=7) return Error::Malformed;
   if(activity) {
     auto p=get(f,T::Presence), stamp=get(f,T::Timestamp), origin=get(f,T::Source);
     if(!get(f,T::EventSeq) || p>3 || ((p&1) ? !stamp : stamp!=0) ||
@@ -630,10 +637,17 @@ Error validate(const Frame &f) {
       return Error::Malformed;
     if(f.type==Type::Authorization) {
       const auto link=attemptSequence(idValue(f,T::AttemptLink));
-      if(origin!=2 || (p&1) || stamp || !link || link>=get(f,T::EventSeq) ||
+      if(origin!=2 || !link || link>=get(f,T::EventSeq) ||
          !get(f,T::EffectiveRev) || get(f,T::Decision)<1 || get(f,T::Decision)>2 ||
          get(f,T::ScopeKind)<3 || get(f,T::ScopeKind)>5 ||
          get(f,T::Durable)!=1 || get(f,T::ProofState)!=2) return Error::Malformed;
+    }
+    if(f.type==Type::Traffic) {
+      const auto link=attemptSequence(idValue(f,T::AttemptLink));
+      if(origin!=2 || p!=3 || !link || link>=get(f,T::EventSeq) || !get(f,T::PacketCount) ||
+         get(f,T::PacketDirection)<1 || get(f,T::PacketDirection)>2 || !get(f,T::EffectiveRev) ||
+         get(f,T::ScopeKind)<3 || get(f,T::ScopeKind)>5 || get(f,T::Durable)!=1 || get(f,T::ProofState)!=2)
+        return Error::Malformed;
     }
   }
   if(f.type==Type::ObservationGap) {

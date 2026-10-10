@@ -19,6 +19,7 @@ class NativeClassifier final : public std::enable_shared_from_this<NativeClassif
     bool reset() noexcept;
     bool decide(const GB_SCOPE_DECISION &, GB_SCOPE_RECEIPT &) noexcept;
     bool readback(const GB_SCOPE_DECISION &, GB_SCOPE_RECEIPT &) noexcept;
+    bool activity(const ClassifierCause &, const GB_SCOPE_DECISION &, HANDLE, GB_ACTIVITY_SNAPSHOT &) const noexcept;
     bool cancel(const GB_SCOPE_DECISION &, GB_CANCEL_RECEIPT &) noexcept;
     bool cancelReadback(const GB_SCOPE_DECISION &, GB_CANCEL_RECEIPT &) const noexcept;
     bool cancelIoctl(DWORD, const GB_SCOPE_DECISION &, GB_CANCEL_RECEIPT &) const noexcept;

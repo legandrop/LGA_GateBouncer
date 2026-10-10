@@ -110,7 +110,7 @@ void NativeRuntime::pruneScopedOutcomes() noexcept {
            (outcome.activityAttempt.type!=Type::Attempt || outcome.activityCompleted) &&
            (outcome.result.state==State::Prepared || outcome.result.state==State::Applied)) {
             const auto charged=outcome.payload.capacity()+outcome.identity.account.capacity()+
-                outcome.identity.logon.capacity()+sizeof(PrincipalOutcome)+128+NativeActivityRing::bytes(outcome.activityAttempt);
+                outcome.identity.logon.capacity()+sizeof(PrincipalOutcome)+128+NativeActivityRing::bytes(outcome.activityAttempt)+outcome.activityCharge;
             if(charged>principalOutcomeBytes_){principalWriteFault_=true;return;}
             principalOutcomeBytes_-=charged;it=principalOutcomes_.erase(it);
         } else ++it;

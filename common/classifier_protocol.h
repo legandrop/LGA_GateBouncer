@@ -15,6 +15,12 @@
 #define GB_CLASSIFIER_READBACK CTL_CODE(FILE_DEVICE_NETWORK, 0x906, METHOD_BUFFERED, FILE_READ_DATA)
 #define GB_CLASSIFIER_CANCEL CTL_CODE(FILE_DEVICE_NETWORK, 0x907, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define GB_CLASSIFIER_CANCEL_READBACK CTL_CODE(FILE_DEVICE_NETWORK, 0x908, METHOD_BUFFERED, FILE_READ_DATA)
+#define GB_CLASSIFIER_ACTIVITY CTL_CODE(FILE_DEVICE_NETWORK, 0x909, METHOD_BUFFERED, FILE_READ_DATA)
+#define GB_ACTIVITY_VERSION 1u
+#define GB_ACTIVITY_AUTH_UTC 1u
+#define GB_ACTIVITY_OUTBOUND 2u
+#define GB_ACTIVITY_INBOUND 4u
+#define GB_ACTIVITY_INCOMPLETE 8u
 #define GB_SCOPE_ONCE 3u
 #define GB_SCOPE_INSTANCE 4u
 #define GB_SCOPE_DURATION 5u
@@ -79,6 +85,15 @@ typedef struct GB_SCOPE_RECEIPT {
     UINT64 deadline, flow, observedAt;
     UINT32 state, applied, current, reserved;
 } GB_SCOPE_RECEIPT;
+// Lectura histórica propia; no cambia el receipt durable ABI2.
+typedef struct GB_ACTIVITY_SNAPSHOT {
+    UINT32 version, bytes;
+    GB_SCOPE_DECISION decision;
+    UINT64 loss, authorizedUtc, flow;
+    UINT64 outboundBytes, outboundPackets, outboundUtc, outboundRevision;
+    UINT64 inboundBytes, inboundPackets, inboundUtc, inboundRevision;
+    UINT32 flags, reserved;
+} GB_ACTIVITY_SNAPSHOT;
 // guarded prueba guard negativo retenido, no es ACK de CompleteOperation.
 typedef struct GB_CANCEL_RECEIPT {
     GB_SCOPE_DECISION decision;

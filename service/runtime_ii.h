@@ -57,6 +57,7 @@ class NativeRuntime {
         std::map<Id, PrincipalPage> pages;
         bool cancelled = false;
         bool readonly = false;
+        std::uint32_t subscriptionMask=0;
         std::filesystem::path admittedImage;
     };
     struct PrincipalObservation;
@@ -89,6 +90,9 @@ class NativeRuntime {
     bool principalEventCurrent(const PrincipalPeer &, const Frame &) noexcept;
     Frame subscribePrincipalEvents(const Frame &, const std::shared_ptr<PrincipalPeer> &);
     void publishPrincipalAuthorization(PrincipalOutcome &) noexcept;
+    void pollPrincipalTraffic() noexcept;
+    bool principalTrafficReady() const noexcept;
+    static std::size_t activityCauseBytes(const allnative::ClassifierCause &) noexcept;
     void invalidatePrincipalObservations() noexcept;
     bool ordinaryPeer(HANDLE, std::shared_ptr<PrincipalPeer> &, bool readonly = false);
     bool principalPeerCurrent(const PrincipalPeer &) const noexcept;
@@ -114,6 +118,20 @@ class NativeRuntime {
     std::uint64_t principalObservedRevision_ = 0;
     std::size_t principalPendingBytes_ = 0;
     NativeActivityRing principalEvents_;
+    bool principalTrafficAcquired_ = false;
+    std::size_t principalMask3Subscribers_=0;
+    struct PrincipalTrafficWatcher {
+        Frame attempt;
+        std::shared_ptr<allnative::NativeSource> source;
+        std::shared_ptr<const allnative::CatalogSnapshot> catalog;
+        std::shared_ptr<allnative::ClassifierCause> cause;
+        GB_SCOPE_DECISION decision{};
+        GB_ACTIVITY_SNAPSHOT published{};
+        std::size_t charged=0;
+    };
+    std::map<Id,std::shared_ptr<PrincipalTrafficWatcher>> principalTraffic_;
+    Id principalTrafficCursor_{};
+    std::size_t principalTrafficBytes_=0;
     struct PrincipalOutcome {
         Bytes payload;
         directional::Result result;
@@ -127,6 +145,10 @@ class NativeRuntime {
         GB_SCOPE_DECISION scoped{};
         Frame activityAttempt;
         std::uint64_t activitySession = 0, activityCause = 0;
+        std::shared_ptr<allnative::NativeSource> activitySource;
+        std::shared_ptr<const allnative::CatalogSnapshot> activityCatalog;
+        std::shared_ptr<allnative::ClassifierCause> activityOwner;
+        std::size_t activityCharge=0;
         bool activityCompleted = false;
     };
     std::map<Id, PrincipalOutcome> principalOutcomes_;

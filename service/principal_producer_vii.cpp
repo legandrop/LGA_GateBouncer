@@ -51,6 +51,13 @@ bool NativeRuntime::principalEventsReady() const noexcept {
         principalEvents_.context().engineContext == principalSource_->binding_->epoch &&
         principalEvents_.context().engineBindingGeneration == principalSource_->binding_->generation;
 }
+bool NativeRuntime::principalTrafficReady() const noexcept {
+    return principalTrafficAcquired_ && principalEventsReady();
+}
+std::size_t NativeRuntime::activityCauseBytes(const allnative::ClassifierCause &cause) noexcept {
+    return sizeof(cause)+128+cause.process_.image.native().capacity()*sizeof(wchar_t)+
+        cause.token_.account.capacity()+cause.token_.logon.capacity();
+}
 bool NativeRuntime::principalEventCurrent(const PrincipalPeer &peer, const Frame &event) noexcept {
   try {
     if (!principalPeerCurrent(peer) || peer.profile != principalEvents_.profile()) return false;
@@ -79,11 +86,16 @@ Frame NativeRuntime::subscribePrincipalEvents(const Frame &request, const std::s
         idValue(request, Tag::SourceEpoch) != context.engineContext ||
         get(request, Tag::ProfileGeneration) != peer->profile) return principalError(Error::Stale);
     const auto cursor = get(request, Tag::AfterEventSeq);
+    const auto mask=principalTrafficReady() ? 7u : 3u;
+    if(get(request,Tag::EventMask)!=mask)return principalError(Error::Stale);
     if (cursor > principalEvents_.latest()) return principalError(Error::Stale);
     auto ack = principalEvents_.frame(Type::SubscriptionAck);
     for (auto &field : ack.fields)
         if (field.tag == Tag::EventSeq) field = value(Tag::EventSeq, cursor ? cursor : principalEvents_.latest());
-    ack.fields.push_back(value(Tag::EventMask, 3, 4));
+    ack.fields.push_back(value(Tag::EventMask, mask, 4));
+    if(peer->subscriptionMask==3 && mask!=3 && principalMask3Subscribers_)--principalMask3Subscribers_;
+    if(peer->subscriptionMask!=3 && mask==3)++principalMask3Subscribers_;
+    peer->subscriptionMask=mask; // Reservado antes del send; close libera incluso un ACK fallido.
     return ordered(std::move(ack));
 }
 void NativeRuntime::publishPrincipalAuthorization(PrincipalOutcome &outcome) noexcept {
@@ -113,9 +125,25 @@ void NativeRuntime::publishPrincipalAuthorization(PrincipalOutcome &outcome) noe
         principalEvents_.lose(); return;
     }
     auto event = outcome.activityAttempt; event.type = Type::Authorization;
+    GB_ACTIVITY_SNAPSHOT activity{};
+    const auto source=principalSource_;const auto catalog=principalCatalog_;
+    const auto current=readServiceContext();
+    const bool originalSource=source==principalSource_ && catalog==principalCatalog_ &&
+        source==outcome.activitySource && catalog==outcome.activityCatalog && principalEventsReady() &&
+        NativeActivityRing::same(current,original);
+    const bool acquired=originalSource && outcome.activityOwner && principalClassifier_ &&
+        outcome.activityOwner->owner_==principalClassifier_ &&
+        principalClassifier_->activity(*outcome.activityOwner,outcome.scoped,backend_.engine_,activity);
+    if(!originalSource) {principalEvents_.lose();return;}
+    const auto after=readServiceContext();
+    if(source!=principalSource_ || catalog!=principalCatalog_ || !principalEventsReady() ||
+       !NativeActivityRing::same(after,original)) {principalEvents_.lose();return;}
+    std::uint64_t authorizedUtc=0;
+    if(acquired && (activity.flags & GB_ACTIVITY_AUTH_UTC))ii::filetimeUtc(activity.authorizedUtc,authorizedUtc);
+    if(acquired)principalTrafficAcquired_=true;
     for (auto &field : event.fields) {
-        if (field.tag == Tag::Timestamp) field = value(Tag::Timestamp, 0);
-        if (field.tag == Tag::Presence) field = value(Tag::Presence, get(event, Tag::Presence) & ~1ull);
+        if (field.tag == Tag::Timestamp) field = value(Tag::Timestamp, authorizedUtc);
+        if (field.tag == Tag::Presence) field = value(Tag::Presence, (get(event, Tag::Presence) & ~1ull) | (authorizedUtc ? 1ull : 0ull));
     }
     Id command{}; std::copy(std::begin(outcome.scoped.command), std::end(outcome.scoped.command), command.begin());
     if (commandFrame.correlation!=command) { principalEvents_.lose(); return; }
@@ -123,8 +151,103 @@ void NativeRuntime::publishPrincipalAuthorization(PrincipalOutcome &outcome) noe
         value(Tag::AttemptLink, wire::iv::attemptLink(get(outcome.activityAttempt, Tag::EventSeq))),
         value(Tag::EffectiveRev, outcome.scoped.revision), value(Tag::Decision, outcome.scoped.action, 1),
         value(Tag::ScopeKind, outcome.scope, 1), value(Tag::Durable, 1, 1), value(Tag::ProofState, 2, 1)});
-    if (principalEvents_.append(std::move(event)) != Error::Ok) principalEvents_.lose();
+    if (principalEvents_.append(std::move(event)) != Error::Ok) {principalEvents_.lose();return;}
+    if(outcome.scoped.action!=2 || !acquired)return;
+    if(activity.flags & GB_ACTIVITY_INCOMPLETE) {principalEvents_.discontinuity();return;}
+    try {
+    const auto charged=sizeof(PrincipalTrafficWatcher)+128+NativeActivityRing::bytes(outcome.activityAttempt)+outcome.activityCharge;
+    if(principalTraffic_.size()>=64 || charged>PendingBytesLimit ||
+       principalPendingBytes_>PendingBytesLimit-charged || principalTrafficBytes_>PendingBytesLimit-charged-principalPendingBytes_) {
+        principalEvents_.discontinuity();return;
+    }
+    auto watcher=std::make_shared<PrincipalTrafficWatcher>();
+    watcher->attempt=outcome.activityAttempt;watcher->source=source;watcher->catalog=catalog;
+    watcher->cause=outcome.activityOwner;watcher->decision=outcome.scoped;
+    watcher->charged=sizeof(PrincipalTrafficWatcher)+128+NativeActivityRing::bytes(watcher->attempt)+outcome.activityCharge;
+    if(watcher->charged>PendingBytesLimit || principalPendingBytes_>PendingBytesLimit-watcher->charged ||
+       principalTrafficBytes_>PendingBytesLimit-watcher->charged-principalPendingBytes_) {principalEvents_.discontinuity();return;}
+    const auto retainedCharge=watcher->charged;
+    if(!principalTraffic_.emplace(command,std::move(watcher)).second) {principalEvents_.discontinuity();return;}
+    principalTrafficBytes_+=retainedCharge;
+    } catch(...) {principalEvents_.discontinuity();} // Ya insertada Auth: asignar watcher no la suprime.
   } catch (...) { principalEvents_.fail(); }
+}
+void NativeRuntime::pollPrincipalTraffic() noexcept {
+  try {
+    if(!principalTrafficReady() || principalMask3Subscribers_)return;
+    const auto limit=std::min<std::size_t>(8,principalTraffic_.size());
+    for(std::size_t work=0;work<limit && !principalTraffic_.empty();++work) {
+        auto it=principalTraffic_.upper_bound(principalTrafficCursor_);
+        if(it==principalTraffic_.end())it=principalTraffic_.begin();
+        const auto command=it->first;const auto watcher=it->second;principalTrafficCursor_=command;
+        auto retire=[&]() {
+            auto present=principalTraffic_.find(command);
+            if(present!=principalTraffic_.end() && present->second==watcher) {
+                principalTrafficBytes_-=watcher->charged;principalTraffic_.erase(present);
+            }
+            if(principalEvents_.ready())principalEvents_.discontinuity();
+        };
+        wire::iv::ServiceContext original;
+        if(wire::iv::decodeServiceContext(watcher->attempt,original)!=Error::Ok) {retire();continue;}
+        const auto current=readServiceContext(); // No Ready cacheado, también sin nuevos paquetes.
+        auto present=principalTraffic_.find(command);
+        if(present==principalTraffic_.end() || present->second!=watcher)continue;
+        if(!principalTrafficReady() || principalSource_!=watcher->source || principalCatalog_!=watcher->catalog ||
+           !NativeActivityRing::same(original,current) || !principalClassifier_ || !watcher->cause ||
+           watcher->cause->owner_!=principalClassifier_) {retire();continue;}
+        GB_ACTIVITY_SNAPSHOT snapshot{};
+        if(!principalClassifier_->activity(*watcher->cause,watcher->decision,backend_.engine_,snapshot) ||
+           (snapshot.flags & GB_ACTIVITY_INCOMPLETE)) {retire();continue;}
+        const auto after=readServiceContext();
+        present=principalTraffic_.find(command);
+        if(present==principalTraffic_.end() || present->second!=watcher)continue;
+        if(watcher->source!=principalSource_ || watcher->catalog!=principalCatalog_ || !principalTrafficReady() ||
+           !NativeActivityRing::same(after,original)) {retire();continue;}
+        bool broken=false;
+        for(unsigned direction=1;direction<=2 && !broken;++direction) {
+            const bool outbound=direction==1;
+            const auto flag=outbound ? GB_ACTIVITY_OUTBOUND : GB_ACTIVITY_INBOUND;
+            const auto bytes=outbound ? snapshot.outboundBytes : snapshot.inboundBytes;
+            const auto packets=outbound ? snapshot.outboundPackets : snapshot.inboundPackets;
+            const auto utc=outbound ? snapshot.outboundUtc : snapshot.inboundUtc;
+            const auto revision=outbound ? snapshot.outboundRevision : snapshot.inboundRevision;
+            auto &last=watcher->published;
+            const auto beforeBytes=outbound ? last.outboundBytes : last.inboundBytes;
+            const auto beforePackets=outbound ? last.outboundPackets : last.inboundPackets;
+            const auto beforeUtc=outbound ? last.outboundUtc : last.inboundUtc;
+            const auto beforeRevision=outbound ? last.outboundRevision : last.inboundRevision;
+            if(bytes<beforeBytes || packets<beforePackets || utc<beforeUtc || revision<beforeRevision ||
+               (!(snapshot.flags & flag) && (last.flags & flag))) {broken=true;break;}
+            if(packets==beforePackets) {
+                if(bytes!=beforeBytes || utc!=beforeUtc || revision!=beforeRevision)broken=true;
+                continue;
+            }
+            std::uint64_t unixUtc=0;
+            if(!(snapshot.flags & flag) || revision<=beforeRevision || !ii::filetimeUtc(utc,unixUtc) || !unixUtc) {
+                broken=true;break;
+            }
+            auto event=watcher->attempt;event.type=Type::Traffic;
+            for(auto &field:event.fields) {
+                if(field.tag==Tag::Timestamp)field=value(Tag::Timestamp,unixUtc);
+                if(field.tag==Tag::Presence)field=value(Tag::Presence,3);
+            }
+            event.fields.insert(event.fields.end(),{value(Tag::CommandId,command),
+                value(Tag::AttemptLink,wire::iv::attemptLink(get(watcher->attempt,Tag::EventSeq))),
+                value(Tag::ByteCount,bytes-beforeBytes),value(Tag::PacketCount,packets-beforePackets),
+                value(Tag::PacketDirection,direction,1),value(Tag::EffectiveRev,watcher->decision.revision),
+                value(Tag::ScopeKind,watcher->decision.scope,1),value(Tag::Durable,1,1),value(Tag::ProofState,2,1)});
+            if(principalEvents_.append(std::move(event))!=Error::Ok) {broken=true;break;}
+            // Sólo la inserción admite avance; READ repetido produce cero eventos.
+            if(outbound) {last.outboundBytes=bytes;last.outboundPackets=packets;last.outboundUtc=utc;last.outboundRevision=revision;}
+            else {last.inboundBytes=bytes;last.inboundPackets=packets;last.inboundUtc=utc;last.inboundRevision=revision;}
+            last.flags|=flag;
+        }
+        if(broken)retire();
+    }
+  } catch(...) {
+    principalTraffic_.clear();principalTrafficBytes_=0;
+    if(principalEvents_.ready())principalEvents_.discontinuity();
+  }
 }
 bool NativeRuntime::principalPeerCurrent(const PrincipalPeer &peer) const noexcept {
     struct Check { const NativeRuntime &runtime; const PrincipalPeer &peer; } check{*this, peer};
@@ -190,6 +313,10 @@ bool NativeRuntime::ordinaryPeer(HANDLE pipe, std::shared_ptr<PrincipalPeer> &pe
     } catch (...) { return false; }
 }
 void NativeRuntime::closeOrdinaryPeer(const std::shared_ptr<PrincipalPeer> &peer) noexcept {
+    if(peer && peer->subscriptionMask==3) {
+        if(principalMask3Subscribers_)--principalMask3Subscribers_;
+        peer->subscriptionMask=0;
+    }
     if (!peer) return;
     peer->cancelled = true;
     for (auto &entry : principalAdmissions_) if (entry.second->owner == peer) entry.second->cancelled = true;
@@ -222,6 +349,7 @@ Frame NativeRuntime::ordinaryStatus(Type type, const std::shared_ptr<PrincipalPe
     for (auto &field : frame.fields) {
         if (field.tag == Tag::Capabilities) field = value(Tag::Capabilities,
             ReadStatus | (admitted ? ObservedRead | (principalEventsReady() ? wire::iv::NativeEvents : 0) |
+                (principalTrafficReady() ? wire::iv::NativeTraffic : 0) |
                 (!peer->readonly && principalPolicyReady() ? FuturePolicyControl : 0) : 0));
         if (field.tag == Tag::IVProfile) field = value(Tag::IVProfile, admitted && !peer->readonly && principalPolicyReady() ? 1 : 0, 1);
     }
@@ -415,9 +543,15 @@ Frame NativeRuntime::commitPrincipal(const Frame &frame, const std::shared_ptr<P
     if (admission->scope >= 3) {
         reserved.activityAttempt = admission->activityAttempt;
         reserved.activitySession = admission->activitySession; reserved.activityCause = admission->activityCause;
+        reserved.activitySource=admission->source;
+        if(admission->event) {
+            reserved.activityCatalog=admission->event->snapshot_;
+            reserved.activityOwner=admission->event->classifier_;
+            if(reserved.activityOwner)reserved.activityCharge=activityCauseBytes(*reserved.activityOwner);
+        }
     }
     const auto charged = reserved.payload.capacity() + reserved.identity.account.capacity() +
-        reserved.identity.logon.capacity() + sizeof(PrincipalOutcome) + 128 + NativeActivityRing::bytes(reserved.activityAttempt);
+        reserved.identity.logon.capacity() + sizeof(PrincipalOutcome) + 128 + NativeActivityRing::bytes(reserved.activityAttempt)+reserved.activityCharge;
     if (charged > 512 * 1024 || principalOutcomeBytes_ > 512 * 1024 - charged) return principalError(Error::Capacity);
     auto inserted = principalOutcomes_.emplace(frame.correlation, std::move(reserved));
     if (!inserted.second) return principalError(Error::Conflict);
@@ -629,6 +763,7 @@ Frame NativeRuntime::dispatchOrdinary(const Frame &frame, const std::shared_ptr<
 }
 void NativeRuntime::invalidatePrincipalObservations() noexcept {
     principalEvents_.lose();
+    principalTrafficAcquired_=false;principalTraffic_.clear();principalTrafficBytes_=0;
     for (auto &entry : principalAdmissions_) entry.second->cancelled = true;
     principalAdmissions_.clear();
     principalPendingBytes_ = 0;
@@ -719,6 +854,7 @@ void NativeRuntime::collectPrincipalObservations() {
             }
         }
         if (charged > PendingBytesLimit || principalPendingBytes_ - prior > PendingBytesLimit - charged ||
+            principalTrafficBytes_>PendingBytesLimit-charged-(principalPendingBytes_-prior) ||
             (same == principalObservations_.end() && principalObservations_.size() >= PendingLimit)) {
             principalSource_->lose(); invalidatePrincipalObservations(); break;
         }

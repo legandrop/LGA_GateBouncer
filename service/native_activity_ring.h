@@ -44,6 +44,12 @@ public:
         ready_ = false;
       } catch (...) { fail(); }
     }
+    bool discontinuity(std::uint8_t reason=1) noexcept {
+      try {
+        if(!ready() || sequence_==UINT64_MAX || !advanceGap())return false;
+        return append(gap(sequence_+1,sequence_,reason,false))==wire::Error::Ok;
+      } catch(...) { fail();return false; }
+    }
     wire::Frame frame(wire::Type type) const {
         wire::Frame event; event.minor = 3; event.type = type;
         event.connection = context_.serviceEpoch; event.correlation = context_.serviceEpoch;
@@ -58,7 +64,7 @@ public:
     }
     wire::Error append(wire::Frame event) noexcept {
       try {
-        if (event.type!=wire::Type::Attempt && event.type!=wire::Type::Authorization &&
+        if (event.type!=wire::Type::Attempt && event.type!=wire::Type::Authorization && event.type!=wire::Type::Traffic &&
             event.type!=wire::Type::ObservationGap) return wire::Error::Unsupported;
         if (!ready() || sequence_ == UINT64_MAX) { exhausted_ = true; ready_ = false; return wire::Error::Capacity; }
         for (auto &field : event.fields)

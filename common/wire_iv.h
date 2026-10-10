@@ -4,6 +4,7 @@
 namespace gb::wire::iv {
 constexpr std::size_t MaxRecordsBytes = 57344;
 constexpr std::uint64_t NativeEvents = 1ull << 25;
+constexpr std::uint64_t NativeTraffic = 1ull << 26;
 // Enlace histórico a secuencia; no es un identificador de autorización.
 Id attemptLink(std::uint64_t sequence);
 std::uint64_t attemptSequence(const Id &link);

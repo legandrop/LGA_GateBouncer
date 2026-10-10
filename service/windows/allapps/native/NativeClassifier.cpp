@@ -5,6 +5,17 @@
 #include "NativeClassifier.h"
 #include <algorithm>
 #include <cstring>
+#include <cstddef>
+static_assert(sizeof(GB_ACTIVITY_SNAPSHOT)==168);
+static_assert(sizeof(GB_SCOPE_DECISION)==64 && sizeof(GB_SCOPE_RECEIPT)==104);
+static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,decision)==8 && offsetof(GB_ACTIVITY_SNAPSHOT,loss)==72);
+static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,authorizedUtc)==80 && offsetof(GB_ACTIVITY_SNAPSHOT,flow)==88);
+static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,outboundBytes)==96 && offsetof(GB_ACTIVITY_SNAPSHOT,inboundBytes)==128);
+static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,outboundPackets)==104 && offsetof(GB_ACTIVITY_SNAPSHOT,outboundUtc)==112 &&
+    offsetof(GB_ACTIVITY_SNAPSHOT,outboundRevision)==120);
+static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,inboundPackets)==136 && offsetof(GB_ACTIVITY_SNAPSHOT,inboundUtc)==144 &&
+    offsetof(GB_ACTIVITY_SNAPSHOT,inboundRevision)==152);
+static_assert(offsetof(GB_ACTIVITY_SNAPSHOT,flags)==160 && offsetof(GB_ACTIVITY_SNAPSHOT,reserved)==164);
 
 namespace gatebouncer::service::windows::allapps::native {
 namespace {
@@ -49,6 +60,41 @@ bool NativeClassifier::decide(const GB_SCOPE_DECISION &d, GB_SCOPE_RECEIPT &r) n
 }
 bool NativeClassifier::readback(const GB_SCOPE_DECISION &d, GB_SCOPE_RECEIPT &r) noexcept {
     return scopeIoctl(GB_CLASSIFIER_READBACK,d,r);
+}
+bool NativeClassifier::activity(const ClassifierCause &cause,const GB_SCOPE_DECISION &decision,
+    HANDLE engine,GB_ACTIVITY_SNAPSHOT &snapshot) const noexcept {
+    snapshot={};
+    try {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if(cause.owner_.get()!=this || !device_ || !serviceCaller() || decision.version!=GB_CLASSIFIER_VERSION ||
+           decision.bytes!=sizeof(decision) || decision.session!=session_ || decision.session!=cause.record_.session ||
+           decision.cause!=cause.record_.cause || cause.record_.loss!=loss_ || !decision.revision) return false;
+        auto original=[&]() {
+            gb::native::Handle token;HANDLE raw=nullptr;gb::native::TokenEvidence identity;
+            if(!cause.process_.current() || !OpenProcessToken(cause.process_.process.value,TOKEN_QUERY,&raw))return false;
+            token.reset(raw);
+            wchar_t path[32768]{};DWORD n=32768;
+            return gb::native::tokenEvidence(token.value,identity) && identity.account==cause.token_.account &&
+                identity.logon==cause.token_.logon && identity.session==cause.token_.session &&
+                QueryFullProcessImageNameW(cause.process_.process.value,0,path,&n) && n && n<32768 &&
+                std::filesystem::path(std::wstring(path,n))==cause.process_.image && cause.process_.current();
+        };
+        if(!original() || !catalogCurrent(cause,engine))return false;
+        auto copy=decision;DWORD bytes=0;GB_ACTIVITY_SNAPSHOT observed{};
+        if(!DeviceIoControl(device_.value,GB_CLASSIFIER_ACTIVITY,&copy,sizeof(copy),&observed,sizeof(observed),&bytes,nullptr) ||
+           bytes!=sizeof(observed) || observed.version!=GB_ACTIVITY_VERSION || observed.bytes!=sizeof(observed) ||
+           observed.reserved || (observed.flags & ~15u) || observed.loss!=cause.record_.loss ||
+           std::memcmp(&observed.decision,&decision,sizeof(decision))!=0 ||
+           ((observed.flags & (GB_ACTIVITY_OUTBOUND|GB_ACTIVITY_INBOUND)) && (!observed.flow || decision.action!=2)) ||
+           ((observed.flags & GB_ACTIVITY_AUTH_UTC) ? !observed.authorizedUtc : observed.authorizedUtc!=0))return false;
+        auto group=[](UINT32 flags,UINT32 bit,UINT64 bytes,UINT64 packets,UINT64 utc,UINT64 revision) {
+            return (flags & bit) ? packets && utc && revision : !bytes && !packets && !utc && !revision;
+        };
+        if(!group(observed.flags,GB_ACTIVITY_OUTBOUND,observed.outboundBytes,observed.outboundPackets,observed.outboundUtc,observed.outboundRevision) ||
+           !group(observed.flags,GB_ACTIVITY_INBOUND,observed.inboundBytes,observed.inboundPackets,observed.inboundUtc,observed.inboundRevision) ||
+           !original() || !catalogCurrent(cause,engine))return false;
+        snapshot=observed;return true;
+    } catch(...) { snapshot={};return false; }
 }
 bool NativeClassifier::cancelIoctl(DWORD code, const GB_SCOPE_DECISION &decision, GB_CANCEL_RECEIPT &receipt) const noexcept {
     receipt = {}; std::lock_guard<std::mutex> lock(mutex_);

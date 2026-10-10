@@ -526,6 +526,7 @@ void NativeRuntime::tick() {
             if (outcome->second.activityAttempt.type==Type::Attempt && !outcome->second.activityCompleted)
                 refreshScoped(outcome->second);
         }
+        pollPrincipalTraffic();
         const auto now = principalNow_();
         for (auto entry = principalAdmissions_.begin(); entry != principalAdmissions_.end();) {
             auto &admission = *entry->second;
@@ -923,6 +924,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                             runtime_.tick();
                             usable = runtime_.profileGeneration() == profile && ordinaryPeer &&
                                 runtime_.ordinaryPeer(pipe.value,ordinaryPeer,principalReader) &&
+                                mask==(runtime_.principalTrafficReady() ? 7u : 3u) &&
                                 NativeActivityRing::same(runtime_.principalEvents_.context(),subscriptionContext);
                             if (usable) {
                                 // También cuando no llegaron causas: Ready cacheado no acredita catálogo actual.
@@ -958,6 +960,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                             std::lock_guard<std::mutex> lock(runtime_.mutex);
                             // Revalidación individual; el wait/cancel/drain posterior no retiene mutex.
                             if (!ordinaryPeer ||
+                                mask!=(runtime_.principalTrafficReady() ? 7u : 3u) ||
                                 !NativeActivityRing::same(runtime_.principalEvents_.context(),subscriptionContext) ||
                                 !runtime_.principalEventCurrent(*ordinaryPeer,event)) {
                                 sent=false; break;
