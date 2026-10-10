@@ -1051,7 +1051,8 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                     if (!usable)
                         break;
                     bool sent = true;
-                    for (auto &event : events) {
+                    for (std::size_t eventIndex=0; eventIndex<events.size();) {
+                        auto event=std::move(events[eventIndex]);
                         if (ordinary || principalReader) {
                             std::lock_guard<std::mutex> lock(runtime_.mutex);
                             // Revalidación individual; el wait/cancel/drain posterior no retiene mutex.
@@ -1064,13 +1065,17 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                             if(!runtime_.principalEventCurrent(*ordinaryPeer,event)) {
                                 auto &activity=runtime_.principalEventsFor(ordinaryPeer.get());
                                 std::vector<Frame> final;
-                                if(activity.ready() || !runtime_.principalPeerCurrent(*ordinaryPeer) ||
+                                if(terminal || activity.ready() || !runtime_.principalPeerCurrent(*ordinaryPeer) ||
                                    activity.after(after,final)!=Error::Ok || final.empty() ||
-                                   final.front().type!=Type::ObservationGap ||
-                                   !runtime_.principalEventCurrent(*ordinaryPeer,final.front())) {
+                                   final.back().type!=Type::ObservationGap ||
+                                   get(final.back(),Tag::LostCountKnown)!=0 ||
+                                   get(final.back(),Tag::GapReason)!=1 ||
+                                   get(final.back(),Tag::EventSeq)!=activity.latest()) {
                                     sent=false;break;
                                 }
-                                event=std::move(final.front());terminal=true;
+                                // El backlog Gap conocido precede al Gap terminal original.
+                                // Descartar el lote viejo, revalidar y enviar ambos en orden.
+                                events=std::move(final);eventIndex=0;terminal=true;continue;
                             }
                         }
                         if (tx == UINT64_MAX) {
@@ -1084,7 +1089,7 @@ void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
                             break;
                         }
                         after = get(event, Tag::EventSeq);
-                        if(terminal)break; // Sólo el Gap original final; no enviar el resto del lote antiguo.
+                        ++eventIndex;
                     }
                     if (!sent || terminal)
                         break;
