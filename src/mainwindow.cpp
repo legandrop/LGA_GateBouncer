@@ -1187,15 +1187,22 @@ void MainWindow::refreshTable(bool newPage) {
                 const QString received = QLocale().toString(e.receivedAtUtc.toLocalTime(), QLocale::ShortFormat);
                 const QString kind = e.kind == Data::ActivityKind::Authorization
                     ? (e.action == Data::Action::Allow ? "Applied Allow decision" : "Applied Block decision")
-                    : "Attempt observed";
-                const QString reason = n.externalPartial ? "Attempt link unavailable · partial evidence"
-                    : e.kind == Data::ActivityKind::Authorization ? "Causal applied decision · traffic unknown"
+                    : e.kind == Data::ActivityKind::Traffic ? "OS layer activity observed" : "Attempt observed";
+                const QString reason = e.kind == Data::ActivityKind::Traffic
+                    ? QString("%1 bytes · %2 network buffers observed\n%3")
+                        .arg(e.bytes ? QString::number(*e.bytes) : "Unknown", QString::number(n.packetCount),
+                            n.externalPartial ? "Causal evidence unavailable · partial evidence" : "Delivery and physical packet count unproven")
+                    : n.externalPartial ? "Causal evidence unavailable · partial evidence"
+                    : e.kind == Data::ActivityKind::Authorization
+                        ? (n.routeMask == 7 ? "Causal applied decision · traffic recorded separately" : "Causal applied decision · traffic unknown")
                     : n.source == 2 ? "Retained classifier cause · traffic unknown" : "Copied SDK drop · subset only";
                 result.push_back({"history:" + Data::nativeEventKey(e),
                     {{at + "\nReceived " + received, {}, qulonglong(e.sequence.toULongLong())},
                      {"Observed " + n.observed.left(12) + "\nBinding " + n.captureBinding.left(12), {}, {}},
                      {kind, n.externalPartial ? "warning" : "", {}},
-                     {(n.direction == 1 ? "Outbound" : "Inbound") + QString(" · ") +
+                     {(e.kind == Data::ActivityKind::Traffic ?
+                        (n.packetDirection == 1 ? "Outbound packet activity" : "Inbound packet activity") :
+                        (n.direction == 1 ? "Outbound" : "Inbound")) + QString(" · ") +
                         (e.protocol.isEmpty() ? "protocol unknown" : e.protocol) + "\nEndpoint unknown", {}, {}},
                      {reason, {}, {}}}});
             }

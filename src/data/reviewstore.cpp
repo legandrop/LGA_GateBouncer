@@ -201,17 +201,30 @@ bool bindingRead(const QJsonValue &value, NativeSourceBinding &b) {
         decimalUnsigned(o["profile"].toString(), &b.profile) && validNativeBinding(b);
 }
 QJsonObject evidenceJson(const NativeEvidence &n) {
-    return {{"connection", n.connection}, {"observed", n.observed}, {"binding", n.captureBinding}, {"command", n.command},
+    QJsonObject o{{"connection", n.connection}, {"observed", n.observed}, {"binding", n.captureBinding}, {"command", n.command},
         {"revision", QString::number(n.observedRevision)}, {"unixns", QString::number(n.unixNanoseconds)},
         {"presence", QString::number(n.presence)}, {"attempt", QString::number(n.attemptSequence)},
         {"effective", QString::number(n.effectiveRevision)}, {"source", int(n.source)},
         {"direction", int(n.direction)}, {"protocol", int(n.protocol)}, {"scope", int(n.scope)},
         {"durable", n.durable}, {"effect", n.currentEffect}, {"externalPartial", n.externalPartial}};
+    if (n.routeMask == 7) {
+        o["routeMask"] = int(n.routeMask); o["packetCount"] = QString::number(n.packetCount);
+        o["packetDirection"] = int(n.packetDirection);
+    }
+    return o;
 }
 bool evidenceRead(const QJsonValue &value, NativeEvidence &n) {
     if (!value.isObject()) return false;
     const auto o = value.toObject();
-    if (o.size() != 16 || !stringFields(o, {"connection", "observed", "binding", "command"})) return false;
+    if ((o.size() != 16 && o.size() != 19) || !stringFields(o, {"connection", "observed", "binding", "command"})) return false;
+    if (o.size() == 19) {
+        if (!o["routeMask"].isDouble() || o["routeMask"].toDouble() != o["routeMask"].toInt() ||
+            (o["routeMask"].toInt() != 3 && o["routeMask"].toInt() != 7) ||
+            !decimalUnsigned(o["packetCount"].toString(), &n.packetCount) ||
+            !o["packetDirection"].isDouble() || o["packetDirection"].toDouble() != o["packetDirection"].toInt() ||
+            o["packetDirection"].toInt() < 0 || o["packetDirection"].toInt() > 2) return false;
+        n.routeMask = quint8(o["routeMask"].toInt()); n.packetDirection = quint8(o["packetDirection"].toInt());
+    } else if (o.contains("routeMask") || o.contains("packetCount") || o.contains("packetDirection")) return false;
     n.connection = o["connection"].toString(); n.observed = o["observed"].toString();
     n.captureBinding = o["binding"].toString(); n.command = o["command"].toString();
     for (const auto &field : {std::pair<const char *, quint64 *>{"revision", &n.observedRevision},
@@ -273,12 +286,14 @@ QJsonObject historyJson(const HistoryState &state) {
         coverage.push_back(c);
     }
     QJsonObject result{{"events", events}, {"subjects", subjects}, {"hits", hits}, {"coverage", coverage}};
-    QJsonArray attempts, authorizations;
+    QJsonArray attempts, authorizations, traffic;
     for (const auto &event : state.nativeAttempts) attempts.push_back(eventJson(event));
     for (const auto &event : state.nativeAuthorizations) authorizations.push_back(eventJson(event));
+    for (const auto &event : state.nativeTraffic) traffic.push_back(eventJson(event));
     if (!attempts.isEmpty() || !authorizations.isEmpty() ||
         std::any_of(state.coverage.begin(), state.coverage.end(), [](const Coverage &c) { return bool(c.native); })) {
         result["nativeAttempts"] = attempts; result["nativeAuthorizations"] = authorizations;
+        if (!traffic.isEmpty()) result["nativeTraffic"] = traffic;
     }
     return result;
 }
@@ -395,16 +410,18 @@ bool historyRead(const QJsonValue &value, HistoryState &state, bool nativeAllowe
         state.events.push_back(std::move(event));
     }
     if (nativeAllowed) {
-        for (const auto key : {"nativeAttempts", "nativeAuthorizations"}) {
+        for (const auto key : {"nativeAttempts", "nativeAuthorizations", "nativeTraffic"}) {
+            if (QString::fromLatin1(key) == "nativeTraffic" && !object.contains(key)) continue;
             if (!object[key].isArray() || object[key].toArray().size() > 20000) return false;
-            auto &map = QString::fromLatin1(key) == "nativeAttempts" ? state.nativeAttempts : state.nativeAuthorizations;
+            auto &map = QString::fromLatin1(key) == "nativeAttempts" ? state.nativeAttempts :
+                QString::fromLatin1(key) == "nativeAuthorizations" ? state.nativeAuthorizations : state.nativeTraffic;
             for (const auto &entry : object[key].toArray()) {
                 ActivityEvent event;
                 if (!readEvent(entry, event) || !event.native || map.contains(nativeEventKey(event))) return false;
                 map.insert(nativeEventKey(event), std::move(event));
             }
         }
-    } else if (object.contains("nativeAttempts") || object.contains("nativeAuthorizations")) return false;
+    } else if (object.contains("nativeAttempts") || object.contains("nativeAuthorizations") || object.contains("nativeTraffic")) return false;
     const auto subjects = object["subjects"].toObject();
     for (auto it = subjects.begin(); it != subjects.end(); ++it) {
         if (it.key().isEmpty() || !it.value().isObject()) return false;

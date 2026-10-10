@@ -76,7 +76,9 @@ struct NativeEvidence {
     QString connection, observed, captureBinding, command;
     quint64 observedRevision = 0, unixNanoseconds = 0, presence = 0;
     quint64 attemptSequence = 0, effectiveRevision = 0;
+    quint64 packetCount = 0;
     quint8 source = 0, direction = 0, protocol = 0, scope = 0;
+    quint8 routeMask = 3, packetDirection = 0;
     bool durable = false, currentEffect = false, externalPartial = false;
 };
 struct ActivityEvent {
@@ -123,7 +125,7 @@ struct HistoryState {
     QMap<QString, ActivityAggregate> subjects;
     QMap<QString, EventFact> ruleHits;
     QVector<Coverage> coverage;
-    QMap<QString, ActivityEvent> nativeAttempts, nativeAuthorizations;
+    QMap<QString, ActivityEvent> nativeAttempts, nativeAuthorizations, nativeTraffic;
 };
 struct ReviewDocument {
     quint64 revision = 0;

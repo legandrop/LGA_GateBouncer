@@ -242,9 +242,10 @@ bool budgetQNameReview(const ReviewDocument &d, qint64 *bound) {
         return true;
     };
     for (const auto &event : d.history.events) if (!eventBudget(event)) return false;
-    if (d.history.nativeAttempts.size() > 20000 || d.history.nativeAuthorizations.size() > 20000) return false;
+    if (d.history.nativeAttempts.size() > 20000 || d.history.nativeAuthorizations.size() > 20000 || d.history.nativeTraffic.size() > 20000) return false;
     for (const auto &event : d.history.nativeAttempts) if (!eventBudget(event)) return false;
     for (const auto &event : d.history.nativeAuthorizations) if (!eventBudget(event)) return false;
+    for (const auto &event : d.history.nativeTraffic) if (!eventBudget(event)) return false;
     for (auto it = d.history.subjects.begin(); it != d.history.subjects.end(); ++it) {
         if (!fixed(b, 64, 512) || !b.string(it.key())) return false;
         for (const auto *f : {&it->lastAttempt, &it->lastAuthorized, &it->lastTraffic}) if (*f && !factBudget(b, **f)) return false;

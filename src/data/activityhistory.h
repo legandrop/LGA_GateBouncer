@@ -34,5 +34,6 @@ QString nativeEventKey(const ActivityEvent &event);
 bool validNativeBinding(const NativeSourceBinding &binding);
 bool validNativeEvent(const ActivityEvent &event);
 bool nativeCauseMatches(const ActivityEvent &attempt, const ActivityEvent &authorization);
+bool nativeTrafficMatches(const ActivityEvent &attempt, const ActivityEvent &authorization, const ActivityEvent &traffic);
 bool validNativeHistory(const HistoryState &state);
 } // namespace Gate::Data

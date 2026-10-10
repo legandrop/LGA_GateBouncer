@@ -63,7 +63,7 @@ class DecisionViewClient final : public QObject {
     bool recordsCurrent_ = false, historyGap_ = true, subscribed_ = false;
     bool observationUpdateQueued_ = false;
     quint64 profile_ = 0, lastEvent_ = 0, pageRevision_ = 0;
-    quint8 collector_ = 0;
+    quint8 collector_ = 0, nativeMask_ = 3;
     std::uint16_t minor_ = 1;
     gb::wire::Id expected_{}, snapshot_{};
     gb::wire::Type expectedType_ = gb::wire::Type::GetStatus;

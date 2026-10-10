@@ -26,7 +26,8 @@ bool equivalent(const ActivityEvent &a, const ActivityEvent &b) {
         x.presence == y.presence && x.attemptSequence == y.attemptSequence &&
         x.effectiveRevision == y.effectiveRevision && x.source == y.source &&
         x.direction == y.direction && x.protocol == y.protocol && x.scope == y.scope &&
-        x.durable == y.durable && x.currentEffect == y.currentEffect;
+        x.durable == y.durable && x.currentEffect == y.currentEffect &&
+        a.bytes == b.bytes && x.packetCount == y.packetCount && x.packetDirection == y.packetDirection;
 }
 void update(std::optional<EventFact> &target, const ActivityEvent &event) {
     if (!target || target->atUtc < event.observedAtUtc)
@@ -47,13 +48,14 @@ bool validNativeBinding(const NativeSourceBinding &b) {
         b.sourceEpoch == b.engineContext && b.generation && b.profile;
 }
 bool validNativeEvent(const ActivityEvent &e) {
-    if (e.synthetic || !e.native || !utc(e.receivedAtUtc) || e.instance || e.bytes ||
+    if (e.synthetic || !e.native || !utc(e.receivedAtUtc) || e.instance ||
         !e.requestId.isEmpty() || !e.flowId.isEmpty() || !e.winningRuleId.isEmpty() ||
         !e.winningRuleRevision.isEmpty() || !e.endpoint.isEmpty()) return false;
     const auto &n = *e.native;
     quint64 seq = 0;
     if (!decimalUnsigned(e.sequence, &seq) || !seq || !id(n.connection) || !id(n.observed) ||
         !id(n.captureBinding) || !n.observedRevision || (n.presence & ~3ull) ||
+        (n.routeMask != 3 && n.routeMask != 7) ||
         (n.source != 1 && n.source != 2) || (n.direction != 1 && n.direction != 2) ||
         ((n.presence & 1) ? !n.unixNanoseconds : n.unixNanoseconds != 0) ||
         ((n.presence & 2) ? (n.source != 2 || (n.protocol != 6 && n.protocol != 17)) : n.protocol != 0) ||
@@ -64,15 +66,20 @@ bool validNativeEvent(const ActivityEvent &e) {
     } else if (e.observedAtUtc.isValid()) return false;
     if (e.kind == ActivityKind::Attempt)
         return !e.action && n.command.isEmpty() && !n.attemptSequence && !n.effectiveRevision &&
-            !n.scope && !n.durable && !n.currentEffect && !n.externalPartial;
-    return e.kind == ActivityKind::Authorization && e.action && *e.action != Action::Ask &&
-        (*e.action == Action::Allow || *e.action == Action::Block) && n.source == 2 &&
-        !(n.presence & 1) && id(n.command) && n.attemptSequence && n.attemptSequence < seq &&
+            !n.scope && !n.durable && !n.currentEffect && !n.externalPartial &&
+            !e.bytes && !n.packetCount && !n.packetDirection;
+    const bool applied = n.source == 2 && id(n.command) && n.attemptSequence && n.attemptSequence < seq &&
         n.effectiveRevision && n.scope >= 3 && n.scope <= 5 && n.durable && n.currentEffect;
+    if (e.kind == ActivityKind::Authorization)
+        return applied && e.action && (*e.action == Action::Allow || *e.action == Action::Block) &&
+            (n.routeMask == 7 || !(n.presence & 1)) && !e.bytes && !n.packetCount && !n.packetDirection;
+    return e.kind == ActivityKind::Traffic && applied && !e.action && n.routeMask == 7 &&
+        n.presence == 3 && e.bytes.has_value() && n.packetCount &&
+        (n.packetDirection == 1 || n.packetDirection == 2);
 }
 bool nativeCauseMatches(const ActivityEvent &a, const ActivityEvent &b) {
     if (!validNativeEvent(a) || !validNativeEvent(b) || a.kind != ActivityKind::Attempt ||
-        b.kind != ActivityKind::Authorization || a.native->source != 2) return false;
+        (b.kind != ActivityKind::Authorization && b.kind != ActivityKind::Traffic) || a.native->source != 2) return false;
     return a.sourceId == b.sourceId && a.sourceEpoch == b.sourceEpoch &&
         a.sequence == QString::number(b.native->attemptSequence) &&
         a.native->observed == b.native->observed &&
@@ -81,8 +88,15 @@ bool nativeCauseMatches(const ActivityEvent &a, const ActivityEvent &b) {
         a.native->direction == b.native->direction && a.native->protocol == b.native->protocol &&
         (a.native->presence & 2) == (b.native->presence & 2);
 }
+bool nativeTrafficMatches(const ActivityEvent &a, const ActivityEvent &auth, const ActivityEvent &traffic) {
+    return auth.kind == ActivityKind::Authorization && auth.action == Action::Allow &&
+        traffic.kind == ActivityKind::Traffic && nativeCauseMatches(a, auth) && nativeCauseMatches(a, traffic) &&
+        !auth.native->externalPartial && auth.sequence.toULongLong() < traffic.sequence.toULongLong() &&
+        auth.native->command == traffic.native->command &&
+        auth.native->effectiveRevision == traffic.native->effectiveRevision && auth.native->scope == traffic.native->scope;
+}
 bool validNativeHistory(const HistoryState &s) {
-    if (s.nativeAttempts.size() > 20000 || s.nativeAuthorizations.size() > 20000) return false;
+    if (s.nativeAttempts.size() > 20000 || s.nativeAuthorizations.size() > 20000 || s.nativeTraffic.size() > 20000) return false;
     for (const auto &c : s.coverage) {
         if (!c.native) continue;
         QSet<QString> intervals;
@@ -113,12 +127,21 @@ bool validNativeHistory(const HistoryState &s) {
     for (auto it = s.nativeAuthorizations.begin(); it != s.nativeAuthorizations.end(); ++it) {
         auto linked = it.value(); linked.sequence = QString::number(it->native ? it->native->attemptSequence : 0);
         if (it.key() != nativeEventKey(it.value()) || it->kind != ActivityKind::Authorization ||
-            !known(it.value()) || it->native->externalPartial || s.nativeAttempts.contains(it.key()) ||
+            !known(it.value()) || it->native->externalPartial || s.nativeAttempts.contains(it.key()) || s.nativeTraffic.contains(it.key()) ||
             !s.nativeAttempts.contains(nativeEventKey(linked)) ||
             !nativeCauseMatches(s.nativeAttempts[nativeEventKey(linked)], it.value())) return false;
         const auto command = sequenceKey(it->sourceId, it->sourceEpoch) + ':' + it->native->command;
         if (commands.contains(command)) return false;
         commands.insert(command, it.key());
+    }
+    for (auto it = s.nativeTraffic.begin(); it != s.nativeTraffic.end(); ++it) {
+        if (it.key() != nativeEventKey(it.value()) || it->kind != ActivityKind::Traffic || !known(it.value()) ||
+            it->native->externalPartial || s.nativeAttempts.contains(it.key()) || s.nativeAuthorizations.contains(it.key())) return false;
+        auto linked = it.value(); linked.sequence = QString::number(it->native->attemptSequence);
+        const auto cause = s.nativeAttempts.constFind(nativeEventKey(linked));
+        const auto command = sequenceKey(it->sourceId, it->sourceEpoch) + ':' + it->native->command;
+        if (cause == s.nativeAttempts.cend() || !commands.contains(command) ||
+            !nativeTrafficMatches(*cause, s.nativeAuthorizations[commands[command]], it.value())) return false;
     }
     QSet<QString> cursors;
     for (const auto &e : s.events) {
@@ -127,15 +150,28 @@ bool validNativeHistory(const HistoryState &s) {
         const auto cursor = nativeEventKey(e);
         if (cursors.contains(cursor)) return false;
         cursors.insert(cursor);
-        const auto &sameKind = e.kind == ActivityKind::Attempt ? s.nativeAttempts : s.nativeAuthorizations;
-        const auto &otherKind = e.kind == ActivityKind::Attempt ? s.nativeAuthorizations : s.nativeAttempts;
-        if (otherKind.contains(cursor)) return false;
+        const auto &sameKind = e.kind == ActivityKind::Attempt ? s.nativeAttempts :
+            e.kind == ActivityKind::Authorization ? s.nativeAuthorizations : s.nativeTraffic;
+        if ((e.kind != ActivityKind::Attempt && s.nativeAttempts.contains(cursor)) ||
+            (e.kind != ActivityKind::Authorization && s.nativeAuthorizations.contains(cursor)) ||
+            (e.kind != ActivityKind::Traffic && s.nativeTraffic.contains(cursor))) return false;
         if (sameKind.contains(cursor)) {
             const auto &compact = sameKind[cursor];
             if (!equivalent(compact, e) || compact.receivedAtUtc != e.receivedAtUtc ||
                 compact.native->connection != e.native->connection ||
+                compact.native->routeMask != e.native->routeMask ||
                 compact.native->externalPartial != e.native->externalPartial) return false;
-        } else if (e.kind == ActivityKind::Authorization && !e.native->externalPartial) return false;
+        } else if (e.kind != ActivityKind::Attempt && !e.native->externalPartial) return false;
+        if (e.kind == ActivityKind::Traffic) {
+            auto linked = e; linked.sequence = QString::number(e.native->attemptSequence);
+            const auto cause = s.nativeAttempts.constFind(nativeEventKey(linked));
+            const auto command = sequenceKey(e.sourceId, e.sourceEpoch) + ':' + e.native->command;
+            const auto authKey = commands.value(command);
+            const auto auth = s.nativeAuthorizations.constFind(authKey);
+            if ((cause != s.nativeAttempts.cend() && !nativeCauseMatches(*cause, e)) ||
+                (auth != s.nativeAuthorizations.cend() &&
+                    (cause == s.nativeAttempts.cend() || !nativeTrafficMatches(*cause, *auth, e)))) return false;
+        }
         if (e.kind == ActivityKind::Authorization) {
             const auto command = sequenceKey(e.sourceId, e.sourceEpoch) + ':' + e.native->command;
             if (commands.contains(command) && commands[command] != cursor) return false;
@@ -150,9 +186,8 @@ bool validNativeHistory(const HistoryState &s) {
             for (const auto &c : s.coverage)
                 if (c.sourceId == fact->sourceId && c.sourceEpoch == fact->sourceEpoch) native = bool(c.native);
             if (!native) continue;
-            if (kind == 2) return false;
             ActivityEvent key; key.sourceId = fact->sourceId; key.sourceEpoch = fact->sourceEpoch; key.sequence = fact->sequence;
-            const auto &map = kind == 0 ? s.nativeAttempts : s.nativeAuthorizations;
+            const auto &map = kind == 0 ? s.nativeAttempts : kind == 1 ? s.nativeAuthorizations : s.nativeTraffic;
             if (!map.contains(nativeEventKey(key))) return false;
             const auto &e = map[nativeEventKey(key)];
             if (e.subjectId != it.key() || fact->atUtc != e.observedAtUtc ||
@@ -232,12 +267,15 @@ bool ActivityHistory::ingest(const ActivityEvent &event) {
     if (event.native) {
         if (!coverage || coverage->synthetic || !coverage->native ||
             coverage->status == CoverageStatus::Unavailable || !validNativeEvent(event)) return false;
+        if (event.kind == ActivityKind::Traffic)
+            coverage->declaredScope = "Retained principal causes, causal applied decisions and OS layer activity";
         const auto key = sequenceKey(event.sourceId, event.sourceEpoch);
         const quint64 sequence = event.sequence.toULongLong();
         if (sequence <= lastSequences_.value(key)) {
             const ActivityEvent *old = nullptr;
             if (state_.nativeAttempts.contains(nativeEventKey(event))) old = &state_.nativeAttempts[nativeEventKey(event)];
             else if (state_.nativeAuthorizations.contains(nativeEventKey(event))) old = &state_.nativeAuthorizations[nativeEventKey(event)];
+            else if (state_.nativeTraffic.contains(nativeEventKey(event))) old = &state_.nativeTraffic[nativeEventKey(event)];
             else for (const auto &e : state_.events)
                 if (nativeEventKey(e) == nativeEventKey(event)) { old = &e; break; }
             if (old && equivalent(*old, event)) return true;
@@ -254,7 +292,7 @@ bool ActivityHistory::ingest(const ActivityEvent &event) {
                 (!state_.subjects.contains(event.subjectId) && state_.subjects.size() >= 20000)) {
                 compact = false; gap(event.sourceId, event.sourceEpoch, "DescriptorCapacity", 0, false);
             } else state_.nativeAttempts.insert(nativeEventKey(admitted), admitted);
-        } else {
+        } else if (admitted.kind == ActivityKind::Authorization) {
             const auto command = key + ':' + admitted.native->command;
             const bool retainedCommand = std::any_of(state_.events.cbegin(), state_.events.cend(), [&](const ActivityEvent &old) {
                 return old.native && old.kind == ActivityKind::Authorization &&
@@ -277,11 +315,35 @@ bool ActivityHistory::ingest(const ActivityEvent &event) {
                 state_.nativeAuthorizations.insert(nativeEventKey(admitted), admitted);
                 nativeCommands_.insert(command, admitted.sequence);
             }
+        } else {
+            auto linked = admitted; linked.sequence = QString::number(admitted.native->attemptSequence);
+            const auto cause = state_.nativeAttempts.constFind(nativeEventKey(linked));
+            const auto command = key + ':' + admitted.native->command;
+            const auto authSequence = nativeCommands_.constFind(command);
+            ActivityEvent authKey = admitted;
+            if (authSequence != nativeCommands_.cend()) authKey.sequence = *authSequence;
+            const auto auth = authSequence == nativeCommands_.cend() ? state_.nativeAuthorizations.cend() :
+                state_.nativeAuthorizations.constFind(nativeEventKey(authKey));
+            if ((cause != state_.nativeAttempts.cend() && !nativeCauseMatches(*cause, admitted)) ||
+                (auth != state_.nativeAuthorizations.cend() && (auth->action != Action::Allow ||
+                    auth->native->attemptSequence != admitted.native->attemptSequence ||
+                    auth->native->effectiveRevision != admitted.native->effectiveRevision ||
+                    auth->native->scope != admitted.native->scope ||
+                    (cause != state_.nativeAttempts.cend() && !nativeTrafficMatches(*cause, *auth, admitted))))) {
+                disconnectNative(*coverage->native, "TrafficLinkMismatch"); return false;
+            }
+            compact = cause != state_.nativeAttempts.cend() && auth != state_.nativeAuthorizations.cend() &&
+                state_.nativeTraffic.size() < 20000 && (state_.subjects.contains(event.subjectId) || state_.subjects.size() < 20000);
+            admitted.native->externalPartial = !compact;
+            if (!compact) gap(event.sourceId, event.sourceEpoch,
+                state_.nativeTraffic.size() >= 20000 ? "TrafficDescriptorCapacity" : "MissingTrafficEvidence", 0, false);
+            else state_.nativeTraffic.insert(nativeEventKey(admitted), admitted);
         }
         if (compact) {
             auto &aggregate = state_.subjects[admitted.subjectId];
-            auto &fact = admitted.kind == ActivityKind::Attempt ? aggregate.lastAttempt : aggregate.lastAuthorized;
-            if (admitted.kind == ActivityKind::Attempt || admitted.action == Action::Allow)
+            auto &fact = admitted.kind == ActivityKind::Attempt ? aggregate.lastAttempt :
+                admitted.kind == ActivityKind::Authorization ? aggregate.lastAuthorized : aggregate.lastTraffic;
+            if (admitted.kind != ActivityKind::Authorization || admitted.action == Action::Allow)
                 fact = EventFact{admitted.observedAtUtc, admitted.sourceId, admitted.sourceEpoch, admitted.sequence};
         }
         if (admitted.observedAtUtc.isValid()) {

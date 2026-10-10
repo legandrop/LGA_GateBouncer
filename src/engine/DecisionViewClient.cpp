@@ -64,6 +64,7 @@ void DecisionViewClient::invalidate() {
     busy_ = false;
     subscribed_ = false;
     lastEvent_ = 0;
+    nativeMask_ = 3;
     historyGap_ = true;
     emit changed();
 }
@@ -143,8 +144,13 @@ bool DecisionViewClient::adoptStatus(const Frame &f) {
     }
     const auto epoch = idValue(f, Tag::ServiceEpoch), boot = idValue(f, Tag::BootId);
     const auto profile = get(f, Tag::ProfileGeneration);
+    const auto capabilities = get(f, Tag::Capabilities);
+    if ((capabilities & iv::NativeTraffic) &&
+        ((capabilities & (iv::NativeEvents | ObservedRead)) != (iv::NativeEvents | ObservedRead))) return false;
+    const quint8 nextMask = capabilities & iv::NativeTraffic ? 7 : 3;
     if (contextChanged || epoch != status_.serviceEpoch || boot != status_.bootId || profile != profile_) {
         endNativeSource("SourceContextChanged");
+        if (stopping_) return false;
         pending_.clear();
         rules_.clear();
         events_.clear();
@@ -153,6 +159,17 @@ bool DecisionViewClient::adoptStatus(const Frame &f) {
         lastEvent_ = 0;
         subscribed_ = false;
     }
+    if (nativeSource_ && nativeMask_ != nextMask) {
+        // Solo el peer vivo original puede conservar este cursor al cambiar dominio.
+        const bool transition = nativeMask_ == 3 && nextMask == 7 && context && peer &&
+            readPeer_ == peer && serviceContext() && f.connection == status_.connection;
+        endNativeSource(transition ? "ObservationRouteChanged" : "SourceCapabilityLost");
+        if (stopping_) return false;
+        subscribed_ = false;
+        if (!transition) lastEvent_ = 0;
+    }
+    nativeMask_ = nextMask;
+    if (stopping_ || (peer && peer->checkLive() != gb::ipc::ii::ReadPeerState::Current)) return false;
     serviceContext_ = std::move(context);
     readPeer_ = std::move(peer);
     status_.current = true;
@@ -162,7 +179,7 @@ bool DecisionViewClient::adoptStatus(const Frame &f) {
     status_.desired = get(f, Tag::DesiredRev);
     status_.effective = get(f, Tag::EffectiveRev);
     status_.effectiveKnown = get(f, Tag::EffectiveKnown);
-    status_.capabilities = get(f, Tag::Capabilities);
+    status_.capabilities = capabilities;
     if (f.minor == 3 && !(status_.capabilities & iv::NativeEvents)) {
         endNativeSource("SourceCapabilityLost"); subscribed_ = false; lastEvent_ = 0;
     }
@@ -199,7 +216,7 @@ bool DecisionViewClient::send(Type type) {
                     value(Tag::SnapshotId, snapshot_), value(Tag::Cursor, cursor_, 4),
                     value(Tag::Limit, 32, 2)};
     if (type == Type::SubscribeEvents) {
-        f.fields = {value(Tag::ServiceEpoch, status_.serviceEpoch), value(Tag::EventMask, minor_ == 3 ? 3 : 1, 4),
+        f.fields = {value(Tag::ServiceEpoch, status_.serviceEpoch), value(Tag::EventMask, minor_ == 3 ? nativeMask_ : 1, 4),
                     value(Tag::AfterEventSeq, lastEvent_)};
         if (minor_ == 3) {
             const auto context = serviceContext();
@@ -269,7 +286,7 @@ void DecisionViewClient::received(bool ok, Frame f, Id correlation) {
     }
     if (expectedType_ == Type::SubscribeEvents) {
         if (f.type != Type::SubscriptionAck || get(f, Tag::ProfileGeneration) != profile_ ||
-            get(f, Tag::EventMask) != (minor_ == 3 ? 3u : 1u)) {
+            get(f, Tag::EventMask) != (minor_ == 3 ? unsigned(nativeMask_) : 1u)) {
             fail("View II subscription rejected");
             return;
         }
@@ -279,7 +296,7 @@ void DecisionViewClient::received(bool ok, Frame f, Id correlation) {
             nativeSource_ = *binding; lastEvent_ = get(f, Tag::EventSeq);
             subscribed_ = true; busy_ = false;
             emit nativeSourceOpened(*binding, lastEvent_);
-            if (!connected_ || !nativeSource_ || !subscribed_) return;
+            if (!connected_ || !nativeSource_ || !subscribed_ || !nativeBinding(f)) return;
             historyGap_ = true; poll_.start(); emit changed(); return;
         }
         subscribed_ = true;
@@ -368,7 +385,8 @@ void DecisionViewClient::observation(Frame f) {
     if (minor_ == 3) {
         const auto binding = nativeBinding(f);
         if (!binding || !nativeSource_ || !(*binding == *nativeSource_) ||
-            (f.type != Type::Attempt && f.type != Type::Authorization && f.type != Type::ObservationGap)) {
+            (f.type != Type::Attempt && f.type != Type::Authorization && f.type != Type::ObservationGap &&
+             !(nativeMask_ == 7 && f.type == Type::Traffic))) {
             fail("History observation context changed"); return;
         }
         const auto sequence = get(f, Tag::EventSeq);
@@ -379,29 +397,36 @@ void DecisionViewClient::observation(Frame f) {
             Data::ActivityEvent e;
             e.sourceId = Data::nativeSourceId(*binding); e.sourceEpoch = Data::nativeEpochKey(*binding);
             e.sequence = QString::number(sequence); e.receivedAtUtc = QDateTime::currentDateTimeUtc();
-            e.kind = f.type == Type::Attempt ? Data::ActivityKind::Attempt : Data::ActivityKind::Authorization;
+            e.kind = f.type == Type::Attempt ? Data::ActivityKind::Attempt :
+                f.type == Type::Authorization ? Data::ActivityKind::Authorization : Data::ActivityKind::Traffic;
             Data::NativeEvidence n;
             n.connection = QString::fromStdString(hex(f.connection)); n.observed = QString::fromStdString(hex(idValue(f, Tag::ObservedId)));
             n.captureBinding = QString::fromStdString(hex(idValue(f, Tag::CaptureBindingId)));
             n.observedRevision = get(f, Tag::ObservedRevision); n.unixNanoseconds = get(f, Tag::Timestamp);
             n.presence = get(f, Tag::Presence); n.source = quint8(get(f, Tag::Source));
+            n.routeMask = nativeMask_;
             n.direction = quint8(get(f, Tag::FlowDirection)); n.protocol = quint8(get(f, Tag::Protocol));
             if (n.presence & 1) e.observedAtUtc = QDateTime::fromMSecsSinceEpoch(qint64(n.unixNanoseconds / 1000000ull), Qt::UTC);
             if (n.presence & 2) e.protocol = n.protocol == 6 ? "TCP" : "UDP";
             e.subjectId = "native:" + e.sourceId + ':' + e.sourceEpoch + ':' + n.observed + ':' + n.captureBinding + ':' + QString::number(n.observedRevision);
-            if (f.type == Type::Authorization) {
+            if (f.type == Type::Authorization || f.type == Type::Traffic) {
                 n.command = QString::fromStdString(hex(idValue(f, Tag::CommandId)));
                 n.attemptSequence = iv::attemptSequence(idValue(f, Tag::AttemptLink));
                 n.effectiveRevision = get(f, Tag::EffectiveRev); n.scope = quint8(get(f, Tag::ScopeKind));
                 n.durable = get(f, Tag::Durable) == 1; n.currentEffect = get(f, Tag::ProofState) == 2;
-                if (get(f, Tag::Decision) == 1) e.action = Data::Action::Block;
-                else if (get(f, Tag::Decision) == 2) e.action = Data::Action::Allow;
+                if (f.type == Type::Authorization) {
+                    if (get(f, Tag::Decision) == 1) e.action = Data::Action::Block;
+                    else if (get(f, Tag::Decision) == 2) e.action = Data::Action::Allow;
+                } else {
+                    e.bytes = get(f, Tag::ByteCount); n.packetCount = get(f, Tag::PacketCount);
+                    n.packetDirection = quint8(get(f, Tag::PacketDirection));
+                }
             }
             e.native = n;
             if (!Data::validNativeEvent(e)) { fail("History evidence shape rejected"); return; }
             emit nativeEvent(e);
         }
-        if (!connected_ || !nativeSource_ || !subscribed_) return;
+        if (!connected_ || !nativeSource_ || !subscribed_ || !nativeBinding(f)) return;
         lastEvent_ = std::max(lastEvent_, sequence); historyGap_ = true;
         if (!observationUpdateQueued_) {
             observationUpdateQueued_ = true;
