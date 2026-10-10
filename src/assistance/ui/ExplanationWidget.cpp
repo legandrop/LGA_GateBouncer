@@ -106,7 +106,20 @@ void ExplanationWidget::refresh(){
             "\n"+QString::fromUtf8(view.uncertainty);
         network="Registered network operator: "+QString::fromUtf8(view.networkOperator)+"\nAnnouncing ASN: "+QString::fromUtf8(view.routingAsn)+
             "\nObserved domain: Unknown\nPossible network reason: "+QString::fromUtf8(view.networkReason)+"\n"+QString::fromUtf8(view.providerNotice);
-        if(result->failure!=G::Failure::None)text="The explanation is unavailable. Purpose and the effect of blocking remain Unknown. Your request remains undecided.";
+        if(result->failure!=G::Failure::None){
+            text="The explanation is unavailable. The assistance failure cause is Unknown.";
+            switch(result->failure){
+            case G::Failure::Timeout:text="The request timed out.";break;
+            case G::Failure::TlsFailure:text="The secure connection could not be verified.";break;
+            case G::Failure::Cancelled:text="The explanation was cancelled.";break;
+            case G::Failure::RateLimited:text="The request limit was reached.";break;
+            case G::Failure::Uncertain:text="The request outcome could not be confirmed. The network failure cause is Unknown.";break;
+            default:break;
+            }
+            if(result->observedHttpStatus>=100 && result->observedHttpStatus<=599)
+                text+="\nServer response: HTTP "+QString::number(result->observedHttpStatus)+".";
+            text+="\nPurpose and the effect of blocking remain Unknown. Your request remains undecided.";
+        }
     }
     if(original)network+="\nConnection observed: "+utc(original->observedAtMs)+" · original outbound connection";
     if(session_&&!session_->problem().isEmpty())text=session_->problem();

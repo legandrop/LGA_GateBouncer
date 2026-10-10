@@ -13,8 +13,10 @@
 #include <array>
 #include <atomic>
 #include <cstring>
+#include <mutex>
 
 namespace Gate::Assistance {
+namespace W=gatebouncer::websearch;
 struct WinHttpExplanationTransport::State final : QObject, std::enable_shared_from_this<State> {
     enum class Phase { Created, OptionsReady, Sending, Headers, Reading, Closing, Completed };
     RequestBinding binding; QByteArray payload, result; ResponseContract contract=ResponseContract::Legacy1;
@@ -30,6 +32,7 @@ struct WinHttpExplanationTransport::State final : QObject, std::enable_shared_fr
     QTimer deadline, closeDeadline; std::array<unsigned char,4096> readBuffer{};
     Phase phase=Phase::Created; bool delivered=false, closingSeen=false, registered=false; std::shared_ptr<State> keepAlive;
     Broker::Failure failure=Broker::Failure::None; Error coreError=Error::None;
+    std::mutex diagnosticMutex;W::HttpDiagnostic firstDiagnostic;
     std::optional<quint64> expectedLength;
     State(){deadline.setSingleShot(true);closeDeadline.setSingleShot(true);}
     ~State(){if(connection)WinHttpCloseHandle(connection);if(session)WinHttpCloseHandle(session);}
@@ -46,13 +49,32 @@ struct WinHttpExplanationTransport::State final : QObject, std::enable_shared_fr
     }
     static void CALLBACK callback(HINTERNET,DWORD_PTR context,DWORD status,void *data,DWORD length) {
         auto *raw=reinterpret_cast<State *>(context);if(!raw)return;
-        auto state=raw->shared_from_this();DWORD value=0;
+        auto state=raw->shared_from_this();DWORD value=0;std::optional<quint64> api;bool nativeError=false,secureFlags=false;
         if(status==WINHTTP_CALLBACK_STATUS_READ_COMPLETE)value=length;
-        else if(status==WINHTTP_CALLBACK_STATUS_SECURE_FAILURE && data && length==sizeof(DWORD))std::memcpy(&value,data,sizeof(value));
-        else if(status==WINHTTP_CALLBACK_STATUS_REQUEST_ERROR && data && length==sizeof(WINHTTP_ASYNC_RESULT))value=static_cast<WINHTTP_ASYNC_RESULT *>(data)->dwError;
+        else if(status==WINHTTP_CALLBACK_STATUS_SECURE_FAILURE && data && length==sizeof(DWORD)){std::memcpy(&value,data,sizeof(value));secureFlags=true;}
+        else if(status==WINHTTP_CALLBACK_STATUS_REQUEST_ERROR && data && length==sizeof(WINHTTP_ASYNC_RESULT)){
+            WINHTTP_ASYNC_RESULT result{};std::memcpy(&result,data,sizeof(result));value=result.dwError;api=quint64(result.dwResult);nativeError=true;
+        }
+        // Retener escalares antes de la cola Qt: Cancel posterior no borra el primer callback fallido.
+        if(status==WINHTTP_CALLBACK_STATUS_REQUEST_ERROR){
+            auto stage=W::HttpStage::Unknown;
+            if(api){switch(*api){case API_SEND_REQUEST:stage=W::HttpStage::Send;break;case API_RECEIVE_RESPONSE:stage=W::HttpStage::Receive;break;
+                case API_READ_DATA:stage=W::HttpStage::Read;break;default:break;}}
+            state->recordNative(stage,nativeError?std::optional<DWORD>(value):std::nullopt,api);
+        }else if(status==WINHTTP_CALLBACK_STATUS_SECURE_FAILURE)
+            state->recordNative(W::HttpStage::Unknown,{}, {},secureFlags?std::optional<DWORD>(value):std::nullopt);
         QMetaObject::invokeMethod(state.get(),[state,status,value]{state->notification(status,value);},Qt::QueuedConnection);
     }
-    bool option(HINTERNET handle,DWORD option,void *value,DWORD size){return WinHttpSetOption(handle,option,value,size);}
+    void recordNative(W::HttpStage stage,std::optional<DWORD> error={},std::optional<quint64> api={},std::optional<DWORD> flags={}) {
+        std::lock_guard<std::mutex> lock(diagnosticMutex);
+        if(firstDiagnostic.failureObserved)return;
+        firstDiagnostic.stage=stage;firstDiagnostic.winHttpError=error;firstDiagnostic.asyncApi=api;
+        firstDiagnostic.secureFailure=flags;firstDiagnostic.failureObserved=true;
+    }
+    bool nativeFailed(W::HttpStage stage){const auto error=GetLastError();recordNative(stage,error);return false;}
+    bool option(HINTERNET handle,DWORD option,void *value,DWORD size){
+        return WinHttpSetOption(handle,option,value,size)?true:nativeFailed(W::HttpStage::Options);
+    }
     void timers() {
         auto weak=weak_from_this();
         QObject::connect(&deadline,&QTimer::timeout,this,[weak]{if(auto self=weak.lock())self->finish(Broker::Failure::Timeout,Error::Timeout);});
@@ -60,18 +82,19 @@ struct WinHttpExplanationTransport::State final : QObject, std::enable_shared_fr
     }
     bool prepare() {
         session=WinHttpOpen(L"LGA GateBouncer",WINHTTP_ACCESS_TYPE_NO_PROXY,WINHTTP_NO_PROXY_NAME,WINHTTP_NO_PROXY_BYPASS,WINHTTP_FLAG_ASYNC);
-        if(!session)return false;
+        if(!session)return nativeFailed(W::HttpStage::OpenSession);
         BOOL yes=TRUE;DWORD one=1;FailedConnectionRetries retries{0,0};
         DWORD tls=WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2|WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_3;
-        if(!option(session,WINHTTP_OPTION_SECURE_PROTOCOLS,&tls,sizeof(tls))){tls=WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;if(!option(session,WINHTTP_OPTION_SECURE_PROTOCOLS,&tls,sizeof(tls)))return false;}
-        if(!WinHttpSetTimeouts(session,3000,5000,5000,10000)||!option(session,FailedConnectionRetriesOption,&retries,sizeof(retries))||
+        if(!WinHttpSetOption(session,WINHTTP_OPTION_SECURE_PROTOCOLS,&tls,sizeof(tls))){tls=WINHTTP_FLAG_SECURE_PROTOCOL_TLS1_2;if(!option(session,WINHTTP_OPTION_SECURE_PROTOCOLS,&tls,sizeof(tls)))return false;}
+        if(!WinHttpSetTimeouts(session,3000,5000,5000,10000))return nativeFailed(W::HttpStage::Options);
+        if(!option(session,FailedConnectionRetriesOption,&retries,sizeof(retries))||
            !option(session,DisableGlobalPoolingOption,&yes,sizeof(yes))||!option(session,WINHTTP_OPTION_CONNECT_RETRIES,&one,sizeof(one))||
            !option(session,WINHTTP_OPTION_DISABLE_SECURE_PROTOCOL_FALLBACK,&yes,sizeof(yes)))return false;
-        connection=WinHttpConnect(session,host.c_str(),port,0);if(!connection)return false;
-        request=WinHttpOpenRequest(connection,L"POST",L"/v1/chat/completions",nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,secure);if(!request)return false;
+        connection=WinHttpConnect(session,host.c_str(),port,0);if(!connection)return nativeFailed(W::HttpStage::Connect);
+        request=WinHttpOpenRequest(connection,L"POST",L"/v1/chat/completions",nullptr,WINHTTP_NO_REFERER,WINHTTP_DEFAULT_ACCEPT_TYPES,secure);if(!request)return nativeFailed(W::HttpStage::OpenRequest);
         const DWORD_PTR context=reinterpret_cast<DWORD_PTR>(this);
         if(!option(request,WINHTTP_OPTION_CONTEXT_VALUE,const_cast<DWORD_PTR *>(&context),sizeof(context)))return false;
-        if(WinHttpSetStatusCallback(request,&callback,WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS|WINHTTP_CALLBACK_FLAG_HANDLES|WINHTTP_CALLBACK_FLAG_SECURE_FAILURE,0)==WINHTTP_INVALID_STATUS_CALLBACK)return false;
+        if(WinHttpSetStatusCallback(request,&callback,WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS|WINHTTP_CALLBACK_FLAG_HANDLES|WINHTTP_CALLBACK_FLAG_SECURE_FAILURE,0)==WINHTTP_INVALID_STATUS_CALLBACK)return nativeFailed(W::HttpStage::Options);
         registered=true;
         DWORD disabled=WINHTTP_DISABLE_AUTHENTICATION|WINHTTP_DISABLE_COOKIES|WINHTTP_DISABLE_REDIRECTS|WINHTTP_DISABLE_KEEP_ALIVE;
         DWORD autologon=WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH, redirects=WINHTTP_OPTION_REDIRECT_POLICY_NEVER, headers=8192, revocation=WINHTTP_ENABLE_SSL_REVOCATION;
@@ -79,7 +102,7 @@ struct WinHttpExplanationTransport::State final : QObject, std::enable_shared_fr
            !option(request,WINHTTP_OPTION_REDIRECT_POLICY,&redirects,sizeof(redirects))||!option(request,WINHTTP_OPTION_MAX_RESPONSE_HEADER_SIZE,&headers,sizeof(headers))||
            !option(request,WINHTTP_OPTION_ENABLE_FEATURE,&revocation,sizeof(revocation))||
            !option(request,WINHTTP_OPTION_CLIENT_CERT_CONTEXT,WINHTTP_NO_CLIENT_CERT_CONTEXT,0))return false;
-        if(!WinHttpAddRequestHeaders(request,L"Content-Type: application/json; charset=utf-8\r\nAccept: application/json\r\nAccept-Encoding: identity\r\n",DWORD(-1),WINHTTP_ADDREQ_FLAG_ADD|WINHTTP_ADDREQ_FLAG_REPLACE))return false;
+        if(!WinHttpAddRequestHeaders(request,L"Content-Type: application/json; charset=utf-8\r\nAccept: application/json\r\nAccept-Encoding: identity\r\n",DWORD(-1),WINHTTP_ADDREQ_FLAG_ADD|WINHTTP_ADDREQ_FLAG_REPLACE))return nativeFailed(W::HttpStage::Headers);
         phase=Phase::OptionsReady;return true;
     }
     bool authorize(const unsigned char *secret,size_t size) {
@@ -87,7 +110,7 @@ struct WinHttpExplanationTransport::State final : QObject, std::enable_shared_fr
         Broker::SensitiveBytes header((size+24)*sizeof(wchar_t));auto *wide=reinterpret_cast<wchar_t *>(header.data());
         const wchar_t prefix[]=L"Authorization: Bearer ";const size_t prefixSize=(sizeof(prefix)/sizeof(wchar_t))-1;
         std::memcpy(wide,prefix,prefixSize*sizeof(wchar_t));for(size_t i=0;i<size;++i)wide[prefixSize+i]=wchar_t(secret[i]);
-        return WinHttpAddRequestHeaders(request,wide,DWORD(prefixSize+size),WINHTTP_ADDREQ_FLAG_ADD|WINHTTP_ADDREQ_FLAG_REPLACE);
+        return WinHttpAddRequestHeaders(request,wide,DWORD(prefixSize+size),WINHTTP_ADDREQ_FLAG_ADD|WINHTTP_ADDREQ_FLAG_REPLACE)?true:nativeFailed(W::HttpStage::Headers);
     }
     void send() {
         if(contract==ResponseContract::General3) {
@@ -100,17 +123,19 @@ struct WinHttpExplanationTransport::State final : QObject, std::enable_shared_fr
         auto self=shared_from_this();keepAlive=self;
         phase=Phase::Sending;observation.sendStarted=true;deadline.start(20000);
         if(!WinHttpSendRequest(request,WINHTTP_NO_ADDITIONAL_HEADERS,0,payload.data(),DWORD(payload.size()),DWORD(payload.size()),reinterpret_cast<DWORD_PTR>(this)))
-            finish(Broker::Failure::Uncertain,Error::Unavailable);
+            {nativeFailed(W::HttpStage::Send);finish(Broker::Failure::Uncertain,Error::Unavailable);}
     }
     std::optional<QString> header(DWORD key) {
         std::array<wchar_t,4097> buffer{};DWORD bytes=DWORD(buffer.size()*sizeof(wchar_t));
         if(!WinHttpQueryHeaders(request,key,WINHTTP_HEADER_NAME_BY_INDEX,buffer.data(),&bytes,WINHTTP_NO_HEADER_INDEX)){
-            if(GetLastError()==ERROR_WINHTTP_HEADER_NOT_FOUND)return QString();
+            const auto error=GetLastError();
+            if(error==ERROR_WINHTTP_HEADER_NOT_FOUND)return QString();
+            recordNative(W::HttpStage::Headers,error);
             return {};
         }
         return QString::fromWCharArray(buffer.data());
     }
-    void readNext(){if(!request||phase!=Phase::Reading)return;if(!WinHttpReadData(request,readBuffer.data(),DWORD(readBuffer.size()),nullptr))finish(Broker::Failure::Uncertain,Error::Unavailable);}
+    void readNext(){if(!request||phase!=Phase::Reading)return;if(!WinHttpReadData(request,readBuffer.data(),DWORD(readBuffer.size()),nullptr)){nativeFailed(W::HttpStage::Read);finish(Broker::Failure::Uncertain,Error::Unavailable);}}
     void notification(DWORD status,DWORD value) {
         if(status==WINHTTP_CALLBACK_STATUS_HANDLE_CLOSING) {
             closingSeen=true;closeDeadline.stop();phase=Phase::Completed;deliver();keepAlive.reset();return;
@@ -118,10 +143,10 @@ struct WinHttpExplanationTransport::State final : QObject, std::enable_shared_fr
         if(phase==Phase::Closing||phase==Phase::Completed)return;
         switch(status) {
         case WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE:
-            phase=Phase::Headers;if(!WinHttpReceiveResponse(request,nullptr))finish(Broker::Failure::Uncertain,Error::Unavailable);break;
+            phase=Phase::Headers;if(!WinHttpReceiveResponse(request,nullptr)){nativeFailed(W::HttpStage::Receive);finish(Broker::Failure::Uncertain,Error::Unavailable);}break;
         case WINHTTP_CALLBACK_STATUS_HEADERS_AVAILABLE: {
             DWORD code=0,size=sizeof(code);
-            if(!WinHttpQueryHeaders(request,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&code,&size,WINHTTP_NO_HEADER_INDEX)){finish(Broker::Failure::Uncertain,Error::Unavailable);break;}
+            if(!WinHttpQueryHeaders(request,WINHTTP_QUERY_STATUS_CODE|WINHTTP_QUERY_FLAG_NUMBER,WINHTTP_HEADER_NAME_BY_INDEX,&code,&size,WINHTTP_NO_HEADER_INDEX)){nativeFailed(W::HttpStage::Headers);finish(Broker::Failure::Uncertain,Error::Unavailable);break;}
             observation.observedStatus=int(code);
             if(additionalHeaderValidation&&!additionalHeaderValidation(request)){finish(Broker::Failure::TlsFailure,Error::Unavailable);break;}
             if(code==202){finish(Broker::Failure::Uncertain,Error::None);break;}
@@ -153,14 +178,24 @@ struct WinHttpExplanationTransport::State final : QObject, std::enable_shared_fr
             else if(!Broker::boundedExplanation(result)){finish(Broker::Failure::InvalidResponse,Error::InvalidResponse);}
             else finish(Broker::Failure::None,Error::None);
             break;
-        case WINHTTP_CALLBACK_STATUS_SECURE_FAILURE: observation.secureFailure=value;finish(Broker::Failure::TlsFailure,Error::Unavailable);break;
-        case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
+        case WINHTTP_CALLBACK_STATUS_SECURE_FAILURE:
+            observation.secureFailure=value;finish(Broker::Failure::TlsFailure,Error::Unavailable);break;
+        case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: {
             finish(value==ERROR_WINHTTP_TIMEOUT?Broker::Failure::Timeout:(observation.sendStarted?Broker::Failure::Uncertain:Broker::Failure::TransportUnavailable),value==ERROR_WINHTTP_TIMEOUT?Error::Timeout:Error::Unavailable);break;
+        }
         default:break;
         }
     }
     void finish(Broker::Failure why,Error error) {
         if(phase==Phase::Closing||phase==Phase::Completed)return;
+        {
+            std::lock_guard<std::mutex> lock(diagnosticMutex);
+            if(!firstDiagnostic.failureObserved && (why==Broker::Failure::Cancelled||why==Broker::Failure::Timeout)){
+                firstDiagnostic.local=why==Broker::Failure::Cancelled?W::LocalHttpFailure::Cancelled:W::LocalHttpFailure::Deadline;
+                firstDiagnostic.failureObserved=true;
+            }
+            observation.diagnostic=firstDiagnostic;
+        }
         auto self=shared_from_this();keepAlive=self;failure=why;coreError=error;deadline.stop();phase=Phase::Closing;
         if(request){auto old=request;request=nullptr;if(registered)closeDeadline.start(5000);if(!WinHttpCloseHandle(old)){deliver();QCoreApplication::exit(20);}else if(!registered){phase=Phase::Completed;deliver();keepAlive.reset();}}
         else {phase=Phase::Completed;deliver();keepAlive.reset();}

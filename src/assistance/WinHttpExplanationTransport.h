@@ -1,6 +1,7 @@
 #pragma once
 #include "ExplanationContracts.h"
 #include "broker/BrokerWire.h"
+#include "websearch/WebSearch.h"
 #include <QObject>
 #include <cstdint>
 
@@ -20,6 +21,7 @@ struct HttpObservation {
     bool reservationCommitted = false;
     Broker::Failure reservationFailure = Broker::Failure::None;
     unsigned long reservationPrimaryError = 0;
+    gatebouncer::websearch::HttpDiagnostic diagnostic;
 };
 class WinHttpExplanationTransport final : public QObject, public IExplanationTransport {
 public:

@@ -39,6 +39,14 @@ void QtSearchAdapter::receive(const gatebouncer::websearch::SearchResult& r) {
         out.failure=Failure::None;for(const auto& c:r.citations)if(c.retrievalUtc.isValid()&&c.retrievalUtc.toMSecsSinceEpoch()>0)
             out.citations.push_back({0,c.url.toEncoded().toStdString(),c.title.toUtf8().toStdString(),c.snippet.toUtf8().toStdString(),c.origin.toUtf8().toStdString(),std::uint64_t(c.retrievalUtc.toMSecsSinceEpoch()),false,c.kind,c.subject.toStdString()});
     }else if(r.status==gatebouncer::websearch::Status::Cancelled)out.failure=Failure::Cancelled;
+    else if(r.status==gatebouncer::websearch::Status::Unavailable){
+        switch(gatebouncer::websearch::networkFailure(r.diagnostic,r.observedHttpStatus)){
+        case gatebouncer::websearch::NetworkFailure::Timeout:out.failure=Failure::Timeout;break;
+        case gatebouncer::websearch::NetworkFailure::Tls:out.failure=Failure::TlsFailure;break;
+        case gatebouncer::websearch::NetworkFailure::Cancelled:out.failure=Failure::Cancelled;break;
+        default:break;
+        }
+    }
     auto completion=std::move(pending.completion);if(completion)completion(std::move(out));
 }
 }

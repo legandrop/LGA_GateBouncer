@@ -15,6 +15,18 @@
 namespace gatebouncer::websearch {
 enum class Provider { MwmblV2, SearXng };
 enum class Status { Evidence, NoEvidence, Unavailable, Cancelled, Rejected };
+enum class HttpStage { Unknown, OpenSession, Options, Connect, OpenRequest, Send, Receive, Headers, Read };
+enum class LocalHttpFailure { None, Cancelled, Deadline, ResponseLimit, Rejected, Headless, Unsupported, InvalidResponse };
+enum class NetworkFailure { Unknown, Cancelled, Timeout, Tls, Http, Transport, Local };
+struct HttpDiagnostic {
+    HttpStage stage = HttpStage::Unknown;
+    std::optional<quint32> winHttpError;
+    std::optional<quint64> asyncApi;
+    std::optional<quint32> secureFailure;
+    LocalHttpFailure local = LocalHttpFailure::None;
+    bool failureObserved = false;
+};
+NetworkFailure networkFailure(const HttpDiagnostic &, int observedHttpStatus = 0);
 struct ProviderConfig {
     Provider provider = Provider::MwmblV2;
     QUrl endpoint = QUrl(QStringLiteral("https://api.mwmbl.org/api/v2/search/"));
@@ -43,6 +55,8 @@ struct SearchResult {
     Provider provider = Provider::MwmblV2;
     Status status = Status::Unavailable;
     QVector<Citation> citations;
+    HttpDiagnostic diagnostic;
+    int observedHttpStatus = 0;
 };
 struct HttpRequest { ProviderConfig config; QString query; Resource resource=Resource::Search;
     QUrl evidenceUrl;std::optional<Destination> destination; };
@@ -52,6 +66,7 @@ struct HttpResponse {
     QByteArray contentType;
     QByteArray contentEncoding;
     QByteArray body;
+    HttpDiagnostic diagnostic;
 };
 class Exchange {
 public:

@@ -14,6 +14,22 @@
 #include <algorithm>
 
 namespace gatebouncer::websearch {
+NetworkFailure networkFailure(const HttpDiagnostic &d, int http)
+{
+    // Sólo códigos documentados observados; un deadline local no inventa un error WinHTTP.
+    if(d.local==LocalHttpFailure::Cancelled)return NetworkFailure::Cancelled;
+    if(d.local==LocalHttpFailure::Deadline)return NetworkFailure::Timeout;
+    if(d.local!=LocalHttpFailure::None)return NetworkFailure::Local;
+    if(d.secureFailure && *d.secureFailure)return NetworkFailure::Tls;
+    if(d.winHttpError && *d.winHttpError){
+        if(*d.winHttpError==12002)return NetworkFailure::Timeout;
+        if(*d.winHttpError==12017)return NetworkFailure::Cancelled;
+        if(*d.winHttpError==12175)return NetworkFailure::Tls;
+        return NetworkFailure::Transport;
+    }
+    if(http>=100 && http<=599 && http!=200)return NetworkFailure::Http;
+    return NetworkFailure::Unknown;
+}
 namespace {
 constexpr qsizetype BodyLimit = 256 * 1024;
 class SteadyClock final : public MonotonicClock {
@@ -119,6 +135,10 @@ SearchResult parseResponse(const HttpResponse &response, SearchResult result,
                            const QDateTime &retrievalUtc)
 {
     result.status = Status::Unavailable;
+    result.diagnostic = response.diagnostic;
+    result.observedHttpStatus = response.statusCode>=100 && response.statusCode<=599 ? response.statusCode : 0;
+    const bool validating=!result.diagnostic.failureObserved && response.transportOk && response.statusCode==200;
+    if(validating){result.diagnostic.local=LocalHttpFailure::InvalidResponse;result.diagnostic.failureObserved=true;}
     result.citations.clear();
     if (result.provider != Provider::MwmblV2 && result.provider != Provider::SearXng) return result;
     const auto type = response.contentType.toLower().split(';');
@@ -194,6 +214,7 @@ SearchResult parseResponse(const HttpResponse &response, SearchResult result,
             :". Returned for an IP+app query; no literal IP match in this text. It may be unrelated to this connection.");
     }
     result.citations = std::move(citations);
+    if(validating){result.diagnostic.local=LocalHttpFailure::None;result.diagnostic.failureObserved=false;}
     result.status = result.citations.isEmpty() ? Status::NoEvidence : Status::Evidence;
     return result;
 }
@@ -261,6 +282,8 @@ void SearchClient::complete(Status status)
     working_=false;
     current_={};
     auto result = active_;
+    if(status==Status::Cancelled && !result.diagnostic.failureObserved)
+        {result.diagnostic.local=LocalHttpFailure::Cancelled;result.diagnostic.failureObserved=true;}
     result.status = status;
     result.citations.clear();
     const auto operation = std::move(exchange_);
@@ -297,14 +320,14 @@ bool SearchClient::startResource(Resource kind,const QUrl& url) {
 void SearchClient::finishEvidence() {
     if(!working_)return;
     QPointer<SearchClient> self(this);if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return;}if(!self)return;
-    if(clock_->milliseconds()<lastStart_||clock_->milliseconds()>=deadline_){complete(Status::Unavailable);return;}
+    if(clock_->milliseconds()<lastStart_||clock_->milliseconds()>=deadline_){if(clock_->milliseconds()>=deadline_ && !active_.diagnostic.failureObserved){active_.diagnostic.local=LocalHttpFailure::Deadline;active_.diagnostic.failureObserved=true;}complete(Status::Unavailable);return;}
     timer_.stop();working_=false;current_={};
     auto result=active_;
     // Tres fuentes: registro, routing y una asociación de servicio; nunca autoridad de firewall.
     std::stable_sort(result.citations.begin(),result.citations.end(),[](const auto& a,const auto& b){
         const auto rank=[](quint8 kind){return kind==1?0:kind==3?1:2;};return rank(a.kind)<rank(b.kind);});
     if(result.citations.size()>3)result.citations.resize(3);
-    result.status=result.citations.isEmpty()?Status::NoEvidence:Status::Evidence;
+    result.status=result.citations.isEmpty()?(result.diagnostic.failureObserved?Status::Unavailable:Status::NoEvidence):Status::Evidence;
     if(result.input.destination){
         const auto now=clock_->milliseconds();
         auto store=[&](QVector<DestinationCache>& cache,const QString& key,const QVector<Citation>& evidence){
@@ -345,17 +368,24 @@ void SearchClient::tick()
     if(!working_)return;
     QPointer<SearchClient> self(this);if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return;}if(!self)return;
     if(!exchange_){nextResource();return;}
-    if(clock_->milliseconds()>=deadline_){complete(Status::Unavailable);return;}
+    if(clock_->milliseconds()>=deadline_){if(!active_.diagnostic.failureObserved){active_.diagnostic.local=LocalHttpFailure::Deadline;active_.diagnostic.failureObserved=true;}complete(Status::Unavailable);return;}
     HttpResponse response;
     const auto operation=exchange_;if(!operation->poll(response))return;
     if(!self)return;if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return;}if(!self)return;
-    if(clock_->milliseconds()<lastStart_||clock_->milliseconds()>=deadline_){complete(Status::Unavailable);return;}
+    // Conservar la primera falla de una familia, también si etapas posteriores no aportan evidencia.
+    if(!active_.diagnostic.failureObserved &&
+        (response.diagnostic.failureObserved || !response.transportOk || response.statusCode!=200)){
+        active_.diagnostic=response.diagnostic;active_.diagnostic.failureObserved=true;
+        active_.observedHttpStatus=response.statusCode>=100 && response.statusCode<=599?response.statusCode:0;
+    }
+    if(clock_->milliseconds()<lastStart_||clock_->milliseconds()>=deadline_){if(clock_->milliseconds()>=deadline_ && !active_.diagnostic.failureObserved){active_.diagnostic.local=LocalHttpFailure::Deadline;active_.diagnostic.failureObserved=true;}complete(Status::Unavailable);return;}
     exchange_.reset();
     const auto checked=QDateTime::currentDateTimeUtc();
     // Respetar denegación/rate limit del proveedor: no retry ni otra etapa para evadirlo.
     if(response.statusCode==403||response.statusCode==429){finishEvidence();return;}
     if(resource_==Resource::Search||resource_==Resource::DestinationSearch){
         const auto result=parseResponse(response,active_,checked);
+        if(!active_.diagnostic.failureObserved && result.diagnostic.failureObserved){active_.diagnostic=result.diagnostic;active_.observedHttpStatus=result.observedHttpStatus;}
         active_.citations+=result.citations;
         if(!active_.input.destination){timer_.stop();working_=false;current_={};emit finished(result);return;}
     }else if(resource_==Resource::Bootstrap4||resource_==Resource::Bootstrap6){

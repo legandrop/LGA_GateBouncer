@@ -4,6 +4,7 @@
 #include <QUrlQuery>
 #include <array>
 #include <mutex>
+#include <cstring>
 
 #ifdef Q_OS_WIN
 #define WIN32_LEAN_AND_MEAN
@@ -15,8 +16,11 @@ namespace gatebouncer::websearch {
 namespace {
 class ImmediateFailure final : public Exchange {
 public:
-    bool poll(HttpResponse &response) override { response = {}; return true; }
+    explicit ImmediateFailure(LocalHttpFailure why):why_(why){}
+    bool poll(HttpResponse &response) override { response = {}; response.diagnostic.local=why_;response.diagnostic.failureObserved=true;return true; }
     void cancel() override {}
+private:
+    LocalHttpFailure why_;
 };
 #ifdef Q_OS_WIN
 enum class Phase { Waiting, Sent, Headers, Read, Done };
@@ -44,9 +48,20 @@ struct State {
         request = nullptr;
         if (handle) WinHttpCloseHandle(handle);
     }
+    void fail(HttpStage stage,std::optional<DWORD> code={},std::optional<quint64> api={})
+    {
+        if(!response.diagnostic.failureObserved){response.diagnostic.stage=stage;response.diagnostic.winHttpError=code;
+            response.diagnostic.asyncApi=api;response.diagnostic.failureObserved=true;}
+        finish(false);
+    }
 };
 using Context = std::shared_ptr<State>;
-void CALLBACK callback(HINTERNET, DWORD_PTR opaque, DWORD status, void *, DWORD size)
+HttpStage asyncStage(DWORD_PTR api)
+{
+    switch(api){case API_SEND_REQUEST:return HttpStage::Send;case API_RECEIVE_RESPONSE:return HttpStage::Receive;
+    case API_READ_DATA:return HttpStage::Read;default:return HttpStage::Unknown;}
+}
+void CALLBACK callback(HINTERNET, DWORD_PTR opaque, DWORD status, void *data, DWORD size)
 {
     if (!opaque) return;
     auto *context = reinterpret_cast<Context *>(opaque);
@@ -61,17 +76,33 @@ void CALLBACK callback(HINTERNET, DWORD_PTR opaque, DWORD status, void *, DWORD 
         state->received = size;
         state->phase = Phase::Read;
         break;
-    case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: state->finish(false); break;
+    case WINHTTP_CALLBACK_STATUS_REQUEST_ERROR: {
+        // El puntero del callback sólo vive durante esta llamada.
+        if(data && size==sizeof(WINHTTP_ASYNC_RESULT)){WINHTTP_ASYNC_RESULT error{};std::memcpy(&error,data,sizeof(error));
+            state->fail(asyncStage(error.dwResult),error.dwError,quint64(error.dwResult));}
+        else state->fail(HttpStage::Unknown);
+        break;
+    }
+    case WINHTTP_CALLBACK_STATUS_SECURE_FAILURE: {
+        if(data && size==sizeof(DWORD) && !state->response.diagnostic.failureObserved){DWORD flags=0;std::memcpy(&flags,data,sizeof(flags));
+            state->response.diagnostic.secureFailure=flags;}
+        break;
+    }
     default: break;
     }
 }
-QByteArray header(HINTERNET request, DWORD name)
+QByteArray header(HINTERNET request, DWORD name, const Context &state)
 {
     std::array<wchar_t, 512> value{};
     DWORD bytes = DWORD(sizeof(value));
     if (!WinHttpQueryHeaders(request, name, WINHTTP_HEADER_NAME_BY_INDEX,
-        value.data(), &bytes, WINHTTP_NO_HEADER_INDEX))
-        return GetLastError() == ERROR_WINHTTP_HEADER_NOT_FOUND ? QByteArray{} : QByteArrayLiteral("invalid");
+        value.data(), &bytes, WINHTTP_NO_HEADER_INDEX)){
+        const auto error=GetLastError();
+        if(error==ERROR_WINHTTP_HEADER_NOT_FOUND)return {};
+        if(!state->response.diagnostic.failureObserved){state->response.diagnostic.stage=HttpStage::Headers;
+            state->response.diagnostic.winHttpError=error;state->response.diagnostic.failureObserved=true;}
+        return QByteArrayLiteral("invalid");
+    }
     return QString::fromWCharArray(value.data(), int(bytes / sizeof(wchar_t))).toLatin1();
 }
 class NativeExchange final : public Exchange {
@@ -82,7 +113,7 @@ public:
     {
         const auto state = state_;
         std::lock_guard<std::recursive_mutex> lock(state->mutex);
-        if (state->phase != Phase::Done) state->finish(false);
+        if (state->phase != Phase::Done) {if(!state->response.diagnostic.failureObserved){state->response.diagnostic.local=LocalHttpFailure::Cancelled;state->response.diagnostic.failureObserved=true;}state->finish(false);}
     }
     bool poll(HttpResponse &response) override
     {
@@ -91,21 +122,21 @@ public:
         const auto handle = state->request;
         if (state->phase == Phase::Sent) {
             state->phase = Phase::Waiting;
-            if (!WinHttpReceiveResponse(handle, nullptr)) state->finish(false);
+            if (!WinHttpReceiveResponse(handle, nullptr)) {const auto error=GetLastError();state->fail(HttpStage::Receive,error);}
         } else if (state->phase == Phase::Headers) {
             DWORD code = 0, size = sizeof(code);
             if (!WinHttpQueryHeaders(handle, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX)) state->finish(false);
+                WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX)) {const auto error=GetLastError();state->fail(HttpStage::Headers,error);}
             else {
                 state->response.statusCode = int(code);
-                state->response.contentType = header(handle, WINHTTP_QUERY_CONTENT_TYPE);
-                state->response.contentEncoding = header(handle, WINHTTP_QUERY_CONTENT_ENCODING);
+                state->response.contentType = header(handle, WINHTTP_QUERY_CONTENT_TYPE,state);
+                state->response.contentEncoding = header(handle, WINHTTP_QUERY_CONTENT_ENCODING,state);
                 if (code != 200) state->finish(true);
                 else read(state);
             }
         } else if (state->phase == Phase::Read) {
             if (state->received > state->buffer.size()
-                || state->response.body.size() + state->received > 256 * 1024) state->finish(false);
+                || state->response.body.size() + state->received > 256 * 1024) {if(!state->response.diagnostic.failureObserved){state->response.diagnostic.local=LocalHttpFailure::ResponseLimit;state->response.diagnostic.stage=HttpStage::Read;state->response.diagnostic.failureObserved=true;}state->finish(false);}
             else if (state->received == 0) state->finish(true);
             else {
                 state->response.body.append(state->buffer.data(), state->received);
@@ -121,7 +152,7 @@ private:
     {
         state->phase = Phase::Waiting;
         if (!WinHttpReadData(state->request, state->buffer.data(), DWORD(state->buffer.size()), nullptr))
-            state->finish(false);
+            {const auto error=GetLastError();state->fail(HttpStage::Read,error);}
     }
     Context state_;
 };
@@ -135,25 +166,25 @@ public:
             (!search&&!validResource(input.resource,input.evidenceUrl,input.destination))||
             (search&&(!input.evidenceUrl.isEmpty()||(input.resource==Resource::DestinationSearch)!=input.destination.has_value()))||
             (input.resource==Resource::DestinationSearch&&!publicDestination(*input.destination)))
-            return std::make_shared<ImmediateFailure>();
+            return std::make_shared<ImmediateFailure>(LocalHttpFailure::Rejected);
         // La fábrica productiva funciona fuera de QA; el arnés nunca genera red real.
         if (qEnvironmentVariableIsSet("LGA_HEADLESS_DESKTOP")
             || qEnvironmentVariable("QT_QPA_PLATFORM") == QStringLiteral("offscreen")
             || qEnvironmentVariable("QT_QPA_PLATFORM") == QStringLiteral("minimal"))
-            return std::make_shared<ImmediateFailure>();
+            return std::make_shared<ImmediateFailure>(LocalHttpFailure::Headless);
 #ifdef Q_OS_WIN
         const auto state = std::make_shared<State>();
         auto operation = std::make_shared<NativeExchange>(state);
         state->session = WinHttpOpen(L"GateBouncer Web Search", WINHTTP_ACCESS_TYPE_NO_PROXY,
             WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, WINHTTP_FLAG_ASYNC);
-        if (!state->session) return std::make_shared<ImmediateFailure>();
+        if (!state->session) {const auto error=GetLastError();state->fail(HttpStage::OpenSession,error);return operation;}
         if (!WinHttpSetTimeouts(state->session, 5000, 5000, 5000, 5000))
-            return std::make_shared<ImmediateFailure>();
+            {const auto error=GetLastError();state->fail(HttpStage::Options,error);return operation;}
         const auto endpoint=search?input.config.endpoint:input.evidenceUrl;
         const auto host = endpoint.host().toStdWString();
         state->connection = WinHttpConnect(state->session, host.c_str(),
             INTERNET_PORT(endpoint.port(443)), 0);
-        if (!state->connection) return std::make_shared<ImmediateFailure>();
+        if (!state->connection) {const auto error=GetLastError();state->fail(HttpStage::Connect,error);return operation;}
         const bool post = search&&input.config.provider == Provider::SearXng;
         QString path = endpoint.path(QUrl::FullyEncoded);
         const auto encoded = QUrl::toPercentEncoding(input.destination?destinationQuery(input.query,*input.destination):input.query);
@@ -163,7 +194,7 @@ public:
         const auto widePath = path.toStdWString();
         state->request = WinHttpOpenRequest(state->connection, post ? L"POST" : L"GET",
             widePath.c_str(), nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
-        if (!state->request) return std::make_shared<ImmediateFailure>();
+        if (!state->request) {const auto error=GetLastError();state->fail(HttpStage::OpenRequest,error);return operation;}
         DWORD disable = WINHTTP_DISABLE_REDIRECTS | WINHTTP_DISABLE_COOKIES | WINHTTP_DISABLE_AUTHENTICATION;
         DWORD redirect = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
         DWORD autologon = WINHTTP_AUTOLOGON_SECURITY_LEVEL_HIGH;
@@ -175,21 +206,23 @@ public:
             || !WinHttpSetOption(req, WINHTTP_OPTION_AUTOLOGON_POLICY, &autologon, sizeof(autologon))
             || !WinHttpSetOption(req, WINHTTP_OPTION_ENABLE_FEATURE, &revocation, sizeof(revocation))
             || !WinHttpSetOption(req, WINHTTP_OPTION_CONNECT_RETRIES, &retries, sizeof(retries))) {
-            state->finish(false);
+            const auto error=GetLastError();state->fail(HttpStage::Options,error);
             return operation;
         }
         auto *context = new Context(state);
         DWORD_PTR opaque = reinterpret_cast<DWORD_PTR>(context);
         // Registrar contexto antes del callback evita una liberación sin HANDLE_CLOSING.
         if (!WinHttpSetOption(req, WINHTTP_OPTION_CONTEXT_VALUE, &opaque, sizeof(opaque))) {
+            const auto error=GetLastError();
             delete context;
-            state->finish(false);
+            state->fail(HttpStage::Options,error);
             return operation;
         }
         if (WinHttpSetStatusCallback(req, callback, WINHTTP_CALLBACK_FLAG_ALL_COMPLETIONS
-            | WINHTTP_CALLBACK_FLAG_HANDLES, 0) == WINHTTP_INVALID_STATUS_CALLBACK) {
+            | WINHTTP_CALLBACK_FLAG_HANDLES | WINHTTP_CALLBACK_FLAG_SECURE_FAILURE, 0) == WINHTTP_INVALID_STATUS_CALLBACK) {
+            const auto error=GetLastError();
             delete context;
-            state->finish(false);
+            state->fail(HttpStage::Options,error);
             return operation;
         }
         const wchar_t *headers = post
@@ -198,10 +231,10 @@ public:
             : L"Accept: application/rdap+json, application/json\r\nAccept-Encoding: identity\r\n";
         std::lock_guard<std::recursive_mutex> lock(state->mutex);
         if (!WinHttpSendRequest(req, headers, DWORD(-1), post ? state->body.data() : nullptr,
-            DWORD(state->body.size()), DWORD(state->body.size()), opaque)) state->finish(false);
+            DWORD(state->body.size()), DWORD(state->body.size()), opaque)) {const auto error=GetLastError();state->fail(HttpStage::Send,error);}
         return operation;
 #else
-        return std::make_shared<ImmediateFailure>();
+        return std::make_shared<ImmediateFailure>(LocalHttpFailure::Unsupported);
 #endif
     }
 };
