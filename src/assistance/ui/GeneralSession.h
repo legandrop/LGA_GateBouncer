@@ -25,6 +25,7 @@ public:
     bool selectPending(const General::Id128&,General::PendingServiceContext);
     std::optional<General::FullBinding> pendingBinding() const;
     std::optional<General::Destination> observedDestination() const;
+    std::optional<General::LocalFilePresentation> localFileFacts() const;
     bool reviewPublicFields(General::PublicFields);
     bool reviewLocalApplication(const OrdinaryDecisionClient&);
     bool clearPublicReview();

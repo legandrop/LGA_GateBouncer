@@ -12,7 +12,15 @@ struct PendingServiceContext {
     bool operator==(const PendingServiceContext& other) const;
 };
 bool validPendingService(const PendingServiceContext&);
-// Observación sin capacidad de restaurar el owner, hechos locales ni permisos.
+enum class LocalSignatureStatus : std::uint8_t { VerifiedOffline,Unsigned,Invalid,Unavailable,TimedOut,Cancelled };
+// Presentación LOCAL del snapshot retenido. No contiene ruta, hash ni capacidad.
+struct LocalFilePresentation {
+    std::uint64_t size=0,modifiedAtMs=0,checkedAtMs=0;
+    LocalSignatureStatus signature=LocalSignatureStatus::Unavailable;
+    std::string publisher;
+};
+bool validLocalFilePresentation(const LocalFilePresentation&);
+// Observación sin capacidad de restaurar el owner ni permisos.
 class PendingPresentationContext final {
 public:
     const PendingServiceContext& service() const {return service_;}
@@ -25,18 +33,23 @@ public:
     const Id128& snapshotToken() const {return snapshotToken_;}
     std::uint64_t snapshotGeneration() const {return snapshotGeneration_;}
     const std::optional<Destination>& destination() const {return destination_;}
+    const std::optional<LocalFilePresentation>& localFile() const {return localFile_;}
+    std::uint16_t presentationVersion() const {return version_;}
 private:
     friend class GeneralBrokerHost;
     friend std::optional<PendingPresentationContext> pendingPresentationContext(const QByteArray&);
     PendingPresentationContext(PendingServiceContext service,Id128 request,Id128 selector,
         std::uint64_t requestRevision,std::uint64_t selectorRevision,std::uint64_t profileGeneration,
-        Id128 token,std::uint64_t generation,std::optional<Destination> destination={}):service_(service),request_(request),selector_(selector),
+        Id128 token,std::uint64_t generation,std::optional<Destination> destination={},
+        std::optional<LocalFilePresentation> localFile={},std::uint16_t version=3):service_(service),request_(request),selector_(selector),
         snapshotToken_(token),requestRevision_(requestRevision),selectorRevision_(selectorRevision),
-        profileGeneration_(profileGeneration),snapshotGeneration_(generation),destination_(std::move(destination)){}
+        profileGeneration_(profileGeneration),snapshotGeneration_(generation),destination_(std::move(destination)),localFile_(std::move(localFile)),version_(version){}
     PendingServiceContext service_;
     Id128 request_,selector_,snapshotToken_;
     std::uint64_t requestRevision_,selectorRevision_,profileGeneration_,snapshotGeneration_;
     std::optional<Destination> destination_;
+    std::optional<LocalFilePresentation> localFile_;
+    std::uint16_t version_=3;
 };
 std::optional<Id128> pendingQuery(const QByteArray&);
 std::optional<QByteArray> pendingQueryBytes(const Id128&);

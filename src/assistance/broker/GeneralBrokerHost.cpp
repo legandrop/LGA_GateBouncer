@@ -11,6 +11,7 @@
 #include <QCoreApplication>
 #include <QElapsedTimer>
 #include <QDir>
+#include <QDateTime>
 #include <algorithm>
 #include <set>
 
@@ -21,6 +22,16 @@ QString text(const gb::wire::Bytes& bytes){return QString::fromUtf8(
     reinterpret_cast<const char*>(bytes.data()),qsizetype(bytes.size()));}
 std::string requestName(const Id128& id){return QUuid::fromRfc4122(QByteArray(
     reinterpret_cast<const char*>(id.data()),16)).toString().toStdString();}
+LocalSignatureStatus localSignature(L::SignatureState state){
+    switch(state){
+    case L::SignatureState::VerifiedOffline:return LocalSignatureStatus::VerifiedOffline;
+    case L::SignatureState::Unsigned:return LocalSignatureStatus::Unsigned;
+    case L::SignatureState::Invalid:return LocalSignatureStatus::Invalid;
+    case L::SignatureState::TimedOut:return LocalSignatureStatus::TimedOut;
+    case L::SignatureState::Cancelled:return LocalSignatureStatus::Cancelled;
+    default:return LocalSignatureStatus::Unavailable;
+    }
+}
 
 }
 struct GeneralBrokerHost::OwnedFacts {
@@ -35,11 +46,24 @@ struct GeneralBrokerHost::OwnedFacts {
     std::uint64_t generation=0;
     L::detail::OpenFile pin;
     L::Snapshot facts;
+    std::uint64_t checkedAtMs=0;
     bool fileCurrent() const {
         if(!pin.file||facts.state!=L::State::Complete)return false;
         L::Binding now;DWORD error=0;
         return L::detail::bindingFor(pin.file.value,pin.binding.absolutePath,pin.binding.generation,now,error)&&
             L::sameBinding(pin.binding,now)&&L::sameBinding(facts.binding,now);
+    }
+    std::optional<LocalFilePresentation> localPresentation() const {
+        if(!fileCurrent()||!checkedAtMs)return {};
+        // FILETIME es fecha de modificación, no fecha de comprobación ni de firma.
+        constexpr std::uint64_t windowsEpoch=116444736000000000ULL;
+        LocalFilePresentation view{facts.binding.size,facts.binding.modified>=windowsEpoch?
+            (facts.binding.modified-windowsEpoch)/10000:0,checkedAtMs,localSignature(facts.signature.state),{}};
+        if(view.signature==LocalSignatureStatus::VerifiedOffline){
+            const auto publisher=QString::fromStdWString(facts.signature.publisherLocal).toUtf8().toStdString();
+            if(safeText(publisher,1024,true))view.publisher=publisher;
+        }
+        return validLocalFilePresentation(view)&&fileCurrent()?std::optional<LocalFilePresentation>(std::move(view)):std::nullopt;
     }
 };
 struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
@@ -119,6 +143,10 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
             L::WindowsSignatureBackend signature(package);
             owner->facts=L::inspect(request,{},*cancelled,signature);
             if(!package->current())owner->facts.state=L::State::Stale;
+            if(!cancelled->requested&&owner->fileCurrent()){
+                const auto checked=QDateTime::currentDateTimeUtc().toMSecsSinceEpoch();
+                if(checked>0)owner->checkedAtMs=std::uint64_t(checked);
+            }
         });
         const auto thread=worker;
         QObject::connect(thread,&QThread::finished,thread,&QObject::deleteLater);
@@ -127,7 +155,7 @@ struct GeneralBrokerHost::Data : std::enable_shared_from_this<Data> {
             if(self->closed||self->serial!=before||cancelled->requested||!self->sourceCurrent(*owner)){completion({});return;}
             self->selected=owner;
             PendingPresentationContext view(owner->service,owner->record.observed,owner->record.binding,
-                owner->record.revision,owner->record.revision,owner->profile,owner->token,owner->generation,owner->destination);
+                owner->record.revision,owner->record.revision,owner->profile,owner->token,owner->generation,owner->destination,owner->localPresentation());
             const std::weak_ptr<Data> weak=self;
             auto owned=std::shared_ptr<const OwnedPendingPresentation>(new OwnedPendingPresentation(
                 std::move(view),self->connection,owner,[weak,owner]{const auto state=weak.lock();
@@ -190,7 +218,9 @@ std::unique_ptr<GeneralBrokerHost> GeneralBrokerHost::forCurrentUser(std::unique
     QObject::connect(monitor,&QTimer::timeout,host.get(),[weak]{
         const auto owner=weak.lock();if(!owner)return;
         if(!owner->closed&&owner->factory){
-            if(!owner->deployment||!owner->deployment->current())owner->close();
+            const auto selected=owner->selected;
+            // El canal original se retira si desaparece la custodia; la GUI no conserva hechos como actuales.
+            if(!owner->deployment||!owner->deployment->current()||(selected&&!owner->sourceCurrent(*selected)))owner->close();
             else if(owner->factory->peerCurrent())owner->seenPeer=true;
             else if(owner->seenPeer||owner->peerAge.elapsed()>6000)owner->close();
         }

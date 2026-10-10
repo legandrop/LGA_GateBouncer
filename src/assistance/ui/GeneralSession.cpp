@@ -175,6 +175,17 @@ std::optional<G::Destination> GeneralSession::observedDestination() const {
     const auto binding=pendingBinding();
     return self&&binding&&self->generation_==stamp&&self->pendingPresentation_?self->pendingPresentation_->destination():std::nullopt;
 }
+std::optional<G::LocalFilePresentation> GeneralSession::localFileFacts() const {
+    const auto stamp=generation_;QPointer<const GeneralSession> self(this);
+    const auto binding=pendingBinding();
+    if(!self||!binding||self->generation_!=stamp||!self->pendingPresentation_)return {};
+    const auto bytes=G::pendingPresentationBytes(*self->pendingPresentation_);
+    const auto facts=self->pendingPresentation_->localFile();
+    // Dos lecturas del mismo contexto/peer/cause; los datos no sustituyen el predicate original.
+    const auto after=self->pendingBinding();
+    return self&&after&&*after==*binding&&self->generation_==stamp&&self->pendingPresentation_&&
+        bytes&&G::pendingPresentationBytes(*self->pendingPresentation_)==bytes?facts:std::nullopt;
+}
 bool GeneralSession::publicReviewCurrent() const {
     if(!review_||!view_||!presentation_||!pendingCurrent_||!available())return false;
     const auto review=*review_;const auto stamp=generation_;const auto predicate=pendingCurrent_;

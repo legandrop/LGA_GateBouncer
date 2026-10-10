@@ -15,9 +15,9 @@ private:
     Binding binding_;
     QString observedName_; // Sólo presentación; nunca inicia ni aprueba la consulta.
     QLineEdit *product_,*publisher_;
-    QLabel *text_,*state_,*destination_;
+    QLabel *text_,*state_,*destination_,*localSummary_,*localDetails_,*networkDetails_;
     QPushButton *approve_,*start_,*cancel_;
     QProgressBar *progress_;
-    QWidget* citations_;
+    QWidget *citations_,*details_;
 };
 }
