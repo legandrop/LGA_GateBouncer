@@ -7,8 +7,8 @@
 
 namespace Gate::Data {
 namespace {
-const QString xsi = QStringLiteral("http://www.w3.org/2001/XMLSchema-instance");
-const QString xml = QStringLiteral("http://www.w3.org/XML/1998/namespace");
+constexpr QLatin1StringView xsi("http://www.w3.org/2001/XMLSchema-instance");
+constexpr QLatin1StringView xml("http://www.w3.org/XML/1998/namespace");
 thread_local QNameReadDiagnostic lastDiagnostic;
 bool ncName(const QString &value) {
     if (value.isEmpty()) return false;

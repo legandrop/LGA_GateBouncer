@@ -8,9 +8,9 @@
 
 namespace Gate::Data {
 namespace {
-const QString xsi = QStringLiteral("http://www.w3.org/2001/XMLSchema-instance");
-const QString arrays = QStringLiteral("http://schemas.microsoft.com/2003/10/Serialization/Arrays");
-const QString xsd = QStringLiteral("http://www.w3.org/2001/XMLSchema");
+constexpr QLatin1StringView xsi("http://www.w3.org/2001/XMLSchema-instance");
+constexpr QLatin1StringView arrays("http://schemas.microsoft.com/2003/10/Serialization/Arrays");
+constexpr QLatin1StringView xsd("http://www.w3.org/2001/XMLSchema");
 bool ipv4(const QString &text, quint32 &result) {
     const auto parts = text.split('.');
     if (parts.size() != 4) return false;
