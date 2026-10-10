@@ -1315,7 +1315,7 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
              a.command.accountSid == b.command.accountSid &&
              a.command.logonSid == b.command.logonSid;
     };
-    auto ruleChange = [&](const std::vector<Rule> &old, const Frame &f) {
+    auto ruleChange = [&](const std::vector<Rule> &old, const Frame &f, const Bytes &accountSid) {
       bool create = f.type == Type::CommitFuturePolicy;
       const bool replace=f.type==Type::ReplacePrincipalRule;
       auto removed = create ? Id{} : idValue(f, Tag::RuleId);
@@ -1330,7 +1330,8 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
         Target prior,current;
         if(found==old.end() || changed==after.rules.end() || old.size()!=after.rules.size() ||
            found->kind!=1 || changed->kind!=1 || !parseTarget(found->target,prior) ||
-           !parseTarget(changed->target,current) || prior.user!=current.user ||
+           !parseTarget(changed->target,current) || prior.user!=ByteView(accountSid) ||
+           current.user!=ByteView(accountSid) ||
            found->revision!=get(f,Tag::RuleRevision) || found->revision==UINT64_MAX ||
            found->targetRevision!=get(f,Tag::SelectorRevision) ||
            changed->revision!=found->revision+1 || changed->selector!=found->selector ||
@@ -1432,7 +1433,7 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
           return false;
         if (it != after.entries.end() - 1 ||
             get(f, Tag::ExpectedDesiredRev) != old.desired ||
-            !ruleChange(old.rules, f))
+            !ruleChange(old.rules, f, active.command.accountSid))
           return false;
       }
       return true;
@@ -1459,7 +1460,7 @@ bool validTransition(const ByteView &before, const Snapshot &after) {
       return false;
     if (it != after.entries.end() - 1 ||
         after.entries.size() != old.entries.size() + 1 ||
-        !ruleChange(old.rules, f))
+        !ruleChange(old.rules, f, active.command.accountSid))
       return false;
     for (std::size_t i = 0; i < old.entries.size(); ++i)
       if (n(after.entries[i], 4, 2) != 2 ||
