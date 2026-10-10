@@ -56,6 +56,7 @@ struct RuleSnapshot
     gb::wire::Id rule{}, selector{};
     std::uint64_t ruleRevision = 0, targetRevision = 0, desired = 0, filterGeneration = 0;
     ArenaSlice app, user, package;
+    gb::wire::iv::RemoteCondition remoteCondition;
     std::uint32_t slotBegin = 0;
     std::uint8_t action = 0, direction = 0, mode = 0, origin = 0;
     std::uint8_t scope = 0, packageMode = 0, targetKind = 0, slotMask = 0, slotCount = 0;

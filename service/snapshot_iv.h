@@ -11,7 +11,7 @@ namespace gb::principal {
 struct Snapshot;
 struct Entry;
 class SnapshotStore;
-constexpr std::size_t MaxSnapshotBytes = 33554432, MaxTargetBytes = 65696;
+constexpr std::size_t MaxSnapshotBytes = 33554432, MaxTargetBytes = 65744;
 // Vistas inmutables fuertes: ningún APP_ID o archivo se copia por cada regla.
 class ByteView {
 public:
@@ -43,12 +43,19 @@ private:
 struct Target {
   ByteView encoded, app, user, package;
   std::uint8_t packageMode = 0;
+  wire::iv::RemoteCondition remoteCondition;
 };
 bool sidValid(const ByteView &sid);
 bool parseTarget(const ByteView &bytes, Target &out);
+// APT1 permanece estricto. APT2/kind 3 sólo representa la condición original;
+// el actor debe adquirir su propia admisión antes de escribir filtros.
+bool parseConditionalTarget(const ByteView &bytes, Target &out);
 bool serializeTarget(const ByteView &app, const ByteView &user,
                      std::uint8_t packageMode, const ByteView &package,
                      Bytes &out);
+bool serializeConditionalTarget(const ByteView &app, const ByteView &user,
+                     std::uint8_t packageMode, const ByteView &package,
+                     const wire::iv::RemoteCondition &, Bytes &out);
 Digest targetDigest(const ByteView &target, bool legacy = false);
 struct Rule {
   Id id{}, selector{};

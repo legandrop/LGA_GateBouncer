@@ -8,6 +8,24 @@ constexpr std::uint64_t NativeTraffic = 1ull << 26;
 constexpr std::uint64_t NativeProcessFacts = 1ull << 27;
 constexpr std::uint64_t FileFutureControl = 1ull << 28;
 constexpr std::uint64_t AdministrativePrincipalControl = 1ull << 29;
+// Representación de condición original; no capability, admisión ni autoridad.
+enum class RemoteKind : std::uint8_t { None = 0, Ipv4Range = 1 };
+struct RemoteCondition {
+  RemoteKind kind = RemoteKind::None;
+  std::uint8_t match = 1;
+  // IPv4 numérico a<<24|b<<16|c<<8|d; ordinal de regla en el catálogo fuente,
+  // conservado para diagnóstico. No acredita ni decide el orden de un empate.
+  std::uint32_t first = 0, last = 0, sourceWeight = 0, sourceOrdinal = 0;
+  Id sourceRule{}, sourceFilter{};
+};
+inline bool remoteConditionValid(const RemoteCondition &c) noexcept {
+  if (c.match != 1) return false;
+  if (c.kind == RemoteKind::None)
+    return !c.first && !c.last && !c.sourceWeight && !c.sourceOrdinal &&
+           c.sourceRule == Id{} && c.sourceFilter == Id{};
+  return c.kind == RemoteKind::Ipv4Range && c.first <= c.last &&
+         c.sourceWeight <= 2147483647u && c.sourceRule != Id{} && c.sourceFilter != Id{};
+}
 // Archivo original custodiado por fuente; no es un HANDLE de imagen del caller.
 struct ProcessFacts {
   std::uint64_t pid=0, created=0, lastWrite=0;

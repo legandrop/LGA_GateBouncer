@@ -51,6 +51,12 @@ std::uint8_t mask(std::uint8_t direction) noexcept {
                           : 0;
 }
 Reason structure(const RuleView &r) noexcept {
+  const bool conditional = r.targetKind == 3;
+  if (!gb::wire::iv::remoteConditionValid(r.remoteCondition) ||
+      (conditional ? r.remoteCondition.kind != gb::wire::iv::RemoteKind::Ipv4Range ||
+                         r.direction != 1 || r.slotMask != 3
+                   : r.remoteCondition.kind != gb::wire::iv::RemoteKind::None))
+    return Reason::ScopeUnsupported;
   if (zeroId(r.ruleId) || r.ruleId == baseline() || zeroId(r.selectorId) ||
       !r.ruleRevision || !r.targetRevision || r.desired == UINT64_MAX ||
       r.filterGeneration != r.desired + 1 || r.recipeRevision != 1 ||
@@ -66,7 +72,7 @@ Reason structure(const RuleView &r) noexcept {
     return Reason::BadPresence;
   if (r.app.size > 65536 || r.user.size > 68 || r.package.size > 68)
     return Reason::Oversized;
-  if (r.targetKind == 1) {
+  if (r.targetKind == 1 || conditional) {
     if (r.origin != 1 || r.scope != 2 || r.packageMode < 1 || r.packageMode > 2)
       return Reason::InvalidEvent;
     if (!sid(r.user))
@@ -79,7 +85,7 @@ Reason structure(const RuleView &r) noexcept {
   return Reason::None;
 }
 Reason support(const PrincipalSupportView &s, unsigned layer, const GUID &key,
-               FWP_DATA_TYPE expected) noexcept {
+               FWP_DATA_TYPE expected, FWP_MATCH_TYPE match = FWP_MATCH_EQUAL) noexcept {
   const SupportField *found = nullptr;
   for (std::size_t i = 0; i < s.count; ++i) {
     const auto &f = s.fields[i];
@@ -90,7 +96,7 @@ Reason support(const PrincipalSupportView &s, unsigned layer, const GUID &key,
     found = &f;
   }
   if (!found || !same(found->layerKey, *Layers[layer]) ||
-      found->matchType != FWP_MATCH_EQUAL)
+      found->matchType != match)
     return Reason::ScopeUnsupported;
   const auto type = found->classifiedType;
   const bool compatible = expected == FWP_SECURITY_DESCRIPTOR_TYPE
@@ -128,6 +134,29 @@ Reason condition(const FWP_CONDITION_VALUE0 &actual,
   if (actual.type != expected.type)
     return Reason::ForeignFilter;
   switch (expected.type) {
+  case FWP_RANGE_TYPE: {
+    FWP_RANGE0 range{};
+    const auto *want = expected.rangeValue;
+    if (!want || !actual.rangeValue ||
+        !read(&range, actual.rangeValue, sizeof(range)))
+      return Reason::Unreadable;
+    if (range.valueLow.type != want->valueLow.type || range.valueHigh.type != want->valueHigh.type)
+      return Reason::ForeignFilter;
+    if (want->valueLow.type == FWP_BYTE_ARRAY16_TYPE &&
+        want->valueHigh.type == FWP_BYTE_ARRAY16_TYPE) {
+      auto result = bytes(range.valueLow.byteArray16,
+                          {reinterpret_cast<const std::uint8_t *>(want->valueLow.byteArray16), 16}, w, read);
+      return result == Reason::None
+                 ? bytes(range.valueHigh.byteArray16,
+                          {reinterpret_cast<const std::uint8_t *>(want->valueHigh.byteArray16), 16}, w, read)
+                 : result;
+    }
+    if (want->valueLow.type != FWP_UINT32 || want->valueHigh.type != FWP_UINT32)
+      return Reason::Unsupported;
+    return range.valueLow.uint32 == want->valueLow.uint32 &&
+                   range.valueHigh.uint32 == want->valueHigh.uint32
+               ? Reason::None : Reason::ForeignFilter;
+  }
   case FWP_UINT8:
     return actual.uint8 == expected.uint8 ? Reason::None
                                           : Reason::ForeignFilter;
@@ -195,8 +224,11 @@ Reason deriveFilterKey(const gb::wire::Id &id, std::uint32_t slot,
 }
 Reason slotCount(const RuleView &r, std::uint32_t &outCount) noexcept {
   outCount = 0;
-  if (!mask(r.direction))
-    return Reason::InvalidEvent;
+  if (!mask(r.direction)) return Reason::InvalidEvent;
+  if (r.targetKind == 3) {
+    const auto valid = structure(r);
+    if (valid != Reason::None) return valid;
+  }
   outCount = r.direction == 1 ? 2 : r.direction == 2 ? 4 : 6;
   return Reason::None;
 }
@@ -218,12 +250,17 @@ Reason validateRule(const RuleView &r, const PrincipalSupportView &s) noexcept {
     const FWP_DATA_TYPE types[] = {
         FWP_BYTE_BLOB_TYPE, FWP_SECURITY_DESCRIPTOR_TYPE, FWP_SID, FWP_UINT8};
     for (unsigned i = 0; i < 4; ++i) {
-      if ((i == 1 && r.targetKind != 1) || (i == 2 && r.packageMode != 2) ||
-          (i == 3 && (r.action != 2 || r.direction != 1)))
+      if ((i == 1 && r.targetKind != 1 && r.targetKind != 3) || (i == 2 && r.packageMode != 2) ||
+          (i == 3 && (r.targetKind == 3 || r.action != 2 || r.direction != 1)))
         continue;
       const auto result = support(s, layer, *keys[i], types[i]);
       if (result != Reason::None)
         return result;
+    }
+    if (r.targetKind == 3) {
+      const auto result = support(s, layer, FWPM_CONDITION_IP_REMOTE_ADDRESS,
+                                  layer == 0 ? FWP_UINT32 : FWP_BYTE_ARRAY16_TYPE, FWP_MATCH_RANGE);
+      if (result != Reason::None) return result;
     }
   }
   return Reason::None;
@@ -254,8 +291,10 @@ Reason buildExpectedView(const SlotView &s, RecipeWorkspace &w,
     direction = r.direction;
     mode = r.mode;
     action = r.action;
-    weight = action == 1 ? 200 : 100;
-    unicast = action == 2 && direction == 1;
+    // El ordinal se conserva: no inventa desempate. El catálogo rechaza overlaps.
+    weight = r.targetKind == 3 ? 0x100000000ull + r.remoteCondition.sourceWeight
+                              : action == 1 ? 200 : 100;
+    unicast = r.targetKind != 3 && action == 2 && direction == 1;
   } else {
     if (s.ordinal >= 28)
       return Reason::InvalidEvent;
@@ -282,6 +321,8 @@ Reason buildExpectedView(const SlotView &s, RecipeWorkspace &w,
     return Reason::Ambiguous;
   w.conditions = {};
   w.blobs = {};
+  w.remoteRange = {};
+  w.mappedRemote = {};
   w.sd = {};
   w.metadata = {};
   std::copy_n("GBF2", 4, w.metadata.begin());
@@ -317,7 +358,7 @@ Reason buildExpectedView(const SlotView &s, RecipeWorkspace &w,
   if (s.rule) {
     const auto &r = *s.rule;
     blob(FWPM_CONDITION_ALE_APP_ID, FWP_BYTE_BLOB_TYPE, r.app);
-    if (r.targetKind == 1) {
+    if (r.targetKind == 1 || r.targetKind == 3) {
       w.sd[0] = 1;
       put(w.sd.data() + 2, 0x8004, 2);
       put(w.sd.data() + 16, 20, 4);
@@ -337,6 +378,31 @@ Reason buildExpectedView(const SlotView &s, RecipeWorkspace &w,
         c.conditionValue.sid =
             reinterpret_cast<SID *>(const_cast<std::uint8_t *>(r.package.data));
       }
+    }
+    if (r.targetKind == 3) {
+      auto &c = w.conditions[count++];
+      c.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+      c.matchType = FWP_MATCH_RANGE;
+      c.conditionValue.type = FWP_RANGE_TYPE;
+      if (layer == 0) {
+        w.remoteRange.valueLow.type = w.remoteRange.valueHigh.type = FWP_UINT32;
+        w.remoteRange.valueLow.uint32 = r.remoteCondition.first;
+        w.remoteRange.valueHigh.uint32 = r.remoteCondition.last;
+      } else {
+        // Los sockets dual pueden clasificar IPv4 únicamente en ALE Connect6.
+        // Representar sólo ::ffff:IPv4; no ensanchar a destinos IPv6 nativos.
+        const std::uint32_t endpoints[] = {r.remoteCondition.first, r.remoteCondition.last};
+        for (unsigned i = 0; i < 2; ++i) {
+          auto &mapped = w.mappedRemote[i].byteArray16;
+          mapped[10] = mapped[11] = 0xff;
+          for (unsigned j = 0; j < 4; ++j)
+            mapped[12 + j] = std::uint8_t(endpoints[i] >> (24 - 8 * j));
+        }
+        w.remoteRange.valueLow.type = w.remoteRange.valueHigh.type = FWP_BYTE_ARRAY16_TYPE;
+        w.remoteRange.valueLow.byteArray16 = &w.mappedRemote[0];
+        w.remoteRange.valueHigh.byteArray16 = &w.mappedRemote[1];
+      }
+      c.conditionValue.rangeValue = &w.remoteRange;
     }
   }
   if (raw)

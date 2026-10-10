@@ -1,5 +1,5 @@
 #pragma once
-#include "../../../../common/wire_v1.h"
+#include "../../../../common/wire_iv.h"
 #include "../AllAppsMetadata.h"
 #include <array>
 #include <cstddef>
@@ -37,12 +37,14 @@ struct RuleView {
   std::uint8_t action = 1, direction = 1, mode = 0, origin = 1, scope = 2,
                packageMode = 1, targetKind = 1, slotMask = 0;
   ByteView app, user, package;
+  gb::wire::iv::RemoteCondition remoteCondition;
 };
 // Metadata copiada por el owner de cada capa y campo; no flag trusted.
 struct SupportField {
   NativeLayer8 layer = NativeLayer8::Connect4;
   GUID layerKey{}, fieldKey{};
   FWP_DATA_TYPE classifiedType = FWP_EMPTY;
+  // Match cerrado por la receta para ese tipo; FWPM_FIELD0 no lo atestigua.
   FWP_MATCH_TYPE matchType = FWP_MATCH_EQUAL;
 };
 struct PrincipalSupportView {
@@ -62,6 +64,8 @@ struct RecipeWorkspace {
   std::array<std::uint8_t, 32> metadata{};
   std::array<FWPM_FILTER_CONDITION0, 32> conditions{};
   std::array<FWP_BYTE_BLOB, 32> blobs{};
+  FWP_RANGE0 remoteRange{};
+  std::array<FWP_BYTE_ARRAY16, 2> mappedRemote{};
   std::array<std::uint8_t, 4096> chunk{};
 };
 static_assert(sizeof(RecipeWorkspace) <= 64 * 1024);

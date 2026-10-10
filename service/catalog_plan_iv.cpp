@@ -150,16 +150,18 @@ Reason CatalogPlanBuilder::stage(const principal::ByteView &bytes,
       rule.direction = input.direction;
       rule.mode = input.mode;
       rule.targetKind = input.kind;
-      rule.origin = input.kind == 1 ? 1 : 0;
-      rule.scope = input.kind == 1 ? 2 : 1;
+      rule.origin = input.kind == 1 || input.kind == 3 ? 1 : 0;
+      rule.scope = input.kind == 1 || input.kind == 3 ? 2 : 1;
       rule.slotMask = input.direction == 1 ? 3 : input.direction == 2 ? 0x3c : 0x3f;
-      if (input.kind == 1) {
+      if (input.kind == 1 || input.kind == 3) {
         principal::Target target;
-        if (!principal::parseTarget(input.target, target) ||
+        if (!(input.kind == 3 ? principal::parseConditionalTarget(input.target, target)
+                             : principal::parseTarget(input.target, target)) ||
             !slice(bytes, target.app, rule.app) || !slice(bytes, target.user, rule.user) ||
             !slice(bytes, target.package, rule.package))
           return fail(Reason::InvalidEvent);
         rule.packageMode = target.packageMode;
+        rule.remoteCondition = target.remoteCondition;
       } else if (!slice(bytes, input.target, rule.app))
         return fail(Reason::InvalidEvent);
       const auto view = s.ruleView(i);
@@ -284,6 +286,17 @@ CatalogPlanBuilder::WriteOutcome CatalogPlanBuilder::transactBody(
     return result;
   const auto &after = *storage_.storage_;
   if (!after.binding_) return result;
+  // El actor actual sólo admite APT1. Representar/cotejar APT2 no autoriza una
+  // escritura: el puente de admisión original debe adquirir todas las condiciones
+  // y precedencia antes de reemplazar esta guarda, también para borrar reglas.
+  auto conditional = [](const auto &catalog) {
+    return std::any_of(catalog.rules_.begin(), catalog.rules_.end(),
+                       [](const auto &rule) { return rule.targetKind == 3; });
+  };
+  if (conditional(after) || (before && conditional(*before))) {
+    result.error = ERROR_NOT_SUPPORTED;
+    return result;
+  }
   if (initial) {
     if (before || !initialCandidate_ || !after.arena_ || after.desired_ || after.generation_ != 1 ||
         !after.rules_.empty() || after.slots_.size() != 28) return result;

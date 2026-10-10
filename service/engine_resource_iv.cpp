@@ -184,7 +184,8 @@ gatebouncer::service::windows::allapps::Reason EngineResource::readDomain(
     std::array<native::recipe::SupportField, 32> candidateSupport{};
     std::size_t count = 0;
     const GUID *fields[] = {&FWPM_CONDITION_ALE_APP_ID, &FWPM_CONDITION_ALE_USER_ID,
-                            &FWPM_CONDITION_ALE_PACKAGE_ID, &FWPM_CONDITION_IP_DESTINATION_ADDRESS_TYPE};
+                            &FWPM_CONDITION_ALE_PACKAGE_ID, &FWPM_CONDITION_IP_DESTINATION_ADDRESS_TYPE,
+                            &FWPM_CONDITION_IP_REMOTE_ADDRESS};
     for (std::uint8_t i = 0; i < 8; ++i) {
       const auto layerKey = native::nativeLayerGuid(static_cast<native::NativeLayer8>(i));
       FWPM_LAYER0 *borrowed = nullptr;
@@ -200,20 +201,23 @@ gatebouncer::service::windows::allapps::Reason EngineResource::readDomain(
         if (candidateDomain[j] == header.layerId)
           return Reason::Ambiguous;
       candidateDomain[i] = header.layerId;
-      std::array<bool, 4> seen{};
+      std::array<bool, 5> seen{};
       for (UINT32 j = 0; j < header.numFields; ++j) {
         FWPM_FIELD0 field{};
         GUID key{};
         if (!api.read(&field, header.field + j, sizeof(field)) || !field.fieldKey ||
             !api.read(&key, field.fieldKey, sizeof(key)))
           return Reason::Unreadable;
-        for (std::size_t k = 0; k < 4; ++k)
-          if (std::memcmp(&key, fields[k], sizeof(key)) == 0) {
+        for (std::size_t k = 0; k < 5; ++k)
+          // Connect6 conserva el tipo real para el rango IPv4 mapeado; no
+          // inferirlo desde Connect4. Listen/Resource no habilitan fallback.
+          if ((k != 4 || i == 0 || i == 1 || i == 2) &&
+              std::memcmp(&key, fields[k], sizeof(key)) == 0) {
             if (seen[k] || count == candidateSupport.size())
               return Reason::Ambiguous;
             seen[k] = true;
             candidateSupport[count++] = {static_cast<native::NativeLayer8>(i), layerKey,
-                                         key, field.dataType, FWP_MATCH_EQUAL};
+                                         key, field.dataType, k == 4 ? FWP_MATCH_RANGE : FWP_MATCH_EQUAL};
           }
       }
     }

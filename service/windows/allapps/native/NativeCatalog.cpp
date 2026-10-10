@@ -192,6 +192,7 @@ recipe::RuleView CatalogSnapshot::ruleView(std::size_t index) const noexcept
     view.packageMode = source.packageMode;
     view.targetKind = source.targetKind;
     view.slotMask = source.slotMask;
+    view.remoteCondition = source.remoteCondition;
     auto bytes = [&](ArenaSlice slice) -> recipe::ByteView {
         if (!arena_ || !sliceFits(slice, arena_->size()) || !slice.size)
             return {};

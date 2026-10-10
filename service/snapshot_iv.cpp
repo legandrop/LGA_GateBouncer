@@ -201,7 +201,7 @@ ByteView app(const Rule &r) {
   if (r.kind == 2)
     return r.target.sub(53, r.target.size() - 53);
   Target t;
-  if (!parseTarget(r.target, t))
+  if (!(r.kind == 3 ? parseConditionalTarget(r.target, t) : parseTarget(r.target, t)))
     throw std::runtime_error("Target invalido");
   return t.app;
 }
@@ -427,8 +427,8 @@ bool headerRules(const ByteView &p, const ByteView &d, std::uint64_t desired,
         return false;
       auto size = std::size_t(n(p, at, 4));
       auto kind = n(p, at + 4, 2);
-      if (size < 64 || size > 65760 || size > p.size() - at - 8 || kind < 1 ||
-          kind > 2 || n(p, at + 6, 2) != 1)
+      if (size < 64 || size > 64 + MaxTargetBytes || size > p.size() - at - 8 || kind < 1 ||
+          kind > 3 || n(p, at + 6, 2) != 1)
         return false;
       row = p.sub(at + 8, size);
       r.kind = std::uint8_t(kind);
@@ -521,14 +521,65 @@ bool serializeTarget(const ByteView &a, const ByteView &u, std::uint8_t m,
 Digest targetDigest(const ByteView &b, bool legacy) {
   return domainHash(legacy ? "GBS4LGT1" : "GBS4TGT1", b);
 }
+bool parseConditionalTarget(const ByteView &b, Target &out) {
+  try {
+    if (b.size() < 72 || b.size() > MaxTargetBytes || !magic(b, "APT2") ||
+        n(b, 4, 2) != 1 || n(b, 6, 2) != 72 || n(b, 17, 1) != 2 ||
+        !zeros(b, 28, 4)) return false;
+    const auto a = n(b, 8, 4), u = n(b, 12, 2), p = n(b, 14, 2), m = n(b, 16, 1);
+    if (!a || a > 65536 || u > 68 || p > 68 || 72 + a + u + p != b.size() ||
+        m < 1 || m > 2 || (m == 1 && p)) return false;
+    Target t;
+    t.encoded = b;
+    t.app = b.sub(72, std::size_t(a));
+    t.user = b.sub(72 + std::size_t(a), std::size_t(u));
+    t.package = b.sub(72 + std::size_t(a + u), std::size_t(p));
+    t.packageMode = std::uint8_t(m);
+    auto &c = t.remoteCondition;
+    c.kind = static_cast<wire::iv::RemoteKind>(n(b, 18, 1));
+    c.match = std::uint8_t(n(b, 19, 1));
+    c.sourceWeight = std::uint32_t(n(b, 20, 4));
+    c.sourceOrdinal = std::uint32_t(n(b, 24, 4));
+    c.first = std::uint32_t(n(b, 32, 4));
+    c.last = std::uint32_t(n(b, 36, 4));
+    c.sourceRule = array<16>(b, 40);
+    c.sourceFilter = array<16>(b, 56);
+    if (!sidValid(t.user) || (m == 2 && !sidValid(t.package)) ||
+        c.kind != wire::iv::RemoteKind::Ipv4Range || !wire::iv::remoteConditionValid(c))
+      return false;
+    out = std::move(t);
+    return true;
+  } catch (...) { return false; }
+}
+bool serializeConditionalTarget(const ByteView &a, const ByteView &u, std::uint8_t m,
+                                const ByteView &p, const wire::iv::RemoteCondition &c, Bytes &out) {
+  if (!a.size() || a.size() > 65536 || !sidValid(u) || m < 1 || m > 2 ||
+      (m == 1 ? p.size() != 0 : !sidValid(p)) ||
+      c.kind != wire::iv::RemoteKind::Ipv4Range || !wire::iv::remoteConditionValid(c)) return false;
+  Bytes b(72);
+  std::copy_n("APT2", 4, b.begin());
+  put(b, 4, 1, 2); put(b, 6, 72, 2); put(b, 8, a.size(), 4);
+  put(b, 12, u.size(), 2); put(b, 14, p.size(), 2);
+  b[16] = m; b[17] = 2; b[18] = std::uint8_t(c.kind); b[19] = c.match;
+  put(b, 20, c.sourceWeight, 4); put(b, 24, c.sourceOrdinal, 4);
+  put(b, 32, c.first, 4); put(b, 36, c.last, 4);
+  put(b, 40, c.sourceRule); put(b, 56, c.sourceFilter);
+  append(b, a); append(b, u); append(b, p);
+  out = std::move(b);
+  return true;
+}
 bool overlaps(const Rule &a, const Rule &b) {
   if (!(a.direction & b.direction) || app(a) != app(b))
     return false;
   if (a.kind == 2 || b.kind == 2)
     return true;
   Target x, y;
-  if (!parseTarget(a.target, x) || !parseTarget(b.target, y))
+  if (!(a.kind == 3 ? parseConditionalTarget(a.target, x) : parseTarget(a.target, x)) ||
+      !(b.kind == 3 ? parseConditionalTarget(b.target, y) : parseTarget(b.target, y)))
     return true;
+  if (a.kind == 3 && b.kind == 3 &&
+      (x.remoteCondition.last < y.remoteCondition.first ||
+       y.remoteCondition.last < x.remoteCondition.first)) return false;
   return x.user == y.user &&
          (x.packageMode == 1 || y.packageMode == 1 || x.package == y.package);
 }
@@ -545,12 +596,21 @@ bool rulesValid(const std::vector<Rule> &rows) {
           r.action > 2 || r.direction < 1 || r.direction > 3 ||
           r.mode != mode(r.action, r.direction) ||
           (r.kind == 1 ? !parseTarget(r.target, t)
-                       : r.kind != 2 || !legacyRule(r)))
+           : r.kind == 3 ? r.direction != 1 || !parseConditionalTarget(r.target, t)
+                         : r.kind != 2 || !legacyRule(r)))
         return false;
-      for (std::size_t j = 0; j < i; ++j)
-        if ((rows[j].selector == r.selector && rows[j].target != r.target) ||
-            overlaps(rows[j], r))
+      for (std::size_t j = 0; j < i; ++j) {
+        bool selectorConflict = rows[j].selector == r.selector && rows[j].target != r.target;
+        if (selectorConflict && r.kind == 3 && rows[j].kind == 3) {
+          Target previous;
+          if (!parseConditionalTarget(rows[j].target, previous)) return false;
+          selectorConflict = previous.app != t.app || previous.user != t.user ||
+                             previous.packageMode != t.packageMode || previous.package != t.package;
+        }
+        // Nunca traducir ties/orden fuente a un desempate WFP inventado.
+        if (selectorConflict || overlaps(rows[j], r))
           return false;
+      }
     }
     return true;
   } catch (...) {
