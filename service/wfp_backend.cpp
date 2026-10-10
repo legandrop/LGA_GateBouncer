@@ -100,11 +100,6 @@ bool initialAbsent(HANDLE engine) {
     return FwpmFilterDestroyEnumHandle0(engine,enumeration) == ERROR_SUCCESS && ok && ended;
 }
 }
-bool guestActivationAuthorized(){
-    // Marcador administrativo del harness invitado. No se escribe desde el producto.
-    DWORD enabled=0,size=sizeof(enabled);auto e=RegGetValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",L"EnableWfp",RRF_RT_REG_DWORD,nullptr,&enabled,&size);
-    return e==ERROR_SUCCESS&&enabled==1&&IsUserAnAdmin();
-}
 WfpBackend::~WfpBackend(){if(subscription_)FwpmNetEventUnsubscribe0(engine_,subscription_);if(engine_)FwpmEngineClose0(engine_);}
 bool WfpBackend::authorized() const {
     return deployment_ ? deployment_->mode() == controller::DeploymentMode::Product &&

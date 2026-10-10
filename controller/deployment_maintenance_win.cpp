@@ -2,8 +2,16 @@
 #include "../service/maintenance_iv.h"
 #include <aclapi.h>
 #include <sddl.h>
+#include <shlobj.h>
 #include <algorithm>
 #include <set>
+namespace gb {
+bool guestActivationAuthorized(){
+    // Marcador administrativo del harness invitado. No se escribe desde el producto.
+    DWORD enabled=0,size=sizeof(enabled);auto e=RegGetValueW(HKEY_LOCAL_MACHINE,L"SOFTWARE\\LGA\\GateBouncerLab",L"EnableWfp",RRF_RT_REG_DWORD,nullptr,&enabled,&size);
+    return e==ERROR_SUCCESS&&enabled==1&&IsUserAnAdmin();
+}
+}
 namespace gb::controller {
 namespace {
 constexpr wchar_t mutexName[] = L"Global\\LGA.GateBouncerLab.Maintenance.IX";
