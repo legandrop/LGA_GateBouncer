@@ -434,7 +434,7 @@ bool headerRules(const ByteView &p, const ByteView &d, std::uint64_t desired,
       r.kind = std::uint8_t(kind);
       at += 8 + size;
       if (!zeros(row, 50, 6) || !zeros(row, 60, 4) ||
-          n(row, 56, 4) != size - 64 || n(row, 49, 1) != (kind == 1 ? 1 : 0))
+          n(row, 56, 4) != size - 64 || n(row, 49, 1) != (kind == 2 ? 0 : 1))
         return false;
       r.target = row.sub(64, size - 64);
     } else {
@@ -662,7 +662,7 @@ bool sections(const std::vector<Rule> &rows, std::uint64_t desired,
     put(p, at + 32, r->revision, 8);
     put(p, at + 40, r->targetRevision, 8);
     p[at + 48] = r->action;
-    p[at + 49] = r->kind == 1 ? 1 : 0;
+    p[at + 49] = r->kind == 2 ? 0 : 1;
     put(p, at + 56, r->target.size(), 4);
     append(p, r->target);
     append(d, r->id);
@@ -1269,7 +1269,7 @@ bool ByteView::prepareOwned(const Snapshot &s, const Entry &command, ByteView &o
       const auto row = at + 8;
       put(b, row, rule->id); put(b, row + 16, rule->selector);
       put(b, row + 32, rule->revision, 8); put(b, row + 40, rule->targetRevision, 8);
-      b[row + 48] = rule->action; b[row + 49] = rule->kind == 1 ? 1 : 0;
+      b[row + 48] = rule->action; b[row + 49] = rule->kind == 2 ? 0 : 1;
       put(b, row + 56, rule->target.size(), 4);
       if (rule->target.size()) std::copy_n(rule->target.data(), rule->target.size(), b.begin() + row + 64);
       at += 72 + rule->target.size();
