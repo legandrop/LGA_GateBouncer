@@ -72,7 +72,7 @@ struct Scanner {
             if (QChar::isLowSurrogate(c) && !high) return false;
             high = QChar::isHighSurrogate(c);
             if (out) out->append(QChar(c));
-            cost += c == '"' || c == '\\' ? 2 : c < 32 || c >= 127 ? 6 : 1;
+            cost += QNameBudget::jsonUnitBytes(c);
             return true;
         };
         while (at < bytes.size()) {
@@ -223,16 +223,8 @@ bool budgetQNameReview(const ReviewDocument &d, qint64 *bound) {
     for (const auto *list : {&d.report.filters, &d.report.identities}) for (const auto &n : *list) if (!xmlBudget(b, n, 1, nodes)) return false;
     for (const auto &s : d.report.diagnostics) if (!b.string(s) || !b.structure(4)) return false;
     const auto &e = *d.qnameEvidence;
-    if (!fixed(b, 64, 512) || !strings(b, {e.profileId, e.digest}) || e.nodes.size() > 200000) return false;
-    for (const auto &n : e.nodes) {
-        if (!fixed(b, 104, 80) || !strings(b, {n.name.uri, n.name.local, n.qualifiedName}) || n.attributes.size() + n.declarations.size() > 32) return false;
-        if (n.resolvedType && (!fixed(b, 8, 64) || !strings(b, {n.resolvedType->uri, n.resolvedType->local}))) return false;
-        for (const auto &a : n.attributes) if (!fixed(b, 40, 40) || !strings(b, {a.name.uri, a.name.local, a.qualifiedName, a.value})) return false;
-        for (const auto *list : {&n.declarations, &n.closure}) for (const auto &a : *list) if (!fixed(b, 12, 24) || !strings(b, {a.prefix, a.uri})) return false;
-        for (const auto &c : n.content) if (!fixed(b, 9, 24) || !b.string(c.text)) return false;
-    }
-    for (const auto &r : e.rows) if (!fixed(b, 15, 128) || !b.string(r.candidateId)) return false;
-    if (!b.structure(e.roles.size() * 68ll)) return false;
+    if (e.nodes.size() > 200000 || !budgetQNameEvidence(b, e)) return false;
+    for (const auto &n : e.nodes) if (n.attributes.size() + n.declarations.size() > 32) return false;
     const auto eventBudget = [&](const ActivityEvent &event) {
         if (!fixed(b, 256, 4096) || !strings(b, {event.sourceId, event.sourceEpoch, event.sequence, event.subjectId, event.requestId,
             event.flowId, event.winningRuleId, event.winningRuleRevision, event.endpoint, event.protocol,

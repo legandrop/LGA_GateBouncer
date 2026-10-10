@@ -30,18 +30,6 @@ bool ncName(const QString &value) {
     }
     return true;
 }
-bool names(QNameBudget &b, const ExpandedName &n) { return b.string(n.uri) && b.string(n.local); }
-bool nodeBudget(QNameBudget &b, const QNameNode &n) {
-    // Cota de estructura JSON (keys/puntuación/índices), no tamaño ficticio de un objeto RAM.
-    if (!names(b, n.name) || !b.string(n.qualifiedName) || !b.structure(192)) return false;
-    for (const auto &a : n.attributes)
-        if (!names(b, a.name) || !b.string(a.qualifiedName) || !b.string(a.value) || !b.structure(80)) return false;
-    for (const auto *bindings : {&n.declarations, &n.closure})
-        for (const auto &d : *bindings) if (!b.string(d.prefix) || !b.string(d.uri) || !b.structure(48)) return false;
-    if (n.resolvedType && !names(b, *n.resolvedType)) return false;
-    for (const auto &c : n.content) if (!b.string(c.text) || !b.structure(48)) return false;
-    return true;
-}
 QString prefix(const QString &qualified) { return qualified.contains(':') ? qualified.section(':', 0, 0) : QString{}; }
 QMap<QString, QString> initial() { return {{QStringLiteral("xml"), xml}}; }
 bool declarations(const QVector<NamespaceBinding> &decl, QMap<QString, QString> &env) {
@@ -131,10 +119,9 @@ QNameReadResult readQNameXml(const QByteArray &bytes, const ImportLimits &limits
                 n.attributes.push_back({{a.namespaceUri().toString(), a.name().toString()}, a.qualifiedName().toString(), a.value().toString()});
                 if (a.namespaceUri() == xsi && a.name() == "type") n.resolvedType = resolveQName(a.value().toString(), env);
             }
-            if (!nodeBudget(budget, n) || !nodeNames(n, env)) { result.error = "XmlNamesOrBudget"; break; }
+            if (!nodeNames(n, env)) { result.error = "XmlNamesOrBudget"; break; }
             const int index = result.nodes.size();
             if (!stack.isEmpty()) {
-                if (!budget.structure(48)) { result.error = "XmlBudget"; break; }
                 result.nodes[stack.last()].content.push_back({index, {}});
             }
             result.nodes.push_back(std::move(n)); stack.push_back(index); environments.push_back(std::move(env));
@@ -143,38 +130,17 @@ QNameReadResult readQNameXml(const QByteArray &bytes, const ImportLimits &limits
             auto &content = result.nodes[stack.last()].content;
             ++textChunks;
             const auto prior = budget;
-            auto failure = [&](QNameReadGuard guard, qint64 charge = 0) {
+            auto failure = [&](QNameReadGuard guard) {
                 auto &d = result.diagnostic;
                 d.guard = guard; d.textUnits = text.size(); d.textLimit = limits.text;
                 d.unitsBefore = prior.units; d.unitsAfter = budget.units;
                 d.jsonBefore = prior.jsonBound; d.jsonAfter = budget.jsonBound;
                 d.nodes = result.nodes.size(); d.contentItems = content.size(); d.textChunks = textChunks;
                 d.mergedUnits = !content.isEmpty() && content.last().child < 0 ? content.last().text.size() : 0;
-                d.stringCharge = charge; lastDiagnostic = d;
+                d.contentCharge = 0; lastDiagnostic = d;
             };
             if (text.size() > limits.text) {
                 failure(QNameReadGuard::TextUnits); result.error = "XmlTextBudget"; break;
-            }
-            if (!budget.string(text)) {
-                auto guard = !prior.valid ? QNameReadGuard::InvalidBudget :
-                    text.size() > 32768 ? QNameReadGuard::StringUnits :
-                    text.size() > QNameBudget::unitLimit - prior.units ? QNameReadGuard::TotalUnits : QNameReadGuard::JsonStringBytes;
-                qint64 charge = 2;
-                // Sólo en fallo: reproduce el cargo conservador sin exponer los caracteres.
-                if (guard == QNameReadGuard::JsonStringBytes) for (qsizetype i = 0; i < text.size(); ++i) {
-                    const auto ch = text[i];
-                    if (ch.isHighSurrogate()) {
-                        if (++i >= text.size() || !text[i].isLowSurrogate()) { guard = QNameReadGuard::InvalidUtf16; break; }
-                        charge += 12;
-                    } else if (ch.isLowSurrogate()) { guard = QNameReadGuard::InvalidUtf16; break; }
-                    else charge += ch == '"' || ch == '\\' ? 2 : ch.unicode() < 32 || ch.unicode() >= 127 ? 6 : 1;
-                }
-                failure(guard, charge);
-                result.error = "XmlTextBudget"; break;
-            }
-            if (!budget.structure(48)) {
-                failure(QNameReadGuard::JsonContentBytes, budget.jsonBound - prior.jsonBound);
-                result.error = "XmlTextBudget"; break;
             }
             if (!content.isEmpty() && content.last().child < 0) {
                 if (content.last().text.size() + text.size() > limits.text) {
@@ -182,8 +148,13 @@ QNameReadResult readQNameXml(const QByteArray &bytes, const ImportLimits &limits
                 }
                 content.last().text += text;
             } else content.push_back({-1, text});
-        } else if (token == QXmlStreamReader::EndElement) { stack.removeLast(); environments.removeLast(); }
+        } else if (token == QXmlStreamReader::EndElement) {
+            // Se cobra la representación final: CDATA/Characters contiguos forman un solo item.
+            if (!budgetQNameNode(budget, result.nodes[stack.last()])) { result.error = "XmlBudget"; break; }
+            stack.removeLast(); environments.removeLast();
+        }
     }
+    if (result.error.isEmpty() && !reader.hasError() && !budget.array(result.nodes.size())) result.error = "XmlBudget";
     if (reader.hasError() || roots != 1 || !stack.isEmpty()) result.error = result.error.isEmpty() ? "XmlMalformed" : result.error;
     result.accepted = result.error.isEmpty();
     if (!result.accepted) result.nodes.clear();
@@ -231,7 +202,7 @@ bool validateQNameEvidence(const QNameEvidence &e, const ImportLimits &limits) {
     for (const auto ch : e.digest) if (!QStringLiteral("0123456789abcdef").contains(ch)) return false;
     QVector<bool> visited(e.nodes.size(), false);
     QNameBudget budget;
-    if (!budget.string(e.profileId) || !budget.string(e.digest)) return false;
+    if (!budgetQNameEvidence(budget, e)) return false;
     QSet<QString> roleNames, ids;
     QSet<int> ruleNodes;
     std::function<bool(int, int, QMap<QString, QString>, QSet<QString>, const QMap<QString, QString> &, QMap<QString, QString> &)> visit;
@@ -241,7 +212,7 @@ bool validateQNameEvidence(const QNameEvidence &e, const ImportLimits &limits) {
         visited[i] = true;
         const auto &n = e.nodes[i];
         if (n.ordinal < 0 || n.attributes.size() + n.declarations.size() > limits.attributes ||
-            (depth > 1 && !n.closure.isEmpty()) || !nodeBudget(budget, n) || !declarations(n.declarations, env)) return false;
+            (depth > 1 && !n.closure.isEmpty()) || !declarations(n.declarations, env)) return false;
         for (const auto &d : n.declarations) local.insert(d.prefix);
         uses(n, local, closure, needed);
         if (!nodeNames(n, env)) return false;
@@ -275,7 +246,7 @@ bool validateQNameEvidence(const QNameEvidence &e, const ImportLimits &limits) {
     QSet<int> bound;
     for (const auto &row : e.rows) {
         if (ids.contains(row.candidateId) || bound.contains(row.node) || !ruleNodes.contains(row.node) ||
-            row.candidateId != qnameCandidateId(e, row.node) || !budget.string(row.candidateId)) return false;
+            row.candidateId != qnameCandidateId(e, row.node)) return false;
         ids.insert(row.candidateId); bound.insert(row.node);
     }
     return bound == ruleNodes;
