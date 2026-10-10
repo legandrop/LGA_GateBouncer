@@ -3,6 +3,7 @@
 #include "principal_actor_vi.h"
 #include "../common/ordinary_iii_win.h"
 #include <algorithm>
+#include <stdexcept>
 #include <thread>
 namespace gb::decisions {
 namespace {
@@ -833,7 +834,7 @@ bool NativeServer::run(HANDLE stop) {
         runtime_.principalImageWorker_.reset(new allnative::NativeImageWorker());
         runtime_.principalImageBaseCharge_=sizeof(allnative::NativeImageWorker)+sizeof(allnative::NativeImageWorker::State)+128;
     }
-    catch (...) { return false; }
+    catch (...) { runtime_.finishPrincipalImages();throw; }
     std::thread view([&] { channel(false, stop); }), control([&] { channel(true, stop); }),
         ordinary([&] { channel(false, stop, true); });
     HANDLE waits[]={stop,runtime_.principalImageWorker_->state_->wake.value};
@@ -854,7 +855,8 @@ bool NativeServer::run(HANDLE stop) {
         if(runtime_.principalClassifier_)runtime_.principalClassifier_->reset();
     }
     runtime_.finishPrincipalImages();
-    return waited;
+    if(!waited)throw std::runtime_error("Espera original del servidor fallida");
+    return true;
 }
 void NativeServer::channel(bool control, HANDLE stop, bool ordinary) {
     const std::wstring name = ordinary ? ipc::iii::OrdinaryPipe : control ? L"\\\\.\\pipe\\LGA.GateBouncer.Control.v1"
