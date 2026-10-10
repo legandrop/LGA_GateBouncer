@@ -421,8 +421,12 @@ struct LocalLinuxReaders::Impl {
         request.header.nlmsg_seq = sequence; request.header.nlmsg_pid = port; request.body.rtgen_family = AF_UNSPEC;
         sockaddr_nl kernel{}; kernel.nl_family = AF_NETLINK;
         const auto beginning = Now();
+        const auto withinDeadline = [&]() {
+            const auto current = Now();
+            return !cancelled.load() && beginning >= 0 && current >= beginning && current - beginning < 500;
+        };
         if (beginning < 0 || sendto(Fd(netSlot), &request, request.header.nlmsg_len, 0,
-            reinterpret_cast<sockaddr*>(&kernel), sizeof(kernel)) != request.header.nlmsg_len) return false;
+            reinterpret_cast<sockaddr*>(&kernel), sizeof(kernel)) != request.header.nlmsg_len || !withinDeadline()) return false;
         unsigned matches = 0, messages = 0;
         std::array<unsigned char, 65536> buffer{};
         while (!cancelled.load()) {
@@ -430,19 +434,20 @@ struct LocalLinuxReaders::Impl {
             if (now < beginning || now - beginning >= 500) return false;
             pollfd ready{Fd(netSlot), POLLIN, 0};
             const int result = poll(&ready, 1, static_cast<int>(500 - (now - beginning)));
+            if (!withinDeadline()) return false;
             if (result < 0 && errno == EINTR) continue;
             if (result != 1 || ready.revents != POLLIN) return false;
             sockaddr_nl sender{}; iovec vector{buffer.data(), buffer.size()};
             msghdr packet{}; packet.msg_name = &sender; packet.msg_namelen = sizeof(sender);
             packet.msg_iov = &vector; packet.msg_iovlen = 1;
             const auto received = recvmsg(Fd(netSlot), &packet, MSG_DONTWAIT);
-            if (received <= 0 || packet.msg_flags & (MSG_TRUNC | MSG_CTRUNC) ||
+            if (!withinDeadline() || received <= 0 || packet.msg_flags & (MSG_TRUNC | MSG_CTRUNC) ||
                 packet.msg_namelen != sizeof(sender) || sender.nl_family != AF_NETLINK || sender.nl_pid || sender.nl_groups)
                 return false;
             const auto total = static_cast<std::size_t>(received);
             std::size_t at = 0;
             while (at < total) {
-                if (total - at < sizeof(nlmsghdr) || ++messages > 1024) return false;
+                if (!withinDeadline() || total - at < sizeof(nlmsghdr) || ++messages > 1024) return false;
                 nlmsghdr header{}; std::memcpy(&header, buffer.data() + at, sizeof(header));
                 const auto aligned = static_cast<std::size_t>(NLMSG_ALIGN(header.nlmsg_len));
                 if (header.nlmsg_len < NLMSG_HDRLEN || header.nlmsg_len > total - at || aligned > total - at ||
@@ -453,7 +458,7 @@ struct LocalLinuxReaders::Impl {
                     int error = 0;
                     if (bytes != 0 && bytes != sizeof(error)) return false;
                     if (bytes) std::memcpy(&error, payload, sizeof(error));
-                    return !error && at + aligned == total && matches == 1;
+                    return !error && at + aligned == total && matches == 1 && withinDeadline();
                 }
                 if (header.nlmsg_type != (links ? RTM_NEWLINK : RTM_NEWADDR) || !(header.nlmsg_flags & NLM_F_MULTI) ||
                     !(links ? Link(payload, bytes, matches) : Address(payload, bytes, matches))) return false;
