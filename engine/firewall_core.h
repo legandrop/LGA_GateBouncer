@@ -75,7 +75,7 @@ class FirewallCore {
     bool removeAskFilters(std::wstring &error);
     bool installRule(Rule &rule, std::wstring &error);
     void addActivity(Activity a);
-    bool load(std::wstring &error);
+    void load();
     bool save(std::wstring &error);
 
     CoreOptions options_;

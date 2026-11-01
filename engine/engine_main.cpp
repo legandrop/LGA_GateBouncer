@@ -176,7 +176,8 @@ void WINAPI serviceMain(DWORD, wchar_t **) {
     }
     gbe::PipeServer server(core, trustedClients(dir));
     if (!server.start(error)) log(dir, L"Sin canal con la ventana: " + error);
-    log(dir, L"Motor activo");
+    const std::wstring warning = core.status().lastError;
+    log(dir, warning.empty() ? L"Motor activo" : L"Motor activo. Aviso: " + warning);
     setServiceState(SERVICE_RUNNING);
     WaitForSingleObject(serviceStop, INFINITE);
     server.stop();
@@ -327,6 +328,8 @@ int console(int argc, wchar_t **argv) {
     consoleStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     SetConsoleCtrlHandler(consoleHandler, TRUE);
     wprintf(L"Engine running%ls. Channel: %ls\n", options.dynamic ? L" (dynamic session)" : L"", gbe::PipeName);
+    const std::wstring warning = core.status().lastError;
+    if (!warning.empty()) wprintf(L"Warning: %ls\n", warning.c_str());
     fflush(stdout);
     WaitForSingleObject(consoleStop, seconds == 0 ? INFINITE : seconds * 1000);
     server.stop();

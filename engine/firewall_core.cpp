@@ -72,7 +72,7 @@ std::int64_t FirewallCore::now() {
 
 bool FirewallCore::start(std::wstring &error) {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!load(error)) return false;
+    load();
     if (!wfp_.open(options_.dynamic, error) || !wfp_.ensureObjects(error)) return false;
     // Un arranque reconstruye todo desde las reglas guardadas en UNA transacción: si algo falla, quedan los filtros
     // anteriores tal cual y nunca un bloqueo general sin sus permisos de base.
@@ -105,7 +105,9 @@ bool FirewallCore::start(std::wstring &error) {
         return false;
     }
     if (!wfp_.commit(error)) return false;
-    if (skipped) lastError_ = std::to_wstring(skipped) + L" rules skipped: executable not found";
+    if (skipped)
+        lastError_ += (lastError_.empty() ? L"" : L"; ") + std::to_wstring(skipped) +
+                      L" rules skipped: executable not found";
     if (!wfp_.subscribeDrops([this](const DropEvent &d) { onDrop(d); }, error)) return false;
     started_ = now();
     return true;
@@ -270,14 +272,16 @@ std::vector<Activity> FirewallCore::activity() {
     return {activity_.begin(), activity_.end()};
 }
 
-bool FirewallCore::load(std::wstring &error) {
+void FirewallCore::load() {
     rules_.clear();
     ask_ = true;
-    if (options_.dataDir.empty()) return true;
+    lastError_.clear();
+    if (options_.dataDir.empty()) return;
     std::ifstream in(options_.dataDir + L"\\rules.tsv", std::ios::binary);
-    if (!in) return true; // primera vez: sin reglas
+    if (!in) return; // primera vez: sin reglas
     std::string line;
     int number = 0;
+    std::wstring invalid;
     while (std::getline(in, line)) {
         ++number;
         if (!line.empty() && line.back() == '\r') line.pop_back();
@@ -293,11 +297,17 @@ bool FirewallCore::load(std::wstring &error) {
             r.path = fromUtf8(f[4]);
             if (!r.path.empty()) rules_[key(r.path)] = r;
         } else {
-            error = L"rules.tsv: invalid line " + std::to_wstring(number);
-            return false;
+            // Una línea rota no deja al motor sin arrancar: eso dejaría la PC sin ninguna regla. Se saltea y se avisa.
+            invalid += (invalid.empty() ? L"" : L", ") + std::to_wstring(number);
         }
     }
-    return true;
+    if (invalid.empty()) return;
+    // La próxima decisión reescribe rules.tsv sin esas líneas: antes se guarda el original para no perderlas.
+    in.close();
+    const std::wstring target = options_.dataDir + L"\\rules.tsv";
+    const bool kept = CopyFileW(target.c_str(), (target + L".bad").c_str(), FALSE);
+    lastError_ = L"rules.tsv: skipped invalid lines " + invalid +
+                 (kept ? L" (original kept as rules.tsv.bad)" : L" (could not keep a copy of the original)");
 }
 
 bool FirewallCore::save(std::wstring &error) {
@@ -320,13 +330,13 @@ bool FirewallCore::save(std::wstring &error) {
         if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
         if (!ok) {
             error = L"Could not write " + temp;
-            lastError_ = error;
+            lastError_ += (lastError_.empty() ? L"" : L"; ") + error;
             return false;
         }
     }
     if (!MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
         error = L"Could not replace " + target + L": " + WfpEngine::errorText(GetLastError());
-        lastError_ = error;
+        lastError_ += (lastError_.empty() ? L"" : L"; ") + error;
         return false;
     }
     return true;

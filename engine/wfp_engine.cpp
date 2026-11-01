@@ -309,16 +309,13 @@ bool WfpEngine::removeFilter(std::uint64_t id) {
 }
 
 bool WfpEngine::removeAllOwnFilters(std::wstring &error) {
-    FWPM_FILTER_ENUM_TEMPLATE0 tmpl{};
-    tmpl.providerKey = const_cast<GUID *>(&ProviderKey);
-    tmpl.enumType = FWP_FILTER_ENUM_FULLY_CONTAINED;
-    tmpl.flags = FWP_FILTER_ENUM_FLAG_INCLUDE_BOOTTIME | FWP_FILTER_ENUM_FLAG_INCLUDE_DISABLED;
-    tmpl.actionMask = 0xFFFFFFFF;
     // Todo junto, y la enumeración dentro de la transacción: borrar uno por uno podía dejar el bloqueo general sin
     // los permisos de DNS y loopback, y un filtro agregado entre enumerar y borrar se escapaba.
     if (!begin(error)) return false;
+    // Sin plantilla: una plantilla exige una capa (sin ella WFP responde FWP_E_LAYER_NOT_FOUND) y los filtros propios
+    // están en varias. Se recorren todos y se eligen los del proveedor o la subcapa propios.
     HANDLE handle = nullptr;
-    DWORD r = FwpmFilterCreateEnumHandle0(engine_, &tmpl, &handle);
+    DWORD r = FwpmFilterCreateEnumHandle0(engine_, nullptr, &handle);
     if (r != ERROR_SUCCESS) {
         error = L"FwpmFilterCreateEnumHandle0: " + errorText(r);
         abort();
@@ -330,7 +327,11 @@ bool WfpEngine::removeAllOwnFilters(std::wstring &error) {
         UINT32 count = 0;
         r = FwpmFilterEnum0(engine_, handle, 256, &rows, &count);
         if (r != ERROR_SUCCESS) break;
-        for (UINT32 i = 0; i < count; ++i) found.push_back(rows[i]->filterId);
+        for (UINT32 i = 0; i < count; ++i) {
+            const FWPM_FILTER0 *f = rows[i];
+            if ((f->providerKey && IsEqualGUID(*f->providerKey, ProviderKey)) || IsEqualGUID(f->subLayerKey, SublayerKey))
+                found.push_back(f->filterId);
+        }
         FwpmFreeMemory0(reinterpret_cast<void **>(&rows));
         if (count < 256) break;
     }
