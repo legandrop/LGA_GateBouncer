@@ -18,6 +18,7 @@ struct EngineSnapshot {
     EngineState state = EngineState::Unavailable;
     bool simulation = true;
     quint64 pendingCount = 0;
+    bool asking = true; // modo «preguntar» del motor; apagado, las apps sin regla se conectan
 };
 
 class TraySurface : public QObject {

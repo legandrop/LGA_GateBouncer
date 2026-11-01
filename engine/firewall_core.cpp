@@ -91,11 +91,22 @@ bool stampOf(const std::wstring &path, FileStamp &stamp) {
 constexpr auto CoverageRecheck = std::chrono::seconds(60);
 // Cada tanto se verifica la firma de todo lo cubierto aunque el sello no haya cambiado.
 constexpr int FullRecheckEvery = 10; // vueltas de CoverageRecheck
+// Las reglas temporales se revisan con esta frecuencia: vencen con hasta este retraso.
+constexpr auto ExpiryCheck = std::chrono::seconds(10);
 
 // Texto del historial para una regla por firma.
 std::wstring describe(const Rule &rule) {
     return rule.scope == Scope::App ? L"any version of " + rule.name + L" from " + rule.signer
                                     : L"all apps from " + rule.signer;
+}
+
+// Texto del historial para la duración de una decisión: vacío si es permanente.
+std::wstring describeExpiry(std::int64_t expires, std::int64_t from) {
+    if (expires == UntilRestart) return L" until restart";
+    if (expires <= 0) return L"";
+    const auto minutes = (expires - from + 30) / 60;
+    return minutes >= 60 && minutes % 60 == 0 ? L" for " + std::to_wstring(minutes / 60) + (minutes == 60 ? L" hour" : L" hours")
+                                              : L" for " + std::to_wstring(minutes) + L" minutes";
 }
 
 } // namespace
@@ -191,6 +202,14 @@ bool FirewallCore::start(std::wstring &error) {
         return false;
     }
     if (!wfp_.commit(error)) return false;
+    // Permiso HTTPS de la ventana en su propia transacción, después del arranque: si falla, el motor arranca igual
+    // (sólo faltan las explicaciones) y una ventana que ya no existe tampoco lo frena.
+    for (const auto &window : options_.windows)
+        if (options_.scope.empty() && isFile(window)) {
+            std::wstring windowError;
+            if (!wfp_.addHttpsPermit(window, systemFilters_, windowError))
+                lastError_ += std::wstring(lastError_.empty() ? L"" : L"; ") + L"Window HTTPS permit: " + windowError;
+        }
     if (skipped)
         lastError_ += (lastError_.empty() ? L"" : L"; ") + std::to_wstring(skipped) +
                       L" rules skipped: executable not found";
@@ -271,9 +290,14 @@ bool FirewallCore::setAsk(bool ask, std::wstring &error) {
     return save(error);
 }
 
-bool FirewallCore::decide(const std::wstring &path, Action action, Scope scope, std::wstring &error) {
+bool FirewallCore::decide(const std::wstring &path, Action action, Scope scope, std::wstring &error,
+                          std::int64_t expires) {
     if (path.empty() || path.find_first_of(L"\t\r\n|") != std::wstring::npos) {
         error = L"Invalid application path";
+        return false;
+    }
+    if (expires != 0 && expires != UntilRestart && expires <= now()) {
+        error = L"Invalid duration";
         return false;
     }
     const auto k = key(path);
@@ -308,6 +332,7 @@ bool FirewallCore::decide(const std::wstring &path, Action action, Scope scope, 
         rule.path = existing != rules_.end() ? existing->second.path : path;
         if (rule.action != action || existing == rules_.end()) rule.created = now();
         rule.action = action;
+        rule.expires = expires;
         // Regla nueva y retiro de la vieja en una sola transacción: nunca hay un hueco ni dos reglas.
         Rule fresh = rule;
         fresh.filters.clear();
@@ -325,7 +350,9 @@ bool FirewallCore::decide(const std::wstring &path, Action action, Scope scope, 
         if (cov != covered_.end()) covered_.erase(cov);
         rules_[k] = fresh;
         pending_.erase(k);
-        addActivity({now(), fresh.path, action == Action::Allow ? L"Rule saved: Allow" : L"Rule saved: Block", L"", 0, 0});
+        addActivity({now(), fresh.path,
+                     (action == Action::Allow ? L"Rule saved: Allow" : L"Rule saved: Block") + describeExpiry(expires, now()),
+                     L"", 0, 0});
         return save(error);
     }
 
@@ -338,6 +365,7 @@ bool FirewallCore::decide(const std::wstring &path, Action action, Scope scope, 
     const auto existing = rules_.find(rk);
     rule.created = existing != rules_.end() && existing->second.action == action ? existing->second.created : now();
     rule.lastBlock = existing != rules_.end() ? existing->second.lastBlock : 0;
+    rule.expires = expires;
     // Rutas que pasan a esta regla ya: la decidida (su firma se acaba de verificar) y las que la regla ya cubría (cambia
     // la acción). Las que tienen regla de ruta se respetan, y una regla de editor no pisa la de una app concreta. Los
     // otros pendientes que coinciden salen de la lista y se cubren en su próximo intento, con la firma verificada de
@@ -391,7 +419,9 @@ bool FirewallCore::decide(const std::wstring &path, Action action, Scope scope, 
                 : std::next(p);
     rules_[rk] = rule;
     addActivity({now(), path,
-                 (action == Action::Allow ? L"Rule saved: Allow " : L"Rule saved: Block ") + describe(rule), L"", 0, 0});
+                 (action == Action::Allow ? L"Rule saved: Allow " : L"Rule saved: Block ") + describe(rule) +
+                     describeExpiry(expires, now()),
+                 L"", 0, 0});
     return save(error);
 }
 
@@ -402,22 +432,52 @@ bool FirewallCore::removeRule(const std::wstring &id, std::wstring &error) {
         error = L"No rule for this application";
         return false;
     }
+    return dropRule(it, L"Rule removed", error) && save(error);
+}
+
+bool FirewallCore::dropRule(std::map<std::wstring, Rule>::iterator it, const std::wstring &reason, std::wstring &error) {
+    // Todo en una transacción: si falla, la regla queda entera y se reintenta después.
+    if (!wfp_.begin(error)) return false;
     if (it->second.scope == Scope::Path) {
         for (auto fid : it->second.filters) wfp_.removeFilter(fid);
-        addActivity({now(), it->second.path, L"Rule removed", L"", 0, 0});
     } else {
         // Las rutas que cubría vuelven a preguntar (o a otra regla de firma que coincida) en su próximo bloqueo.
-        if (!wfp_.begin(error)) return false;
         for (const auto &[ck, c] : covered_)
             if (c.ruleKey == it->first)
                 for (auto fid : c.filters) wfp_.removeFilter(fid);
-        if (!wfp_.commit(error)) return false;
+    }
+    if (!wfp_.commit(error)) return false;
+    if (it->second.scope == Scope::Path) {
+        addActivity({now(), it->second.path, reason, L"", 0, 0});
+    } else {
         for (auto c = covered_.begin(); c != covered_.end();)
             c = c->second.ruleKey == it->first ? covered_.erase(c) : std::next(c);
-        addActivity({now(), L"", L"Rule removed: " + describe(it->second), L"", 0, 0});
+        addActivity({now(), L"", reason + L": " + describe(it->second), L"", 0, 0});
     }
     rules_.erase(it);
-    return save(error);
+    return true;
+}
+
+void FirewallCore::expireRules() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto t = now();
+    bool changed = false;
+    for (auto it = rules_.begin(); it != rules_.end();) {
+        if (it->second.expires <= 0 || it->second.expires > t) {
+            ++it;
+            continue;
+        }
+        auto next = std::next(it);
+        std::wstring error;
+        if (dropRule(it, L"Rule expired", error)) {
+            changed = true;
+        } else {
+            lastError_ = L"Could not withdraw an expired rule: " + error;
+        }
+        it = next;
+    }
+    std::wstring error;
+    if (changed) save(error);
 }
 
 void FirewallCore::onDrop(const DropEvent &drop) {
@@ -465,7 +525,8 @@ void FirewallCore::verifyLoop() {
         bool hasDrop = false;
         {
             std::unique_lock<std::mutex> lock(verifyMutex_);
-            verifyWake_.wait_until(lock, nextRecheck, [this] { return verifyStop_ || !verifyQueue_.empty(); });
+            const auto wake = std::min(nextRecheck, std::chrono::steady_clock::now() + ExpiryCheck);
+            verifyWake_.wait_until(lock, wake, [this] { return verifyStop_ || !verifyQueue_.empty(); });
             if (verifyStop_) return;
             if (!verifyQueue_.empty()) {
                 drop = std::move(verifyQueue_.front());
@@ -474,6 +535,7 @@ void FirewallCore::verifyLoop() {
             }
         }
         if (hasDrop) classify(drop, cachedSigner(drop.appPath));
+        expireRules();
         if (std::chrono::steady_clock::now() >= nextRecheck) {
             recheckCoverage(++recheckRound_ % FullRecheckEvery == 0);
             nextRecheck = std::chrono::steady_clock::now() + CoverageRecheck;
@@ -675,14 +737,16 @@ void FirewallCore::load() {
         const auto action = [](const std::string &s) { return s == "allow" ? Action::Allow : Action::Block; };
         if (f[0] == "mode" && f.size() == 2) {
             ask_ = f[1] != "off";
-        } else if (f[0] == "rule" && f.size() == 5 && (f[1] == "allow" || f[1] == "block")) {
+        } else if (f[0] == "rule" && (f.size() == 5 || f.size() == 6) && (f[1] == "allow" || f[1] == "block")) {
             Rule r;
             r.action = action(f[1]);
             r.created = std::atoll(f[2].c_str());
             r.lastBlock = std::atoll(f[3].c_str());
             r.path = fromUtf8(f[4]);
-            if (!r.path.empty()) rules_[key(r.path)] = r;
-        } else if (f[0] == "signer" && f.size() == 7 && (f[1] == "app" || f[1] == "publisher") &&
+            r.expires = f.size() == 6 ? std::atoll(f[5].c_str()) : 0;
+            // Una temporal que venció con el motor apagado no se reinstala: esa app vuelve a preguntar.
+            if (!r.path.empty() && (r.expires <= 0 || r.expires > now())) rules_[key(r.path)] = r;
+        } else if (f[0] == "signer" && (f.size() == 7 || f.size() == 8) && (f[1] == "app" || f[1] == "publisher") &&
                    (f[2] == "allow" || f[2] == "block") && !f[5].empty() && (f[1] == "publisher" || !f[6].empty())) {
             Rule r;
             r.scope = f[1] == "app" ? Scope::App : Scope::Publisher;
@@ -691,7 +755,8 @@ void FirewallCore::load() {
             r.lastBlock = std::atoll(f[4].c_str());
             r.signer = fromUtf8(f[5]);
             r.name = r.scope == Scope::App ? key(fromUtf8(f[6])) : std::wstring();
-            rules_[ruleKey(r)] = r;
+            r.expires = f.size() == 8 ? std::atoll(f[7].c_str()) : 0;
+            if (r.expires <= 0 || r.expires > now()) rules_[ruleKey(r)] = r;
         } else if (f[0] == "covered" && f.size() == 3 && !f[1].empty() && !f[2].empty()) {
             coverage.push_back({fromUtf8(f[2]), key(fromUtf8(f[1])), {}});
         } else {
@@ -717,14 +782,23 @@ bool FirewallCore::save(std::wstring &error) {
     out << "# LGA GateBouncer rules v2\n";
     out << "mode\t" << (ask_ ? "ask" : "off") << "\n";
     for (const auto &[k, r] : rules_) {
+        // «Hasta reiniciar» no se guarda: el arranque siguiente ya no la encuentra. Las temporales llevan su vencimiento
+        // como último campo; las permanentes quedan con el formato de siempre.
+        if (r.expires == UntilRestart) continue;
         const char *action = r.action == Action::Allow ? "allow" : "block";
+        const std::string expiry = r.expires > 0 ? "\t" + std::to_string(r.expires) : std::string();
         if (r.scope == Scope::Path)
-            out << "rule\t" << action << "\t" << r.created << "\t" << r.lastBlock << "\t" << toUtf8(r.path) << "\n";
+            out << "rule\t" << action << "\t" << r.created << "\t" << r.lastBlock << "\t" << toUtf8(r.path) << expiry
+                << "\n";
         else
             out << "signer\t" << (r.scope == Scope::App ? "app" : "publisher") << "\t" << action << "\t" << r.created
-                << "\t" << r.lastBlock << "\t" << toUtf8(r.signer) << "\t" << toUtf8(r.name) << "\n";
+                << "\t" << r.lastBlock << "\t" << toUtf8(r.signer) << "\t" << toUtf8(r.name) << expiry << "\n";
     }
-    for (const auto &[k, c] : covered_) out << "covered\t" << toUtf8(c.ruleKey) << "\t" << toUtf8(c.path) << "\n";
+    for (const auto &[k, c] : covered_) {
+        const auto owner = rules_.find(c.ruleKey);
+        if (owner != rules_.end() && owner->second.expires == UntilRestart) continue;
+        out << "covered\t" << toUtf8(c.ruleKey) << "\t" << toUtf8(c.path) << "\n";
+    }
     const std::wstring target = options_.dataDir + L"\\rules.tsv";
     const std::wstring temp = target + L".tmp";
     {

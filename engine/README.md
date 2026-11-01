@@ -20,6 +20,11 @@ other driverless Windows firewalls.
   path rule is blocked, the engine checks its embedded Authenticode signature (offline, no revocation lookup) and, if
   a signature rule matches, adds the filter for that path. The first attempt is still lost; the next one uses the rule.
   These paths are saved with the rule and verified again at every engine start.
+- **Temporary rules.** A decision can last from one minute to a week, or until the engine restarts. The engine checks
+  expiry every ten seconds; an expired rule is removed (with the paths it covered) and the application asks again.
+  Until-restart rules are never written to the rules file.
+- **The window's own requests.** The installed `GateBouncer.exe` may connect to TCP port 443 only, for AI
+  explanations, without a request of its own. Nothing else about it is exempt.
 
 Filters are persistent. If the service stops or crashes, unknown applications stay blocked and saved rules keep
 working. Uninstalling removes every GateBouncer filter.
@@ -30,9 +35,17 @@ From an administrator command prompt, in the folder that holds `GateBouncerEngin
 
 ```bat
 GateBouncerEngine.exe --install
+GateBouncerEngine.exe --update <folder>
 GateBouncerEngine.exe --uninstall
 GateBouncerEngine.exe --remove-filters
 ```
+
+`--update <folder>` applies a newer build to an existing installation: it stops the service, copies the folder into
+the installed one (files that did not change are left alone; a file in use, such as the open window, is renamed to
+`.old` and replaced), and starts the service again. Saved rules are kept. Restart the window afterwards to use its new
+version. While the service is stopped, the persistent filters keep blocking unknown applications.
+`--send <fields>...` sends one request over the local channel and prints the answer, for scripts and administration
+(for example `--send STATUS`, or from an administrator prompt `--send REMOVE <path>`).
 
 `--install` registers and starts the `LGAGateBouncer` service (LocalSystem, automatic start, depends on BFE) and
 registers `GateBouncer.exe --start-minimized` to start at sign-in for every user, because the service has no desktop
@@ -55,8 +68,10 @@ The desktop window talks to the engine over the named pipe `\\.\pipe\LGA.GateBou
 line, tab-separated fields, and a reply terminated by `END`. Interactive users can read status, pending requests,
 rules and activity, but cannot create instances of the pipe. Only the installed `GateBouncer.exe` next to the engine,
 or an elevated process, can change rules (`DECIDE`, `REMOVE`, `MODE`). `DECIDE` takes the reach of the rule (`path`,
-`app` or `publisher`) and the executable; the engine reads the signer from the file itself and never trusts a signer
-sent by the client. That check uses the client's executable path:
+`app` or `publisher`), the executable and optionally how long it lasts (`always`, `restart` or a number of seconds,
+from 60 to 604800); the engine reads the signer from the file itself and never trusts a signer sent by the client.
+`RULES` reports each rule's expiry (0 permanent, -1 until restart, otherwise Unix time). That check uses the client's
+executable path:
 it keeps other programs from changing rules by accident, but it is not a boundary against malicious software already
 running under your account, which could start the window and inject code into it.
 
@@ -64,6 +79,8 @@ running under your account, which could start the window and inject code into it
 
 `--console --dynamic` runs the engine in a dynamic WFP session: everything it adds disappears when it exits. With
 `--scope <exe>` only that executable asks before connecting, so the rest of the computer is never affected.
+With the service installed and running, a console engine shares its filters, so test it on a machine without the
+service; `--pipe <name>` gives the console engine its own channel name.
 `GateBouncerEngineSelfTest.exe` checks the full cycle on a copy of an HTTP client, also in a dynamic session.
 `--signer <exe>` prints the signer that signature rules use for that file; it needs no administrator rights.
 

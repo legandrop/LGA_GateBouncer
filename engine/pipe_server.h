@@ -13,7 +13,8 @@ constexpr wchar_t PipeName[] = L"\\\\.\\pipe\\LGA.GateBouncer.Engine";
 
 class PipeServer {
   public:
-    PipeServer(FirewallCore &core, std::vector<std::wstring> trustedClients);
+    // name: otro canal para las pruebas en consola con el servicio instalado corriendo al mismo tiempo.
+    PipeServer(FirewallCore &core, std::vector<std::wstring> trustedClients, std::wstring name = PipeName);
     ~PipeServer();
     bool start(std::wstring &error);
     void stop();
@@ -27,6 +28,7 @@ class PipeServer {
 
     FirewallCore &core_;
     std::vector<std::wstring> trusted_;
+    std::wstring name_;
     std::atomic<bool> running_{false};
     std::atomic<int> clients_{0}; // hilos de clientes vivos: stop() los espera antes de liberar
     std::thread acceptThread_;

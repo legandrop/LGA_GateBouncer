@@ -5,7 +5,9 @@
 #include "lifecycle/StartupPreference.h"
 #include "engine/ReviewGateway.h"
 #include "engine/FirewallClient.h"
+#include "engine/NetLimiterRules.h"
 #include "accesstoast.h"
+#include "explain/Explainer.h"
 #include <QMainWindow>
 #include <QPointer>
 #include <QSet>
@@ -103,6 +105,11 @@ class MainWindow final : public QMainWindow {
     void openFirewallRequest(const QString &path);
     // Aviso fijo de escritorio (AccessToast): uno por vez, el pendiente más viejo que no se cerró.
     void updateFirewallToast();
+    // Explicación con IA de la app del aviso: sólo ayuda, nunca decide. automatic: pedida al aparecer el aviso.
+    void explainFirewallRequest(const QString &path, bool automatic);
+    void buildFirewallSettings(QVBoxLayout *layout);
+    // Import de reglas de NetLimiter al motor sin driver.
+    void buildFirewallImport();
     void editFirewallRule(const QString &id);
     void onNewFirewallPending(const QString &path);
     void finishShutdownWhenIdle();
@@ -149,6 +156,10 @@ class MainWindow final : public QMainWindow {
     QPointer<QFrame> detail_, notice_, modalOverlay_, message_;
     FirewallClient firewall_;
     QPointer<AccessToast> firewallToast_;
+    Explain::Explainer explainer_;
+    QHash<QString, QString> explainErrors_; // ruta en minúsculas -> último error de explicación
+    QVector<NetLimiterRule> netLimiterRules_;
+    QString netLimiterFile_;
     QSet<QString> dismissedRequests_; // rutas en minúsculas cerradas con ×: siguen pendientes, sin aviso
     QString preferredRequest_;        // la que se pidió ver desde Pending
     QByteArray ordinaryNoticeKey_;

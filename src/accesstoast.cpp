@@ -133,7 +133,14 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
         "#accessToast QPushButton#toastOpen { font-size:11px; color:%9; }"
         "#accessToast QPushButton#toastOpen:hover { text-decoration:underline; }"
         "#accessToast QPushButton#toastMenu, #accessToast QPushButton#toastClose { color:%10; font-size:15px; }"
-        "#accessToast QPushButton#toastMenu:hover, #accessToast QPushButton#toastClose:hover { color:%1; }")
+        "#accessToast QPushButton#toastMenu:hover, #accessToast QPushButton#toastClose:hover { color:%1; }"
+        "#accessToast QWidget#toastExplainBox { background:%4; border:1px solid %5; border-radius:6px; }"
+        "#accessToast QLabel#toastExplainStatus, #accessToast QLabel#toastExplainFoot, #accessToast QLabel#toastRisk"
+        " { font-size:11px; color:%3; }"
+        "#accessToast QLabel#toastWhat, #accessToast QLabel#toastWhy { font-size:12px; color:%2; }"
+        "#accessToast QLabel#toastSuggestion { font-size:12px; color:%1; }"
+        "#accessToast QPushButton#toastExplain { font-size:12px; color:%9; text-align:left; padding:0; }"
+        "#accessToast QPushButton#toastExplain:hover { text-decoration:underline; }")
         .arg(Text, Body, Faint, Field, FieldBorder, Button, ButtonBorder, ButtonHover, Link)
         .arg(HeaderIcon));
 
@@ -210,15 +217,79 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     path_ = new QLabel(this);
     path_->setObjectName("toastPath");
     layout->addWidget(path_);
-    layout->addSpacing(14);
+    layout->addSpacing(10);
 
-    auto *scopeLabel = new QLabel("Apply to", this);
-    layout->addWidget(scopeLabel);
-    layout->addSpacing(7);
+    // Explicación con IA. El enlace la pide; la respuesta va en un recuadro aparte y nunca toca la decisión.
+    explainAction_ = new QPushButton(this);
+    explainAction_->setObjectName("toastExplain");
+    explainAction_->setCursor(Qt::PointingHandCursor);
+    explainAction_->setFlat(true);
+    layout->addWidget(explainAction_, 0, Qt::AlignLeft);
+    explainStatus_ = new QLabel(this);
+    explainStatus_->setObjectName("toastExplainStatus");
+    explainStatus_->setWordWrap(true);
+    explainStatus_->setFixedWidth(Width - 32);
+    explainStatus_->setTextFormat(Qt::PlainText);
+    layout->addWidget(explainStatus_);
+    explainBox_ = new QWidget(this);
+    explainBox_->setObjectName("toastExplainBox");
+    explainBox_->setAttribute(Qt::WA_StyledBackground);
+    auto *box = new QVBoxLayout(explainBox_);
+    box->setContentsMargins(11, 9, 11, 9);
+    box->setSpacing(6);
+    for (auto **label : {&what_, &why_, &risk_, &suggestion_, &explainFoot_}) {
+        *label = new QLabel(explainBox_);
+        (*label)->setWordWrap(true);
+        // La respuesta del modelo es texto no confiable: siempre plano, nunca HTML ni enlaces.
+        (*label)->setTextFormat(Qt::PlainText);
+        // Ancho fijo: así el alto de cada párrafo se calcula bien y el recuadro no corta el texto.
+        (*label)->setFixedWidth(Width - 32 - 22);
+        box->addWidget(*label);
+    }
+    what_->setObjectName("toastWhat");
+    why_->setObjectName("toastWhy");
+    risk_->setObjectName("toastRisk");
+    suggestion_->setObjectName("toastSuggestion");
+    explainFoot_->setObjectName("toastExplainFoot");
+    layout->addWidget(explainBox_);
+    dots_ = new QTimer(this);
+    dots_->setInterval(450);
+    connect(dots_, &QTimer::timeout, this, [this] {
+        dotCount_ = (dotCount_ + 1) % 4;
+        explainStatus_->setText("Asking NVIDIA" + QString(dotCount_, QChar('.')));
+    });
+    connect(explainAction_, &QPushButton::clicked, this, [this] {
+        if (explanation_.state == Explanation::NoKey) emit settingsRequested();
+        else emit explainRequested(request_.path);
+    });
+    layout->addSpacing(12);
+
+    auto *choices = new QHBoxLayout;
+    choices->setSpacing(10);
+    auto *scopeColumn = new QVBoxLayout;
+    scopeColumn->setSpacing(7);
+    scopeColumn->addWidget(new QLabel("Apply to", this));
     scope_ = new ScopeCombo(this);
     scope_->setObjectName("toastScope");
     scope_->setAccessibleName("Apply to");
-    layout->addWidget(scope_);
+    scopeColumn->addWidget(scope_);
+    choices->addLayout(scopeColumn, 1);
+    auto *durationColumn = new QVBoxLayout;
+    durationColumn->setSpacing(7);
+    durationColumn->addWidget(new QLabel("For", this));
+    duration_ = new ScopeCombo(this);
+    duration_->setObjectName("toastDuration");
+    duration_->setAccessibleName("For");
+    duration_->setFixedWidth(120);
+    duration_->addItem("Always", "always");
+    for (const int minutes : {1, 5, 10, 15, 30})
+        duration_->addItem(minutes == 1 ? QStringLiteral("1 minute") : QString("%1 minutes").arg(minutes),
+                           QString::number(minutes * 60));
+    duration_->addItem("1 hour", "3600");
+    duration_->addItem("Until restart", "restart");
+    durationColumn->addWidget(duration_);
+    choices->addLayout(durationColumn);
+    layout->addLayout(choices);
     note_ = new QLabel("Unsigned apps can only get a rule for this exact file.", this);
     note_->setObjectName("toastNote");
     note_->setWordWrap(true);
@@ -238,7 +309,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     layout->addSpacing(10);
     for (auto *b : {block_, allow_})
         connect(b, &QPushButton::clicked, this, [this, allowed = b == allow_] {
-            emit decided(request_.path, allowed, scope_->currentData().toString());
+            emit decided(request_.path, allowed, scope_->currentData().toString(), duration_->currentData().toString());
         });
 
     auto *foot = new QHBoxLayout;
@@ -271,6 +342,9 @@ void AccessToast::setRequest(const Request &request) {
         path_->setToolTip(path_->text() != QDir::toNativeSeparators(request.path) ? QDir::toNativeSeparators(request.path)
                                                                                    : QString());
         rebuildScopes();
+        duration_->setCurrentIndex(0);
+        explanation_ = {};
+        renderExplanation();
         armed_ = false;
         QTimer::singleShot(600, this, [this, path = request.path] {
             if (request_.path != path) return;
@@ -302,16 +376,56 @@ void AccessToast::updateCounters() {
     block_->setEnabled(request_.canDecide && armed_);
     allow_->setEnabled(request_.canDecide && armed_);
     scope_->setEnabled(request_.canDecide && armed_ && scope_->count() > 1);
+    duration_->setEnabled(request_.canDecide && armed_);
     QStringList parts;
-    if (request_.attempts > 1) parts << QString("Attempts blocked: %1").arg(request_.attempts);
+    if (request_.attempts > 1) parts << QString("%1 attempts").arg(request_.attempts);
     if (request_.othersWaiting > 0) parts << QString("%1 more waiting").arg(request_.othersWaiting);
-    if (!request_.canDecide) parts << "Rules can't be changed from here";
+    if (!request_.canDecide) parts << "read only";
     footer_->setText(parts.join(" · "));
+}
+
+void AccessToast::setExplanation(const QString &path, const Explanation &explanation) {
+    if (path.compare(request_.path, Qt::CaseInsensitive) != 0) return;
+    explanation_ = explanation;
+    renderExplanation();
+    // Crece hacia arriba: el borde de abajo queda en su lugar.
+    if (screen_ && isVisible()) placeOn(screen_);
+    else adjustSize();
+}
+
+void AccessToast::renderExplanation() {
+    const auto &e = explanation_;
+    const bool working = e.state == Explanation::Working;
+    working ? dots_->start() : dots_->stop();
+    explainAction_->setVisible(e.state != Explanation::Working && e.state != Explanation::Ready);
+    explainAction_->setText(e.state == Explanation::NoKey   ? "Set up AI explanations in Settings"
+                            : e.state == Explanation::Failed ? "Try again"
+                                                             : "What is this? Ask AI");
+    explainStatus_->setVisible(working || e.state == Explanation::Failed);
+    if (working) explainStatus_->setText("Asking NVIDIA");
+    else if (e.state == Explanation::Failed) explainStatus_->setText(e.error);
+    explainBox_->setVisible(e.state == Explanation::Ready);
+    if (e.state != Explanation::Ready) return;
+    what_->setText(e.what);
+    why_->setText(e.why);
+    why_->setVisible(!e.why.isEmpty());
+    risk_->setText(e.risk);
+    risk_->setVisible(!e.risk.isEmpty());
+    const QString verdict = e.suggestion == "allow" ? "Suggestion: Allow" : e.suggestion == "block" ? "Suggestion: Block"
+                                                                                                  : "Suggestion: Your call";
+    suggestion_->setText(e.reason.isEmpty() ? verdict : verdict + " · " + e.reason);
+    explainFoot_->setText("AI explanation · " + e.model.section('/', -1) + " · it can be wrong and never decides for you");
+    // El alto de cada párrafo se fija con la fuente ya aplicada: el recuadro estaba oculto y no se había calculado.
+    for (auto *label : {what_, why_, risk_, suggestion_, explainFoot_}) {
+        label->ensurePolished();
+        label->setFixedHeight(label->heightForWidth(label->width()));
+    }
 }
 
 void AccessToast::placeOn(QScreen *screen) {
     if (!screen) screen = QGuiApplication::primaryScreen();
     if (!screen) return;
+    screen_ = screen;
     adjustSize();
     const QRect area = screen->availableGeometry();
     move(area.right() - width() - Margin, area.bottom() - height() - Margin);

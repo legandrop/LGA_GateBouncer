@@ -157,10 +157,11 @@ void LifecycleController::applyEngineSnapshot(const EngineSnapshot &snapshot) {
     updatePresentation();
 }
 QString LifecycleController::statusText() const {
-    if (!snapshot_.current) return tr("Engine unavailable");
+    if (!snapshot_.current) return tr("Engine not running");
     if (snapshot_.simulation) return tr("Simulation: no traffic filtering");
     switch (snapshot_.state) {
-    case EngineState::Active: return tr("Engine reports active");
+    case EngineState::Active:
+        return snapshot_.asking ? tr("Asking before new apps connect") : tr("Not asking: new apps connect");
     case EngineState::Degraded: return tr("Engine degraded");
     case EngineState::Unavailable: return tr("Engine unavailable");
     }

@@ -38,14 +38,14 @@ constexpr DWORD WriteTimeoutMs = 10000;
 
 } // namespace
 
-PipeServer::PipeServer(FirewallCore &core, std::vector<std::wstring> trustedClients)
-    : core_(core), trusted_(std::move(trustedClients)) {}
+PipeServer::PipeServer(FirewallCore &core, std::vector<std::wstring> trustedClients, std::wstring name)
+    : core_(core), trusted_(std::move(trustedClients)), name_(std::move(name)) {}
 
 PipeServer::~PipeServer() { stop(); }
 
 HANDLE PipeServer::createInstance(bool first) {
     SECURITY_ATTRIBUTES sa{sizeof(sa), sd_, FALSE};
-    return CreateNamedPipeW(PipeName, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
+    return CreateNamedPipeW(name_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (first ? FILE_FLAG_FIRST_PIPE_INSTANCE : 0),
                             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
                             PIPE_UNLIMITED_INSTANCES, 64 * 1024, 4096, 0, &sa);
 }
@@ -241,22 +241,24 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         return out.str();
     }
     if (command == "RULES") {
-        // acción, creada, último bloqueo, alcance (path/app/publisher/covered), firmante, nombre, id.
+        // acción, creada, último bloqueo, alcance (path/app/publisher/covered), firmante, nombre, id, vencimiento.
         // id: la ruta (path y covered) o la clave de la regla (app y publisher). Una fila covered es la ruta que
-        // una regla de firma ya permitió o bloqueó; su nombre es la clave de esa regla.
+        // una regla de firma ya permitió o bloqueó; su nombre es la clave de esa regla. Vencimiento: 0 permanente,
+        // -1 hasta reiniciar el motor, o el momento Unix en que se retira.
         out << "OK\n";
         const auto rules = core_.rules();
         for (const auto &r : rules) {
             const char *scope = r.scope == Scope::App ? "app" : r.scope == Scope::Publisher ? "publisher" : "path";
             out << (r.action == Action::Allow ? "allow" : "block") << "\t" << r.created << "\t" << r.lastBlock << "\t"
                 << scope << "\t" << field(r.signer) << "\t" << field(r.name) << "\t"
-                << field(r.scope == Scope::Path ? r.path : FirewallCore::ruleKey(r)) << "\n";
+                << field(r.scope == Scope::Path ? r.path : FirewallCore::ruleKey(r)) << "\t" << r.expires << "\n";
         }
         for (const auto &c : core_.covered())
             for (const auto &r : rules)
                 if (r.scope != Scope::Path && FirewallCore::ruleKey(r) == c.ruleKey)
                     out << (r.action == Action::Allow ? "allow" : "block") << "\t" << r.created << "\t" << r.lastBlock
-                        << "\tcovered\t" << field(r.signer) << "\t" << field(c.ruleKey) << "\t" << field(c.path) << "\n";
+                        << "\tcovered\t" << field(r.signer) << "\t" << field(c.ruleKey) << "\t" << field(c.path) << "\t"
+                        << r.expires << "\n";
         out << "END\n";
         return out.str();
     }
@@ -273,13 +275,27 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     if (!mayChange) return err(L"Only GateBouncer or an administrator can change rules");
     std::wstring error;
     bool ok = false;
-    // DECIDE <allow|block> <ruta> (sólo esa ruta) o DECIDE <allow|block> <path|app|publisher> <ruta>.
+    // DECIDE <allow|block> <ruta> (sólo esa ruta) o DECIDE <allow|block> <path|app|publisher> <ruta> [duración].
+    // Duración: "always", "restart" (hasta que el motor se reinicie) o segundos, de un minuto a una semana.
+    std::int64_t expires = 0;
+    bool durationOk = true;
+    if (command == "DECIDE" && f.size() == 5) {
+        if (f[4] == "restart") {
+            expires = UntilRestart;
+        } else if (f[4] != "always") {
+            const auto seconds = std::atoll(f[4].c_str());
+            durationOk = f[4].find_first_not_of("0123456789") == std::string::npos && seconds >= 60 &&
+                         seconds <= 7 * 24 * 3600;
+            expires = FirewallCore::now() + seconds;
+        }
+    }
     if (command == "DECIDE" && f.size() == 3 && (f[1] == "allow" || f[1] == "block"))
         ok = core_.decide(wide(f[2]), f[1] == "allow" ? Action::Allow : Action::Block, Scope::Path, error);
-    else if (command == "DECIDE" && f.size() == 4 && (f[1] == "allow" || f[1] == "block") &&
-             (f[2] == "path" || f[2] == "app" || f[2] == "publisher"))
+    else if (command == "DECIDE" && (f.size() == 4 || f.size() == 5) && durationOk &&
+             (f[1] == "allow" || f[1] == "block") && (f[2] == "path" || f[2] == "app" || f[2] == "publisher"))
         ok = core_.decide(wide(f[3]), f[1] == "allow" ? Action::Allow : Action::Block,
-                          f[2] == "app" ? Scope::App : f[2] == "publisher" ? Scope::Publisher : Scope::Path, error);
+                          f[2] == "app" ? Scope::App : f[2] == "publisher" ? Scope::Publisher : Scope::Path, error,
+                          expires);
     else if (command == "REMOVE" && f.size() == 2)
         ok = core_.removeRule(wide(f[1]), error);
     else if (command == "MODE" && f.size() == 2 && (f[1] == "ask" || f[1] == "off"))

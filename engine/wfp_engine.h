@@ -62,6 +62,8 @@ class WfpEngine {
     bool addDefaultBlock(Direction direction, std::vector<std::uint64_t> &ids, std::wstring &error);
     // Permisos de base para que el bloqueo por defecto no rompa la PC: loopback y servicios del sistema.
     bool addSystemAllowances(std::vector<std::uint64_t> &ids, std::wstring &error);
+    // La ventana de GateBouncer sale sólo por TCP 443 (las explicaciones con IA): HTTPS y nada más.
+    bool addHttpsPermit(const std::wstring &path, std::vector<std::uint64_t> &ids, std::wstring &error);
     bool removeFilter(std::uint64_t id);
     // Borra todos los filtros del proveedor propio (desinstalar o reconstruir).
     bool removeAllOwnFilters(std::wstring &error);

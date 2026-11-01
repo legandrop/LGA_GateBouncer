@@ -1,4 +1,5 @@
 #include "FirewallClient.h"
+#include <QDateTime>
 #include <QFileInfo>
 #include <QLocalSocket>
 
@@ -74,14 +75,37 @@ bool FirewallClient::publisherRuleAllowed(const QString &signer) {
     return !signer.isEmpty() && !signer.startsWith("Microsoft", Qt::CaseInsensitive);
 }
 
-void FirewallClient::decide(const QString &path, bool allow, const QString &scope) {
+QString FirewallClient::describeDuration(qint64 seconds) {
+    const qint64 minutes = (seconds + 30) / 60;
+    if (minutes >= 60 && minutes % 60 == 0)
+        return minutes == 60 ? QStringLiteral("1 hour") : QString("%1 hours").arg(minutes / 60);
+    return minutes == 1 ? QStringLiteral("1 minute") : QString("%1 minutes").arg(minutes);
+}
+
+QString FirewallClient::remaining(const RuleItem &rule) {
+    if (rule.expires == 0) return {};
+    if (rule.expires < 0) return QStringLiteral("until restart");
+    const qint64 left = rule.expires - QDateTime::currentSecsSinceEpoch();
+    if (left <= 60) return QStringLiteral("expires now");
+    const qint64 minutes = (left + 59) / 60;
+    return minutes < 60 ? QString("%1 min left").arg(minutes)
+                        : QString("%1 h %2 min left").arg(minutes / 60).arg(minutes % 60);
+}
+
+void FirewallClient::decide(const QString &path, bool allow, const QString &scope, const QString &duration) {
     const auto *p = pendingFor(path);
     const QString signer = p ? p->signer : QString();
     QString what = fileName(path);
     if (scope == "app") what = QString("any version of %1 from %2").arg(fileName(path), signer);
     else if (scope == "publisher") what = "all apps from " + signer;
-    enqueue(QString("DECIDE\t%1\t%2\t%3").arg(allow ? "allow" : "block", scope, path), Request::Command,
-            QString("%1 saved for %2. The next connection attempt uses this rule.").arg(allow ? "Allow" : "Block", what));
+    QString line = QString("DECIDE\t%1\t%2\t%3").arg(allow ? "allow" : "block", scope, path);
+    if (duration != "always") line += "\t" + duration;
+    const QString span = duration == "restart" ? QStringLiteral(" until restart")
+                         : duration == "always" ? QString()
+                                                : " for " + describeDuration(duration.toLongLong());
+    enqueue(line, Request::Command,
+            QString("%1%2 saved for %3. The next connection attempt uses this rule.")
+                .arg(allow ? "Allow" : "Block", span, what));
     poll();
 }
 
@@ -214,7 +238,8 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
         rules_.clear();
         for (const auto &row : rows) {
             const auto f = row.split('\t');
-            if (f.size() != 7) continue;
+            // El motor anterior manda 7 campos; desde las reglas temporales, 8 (vencimiento).
+            if (f.size() != 7 && f.size() != 8) continue;
             RuleItem r;
             r.allow = f[0] == "allow";
             r.created = f[1].toLongLong();
@@ -223,6 +248,7 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
             r.signer = f[4];
             r.name = f[5];
             r.id = f[6];
+            r.expires = f.size() == 8 ? f[7].toLongLong() : 0;
             if (r.scope == "path" || r.scope == "covered") r.path = r.id;
             rules_.push_back(r);
         }

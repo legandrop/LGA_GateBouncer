@@ -30,8 +30,12 @@ struct Rule {
     Action action = Action::Allow;
     std::int64_t created = 0;   // segundos Unix UTC
     std::int64_t lastBlock = 0; // último bloqueo atribuido a la regla (sólo reglas Block)
+    // Vencimiento: 0 permanente; >0 segundos Unix UTC en que se retira; UntilRestart: no se guarda y desaparece
+    // cuando el motor vuelve a arrancar. Al vencer, la app vuelve a preguntar.
+    std::int64_t expires = 0;
     std::vector<std::uint64_t> filters; // sólo reglas Path
 };
+constexpr std::int64_t UntilRestart = -1;
 
 // Sello de un archivo verificado: hora de cambio de NTFS, id de archivo y tamaño. Detecta un reemplazo común sin leer
 // el contenido; no es prueba contra quien lo falsifica a propósito, por eso además se re-verifica todo cada tanto.
@@ -75,6 +79,9 @@ struct CoreOptions {
     bool dynamic = false;               // pruebas: todo desaparece al cerrar
     std::vector<std::wstring> scope;    // vacío = toda la PC; si no, sólo estas apps (pruebas)
     std::wstring dataDir;               // reglas guardadas
+    // Ventanas de GateBouncer de confianza (la instalada junto al motor): salen por HTTPS sin preguntar, para las
+    // explicaciones con IA. Sólo con toda la PC en modo preguntar; en las pruebas acotadas no hace falta.
+    std::vector<std::wstring> windows;
 };
 
 class FirewallCore {
@@ -88,7 +95,8 @@ class FirewallCore {
     // Modo ask: lo desconocido se bloquea y se pregunta. Modo off: sin bloqueo por defecto (las reglas siguen).
     bool setAsk(bool ask, std::wstring &error);
     // La firma se lee del archivo en el motor: nunca se confía en un editor que mande la ventana.
-    bool decide(const std::wstring &path, Action action, Scope scope, std::wstring &error);
+    // expires: 0 permanente, >0 momento Unix en que vence, UntilRestart hasta que el motor se reinicie.
+    bool decide(const std::wstring &path, Action action, Scope scope, std::wstring &error, std::int64_t expires = 0);
     // id: la ruta de una regla Path o la clave de una regla App/Publisher.
     bool removeRule(const std::wstring &id, std::wstring &error);
 
@@ -114,6 +122,9 @@ class FirewallCore {
     void verifyLoop();
     void classify(const DropEvent &drop, const std::wstring &signer);
     void recheckCoverage(bool full);
+    void expireRules();
+    // Retira los filtros de la regla (o de sus coberturas) y la borra. Con mutex_ tomado.
+    bool dropRule(std::map<std::wstring, Rule>::iterator it, const std::wstring &reason, std::wstring &error);
     std::wstring cachedSigner(const std::wstring &path);
     const Rule *signerRuleFor(const std::wstring &path, const std::wstring &signer) const;
     bool matches(const Rule &rule, const std::wstring &path, const std::wstring &signer) const;

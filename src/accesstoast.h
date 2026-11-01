@@ -8,12 +8,18 @@ class QComboBox;
 class QLabel;
 class QPushButton;
 class QScreen;
+class QTimer;
 
 namespace Gate {
 
 class AccessToast final : public QWidget {
     Q_OBJECT
   public:
+    // Explicación con IA: sólo ayuda a decidir. Ofrecida, sin key, pidiendo, lista o fallida.
+    struct Explanation {
+        enum State { Offer, NoKey, Working, Ready, Failed } state = Offer;
+        QString what, why, risk, suggestion, reason, model, error;
+    };
     struct Request {
         QString path;
         QString signer; // vacío: sin firma válida, sólo «This file only»
@@ -27,9 +33,14 @@ class AccessToast final : public QWidget {
     void setRequest(const Request &request);
     QString path() const { return request_.path; }
     void placeOn(QScreen *screen);
+    // Se ignora si el aviso ya muestra otra app: una respuesta tardía nunca cae sobre otra solicitud.
+    void setExplanation(const QString &path, const Explanation &explanation);
 
   signals:
-    void decided(const QString &path, bool allow, const QString &scope);
+    // duration: "always", "restart" o segundos ("900").
+    void decided(const QString &path, bool allow, const QString &scope, const QString &duration);
+    void explainRequested(const QString &path);
+    void settingsRequested();
     void dismissed(const QString &path);
     void openRequested();
     void pendingListRequested();
@@ -40,6 +51,7 @@ class AccessToast final : public QWidget {
   private:
     void rebuildScopes();
     void updateCounters();
+    void renderExplanation();
 
     Request request_;
     // Los botones se habilitan un instante después de mostrar otra app: un clic que iba al aviso anterior (doble clic,
@@ -47,7 +59,15 @@ class AccessToast final : public QWidget {
     bool armed_ = false;
     QLabel *icon_ = nullptr, *title_ = nullptr, *signature_ = nullptr, *signatureMark_ = nullptr, *path_ = nullptr;
     QLabel *note_ = nullptr, *footer_ = nullptr;
-    QComboBox *scope_ = nullptr;
+    QComboBox *scope_ = nullptr, *duration_ = nullptr;
+    Explanation explanation_;
+    QScreen *screen_ = nullptr;
+    QWidget *explainBox_ = nullptr;
+    QLabel *explainStatus_ = nullptr, *what_ = nullptr, *why_ = nullptr, *risk_ = nullptr, *suggestion_ = nullptr;
+    QLabel *explainFoot_ = nullptr;
+    QPushButton *explainAction_ = nullptr;
+    QTimer *dots_ = nullptr;
+    int dotCount_ = 0;
     QPushButton *block_ = nullptr, *allow_ = nullptr;
 };
 

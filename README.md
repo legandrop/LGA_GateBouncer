@@ -22,17 +22,21 @@ In **Live** mode, the Processes, Pending, Activity and Rules views read the engi
 - The notice's **Apply to** list sets the rule's reach: **This app, any version** (same signed publisher and file name,
   in any folder, so updates don't ask again), **This file only** (the exact path), or **All apps from** the publisher.
   Applications without a valid signature can only get a rule for the exact file.
+- The notice's **For** list makes the decision temporary: 1, 5, 10, 15 or 30 minutes, 1 hour, or until the engine
+  restarts. When it expires the rule is removed and the application asks again.
+- **What is this? Ask AI** on the notice asks NVIDIA, with your own NVIDIA API key, what the application is, why it
+  connects and what you gain or lose by allowing it. The answer only helps you decide: it never allows or blocks
+  anything and it can be wrong. See [AI explanations](docs/Explanations.md) for exactly what is sent.
 - **Activity** shows blocked attempts and rule changes recorded by the engine. Allowed connections are not recorded.
-- **Rules** lists saved Allow and Block rules, including rules for an app in any version or for a whole publisher. You
-  can change or remove a rule, and switch between asking for unknown applications and allowing them.
+- **Rules** lists saved Allow and Block rules, including rules for an app in any version or for a whole publisher, and
+  how long a temporary rule has left. You can change or remove a rule.
+- **Import** reads NetLimiter's settings file (`nl_settings.xml`) and turns its firewall rules for single applications
+  into GateBouncer rules. Rules limited to addresses, ports, zones or schedules, Ask rules and incoming-only rules are
+  listed with the reason and not imported.
+- **Settings** switches between asking for unknown applications and letting them connect, and holds the AI
+  explanation setup: the key, what is sent, the model, the language and whether notices ask automatically.
 
-Import offers explicitly selected Structural XML and NetLimiter QName source profiles. It analyzes the chosen file in
-the background and saves reviewed candidates locally, always inactive; imported candidates do not become engine rules
-yet. See [Inactive import review](docs/Import.md).
-
-A separate **Simulation** mode shows the six views with synthetic data that stays in session memory. Settings also holds
-the optional NVIDIA explanation configuration, which is not connected to the engine's requests yet. An explanation
-never grants access or verifies an application's safety.
+A separate **Simulation** mode shows the views with synthetic data that stays in session memory.
 
 When a tray is available, closing hides the window in the notification area. Installing the engine registers the
 window to start at sign-in, minimized to the tray; opening it again brings the running window to the front.
@@ -50,7 +54,9 @@ engine\compilar.bat --no-run
 The first builds `GateBouncer.exe` and the other desktop components without starting them; set `GATEBOUNCER_BUILD_DIR`
 to choose another build directory. The second builds `GateBouncerEngine.exe` with Visual Studio 2022 (or its Build
 Tools) and the Windows SDK; set `GATEBOUNCER_ENGINE_BUILD_DIR` to choose its build directory. Qt runtime libraries and
-the Windows platform plugin are required to run the window. There is no installer yet.
+the Windows platform plugin are required to run the window. There is no installer package yet: copy both programs and
+the Qt runtime to a protected folder and run `GateBouncerEngine.exe --install`; later versions are applied with
+`GateBouncerEngine.exe --update <folder>` (see the [engine documentation](engine/README.md)).
 
 ## Earlier driver-based design
 

@@ -4,7 +4,9 @@
 //   --install [--ui <exe>]...      instala y arranca el servicio (administrador)
 //   --uninstall                    detiene y borra el servicio, sus filtros y su proveedor (administrador)
 //   --remove-filters               emergencia: borra todos los filtros propios y deja la red sin GateBouncer
-//   --console [--dynamic] [--scope <exe>]... [--data <dir>] [--ui <exe>]... [--seconds <n>]
+//   --update <carpeta>             actualiza la instalación con los archivos de esa carpeta (administrador)
+//   --send <campo>...              un pedido por el canal del servicio (DECIDE, REMOVE, MODE elevado; STATUS...)
+//   --console [--dynamic] [--scope <exe>]... [--data <dir>] [--ui <exe>]... [--seconds <n>] [--pipe <nombre>]
 //                                  corre en primer plano (pruebas). --dynamic: nada sobrevive al cierre.
 //                                  --scope: sólo esas apps quedan bajo «preguntar»; el resto de la PC no se toca.
 //   --signer <exe>                 muestra el firmante que usan las reglas por editor (no hace falta administrador)
@@ -17,6 +19,7 @@
 #include <fcntl.h>
 #include <fstream>
 #include <io.h>
+#include <vector>
 
 #pragma comment(lib, "shell32.lib")
 
@@ -173,6 +176,7 @@ void WINAPI serviceMain(DWORD, wchar_t **) {
     }
     gbe::CoreOptions options;
     options.dataDir = dir;
+    options.windows = trustedClients(dir);
     gbe::FirewallCore core(options);
     if (!core.start(error)) {
         log(dir, L"No arrancó: " + error);
@@ -307,6 +311,152 @@ int uninstall() {
     return r;
 }
 
+// Carpeta de la instalación: la del ejecutable que el servicio arranca.
+std::wstring installedDir(SC_HANDLE service) {
+    DWORD size = 0;
+    QueryServiceConfigW(service, nullptr, 0, &size);
+    std::vector<BYTE> buffer(size);
+    auto *config = reinterpret_cast<QUERY_SERVICE_CONFIGW *>(buffer.data());
+    if (!size || !QueryServiceConfigW(service, config, size, &size)) return {};
+    std::wstring command = config->lpBinaryPathName;
+    if (!command.empty() && command[0] == L'"') command = command.substr(1, command.find(L'"', 1) - 1);
+    return command.substr(0, command.find_last_of(L'\\'));
+}
+
+bool waitFor(SC_HANDLE service, DWORD state) {
+    SERVICE_STATUS s{};
+    for (int i = 0; i < 300; ++i) {
+        if (QueryServiceStatus(service, &s) && s.dwCurrentState == state) return true;
+        Sleep(100);
+    }
+    return false;
+}
+
+// Copia el árbol de una carpeta. Un archivo en uso (la ventana abierta) se renombra a .old y se reemplaza: la ventana
+// sigue con el viejo hasta que se reinicia. Los .old de una actualización anterior se borran si ya nadie los usa.
+bool copyTree(const std::wstring &from, const std::wstring &to, std::wstring &error) {
+    CreateDirectoryW(to.c_str(), nullptr);
+    WIN32_FIND_DATAW item{};
+    HANDLE find = FindFirstFileW((from + L"\\*").c_str(), &item);
+    if (find == INVALID_HANDLE_VALUE) {
+        error = L"Cannot read " + from;
+        return false;
+    }
+    bool ok = true;
+    do {
+        const std::wstring name = item.cFileName;
+        if (name == L"." || name == L"..") continue;
+        if (item.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        const std::wstring source = from + L"\\" + name, target = to + L"\\" + name;
+        if (item.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ok = copyTree(source, target, error);
+            continue;
+        }
+        if (name.size() > 4 && (name.rfind(L".old") == name.size() - 4 || name.rfind(L".new") == name.size() - 4)) continue;
+        DeleteFileW((target + L".old").c_str());
+        // Igual tamaño y fecha: es el mismo archivo (las DLL de Qt casi nunca cambian) y no se toca.
+        WIN32_FILE_ATTRIBUTE_DATA current{};
+        if (GetFileAttributesExW(target.c_str(), GetFileExInfoStandard, &current) &&
+            current.nFileSizeLow == item.nFileSizeLow && current.nFileSizeHigh == item.nFileSizeHigh &&
+            CompareFileTime(&current.ftLastWriteTime, &item.ftLastWriteTime) == 0)
+            continue;
+        // Primero a un .new al lado y después un renombre: una copia cortada (disco lleno, antivirus) nunca deja un
+        // ejecutable a medias en su lugar. Si el destino está en uso, el viejo pasa a .old y el nuevo toma su nombre.
+        const std::wstring fresh = target + L".new";
+        const bool copied = CopyFileW(source.c_str(), fresh.c_str(), FALSE);
+        bool placed =
+            copied && MoveFileExW(fresh.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        // El plan B sólo con una copia completa: un .new a medias nunca toma el lugar del exe.
+        if (!placed && copied &&
+            MoveFileExW(target.c_str(), (target + L".old").c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            placed = MoveFileExW(fresh.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH);
+            if (!placed) MoveFileExW((target + L".old").c_str(), target.c_str(), 0);  // devuelve el viejo
+        }
+        if (!placed) {
+            error = L"Cannot copy " + name + L": " + gbe::WfpEngine::errorText(GetLastError());
+            DeleteFileW(fresh.c_str());
+            ok = false;
+        }
+    } while (ok && FindNextFileW(find, &item));
+    FindClose(find);
+    return ok;
+}
+
+// Actualiza una instalación existente con los archivos de otra carpeta: detiene el servicio, copia y lo vuelve a
+// arrancar. Las reglas no se tocan. Mientras está detenido, los filtros persistentes siguen: nada desconocido pasa.
+int update(const std::wstring &from) {
+    const DWORD a = GetFileAttributesW((from + L"\\GateBouncerEngine.exe").c_str());
+    if (a == INVALID_FILE_ATTRIBUTES || GetFileAttributesW((from + L"\\GateBouncer.exe").c_str()) == INVALID_FILE_ATTRIBUTES) {
+        fwprintf(stderr, L"%ls does not contain GateBouncerEngine.exe and GateBouncer.exe.\n", from.c_str());
+        return 2;
+    }
+    SC_HANDLE scm = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    SC_HANDLE service = scm ? OpenServiceW(scm, ServiceName, SERVICE_STOP | SERVICE_START | SERVICE_QUERY_STATUS |
+                                                                 SERVICE_QUERY_CONFIG)
+                            : nullptr;
+    if (!service) {
+        fwprintf(stderr, L"GateBouncer is not installed. Use --install.\n");
+        if (scm) CloseServiceHandle(scm);
+        return 1;
+    }
+    const std::wstring to = installedDir(service);
+    std::wstring error;
+    if (to.empty() || !adminOnlyWritable(to, error)) {
+        fwprintf(stderr, L"The installation folder is not protected: %ls\n", error.c_str());
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+        return 1;
+    }
+    SERVICE_STATUS s{};
+    ControlService(service, SERVICE_CONTROL_STOP, &s);
+    if (!waitFor(service, SERVICE_STOPPED)) {
+        fwprintf(stderr, L"The service did not stop. Nothing was copied.\n");
+        CloseServiceHandle(service);
+        CloseServiceHandle(scm);
+        return 1;
+    }
+    const bool copied = copyTree(from, to, error);
+    if (!copied) fwprintf(stderr, L"%ls\n", error.c_str());
+    // Arranca igual: con los archivos nuevos o, si la copia falló a medias, con lo que haya.
+    const bool started = StartServiceW(service, 0, nullptr) && waitFor(service, SERVICE_RUNNING);
+    CloseServiceHandle(service);
+    CloseServiceHandle(scm);
+    wprintf(L"%ls %ls\n", copied ? L"Updated" : L"Update incomplete:", to.c_str());
+    wprintf(started ? L"Service running.\n" : L"The service did not start. Use emergencia.ps1 or --remove-filters.\n");
+    return copied && started ? 0 : 1;
+}
+
+// Un pedido por el canal del servicio, con los campos unidos por tabulaciones; muestra la respuesta. Elevado, el canal
+// lo deja cambiar reglas (pruebas y administración sin abrir la ventana).
+int send(int argc, wchar_t **argv) {
+    std::string line;
+    for (int i = 2; i < argc; ++i) {
+        const int n = WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, nullptr, 0, nullptr, nullptr);
+        std::string field(std::size_t(n > 0 ? n - 1 : 0), '\0');
+        if (n > 1) WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, field.data(), n, nullptr, nullptr);
+        line += (i > 2 ? "\t" : "") + field;
+    }
+    line += "\n";
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    for (int i = 0; i < 50 && pipe == INVALID_HANDLE_VALUE; ++i) {
+        pipe = CreateFileW(gbe::PipeName, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (pipe == INVALID_HANDLE_VALUE) WaitNamedPipeW(gbe::PipeName, 200);
+    }
+    if (pipe == INVALID_HANDLE_VALUE) {
+        fwprintf(stderr, L"The engine is not running.\n");
+        return 1;
+    }
+    DWORD done = 0;
+    WriteFile(pipe, line.data(), DWORD(line.size()), &done, nullptr);
+    std::string reply;
+    char buffer[4096];
+    while (reply.find("END\n") == std::string::npos && ReadFile(pipe, buffer, sizeof(buffer), &done, nullptr) && done)
+        reply.append(buffer, done);
+    CloseHandle(pipe);
+    fwrite(reply.data(), 1, reply.size(), stdout);
+    return reply.rfind("OK", 0) == 0 ? 0 : 1;
+}
+
 HANDLE consoleStop = nullptr;
 BOOL WINAPI consoleHandler(DWORD) {
     SetEvent(consoleStop);
@@ -317,6 +467,7 @@ int console(int argc, wchar_t **argv) {
     gbe::CoreOptions options;
     std::vector<std::wstring> ui;
     DWORD seconds = INFINITE;
+    std::wstring pipe = gbe::PipeName;
     for (int i = 2; i < argc; ++i) {
         const std::wstring a = argv[i];
         const bool hasValue = i + 1 < argc;
@@ -325,6 +476,7 @@ int console(int argc, wchar_t **argv) {
         else if (a == L"--data" && hasValue) options.dataDir = argv[++i];
         else if (a == L"--ui" && hasValue) ui.push_back(argv[++i]);
         else if (a == L"--seconds" && hasValue) seconds = DWORD(_wtoi(argv[++i]));
+        else if (a == L"--pipe" && hasValue) pipe = std::wstring(L"\\\\.\\pipe\\") + argv[++i];
         else {
             fwprintf(stderr, L"Unknown argument: %ls\n", a.c_str());
             return 2;
@@ -340,19 +492,20 @@ int console(int argc, wchar_t **argv) {
         fwprintf(stderr, L"Cannot create %ls\n", options.dataDir.c_str());
         return 1;
     }
+    options.windows = ui;
     gbe::FirewallCore core(options);
     if (!core.start(error)) {
         fwprintf(stderr, L"Could not start: %ls\n", error.c_str());
         return 1;
     }
-    gbe::PipeServer server(core, ui);
+    gbe::PipeServer server(core, ui, pipe);
     if (!server.start(error)) {
         fwprintf(stderr, L"No local channel: %ls\n", error.c_str());
         return 1;
     }
     consoleStop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     SetConsoleCtrlHandler(consoleHandler, TRUE);
-    wprintf(L"Engine running%ls. Channel: %ls\n", options.dynamic ? L" (dynamic session)" : L"", gbe::PipeName);
+    wprintf(L"Engine running%ls. Channel: %ls\n", options.dynamic ? L" (dynamic session)" : L"", pipe.c_str());
     const std::wstring warning = core.status().lastError;
     if (!warning.empty()) wprintf(L"Warning: %ls\n", warning.c_str());
     fflush(stdout);
@@ -388,6 +541,8 @@ int wmain(int argc, wchar_t **argv) {
         return install(ui, allowUnprotected);
     }
     if (mode == L"--uninstall") return uninstall();
+    if (mode == L"--update" && argc == 3) return update(argv[2]);
+    if (mode == L"--send" && argc >= 3) return send(argc, argv);
     if (mode == L"--remove-filters") return removeFilters(false);
     if (mode == L"--console") return console(argc, argv);
     if (mode == L"--signer" && argc == 3) {
@@ -396,6 +551,6 @@ int wmain(int argc, wchar_t **argv) {
         return signer.empty() ? 1 : 0;
     }
     fwprintf(stderr, L"Usage: GateBouncerEngine.exe --install [--ui <exe>] [--allow-unprotected-folder] | --uninstall | "
-                     L"--remove-filters | --console ... | --signer <exe>\n");
+                     L"--remove-filters | --update <folder> | --send <field>... | --console ... | --signer <exe>\n");
     return 2;
 }

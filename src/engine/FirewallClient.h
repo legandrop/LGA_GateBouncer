@@ -31,6 +31,7 @@ class FirewallClient final : public QObject {
         bool allow = true;
         qint64 created = 0, lastBlock = 0;
         QString scope = "path", signer, name, id; // id: lo que se manda en REMOVE
+        qint64 expires = 0; // 0 permanente, -1 hasta reiniciar el motor, si no el momento Unix en que vence
     };
     struct ActivityItem {
         qint64 time = 0;
@@ -54,7 +55,8 @@ class FirewallClient final : public QObject {
     bool busy() const { return commandsInFlight_ > 0; }
 
     // scope: "path", "app" o "publisher". La firma la verifica el motor, no la ventana.
-    void decide(const QString &path, bool allow, const QString &scope = "path");
+    // duration: "always", "restart" (hasta que el motor se reinicie) o segundos ("900").
+    void decide(const QString &path, bool allow, const QString &scope = "path", const QString &duration = "always");
     void removeRule(const QString &id);
     void setAsk(bool ask);
     void refreshNow();
@@ -65,6 +67,10 @@ class FirewallClient final : public QObject {
     static QString describe(const RuleItem &rule);
     // Igual que el motor: un firmante de Microsoft no admite «All apps from».
     static bool publisherRuleAllowed(const QString &signer);
+    // "15 minutes", "1 hour".
+    static QString describeDuration(qint64 seconds);
+    // Lo que le queda a una regla: vacío si es permanente, "until restart" o "12 min left".
+    static QString remaining(const RuleItem &rule);
 
   signals:
     void changed();

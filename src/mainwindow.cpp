@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "explain/KeyStore.h"
 #include "assistance/ui/SettingsWidget.h"
 #include "assistance/ui/ExplanationWidget.h"
 #include "assistance/ui/ObservationSelection.h"
@@ -6,6 +7,13 @@
 #include <QApplication>
 #include <QButtonGroup>
 #include <QCheckBox>
+#include <QFileInfo>
+#include <QFile>
+#include <QTableWidget>
+#include <QCoreApplication>
+#include <QDir>
+#include <thread>
+#include <QWheelEvent>
 #include <QCloseEvent>
 #include <QComboBox>
 #include <QEvent>
@@ -176,6 +184,8 @@ QPushButton *button(const QString &text, const QString &name, const QString &rol
 }
 class ChevronCombo final : public QComboBox {
   protected:
+    // La rueda nunca cambia lo elegido: desplaza la página aunque el puntero pase por encima.
+    void wheelEvent(QWheelEvent *event) override { event->ignore(); }
     void paintEvent(QPaintEvent *event) override {
         QComboBox::paintEvent(event);
         QPainter painter(this);
@@ -627,6 +637,18 @@ MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
             refresh();
         }
     });
+    connect(&firewall_, &FirewallClient::changed, this, &MainWindow::updateLifecycle);
+    connect(&explainer_, &Explain::Explainer::finished, this,
+            [this](const QString &path, bool ok, const Explain::Answer &a, const QString &error) {
+        if (ok) explainErrors_.remove(path.toLower());
+        else explainErrors_.insert(path.toLower(), error);
+        if (!firewallToast_) return;
+        AccessToast::Explanation e;
+        if (ok) e = {AccessToast::Explanation::Ready, a.what, a.why, a.risk, a.suggestion, a.reason, a.model, {}};
+        else e = {AccessToast::Explanation::Failed, {}, {}, {}, {}, {}, {}, error};
+        // El aviso descarta la respuesta si ya muestra otra app.
+        firewallToast_->setExplanation(path, e);
+    });
     connect(&firewall_, &FirewallClient::newPending, this, &MainWindow::onNewFirewallPending);
     connect(&firewall_, &FirewallClient::commandFinished, this, [this](bool, const QString &text) {
         if (!closing_) message(text);
@@ -678,6 +700,17 @@ void MainWindow::startLifecycle(std::unique_ptr<Lifecycle::TraySurface> tray, bo
 void MainWindow::updateLifecycle() {
     if (!lifecycle_) return;
     Lifecycle::EngineSnapshot snapshot;
+    if (!product_.simulation() && firewall_.active()) {
+        // Motor sin driver: el estado y el contador salen del canal del motor, no del camino viejo con driver.
+        const auto &s = firewall_.status();
+        snapshot.simulation = false;
+        snapshot.current = s.connected;
+        snapshot.state = s.connected ? Lifecycle::EngineState::Active : Lifecycle::EngineState::Unavailable;
+        snapshot.asking = s.ask;
+        snapshot.pendingCount = quint64(firewall_.pending().size());
+        lifecycle_->applyEngineSnapshot(snapshot);
+        return;
+    }
     snapshot.simulation = product_.simulation();
     snapshot.current = snapshot.simulation || product_.engine().current;
     // El perfil de cobertura validada aún no tiene evidencia consumible en esta GUI.
@@ -897,8 +930,8 @@ void MainWindow::buildPage() {
             {"pending", {"Pending requests", "Review an application's request and choose how long your decision applies."}},
             {"activity", {"Activity", "Connection requests, decisions and available history."}},
             {"rules", {"Rules", "Service policy records and inactive local review candidates."}},
-            {"import", {"Import from NetLimiter", "Structural analysis only · compatibility not validated."}},
-            {"settings", {"Settings", "Engine status and assistance configuration with separate consents."}}};
+            {"import", {"Import from NetLimiter", "Turn NetLimiter firewall rules for single applications into GateBouncer rules."}},
+            {"settings", {"Settings", "Firewall mode, AI explanations and startup."}}};
         const QMap<QString, QStringList> firewallHeadings{
             {"processes", {"Applications", "Running applications and every application with a rule or a request."}},
             {"pending", {"Pending requests", "Applications blocked until you allow or block them."}},
@@ -1419,8 +1452,11 @@ void MainWindow::refreshTable(bool newPage) {
                     app = {"All apps from " + r.signer + "\nAny application with this signature",
                            "glyph:" + r.signer.left(2).toUpper(), r.signer.toLower()};
                 const Cell policy = r.allow ? Cell{"Allow", "Allow", {}} : Cell{"Block", "Block", {}};
+                // Una regla temporal muestra cuánto le queda debajo de su fecha.
+                const QString left = FirewallClient::remaining(r);
                 result.push_back({firewallId(r.id), {app, policy,
-                    {firewallTime(r.created), {}, r.created}, {firewallTime(r.lastBlock), {}, r.lastBlock}, {"Edit", "action", {}}}});
+                    {firewallTime(r.created) + (left.isEmpty() ? QString() : "\n" + left), {}, r.created},
+                    {firewallTime(r.lastBlock), {}, r.lastBlock}, {"Edit", "action", {}}}});
             }
             if (auto *count = pageControl<QLabel>(page_, "firewall-rule-count"))
                 count->setText(QString("%1 Allow rules · %2 Block rules").arg(allow).arg(firewall_.ruleCount() - allow));
@@ -2417,6 +2453,22 @@ void MainWindow::reviewSourceSelector() {
         : "Review requests and application rules for your account. Administrative review uses a separate signed-in session.","faint",true));
 }
 void MainWindow::renderLive() {
+    if (view_ == "settings") {
+        // Settings del motor sin driver: firewall, explicaciones con IA y arranque.
+        auto *content = new QWidget;
+        auto *l = new QVBoxLayout(content);
+        l->setContentsMargins(0, 0, 0, 15);
+        l->setSpacing(12);
+        content->setMaximumWidth(830);
+        buildFirewallSettings(l);
+        l->addStretch();
+        pageLayout_->addWidget(scrollArea(content), 1);
+        return;
+    }
+    if (view_ == "import") {
+        buildFirewallImport();
+        return;
+    }
     if (view_ == "pending" || view_ == "rules") reviewSourceSelector();
     if (product_.administrativeSelected() && (view_ == "processes" || view_ == "activity"))
         pageLayout_->addWidget(note("Administrative history is recorded in a separate review session. Application identity is Unknown when no identity records are available; these records do not change the current process list."));
@@ -3634,8 +3686,9 @@ void MainWindow::updateFirewallToast() {
     if (!current) return;
     if (!firewallToast_) {
         firewallToast_ = new AccessToast;
-        connect(firewallToast_, &AccessToast::decided, this, [this](const QString &path, bool allow, const QString &scope) {
-            firewall_.decide(path, allow, scope);
+        connect(firewallToast_, &AccessToast::decided, this,
+                [this](const QString &path, bool allow, const QString &scope, const QString &duration) {
+            firewall_.decide(path, allow, scope, duration);
             // Se oculta ya: si la decisión falla, el pedido sigue pendiente y vuelve a aparecer.
             if (firewallToast_) {
                 firewallToast_->close();
@@ -3663,16 +3716,53 @@ void MainWindow::updateFirewallToast() {
             bringToFront();
             selectView("pending");
         });
+        connect(firewallToast_, &AccessToast::explainRequested, this,
+                [this](const QString &path) { explainFirewallRequest(path, false); });
+        connect(firewallToast_, &AccessToast::settingsRequested, this, [this] {
+            bringToFront();
+            selectView("settings");
+        });
     }
     int others = 0;
     for (const auto &p : pending)
         if (showable(p) && p.path.compare(current->path, Qt::CaseInsensitive) != 0) ++others;
+    const bool newApp = firewallToast_->path().compare(current->path, Qt::CaseInsensitive) != 0;
     firewallToast_->setRequest({current->path, current->signer, current->attempts, others,
                                 firewall_.status().control && !firewall_.busy()});
+    if (newApp) explainFirewallRequest(current->path, true);
     if (!firewallToast_->isVisible()) {
         firewallToast_->placeOn(isVisible() ? screen() : nullptr);
         firewallToast_->show();
     }
+}
+
+void MainWindow::explainFirewallRequest(const QString &path, bool automatic) {
+    if (!firewallToast_) return;
+    AccessToast::Explanation e;
+    const auto settings = Explain::Settings::load();
+    if (!Explain::qaFixture() && (!Explain::KeyStore::has() || !settings.consent)) {
+        e.state = AccessToast::Explanation::NoKey;
+    } else if (const auto *hit = explainer_.cached(path)) {
+        e = {AccessToast::Explanation::Ready, hit->what, hit->why, hit->risk, hit->suggestion, hit->reason, hit->model, {}};
+    } else if (explainer_.busy(path)) {
+        e.state = AccessToast::Explanation::Working;
+    } else if (automatic && !settings.automatic) {
+        // Al aparecer el aviso sólo se pregunta solo si el usuario lo eligió; si no, queda el enlace.
+        const auto failed = explainErrors_.constFind(path.toLower());
+        if (failed != explainErrors_.constEnd()) e = {AccessToast::Explanation::Failed, {}, {}, {}, {}, {}, {}, *failed};
+    } else {
+        const auto *p = firewall_.pendingFor(path);
+        const auto facts = Explain::collectFacts(path, p ? p->signer : QString(), p ? p->remote : QString(),
+                                                 p ? p->port : 0, p ? p->protocol : 0, p ? p->attempts : 0);
+        QString error;
+        if (explainer_.request(facts, error)) {
+            e.state = AccessToast::Explanation::Working;
+        } else {
+            e.state = AccessToast::Explanation::Failed;
+            e.error = error;
+        }
+    }
+    firewallToast_->setExplanation(path, e);
 }
 
 void MainWindow::editFirewallRule(const QString &id) {
@@ -3757,5 +3847,260 @@ void MainWindow::editFirewallRule(const QString &id) {
             firewall_.decide(path, allowed);
             closeModal();
         });
+}
+
+void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
+    const auto &s = firewall_.status();
+    const bool can = s.connected && s.control && !firewall_.busy();
+
+    auto *engine = frame("panel");
+    auto *ep = new QVBoxLayout(engine);
+    ep->setContentsMargins(16, 16, 16, 16);
+    ep->setSpacing(8);
+    ep->addWidget(label("Firewall", "heading"));
+    ep->addWidget(label(!s.connected ? "The engine is not running. Saved rules and the block on unknown applications stay "
+                                       "active while it is installed, but no new requests appear."
+                        : s.ask ? "Asking before unknown applications connect. Each new application's first attempt is "
+                                  "blocked and a notice asks you to allow or block it."
+                                : "Not asking: unknown applications connect. Saved Allow and Block rules still apply.",
+                        "muted", true));
+    auto *ask = new QCheckBox("Ask before unknown applications connect");
+    ask->setObjectName("firewall-ask");
+    ask->setChecked(s.ask);
+    ask->setEnabled(can);
+    ep->addWidget(ask);
+    connect(ask, &QCheckBox::toggled, this, [this](bool on) { firewall_.setAsk(on); });
+    ep->addWidget(label("Windows services, DNS and local connections are always permitted. To turn GateBouncer off "
+                        "completely, run GateBouncerEngine.exe --remove-filters from an administrator command prompt.",
+                        "faint", true));
+    l->addWidget(engine);
+
+    auto *ai = frame("panel");
+    auto *ap = new QVBoxLayout(ai);
+    ap->setContentsMargins(16, 16, 16, 16);
+    ap->setSpacing(8);
+    ap->addWidget(label("AI explanations", "heading"));
+    ap->addWidget(label("When an application is blocked, the notice can ask NVIDIA what it is and why it connects. The "
+                        "answer only helps you decide: it never allows or blocks anything, and it can be wrong.",
+                        "muted", true));
+    const auto settings = Explain::Settings::load();
+    const bool hasKey = Explain::KeyStore::has();
+    auto *keyState = label(hasKey ? "NVIDIA API key saved for this Windows account (encrypted)."
+                                  : "No NVIDIA API key saved.",
+                           hasKey ? "muted" : "warning", true);
+    keyState->setObjectName("explain-key-state");
+    ap->addWidget(keyState);
+    auto *keyRow = line(ap);
+    auto *key = new QLineEdit;
+    key->setObjectName("explain-key");
+    key->setEchoMode(QLineEdit::Password);
+    key->setPlaceholderText(hasKey ? "Paste a new key to replace the saved one" : "Paste your NVIDIA API key (nvapi-...)");
+    key->setClearButtonEnabled(true);
+    keyRow->addWidget(key, 1);
+    auto *saveKey = button("Save key", "explain-save-key", "primary");
+    keyRow->addWidget(saveKey);
+    auto *removeKey = button("Remove key", "explain-remove-key", "ghost");
+    removeKey->setEnabled(hasKey);
+    keyRow->addWidget(removeKey);
+    auto *consent = new QCheckBox("Send app details to NVIDIA when an explanation is requested");
+    consent->setObjectName("explain-consent");
+    consent->setChecked(settings.consent);
+    ap->addWidget(consent);
+    ap->addWidget(label("Sent: the file name, its folder (with your account name removed), its signature and version "
+                        "details, and the public address it tried to reach. Never the file itself, its command line, "
+                        "or addresses on your local network. Requests use your NVIDIA account and its terms; up to "
+                        "100 explanations a day.",
+                        "faint", true));
+    auto *options = line(ap);
+    options->addWidget(label("Model", "muted"));
+    auto *model = combo(Explain::Settings::models(), "explain-model");
+    if (!Explain::Settings::models().contains(settings.model)) model->addItem(settings.model);
+    model->setCurrentText(settings.model);
+    model->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+    options->addWidget(model);
+    options->addSpacing(12);
+    options->addWidget(label("Language", "muted"));
+    auto *language = combo({"English", "Español"}, "explain-language");
+    language->setCurrentIndex(settings.language == "es" ? 1 : 0);
+    options->addWidget(language);
+    options->addStretch();
+    auto *automatic = new QCheckBox("Explain automatically when a notice appears");
+    automatic->setObjectName("explain-automatic");
+    automatic->setChecked(settings.automatic);
+    ap->addWidget(automatic);
+    auto *testRow = line(ap);
+    auto *test = button("Test with Notepad", "explain-test", "ghost");
+    test->setEnabled(hasKey && settings.consent);
+    testRow->addWidget(test);
+    testRow->addStretch();
+    auto *testResult = label({}, "faint", true);
+    testResult->setObjectName("explain-test-result");
+    testResult->hide();
+    ap->addWidget(testResult);
+    l->addWidget(ai);
+
+    const auto store = [consent, model, language, automatic] {
+        auto next = Explain::Settings::load();
+        next.consent = consent->isChecked();
+        next.model = model->currentText();
+        next.language = language->currentIndex() == 1 ? "es" : "en";
+        next.automatic = automatic->isChecked();
+        next.save();
+    };
+    connect(consent, &QCheckBox::toggled, this, [store, test](bool on) {
+        store();
+        test->setEnabled(on && Explain::KeyStore::has());
+    });
+    connect(automatic, &QCheckBox::toggled, this, store);
+    connect(model, &QComboBox::currentTextChanged, this, store);
+    connect(language, &QComboBox::currentIndexChanged, this, store);
+    connect(saveKey, &QPushButton::clicked, this, [this, key] {
+        QString error;
+        if (!Explain::KeyStore::save(key->text().trimmed(), error)) {
+            message(error);
+            return;
+        }
+        key->clear();
+        message("NVIDIA API key saved for this Windows account.");
+        buildPage();
+    });
+    connect(removeKey, &QPushButton::clicked, this, [this] {
+        QString error;
+        if (!Explain::KeyStore::clear(error)) {
+            message(error);
+            return;
+        }
+        message("NVIDIA API key removed.");
+        buildPage();
+    });
+    connect(test, &QPushButton::clicked, this, [test, testResult] {
+        test->setEnabled(false);
+        testResult->show();
+        testResult->setText("Asking NVIDIA about notepad.exe...");
+        const QString notepad = QDir::fromNativeSeparators(qEnvironmentVariable("SystemRoot") + "\\System32\\notepad.exe");
+        const auto facts = Explain::collectFacts(notepad, "Microsoft Windows", {}, 0, 6, 1);
+        const auto current = Explain::Settings::load();
+        QPointer<QLabel> result(testResult);
+        QPointer<QPushButton> again(test);
+        // Hilo suelto, como las explicaciones: salir de la app no espera esta prueba.
+        std::thread([facts, current, result, again] {
+            Explain::Answer answer;
+            QString error;
+            qint64 ms = 0;
+            const bool ok = Explain::explainNow(facts, current.model, current.language, answer, error, &ms);
+            if (!QCoreApplication::instance()) return;
+            QMetaObject::invokeMethod(
+                QCoreApplication::instance(),
+                [ok, answer, error, ms, result, again] {
+                    if (again) again->setEnabled(true);
+                    if (!result) return;
+                    result->setText(ok ? QString("Working · %1 s · %2").arg(ms / 1000.0, 0, 'f', 1).arg(answer.what)
+                                       : "Not working: " + error);
+                },
+                Qt::QueuedConnection);
+        }).detach();
+    });
+
+    auto *window = frame("panel");
+    auto *wp = new QVBoxLayout(window);
+    wp->setContentsMargins(16, 16, 16, 16);
+    wp->setSpacing(8);
+    wp->addWidget(label("Window and startup", "heading"));
+    wp->addWidget(label("The installed engine starts this window at sign-in, minimized to the tray, so notices can "
+                        "appear. Closing the window hides it; Quit in the tray menu exits it. The firewall keeps "
+                        "working either way.",
+                        "muted", true));
+    l->addWidget(window);
+}
+
+void MainWindow::buildFirewallImport() {
+    const auto &s = firewall_.status();
+    // QA: un archivo de NetLimiter de prueba sin pasar por el diálogo.
+    if (netLimiterFile_.isEmpty() && !qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_NETLIMITER")) {
+        netLimiterFile_ = qEnvironmentVariable("GATEBOUNCER_QA_NETLIMITER");
+        QFile input(netLimiterFile_);
+        QString error;
+        if (input.open(QIODevice::ReadOnly)) netLimiterRules_ = NetLimiterRules::read(input, error);
+    }
+    pageLayout_->addWidget(note("Only NetLimiter firewall rules for one application, for every destination, become "
+                                "GateBouncer rules. Rules limited to addresses, ports, zones or schedules, Ask rules and "
+                                "incoming-only rules are listed with the reason and not imported.",
+                                true));
+    auto *bar = line(pageLayout_);
+    auto *choose = button("Choose NetLimiter settings file…", "netlimiter-choose");
+    bar->addWidget(choose);
+    auto *file = label(netLimiterFile_.isEmpty() ? QString("No file chosen · NetLimiter keeps its rules in nl_settings.xml")
+                                                 : QDir::toNativeSeparators(netLimiterFile_),
+                       "faint");
+    file->setObjectName("netlimiter-file");
+    bar->addWidget(file, 1);
+    connect(choose, &QPushButton::clicked, this, [this] {
+        auto *dialog = new QFileDialog(this, "Choose NetLimiter settings file", NetLimiterRules::defaultFolder(),
+                                       "NetLimiter settings (nl_settings.xml *.xml);;All files (*)");
+        dialog->setObjectName("netlimiter-file-dialog");
+        dialog->setOption(QFileDialog::DontUseNativeDialog);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setFileMode(QFileDialog::ExistingFile);
+        connect(dialog, &QFileDialog::fileSelected, this, [this](const QString &path) {
+            QFile input(path);
+            QString error;
+            netLimiterFile_ = path;
+            netLimiterRules_.clear();
+            if (!input.open(QIODevice::ReadOnly)) error = "The file could not be opened.";
+            else netLimiterRules_ = NetLimiterRules::read(input, error);
+            if (!error.isEmpty()) message(error);
+            buildPage();
+        });
+        dialog->open();
+    });
+
+    int importable = 0;
+    for (const auto &r : netLimiterRules_) importable += r.importable && !firewall_.ruleFor(r.path);
+    auto *table = new QTableWidget(int(netLimiterRules_.size()), 3);
+    table->setObjectName("netlimiter-table");
+    table->setHorizontalHeaderLabels({"Application", "NetLimiter rule", "In GateBouncer"});
+    table->verticalHeader()->hide();
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->setSelectionMode(QAbstractItemView::NoSelection);
+    table->setWordWrap(false);
+    table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+    table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+    table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+    for (int i = 0; i < netLimiterRules_.size(); ++i) {
+        const auto &r = netLimiterRules_[i];
+        const auto *existing = r.path.isEmpty() ? nullptr : firewall_.ruleFor(r.path);
+        auto *app = new QTableWidgetItem(r.path.isEmpty() ? r.ruleName : QFileInfo(r.path).fileName());
+        app->setToolTip(r.path);
+        table->setItem(i, 0, app);
+        table->setItem(i, 1, new QTableWidgetItem(r.action +
+                                                 (r.ruleName.isEmpty() ? QString() : " · " + r.ruleName)));
+        const QString state = existing ? QString("Already has a rule (%1)").arg(existing->allow ? "Allow" : "Block")
+                              : r.importable ? QString(r.allow ? "Will be allowed" : "Will be blocked")
+                                             : "Not imported: " + r.reason;
+        table->setItem(i, 2, new QTableWidgetItem(state));
+    }
+    if (netLimiterRules_.isEmpty()) table->hide();
+    pageLayout_->addWidget(table, 1);
+    if (netLimiterRules_.isEmpty()) pageLayout_->addStretch(1);
+    auto *foot = line(pageLayout_);
+    foot->addWidget(label(netLimiterRules_.isEmpty() ? QString()
+                                                     : QString("%1 NetLimiter rules · %2 can be imported")
+                                                           .arg(netLimiterRules_.size())
+                                                           .arg(importable),
+                          "faint"),
+                    1);
+    auto *run = button(importable == 1 ? QString("Import 1 rule") : QString("Import %1 rules").arg(importable), "netlimiter-import", "primary");
+    run->setEnabled(importable > 0 && s.connected && s.control && !firewall_.busy());
+    foot->addWidget(run);
+    connect(run, &QPushButton::clicked, this, [this] {
+        int sent = 0;
+        for (const auto &r : netLimiterRules_)
+            if (r.importable && !firewall_.ruleFor(r.path)) {
+                firewall_.decide(r.path, r.allow, "path", "always");
+                ++sent;
+            }
+        message(QString("Importing %1 rules from NetLimiter…").arg(sent));
+        QTimer::singleShot(2500, this, [this] { if (view_ == "import") buildPage(); });
+    });
 }
 } // namespace Gate

@@ -246,6 +246,43 @@ bool WfpEngine::addDefaultBlock(Direction direction, std::vector<std::uint64_t> 
     return true;
 }
 
+bool WfpEngine::addHttpsPermit(const std::wstring &path, std::vector<std::uint64_t> &ids, std::wstring &error) {
+    FWP_BYTE_BLOB *appId = nullptr;
+    const DWORD r = FwpmGetAppIdFromFileName0(path.c_str(), &appId);
+    if (r != ERROR_SUCCESS || !appId) {
+        error = L"FwpmGetAppIdFromFileName0: " + errorText(r);
+        return false;
+    }
+    FWPM_FILTER_CONDITION0 conditions[3]{};
+    conditions[0].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+    conditions[0].matchType = FWP_MATCH_EQUAL;
+    conditions[0].conditionValue.type = FWP_BYTE_BLOB_TYPE;
+    conditions[0].conditionValue.byteBlob = appId;
+    conditions[1].fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+    conditions[1].matchType = FWP_MATCH_EQUAL;
+    conditions[1].conditionValue.type = FWP_UINT8;
+    conditions[1].conditionValue.uint8 = IPPROTO_TCP;
+    conditions[2].fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+    conditions[2].matchType = FWP_MATCH_EQUAL;
+    conditions[2].conditionValue.type = FWP_UINT16;
+    conditions[2].conditionValue.uint16 = 443;
+    const bool began = begin(error);
+    bool ok = began;
+    std::vector<std::uint64_t> created;
+    for (const GUID &layer : layersFor(Direction::Outbound)) {
+        if (!ok) break;
+        std::uint64_t id = 0;
+        ok = addFilter(layer, L"LGA GateBouncer window HTTPS", FWP_ACTION_PERMIT, WeightSystem, conditions, 3, id, error);
+        if (ok) created.push_back(id);
+    }
+    if (ok) ok = commit(error);
+    else if (began) abort();
+    FwpmFreeMemory0(reinterpret_cast<void **>(&appId));
+    if (!ok) return false;
+    ids.insert(ids.end(), created.begin(), created.end());
+    return true;
+}
+
 bool WfpEngine::addSystemAllowances(std::vector<std::uint64_t> &ids, std::wstring &error) {
     // Loopback: tráfico interno de la PC, nunca sale a la red.
     FWPM_FILTER_CONDITION0 loopback{};

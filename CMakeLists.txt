@@ -27,6 +27,19 @@ endif()
 target_compile_definitions(gatebouncer_service_view_ui PRIVATE UNICODE _UNICODE NOMINMAX)
 target_compile_options(gatebouncer_service_view_ui PRIVATE -Wall -Wextra -Wpedantic)
 
+# Explicaciones con IA de las apps bloqueadas (key propia del usuario, NVIDIA).
+qt_add_library(gatebouncer_explain STATIC
+    src/explain/KeyStore.cpp
+    src/explain/KeyStore.h
+    src/explain/Explainer.cpp
+    src/explain/Explainer.h
+)
+target_include_directories(gatebouncer_explain PUBLIC src)
+target_link_libraries(gatebouncer_explain PUBLIC Qt6::Core Qt6::Network PRIVATE winhttp crypt32 version advapi32 shell32 ole32)
+target_compile_options(gatebouncer_explain PRIVATE -Wall -Wextra -Wpedantic)
+qt_add_executable(GateBouncerExplainProbe src/explain/probe_main.cpp)
+target_link_libraries(GateBouncerExplainProbe PRIVATE gatebouncer_explain)
+
 qt_add_library(GateBouncerGuiStage SHARED
     src/main.cpp
     controller/deployment_ordinary_stage.cpp
@@ -46,10 +59,12 @@ qt_add_library(GateBouncerGuiStage SHARED
     src/engine/ReviewGateway.h
     src/engine/FirewallClient.cpp
     src/engine/FirewallClient.h
+    src/engine/NetLimiterRules.cpp
+    src/engine/NetLimiterRules.h
     resources/app.rc
 )
 set_source_files_properties(src/main.cpp PROPERTIES COMPILE_DEFINITIONS "main=GateBouncerGuiMain")
-target_link_libraries(GateBouncerGuiStage PRIVATE Qt6::Widgets Qt6::Network gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle advapi32)
+target_link_libraries(GateBouncerGuiStage PRIVATE Qt6::Widgets Qt6::Network gatebouncer_explain gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle advapi32)
 target_include_directories(GateBouncerGuiStage PRIVATE src common)
 target_compile_options(GateBouncerGuiStage PRIVATE -Wall -Wextra -Wpedantic)
 qt_add_resources(GateBouncerGuiStage "gatebouncer_assets"
@@ -128,7 +143,7 @@ get_target_property(gatebouncer_app_sources GateBouncerGuiStage SOURCES)
 list(FILTER gatebouncer_app_sources EXCLUDE REGEX "deployment_ordinary_stage.cpp|src/main.cpp")
 qt_add_executable(GateBouncer WIN32 ${gatebouncer_app_sources} src/app_main.cpp)
 target_include_directories(GateBouncer PRIVATE src common)
-target_link_libraries(GateBouncer PRIVATE Qt6::Widgets Qt6::Network gatebouncer_data gatebouncer_assistance
+target_link_libraries(GateBouncer PRIVATE Qt6::Widgets Qt6::Network gatebouncer_explain gatebouncer_data gatebouncer_assistance
     gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire
     gatebouncer_lifecycle gatebouncer_native_ii advapi32 shell32 fwpuclnt)
 target_compile_options(GateBouncer PRIVATE -Wall -Wextra -Wpedantic)
