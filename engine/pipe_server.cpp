@@ -216,7 +216,7 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     const std::string &command = f[0];
     std::ostringstream out;
     if (command == "HELLO") {
-        out << "OK\tGateBouncerEngine\t1\t" << (mayChange ? "control" : "view") << "\nEND\n";
+        out << "OK\tGateBouncerEngine\t2\t" << (mayChange ? "control" : "view") << "\nEND\n";
         return out.str();
     }
     if (command == "STATUS") {
@@ -236,15 +236,27 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         out << "OK\n";
         for (const auto &p : core_.pending())
             out << p.first << "\t" << p.last << "\t" << p.attempts << "\t" << field(p.remoteAddress) << "\t"
-                << p.remotePort << "\t" << int(p.protocol) << "\t" << field(p.path) << "\n";
+                << p.remotePort << "\t" << int(p.protocol) << "\t" << field(p.signer) << "\t" << field(p.path) << "\n";
         out << "END\n";
         return out.str();
     }
     if (command == "RULES") {
+        // acción, creada, último bloqueo, alcance (path/app/publisher/covered), firmante, nombre, id.
+        // id: la ruta (path y covered) o la clave de la regla (app y publisher). Una fila covered es la ruta que
+        // una regla de firma ya permitió o bloqueó; su nombre es la clave de esa regla.
         out << "OK\n";
-        for (const auto &r : core_.rules())
+        const auto rules = core_.rules();
+        for (const auto &r : rules) {
+            const char *scope = r.scope == Scope::App ? "app" : r.scope == Scope::Publisher ? "publisher" : "path";
             out << (r.action == Action::Allow ? "allow" : "block") << "\t" << r.created << "\t" << r.lastBlock << "\t"
-                << field(r.path) << "\n";
+                << scope << "\t" << field(r.signer) << "\t" << field(r.name) << "\t"
+                << field(r.scope == Scope::Path ? r.path : FirewallCore::ruleKey(r)) << "\n";
+        }
+        for (const auto &c : core_.covered())
+            for (const auto &r : rules)
+                if (r.scope != Scope::Path && FirewallCore::ruleKey(r) == c.ruleKey)
+                    out << (r.action == Action::Allow ? "allow" : "block") << "\t" << r.created << "\t" << r.lastBlock
+                        << "\tcovered\t" << field(r.signer) << "\t" << field(c.ruleKey) << "\t" << field(c.path) << "\n";
         out << "END\n";
         return out.str();
     }
@@ -261,8 +273,13 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     if (!mayChange) return err(L"Only GateBouncer or an administrator can change rules");
     std::wstring error;
     bool ok = false;
+    // DECIDE <allow|block> <ruta> (sólo esa ruta) o DECIDE <allow|block> <path|app|publisher> <ruta>.
     if (command == "DECIDE" && f.size() == 3 && (f[1] == "allow" || f[1] == "block"))
-        ok = core_.decide(wide(f[2]), f[1] == "allow" ? Action::Allow : Action::Block, error);
+        ok = core_.decide(wide(f[2]), f[1] == "allow" ? Action::Allow : Action::Block, Scope::Path, error);
+    else if (command == "DECIDE" && f.size() == 4 && (f[1] == "allow" || f[1] == "block") &&
+             (f[2] == "path" || f[2] == "app" || f[2] == "publisher"))
+        ok = core_.decide(wide(f[3]), f[1] == "allow" ? Action::Allow : Action::Block,
+                          f[2] == "app" ? Scope::App : f[2] == "publisher" ? Scope::Publisher : Scope::Path, error);
     else if (command == "REMOVE" && f.size() == 2)
         ok = core_.removeRule(wide(f[1]), error);
     else if (command == "MODE" && f.size() == 2 && (f[1] == "ask" || f[1] == "off"))

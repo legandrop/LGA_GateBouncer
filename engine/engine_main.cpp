@@ -7,7 +7,9 @@
 //   --console [--dynamic] [--scope <exe>]... [--data <dir>] [--ui <exe>]... [--seconds <n>]
 //                                  corre en primer plano (pruebas). --dynamic: nada sobrevive al cierre.
 //                                  --scope: sólo esas apps quedan bajo «preguntar»; el resto de la PC no se toca.
+//   --signer <exe>                 muestra el firmante que usan las reglas por editor (no hace falta administrador)
 #include "pipe_server.h"
+#include "signature.h"
 #include <aclapi.h>
 #include <shlobj.h>
 #include <sddl.h>
@@ -21,6 +23,9 @@
 namespace {
 
 constexpr wchar_t ServiceName[] = L"LGAGateBouncer";
+// La ventana arranca con cada inicio de sesión: sin ella nadie ve los avisos (el servicio no tiene escritorio).
+constexpr wchar_t RunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t RunValue[] = L"LGA GateBouncer";
 SERVICE_STATUS_HANDLE serviceHandle = nullptr;
 SERVICE_STATUS serviceStatus{};
 HANDLE serviceStop = nullptr;
@@ -193,9 +198,11 @@ int install(const std::vector<std::wstring> &uiPaths, bool allowUnprotected) {
     // archivos, tendría SYSTEM o reglas a voluntad.
     std::vector<std::wstring> folders{moduleDir()};
     for (const auto &p : uiPaths) folders.push_back(p.substr(0, p.find_last_of(L'\\')));
+    bool protectedFolders = true;
     for (const auto &folder : folders) {
         std::wstring why;
         if (!adminOnlyWritable(folder, why)) {
+            protectedFolders = false;
             if (!allowUnprotected) {
                 fwprintf(stderr,
                          L"%ls.\nCopy GateBouncer to a folder only administrators can change, such as "
@@ -239,6 +246,21 @@ int install(const std::vector<std::wstring> &uiPaths, bool allowUnprotected) {
     CloseServiceHandle(service);
     CloseServiceHandle(scm);
     wprintf(started ? L"Service installed and running.\n" : L"Service installed, but it did not start.\n");
+    // Para todos los usuarios (HKLM), y sólo desde una carpeta de administradores: si un usuario común pudiera cambiar
+    // el exe, correría en el inicio de sesión de todos, administradores incluidos.
+    const std::wstring window = uiPaths.empty() ? moduleDir() + L"\\GateBouncer.exe" : uiPaths.front();
+    if (!protectedFolders) {
+        fwprintf(stderr, L"The window was not registered at sign-in because its folder is not protected. Start "
+                         L"GateBouncer.exe yourself to see requests.\n");
+    } else if (GetFileAttributesW(window.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        const std::wstring run = L"\"" + window + L"\" --start-minimized";
+        const LONG r = RegSetKeyValueW(HKEY_LOCAL_MACHINE, RunKey, RunValue, REG_SZ, run.c_str(),
+                                       DWORD((run.size() + 1) * sizeof(wchar_t)));
+        if (r == ERROR_SUCCESS) wprintf(L"GateBouncer window starts at sign-in, minimized to the tray.\n");
+        else fwprintf(stderr, L"Could not register the window at sign-in: %ls\n", gbe::WfpEngine::errorText(r).c_str());
+    } else {
+        fwprintf(stderr, L"%ls not found: the window will not start at sign-in.\n", window.c_str());
+    }
     return started ? 0 : 1;
 }
 
@@ -276,6 +298,9 @@ int uninstall() {
         }
         CloseServiceHandle(scm);
     }
+    const LONG run = RegDeleteKeyValueW(HKEY_LOCAL_MACHINE, RunKey, RunValue);
+    if (run != ERROR_SUCCESS && run != ERROR_FILE_NOT_FOUND)
+        fwprintf(stderr, L"Could not remove the sign-in entry: %ls\n", gbe::WfpEngine::errorText(run).c_str());
     const int r = removeFilters(true);
     wprintf(r == 0 ? L"Service and filters removed. Saved rules stay in ProgramData.\n"
                    : L"Not every filter could be removed.\n");
@@ -365,7 +390,12 @@ int wmain(int argc, wchar_t **argv) {
     if (mode == L"--uninstall") return uninstall();
     if (mode == L"--remove-filters") return removeFilters(false);
     if (mode == L"--console") return console(argc, argv);
+    if (mode == L"--signer" && argc == 3) {
+        const std::wstring signer = gbe::signerOf(argv[2]);
+        wprintf(L"%ls\n", signer.empty() ? L"(no valid embedded signature)" : signer.c_str());
+        return signer.empty() ? 1 : 0;
+    }
     fwprintf(stderr, L"Usage: GateBouncerEngine.exe --install [--ui <exe>] [--allow-unprotected-folder] | --uninstall | "
-                     L"--remove-filters | --console ...\n");
+                     L"--remove-filters | --console ... | --signer <exe>\n");
     return 2;
 }

@@ -36,6 +36,8 @@ qt_add_library(GateBouncerGuiStage SHARED
     src/simulation.h
     src/mainwindow.cpp
     src/mainwindow.h
+    src/accesstoast.cpp
+    src/accesstoast.h
     src/productcontroller.cpp
     src/productcontroller.h
     src/engine/EngineViewClient.cpp

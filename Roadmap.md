@@ -14,6 +14,13 @@ Checkboxes mean **verified on Windows**, not only implemented.
 - [x] **Block, notify, Allow/Block.** Verified on Windows 11 with a test application in a dynamic WFP session: the
   unknown attempt is blocked, the drop event names the executable, the request appears in the window, Allow lets the
   next attempt connect, Block blocks it again, and removing the rule makes it ask again.
+- [x] **Rules that survive updates.** Verified on Windows 11 in a dynamic WFP session with copies of a signed
+  application in two folders: **This app, any version** and **All apps from** a publisher allow the copy in the other
+  folder after its first blocked attempt, and keep working after the engine restarts. Unsigned applications only
+  accept a rule for the exact file; Microsoft signers do not accept a whole-publisher rule.
+- [ ] **Desktop notice.** Implemented: a notice that stays in the corner of the screen until you decide, shown by the
+  window running in the tray, which the engine install registers at sign-in. Done when it is used day to day with the
+  installed service.
 - [ ] **Ask mode for every application.** Implemented: default block with loopback and Windows services permitted.
   Done when it runs as the installed service on a clean machine without breaking DNS, DHCP or updates.
 - [ ] **Permanent rules across restarts.** Implemented: persistent filters rebuilt from the saved rules at startup.

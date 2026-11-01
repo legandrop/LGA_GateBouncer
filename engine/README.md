@@ -15,6 +15,11 @@ other driverless Windows firewalls.
   executable; a drop caused by a Block rule is recorded as activity.
 - **Allow and Block apply to the next attempt.** Without a driver, a connection cannot be held while you decide: the
   attempt that produced the request has already failed. Most applications retry on their own.
+- **Rules by signature.** Besides the exact path, a rule can cover an app in any folder (same signer and file name) or
+  every app from a signer. WFP only matches paths, so these rules live in the engine: when an executable without a
+  path rule is blocked, the engine checks its embedded Authenticode signature (offline, no revocation lookup) and, if
+  a signature rule matches, adds the filter for that path. The first attempt is still lost; the next one uses the rule.
+  These paths are saved with the rule and verified again at every engine start.
 
 Filters are persistent. If the service stops or crashes, unknown applications stay blocked and saved rules keep
 working. Uninstalling removes every GateBouncer filter.
@@ -29,7 +34,9 @@ GateBouncerEngine.exe --uninstall
 GateBouncerEngine.exe --remove-filters
 ```
 
-`--install` registers and starts the `LGAGateBouncer` service (LocalSystem, automatic start, depends on BFE). The
+`--install` registers and starts the `LGAGateBouncer` service (LocalSystem, automatic start, depends on BFE) and
+registers `GateBouncer.exe --start-minimized` to start at sign-in for every user, because the service has no desktop
+and only the window can show requests. `--uninstall` removes that entry too. The
 service runs as SYSTEM and trusts the window next to it, so `--install` refuses a folder that a standard user can
 change, or replace through one of the folders above it; copy both programs to a folder such as `C:\Program Files\LGA GateBouncer` first, or pass
 `--allow-unprotected-folder` to accept that risk. `--uninstall` does nothing unless the service stops.
@@ -47,7 +54,9 @@ that path asks again.
 The desktop window talks to the engine over the named pipe `\\.\pipe\LGA.GateBouncer.Engine`: one UTF-8 request
 line, tab-separated fields, and a reply terminated by `END`. Interactive users can read status, pending requests,
 rules and activity, but cannot create instances of the pipe. Only the installed `GateBouncer.exe` next to the engine,
-or an elevated process, can change rules (`DECIDE`, `REMOVE`, `MODE`). That check uses the client's executable path:
+or an elevated process, can change rules (`DECIDE`, `REMOVE`, `MODE`). `DECIDE` takes the reach of the rule (`path`,
+`app` or `publisher`) and the executable; the engine reads the signer from the file itself and never trusts a signer
+sent by the client. That check uses the client's executable path:
 it keeps other programs from changing rules by accident, but it is not a boundary against malicious software already
 running under your account, which could start the window and inject code into it.
 
@@ -56,12 +65,20 @@ running under your account, which could start the window and inject code into it
 `--console --dynamic` runs the engine in a dynamic WFP session: everything it adds disappears when it exits. With
 `--scope <exe>` only that executable asks before connecting, so the rest of the computer is never affected.
 `GateBouncerEngineSelfTest.exe` checks the full cycle on a copy of an HTTP client, also in a dynamic session.
+`--signer <exe>` prints the signer that signature rules use for that file; it needs no administrator rights.
 
 ## Limits
 
 - The first attempt of an unknown application fails; there is no waiting connection.
-- Rules match the executable path, not its content or publisher. Inbound connections are left to Windows Defender
-  Firewall.
+- Path rules match the executable path, not its content. A path covered by a signature rule is checked every minute:
+  if the file changed (NTFS change time, file ID or size), its signature is verified again and the filter is withdrawn
+  when it no longer matches. Every ten minutes all covered files are verified again regardless. Between checks a
+  replaced file keeps the filter, and a connection opened in that time stays open. Software already running under
+  your account can also start the window and decide for you (see Local channel). Inbound connections are left to
+  Windows Defender Firewall.
+- Only embedded signatures count. Windows tools signed only through a catalog (such as `powershell.exe`) are treated as
+  unsigned, and signers whose name starts with Microsoft do not accept a whole-publisher rule, because it would
+  include Windows tools that download files.
 - Another WFP provider with a hard permit can override a block. An administrator, or software running as
   administrator, can remove the filters.
 - Ask mode for every application has not yet been validated on a clean machine.

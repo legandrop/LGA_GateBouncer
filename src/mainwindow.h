@@ -5,8 +5,10 @@
 #include "lifecycle/StartupPreference.h"
 #include "engine/ReviewGateway.h"
 #include "engine/FirewallClient.h"
+#include "accesstoast.h"
 #include <QMainWindow>
 #include <QPointer>
+#include <QSet>
 #include "assistance/ui/GeneralSession.h"
 #include "assistance/ui/GeneralConnection.h"
 
@@ -36,6 +38,10 @@ class MainWindow final : public QMainWindow {
     Explanation *explanation() { return &explanation_; }
     QString view() const { return view_; }
     void selectView(const QString &view);
+    // Muestra la ventana aunque esté oculta en la bandeja (aviso, segunda instancia).
+    void bringToFront();
+    // Sólo QA: el aviso fijo actual, para capturarlo.
+    AccessToast *accessToast() const { return firewallToast_; }
     void openRequest(const QString &id);
     void openDetail(const QString &id);
     void startLifecycle(std::unique_ptr<Lifecycle::TraySurface> tray, bool minimized,
@@ -95,8 +101,9 @@ class MainWindow final : public QMainWindow {
     bool firewallView() const;
     void renderFirewall();
     void openFirewallRequest(const QString &path);
-    void renderFirewallNotice();
-    void editFirewallRule(const QString &path);
+    // Aviso fijo de escritorio (AccessToast): uno por vez, el pendiente más viejo que no se cerró.
+    void updateFirewallToast();
+    void editFirewallRule(const QString &id);
     void onNewFirewallPending(const QString &path);
     void finishShutdownWhenIdle();
     enum class ModalOwner { General, Simulation, Live, ImportedDraft, ImportedReview, ImportedActivation, FileRule, FileBackup };
@@ -141,9 +148,9 @@ class MainWindow final : public QMainWindow {
     QPointer<QLabel> emptyState_;
     QPointer<QFrame> detail_, notice_, modalOverlay_, message_;
     FirewallClient firewall_;
-    QPointer<QFrame> firewallNotice_;
-    QString firewallNoticePath_;
-    QByteArray firewallNoticeKey_;
+    QPointer<AccessToast> firewallToast_;
+    QSet<QString> dismissedRequests_; // rutas en minúsculas cerradas con ×: siguen pendientes, sin aviso
+    QString preferredRequest_;        // la que se pidió ver desde Pending
     QByteArray ordinaryNoticeKey_;
     QByteArray tableSourceKey_;
     QPointer<Assistance::Ui::ExplanationWidget> ordinaryExplanation_;

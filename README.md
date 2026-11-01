@@ -16,11 +16,15 @@ See the one-page [Roadmap](Roadmap.md) for verified and pending work, and the [d
 In **Live** mode, the Processes, Pending, Activity and Rules views read the engine:
 
 - **Processes** lists running applications and every application with a rule or a request, with its policy.
-- **Pending** lists blocked applications waiting for a decision. A new request also opens a notice in the window, and a
-  tray notification when the window is hidden. Closing the notice keeps the application blocked and pending.
+- **Pending** lists blocked applications waiting for a decision. A new request also shows a notice in the bottom-right
+  corner of the screen, even when the window is hidden in the tray. It stays until you choose Allow or Block, and it
+  does not take focus. Closing it keeps the application blocked and pending.
+- The notice's **Apply to** list sets the rule's reach: **This app, any version** (same signed publisher and file name,
+  in any folder, so updates don't ask again), **This file only** (the exact path), or **All apps from** the publisher.
+  Applications without a valid signature can only get a rule for the exact file.
 - **Activity** shows blocked attempts and rule changes recorded by the engine. Allowed connections are not recorded.
-- **Rules** lists saved Allow and Block rules. You can change or remove a rule, and switch between asking for unknown
-  applications and allowing them.
+- **Rules** lists saved Allow and Block rules, including rules for an app in any version or for a whole publisher. You
+  can change or remove a rule, and switch between asking for unknown applications and allowing them.
 
 Import offers explicitly selected Structural XML and NetLimiter QName source profiles. It analyzes the chosen file in
 the background and saves reviewed candidates locally, always inactive; imported candidates do not become engine rules
@@ -30,7 +34,8 @@ A separate **Simulation** mode shows the six views with synthetic data that stay
 the optional NVIDIA explanation configuration, which is not connected to the engine's requests yet. An explanation
 never grants access or verifies an application's safety.
 
-When a tray is available, closing hides the window in the notification area.
+When a tray is available, closing hides the window in the notification area. Installing the engine registers the
+window to start at sign-in, minimized to the tray; opening it again brings the running window to the front.
 
 ## Build on Windows
 

@@ -16,5 +16,5 @@ target_link_libraries(gatebouncer_engine_core PUBLIC fwpuclnt ws2_32 advapi32)
 add_executable(GateBouncerEngineSelfTest selftest_main.cpp)
 target_link_libraries(GateBouncerEngineSelfTest PRIVATE gatebouncer_engine_core)
 
-add_executable(GateBouncerEngine engine_main.cpp firewall_core.cpp pipe_server.cpp)
-target_link_libraries(GateBouncerEngine PRIVATE gatebouncer_engine_core)
+add_executable(GateBouncerEngine engine_main.cpp firewall_core.cpp pipe_server.cpp signature.cpp)
+target_link_libraries(GateBouncerEngine PRIVATE gatebouncer_engine_core wintrust crypt32)

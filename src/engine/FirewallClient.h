@@ -22,11 +22,15 @@ class FirewallClient final : public QObject {
         QString path, remote;
         qint64 first = 0, last = 0;
         int attempts = 0, port = 0, protocol = 0;
+        QString signer; // vacío: sin firma embebida válida (la verifica el motor)
     };
+    // Alcances del motor: "path" (ruta exacta), "app" (firmante + nombre del exe, cualquier carpeta), "publisher"
+    // (todo lo del firmante) y "covered" (una ruta que una regla app/publisher ya permitió o bloqueó).
     struct RuleItem {
-        QString path;
+        QString path; // path y covered; vacío en app y publisher
         bool allow = true;
         qint64 created = 0, lastBlock = 0;
+        QString scope = "path", signer, name, id; // id: lo que se manda en REMOVE
     };
     struct ActivityItem {
         qint64 time = 0;
@@ -39,19 +43,28 @@ class FirewallClient final : public QObject {
     bool active() const { return active_; }
     const Status &status() const { return status_; }
     const QVector<PendingItem> &pending() const { return pending_; }
+    // Incluye las filas "covered": para contar o listar reglas, saltearlas.
     const QVector<RuleItem> &rules() const { return rules_; }
+    int ruleCount() const;
     const QVector<ActivityItem> &activity() const { return activity_; }
     const PendingItem *pendingFor(const QString &path) const;
+    // Regla de la ruta o cobertura de una regla por firma.
     const RuleItem *ruleFor(const QString &path) const;
+    const RuleItem *ruleById(const QString &id) const;
     bool busy() const { return commandsInFlight_ > 0; }
 
-    void decide(const QString &path, bool allow);
-    void removeRule(const QString &path);
+    // scope: "path", "app" o "publisher". La firma la verifica el motor, no la ventana.
+    void decide(const QString &path, bool allow, const QString &scope = "path");
+    void removeRule(const QString &id);
     void setAsk(bool ask);
     void refreshNow();
 
     static QString fileName(const QString &path);
     static QString protocolName(int protocol);
+    // Texto de una regla por firma: "any version of node.exe from OpenJS Foundation".
+    static QString describe(const RuleItem &rule);
+    // Igual que el motor: un firmante de Microsoft no admite «All apps from».
+    static bool publisherRuleAllowed(const QString &signer);
 
   signals:
     void changed();
@@ -74,7 +87,7 @@ class FirewallClient final : public QObject {
     QLocalSocket *socket_ = nullptr; // hijo de este objeto; fuera del header para no exigir QtNetwork a quien lo incluye
     QTimer timer_;
     std::deque<Request> queue_;
-    bool waiting_ = false, active_ = false, firstPending_ = true;
+    bool waiting_ = false, active_ = false;
     int commandsInFlight_ = 0;
     QByteArray buffer_;
     QByteArray lastRaw_[4];

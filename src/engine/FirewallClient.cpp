@@ -46,21 +46,50 @@ const FirewallClient::PendingItem *FirewallClient::pendingFor(const QString &pat
 }
 
 const FirewallClient::RuleItem *FirewallClient::ruleFor(const QString &path) const {
+    if (path.isEmpty()) return nullptr;
     for (const auto &r : rules_)
         if (key(r.path) == key(path)) return &r;
     return nullptr;
 }
 
-void FirewallClient::decide(const QString &path, bool allow) {
-    enqueue(QString("DECIDE\t%1\t%2").arg(allow ? "allow" : "block", path), Request::Command,
-            QString("%1 saved for %2. Its next connection attempt uses this rule.")
-                .arg(allow ? "Allow" : "Block", fileName(path)));
+int FirewallClient::ruleCount() const {
+    int n = 0;
+    for (const auto &r : rules_) n += r.scope != "covered";
+    return n;
+}
+
+const FirewallClient::RuleItem *FirewallClient::ruleById(const QString &id) const {
+    for (const auto &r : rules_)
+        if (r.scope != "covered" && key(r.id) == key(id)) return &r;
+    return nullptr;
+}
+
+QString FirewallClient::describe(const RuleItem &rule) {
+    if (rule.scope == "app") return QString("any version of %1 from %2").arg(rule.name, rule.signer);
+    if (rule.scope == "publisher") return "all apps from " + rule.signer;
+    return fileName(rule.path);
+}
+
+bool FirewallClient::publisherRuleAllowed(const QString &signer) {
+    return !signer.isEmpty() && !signer.startsWith("Microsoft", Qt::CaseInsensitive);
+}
+
+void FirewallClient::decide(const QString &path, bool allow, const QString &scope) {
+    const auto *p = pendingFor(path);
+    const QString signer = p ? p->signer : QString();
+    QString what = fileName(path);
+    if (scope == "app") what = QString("any version of %1 from %2").arg(fileName(path), signer);
+    else if (scope == "publisher") what = "all apps from " + signer;
+    enqueue(QString("DECIDE\t%1\t%2\t%3").arg(allow ? "allow" : "block", scope, path), Request::Command,
+            QString("%1 saved for %2. The next connection attempt uses this rule.").arg(allow ? "Allow" : "Block", what));
     poll();
 }
 
-void FirewallClient::removeRule(const QString &path) {
-    enqueue("REMOVE\t" + path, Request::Command,
-            QString("Rule removed for %1. Its next connection will be blocked and ask again.").arg(fileName(path)));
+void FirewallClient::removeRule(const QString &id) {
+    const auto *r = ruleById(id);
+    const QString what = r ? describe(*r) : fileName(id);
+    enqueue("REMOVE\t" + id, Request::Command,
+            QString("Rule removed for %1. The next connection will be blocked and ask again.").arg(what));
     poll();
 }
 
@@ -171,21 +200,31 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
         QSet<QString> now;
         for (const auto &row : rows) {
             const auto f = row.split('\t');
-            if (f.size() != 7) continue;
-            pending_.push_back({f[6], f[3], f[0].toLongLong(), f[1].toLongLong(), f[2].toInt(), f[4].toInt(), f[5].toInt()});
-            now.insert(key(f[6]));
-            if (!firstPending_ && !knownPending_.contains(key(f[6]))) emit newPending(f[6]);
+            if (f.size() != 8) continue;
+            pending_.push_back({f[7], f[3], f[0].toLongLong(), f[1].toLongLong(), f[2].toInt(), f[4].toInt(),
+                                f[5].toInt(), f[6]});
+            now.insert(key(f[7]));
+            // También los que ya esperaban al conectar: la ventana arranca con la sesión y tiene que avisarlos.
+            if (!knownPending_.contains(key(f[7]))) emit newPending(f[7]);
         }
         knownPending_ = now;
-        firstPending_ = false;
         break;
     }
     case Request::Rules:
         rules_.clear();
         for (const auto &row : rows) {
             const auto f = row.split('\t');
-            if (f.size() != 4) continue;
-            rules_.push_back({f[3], f[0] == "allow", f[1].toLongLong(), f[2].toLongLong()});
+            if (f.size() != 7) continue;
+            RuleItem r;
+            r.allow = f[0] == "allow";
+            r.created = f[1].toLongLong();
+            r.lastBlock = f[2].toLongLong();
+            r.scope = f[3];
+            r.signer = f[4];
+            r.name = f[5];
+            r.id = f[6];
+            if (r.scope == "path" || r.scope == "covered") r.path = r.id;
+            rules_.push_back(r);
         }
         break;
     case Request::Activity:

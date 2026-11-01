@@ -645,6 +645,7 @@ MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
     QTimer::singleShot(0, &product_, &ProductController::refreshProcesses);
 }
 MainWindow::~MainWindow(){
+    delete firewallToast_; // ventana propia, sin padre
     if(assistanceConnection_)assistanceConnection_->close();
     if(assistance_)assistance_->close();
     assistanceConnection_.reset();
@@ -906,7 +907,7 @@ void MainWindow::buildPage() {
         const auto &headings = firewallView() ? firewallHeadings : liveHeadings;
         title_->setText(headings[view_][0]); subtitle_->setText(headings[view_][1]);
         if (firewallView()) renderFirewall(); else renderLive();
-        updatePageState(); refreshing_ = false; refreshTable(true); restoreFocus(); renderFirewallNotice(); positionOverlays(); return;
+        updatePageState(); refreshing_ = false; refreshTable(true); restoreFocus(); updateFirewallToast(); positionOverlays(); return;
     }
     const QMap<QString, QStringList> headings{
         {"processes",
@@ -1079,7 +1080,7 @@ void MainWindow::updatePageState() {
         if (banner) banner->setText(!s.connected ? "Live · firewall engine not running"
             : s.ask ? "Live · unknown applications are blocked until you decide" : "Live · unknown applications allowed");
         if (firewallView())
-            footer_->setText(s.connected ? QString("%1 rules · %2 pending · engine started %3").arg(firewall_.rules().size())
+            footer_->setText(s.connected ? QString("%1 rules · %2 pending · engine started %3").arg(firewall_.ruleCount())
                 .arg(firewall_.pending().size()).arg(firewallTime(s.started)) : "No engine connection · retrying every second");
     }
 }
@@ -1088,7 +1089,7 @@ void MainWindow::refresh() {
     refreshTable();
     if (detail_ && !selected_.isEmpty()) openDetail(selected_);
     renderNotice();
-    renderFirewallNotice();
+    updateFirewallToast();
     closeStaleModal();
 }
 QTableView *MainWindow::makeTable(const QStringList &headers, const QVector<int> &widths,
@@ -1373,7 +1374,8 @@ void MainWindow::refreshTable(bool newPage) {
             QSet<QString> running;
             for (const auto &p : product_.catalog().processes)
                 if (!p.imagePath.isEmpty()) { apps.insert(p.imagePath.toLower(), p.imagePath); running.insert(p.imagePath.toLower()); }
-            for (const auto &r : firewall_.rules()) apps.insert(r.path.toLower(), r.path);
+            for (const auto &r : firewall_.rules())
+                if (!r.path.isEmpty()) apps.insert(r.path.toLower(), r.path);
             for (const auto &p : firewall_.pending()) apps.insert(p.path.toLower(), p.path);
             for (auto it = apps.cbegin(); it != apps.cend(); ++it) {
                 const auto &path = it.value();
@@ -1405,13 +1407,23 @@ void MainWindow::refreshTable(bool newPage) {
         } else {
             int allow = 0;
             for (const auto &r : firewall_.rules()) {
+                if (r.scope == "covered") continue;
                 allow += r.allow;
-                if (!query_.isEmpty() && !r.path.contains(query_, Qt::CaseInsensitive)) continue;
-                result.push_back({firewallId(r.path), {appCell(r.path), policyCell(r.path),
+                // Reglas por firma: una fila por regla, con lo que cubre en vez de una ruta.
+                const QString searchable = r.scope == "path" ? r.path : FirewallClient::describe(r);
+                if (!query_.isEmpty() && !searchable.contains(query_, Qt::CaseInsensitive)) continue;
+                Cell app = appCell(r.path);
+                if (r.scope == "app")
+                    app = {r.name + " · any version\nSigned by " + r.signer, "glyph:" + r.name.left(2).toUpper(), r.name};
+                else if (r.scope == "publisher")
+                    app = {"All apps from " + r.signer + "\nAny application with this signature",
+                           "glyph:" + r.signer.left(2).toUpper(), r.signer.toLower()};
+                const Cell policy = r.allow ? Cell{"Allow", "Allow", {}} : Cell{"Block", "Block", {}};
+                result.push_back({firewallId(r.id), {app, policy,
                     {firewallTime(r.created), {}, r.created}, {firewallTime(r.lastBlock), {}, r.lastBlock}, {"Edit", "action", {}}}});
             }
             if (auto *count = pageControl<QLabel>(page_, "firewall-rule-count"))
-                count->setText(QString("%1 Allow rules · %2 Block rules").arg(allow).arg(firewall_.rules().size() - allow));
+                count->setText(QString("%1 Allow rules · %2 Block rules").arg(allow).arg(firewall_.ruleCount() - allow));
         }
     } else if (!product_.simulation()) {
         if (view_ == "processes") for (const auto &p : product_.catalog().processes) {
@@ -3388,11 +3400,6 @@ void MainWindow::positionOverlays() {
                            !product_.simulation() || model_.review(explanation_.visibleId()).expanded ? 625 : 541);
         notice_->setGeometry(root_->width() - w - 20, root_->height() - h - 20, w, h);
     }
-    if (firewallNotice_) {
-        const int w = small ? 400 : 420;
-        const int h = qMin(root_->height() - 105, qMax(360, firewallNotice_->sizeHint().height()));
-        firewallNotice_->setGeometry(root_->width() - w - 20, root_->height() - h - 20, w, h);
-    }
     if (modalOverlay_)
         modalOverlay_->setGeometry(0, 36, root_->width(), root_->height() - 36);
     if (message_) {
@@ -3429,10 +3436,6 @@ bool MainWindow::eventFilter(QObject *object, QEvent *event) {
         if (key->key() == Qt::Key_Escape) {
             if (modalOverlay_)
                 closeModal();
-            else if (firewallNotice_) {
-                firewallNoticePath_.clear();
-                renderFirewallNotice();
-            }
             else if (notice_)
                 product_.simulation() ? explanation_.close() : product_.ordinary()->closeNotice();
             else if (detail_) {
@@ -3568,12 +3571,16 @@ void MainWindow::renderFirewall() {
     }
 }
 
-void MainWindow::onNewFirewallPending(const QString &path) {
-    const QString name = FirewallClient::fileName(path);
-    if (lifecycle_ && (!isVisible() || isMinimized()))
-        lifecycle_->notify("GateBouncer blocked " + name,
-                           "It is waiting for your decision. Open GateBouncer to allow or block it.");
-    if (firewallNoticePath_.isEmpty()) openFirewallRequest(path);
+void MainWindow::bringToFront() {
+    if (lifecycle_) lifecycle_->openWindow();
+    else showNormal();
+    raise();
+    activateWindow();
+}
+
+void MainWindow::onNewFirewallPending(const QString &) {
+    // Después de que el cliente termine de leer la lista: el aviso necesita los datos completos.
+    QTimer::singleShot(0, this, &MainWindow::updateFirewallToast);
 }
 
 void MainWindow::openFirewallRequest(const QString &path) {
@@ -3582,100 +3589,142 @@ void MainWindow::openFirewallRequest(const QString &path) {
         editFirewallRule(path);
         return;
     }
-    firewallNoticePath_ = path;
-    firewallNoticeKey_.clear();
-    renderFirewallNotice();
+    // Pedido a mano desde Pending: vuelve a avisar aunque se hubiera cerrado, y le gana al aviso actual.
+    dismissedRequests_.remove(path.toLower());
+    preferredRequest_ = path;
+    if (firewallToast_ && firewallToast_->path().compare(path, Qt::CaseInsensitive) != 0) {
+        firewallToast_->close();
+        firewallToast_->deleteLater();
+        firewallToast_.clear();
+    }
+    updateFirewallToast();
 }
 
-void MainWindow::renderFirewallNotice() {
-    const auto *p = product_.simulation() ? nullptr : firewall_.pendingFor(firewallNoticePath_);
-    if (!p) firewallNoticePath_.clear();
-    QByteArray key;
-    if (p) {
-        QDataStream stamp(&key, QIODevice::WriteOnly);
-        stamp << p->path << p->remote << p->port << p->protocol << p->attempts << p->last << firewall_.status().control
-              << firewall_.busy() << int(firewall_.pending().size());
-    }
-    if (firewallNotice_ && key == firewallNoticeKey_) return;
-    firewallNoticeKey_ = key;
-    if (firewallNotice_) {
-        dispose(firewallNotice_);
-        firewallNotice_.clear();
-    }
-    if (!p) {
-        positionOverlays();
+void MainWindow::updateFirewallToast() {
+    const auto &pending = firewall_.pending();
+    if (closing_ || product_.simulation() || !firewall_.status().connected) {
+        if (firewallToast_) {
+            firewallToast_->close();
+            firewallToast_->deleteLater();
+            firewallToast_.clear();
+        }
         return;
     }
-    const QString path = p->path;
-    firewallNotice_ = new QFrame(root_);
-    firewallNotice_->setObjectName("access-notice");
-    firewallNotice_->setAccessibleName("Access request");
-    auto *l = new QVBoxLayout(firewallNotice_);
-    l->setContentsMargins(15, 12, 15, 12);
-    l->setSpacing(9);
-    auto *head = line(l);
-    head->addWidget(label("LGA   GateBouncer · access request", "faint"), 1);
-    auto *close = button("×", "close-request", "ghost");
-    close->setFixedSize(25, 25);
-    close->setAccessibleName("Close request and keep it pending");
-    head->addWidget(close);
-    l->addWidget(label(FirewallClient::fileName(path), "heading"));
-    l->addWidget(label(wrappablePath(path), "link", true));
-    l->addWidget(label("Blocked · waiting for your decision", "warning"));
-    definition(l, "Destination", firewallDestination(p->remote, p->port, p->protocol) + " · outbound");
-    definition(l, "Last attempt", firewallTime(p->last));
-    definition(l, "Blocked attempts", QString::number(p->attempts));
-    divider(l);
-    l->addWidget(label("This attempt was already blocked. Allow saves a permanent rule and the application's next "
-                       "attempt connects; most applications retry on their own. Block keeps it blocked without asking "
-                       "again.",
-                       "muted", true));
-    l->addStretch();
-    auto *actions = line(l);
-    auto *keep = button("Keep pending", "keep-access-pending", "ghost");
-    actions->addWidget(keep);
-    actions->addStretch();
-    auto *block = button("Block", "decide-block", "danger");
-    auto *allow = button("Allow", "decide-allow", "primary");
-    const bool can = firewall_.status().control && !firewall_.busy();
-    block->setEnabled(can);
-    allow->setEnabled(can);
-    if (!firewall_.status().control)
-        l->addWidget(label("This window cannot change rules. Run the installed GateBouncer.", "faint", true));
-    actions->addWidget(block);
-    actions->addWidget(allow);
-    const auto keepPending = [this] {
-        firewallNoticePath_.clear();
-        renderFirewallNotice();
+    // Lo cerrado que ya no está pendiente se olvida: si la app vuelve a pedir, se avisa de nuevo.
+    QSet<QString> waiting;
+    for (const auto &p : pending) waiting.insert(p.path.toLower());
+    dismissedRequests_.intersect(waiting);
+    const auto showable = [this](const FirewallClient::PendingItem &p) {
+        return !dismissedRequests_.contains(p.path.toLower());
     };
-    connect(close, &QPushButton::clicked, this, keepPending);
-    connect(keep, &QPushButton::clicked, this, keepPending);
-    for (auto *b : {block, allow})
-        connect(b, &QPushButton::clicked, this, [this, path, allowed = b == allow] {
-            firewall_.decide(path, allowed);
-            firewallNoticePath_.clear();
-            renderFirewallNotice();
+    if (firewallToast_ && !firewall_.pendingFor(firewallToast_->path())) {
+        firewallToast_->close();
+        firewallToast_->deleteLater();
+        firewallToast_.clear();
+    }
+    const FirewallClient::PendingItem *current = firewallToast_ ? firewall_.pendingFor(firewallToast_->path()) : nullptr;
+    if (!current) {
+        const auto *preferred = firewall_.pendingFor(preferredRequest_);
+        if (preferred && showable(*preferred)) current = preferred;
+        else
+            for (const auto &p : pending)
+                if (showable(p) && (!current || p.first < current->first)) current = &p;
+    }
+    preferredRequest_.clear();
+    if (!current) return;
+    if (!firewallToast_) {
+        firewallToast_ = new AccessToast;
+        connect(firewallToast_, &AccessToast::decided, this, [this](const QString &path, bool allow, const QString &scope) {
+            firewall_.decide(path, allow, scope);
+            // Se oculta ya: si la decisión falla, el pedido sigue pendiente y vuelve a aparecer.
+            if (firewallToast_) {
+                firewallToast_->close();
+                firewallToast_->deleteLater();
+                firewallToast_.clear();
+            }
+            dismissedRequests_.insert(path.toLower());
+            QTimer::singleShot(1500, this, [this, path] {
+                dismissedRequests_.remove(path.toLower());
+                updateFirewallToast();
+            });
+            updateFirewallToast();
         });
-    auto *pendingLine = line(l);
-    pendingLine->addWidget(label(QString::number(firewall_.pending().size()) + " pending applications", "faint"));
-    pendingLine->addStretch();
-    auto *list = button("View pending list", "view-pending-list", "link");
-    pendingLine->addWidget(list);
-    connect(list, &QPushButton::clicked, this, [this] { selectView("pending"); });
-    positionOverlays();
-    firewallNotice_->show();
-    firewallNotice_->raise();
-    if (modalOverlay_) modalOverlay_->raise();
+        connect(firewallToast_, &AccessToast::dismissed, this, [this](const QString &path) {
+            dismissedRequests_.insert(path.toLower());
+            if (firewallToast_) {
+                firewallToast_->close();
+                firewallToast_->deleteLater();
+                firewallToast_.clear();
+            }
+            updateFirewallToast();
+        });
+        connect(firewallToast_, &AccessToast::openRequested, this, &MainWindow::bringToFront);
+        connect(firewallToast_, &AccessToast::pendingListRequested, this, [this] {
+            bringToFront();
+            selectView("pending");
+        });
+    }
+    int others = 0;
+    for (const auto &p : pending)
+        if (showable(p) && p.path.compare(current->path, Qt::CaseInsensitive) != 0) ++others;
+    firewallToast_->setRequest({current->path, current->signer, current->attempts, others,
+                                firewall_.status().control && !firewall_.busy()});
+    if (!firewallToast_->isVisible()) {
+        firewallToast_->placeOn(isVisible() ? screen() : nullptr);
+        firewallToast_->show();
+    }
 }
 
-void MainWindow::editFirewallRule(const QString &path) {
-    if (path.isEmpty()) return;
-    const auto *rule = firewall_.ruleFor(path);
+void MainWindow::editFirewallRule(const QString &id) {
+    if (id.isEmpty()) return;
+    const bool can = firewall_.status().connected && firewall_.status().control && !firewall_.busy();
+    const auto *signerRule = firewall_.ruleById(id);
+    if (signerRule && signerRule->scope != "path") {
+        // Regla por firma: se quita o se deja. Cambiarla se hace desde el próximo aviso de una app que coincida.
+        const QString ruleId = signerRule->id;
+        auto *l = modal("Edit rule", ModalOwner::General);
+        l->addWidget(label(signerRule->scope == "app" ? signerRule->name + " · any version"
+                                                      : "All apps from " + signerRule->signer, "heading"));
+        definition(l, "Signed by", signerRule->signer);
+        definition(l, "Current policy", signerRule->allow ? "Allow" : "Block");
+        definition(l, "Created", firewallTime(signerRule->created));
+        definition(l, "Last blocked attempt", firewallTime(signerRule->lastBlock));
+        int covered = 0;
+        for (const auto &r : firewall_.rules()) covered += r.scope == "covered" && r.name == ruleId;
+        definition(l, "Files seen", QString::number(covered));
+        l->addWidget(label(signerRule->scope == "app"
+                               ? "Applies to this executable in any folder while it keeps a valid signature from this "
+                                 "publisher, so updates don't ask again."
+                               : "Applies to any executable with a valid signature from this publisher.",
+                           "muted", true));
+        auto *actions = line(l);
+        auto *remove = button("Remove rule", "remove-rule", "ghost");
+        remove->setEnabled(can);
+        actions->addWidget(remove);
+        actions->addStretch();
+        auto *cancel = button("Cancel", "cancel-rule", "ghost");
+        actions->addWidget(cancel);
+        connect(remove, &QPushButton::clicked, this, [this, ruleId] {
+            firewall_.removeRule(ruleId);
+            closeModal();
+        });
+        connect(cancel, &QPushButton::clicked, this, &MainWindow::closeModal);
+        return;
+    }
+    const QString path = signerRule ? signerRule->path : id;
+    const auto *rule = signerRule;
+    const auto *covering = rule ? nullptr : firewall_.ruleFor(path); // cobertura de una regla por firma
     auto *l = modal(rule ? "Edit rule" : "Add rule", ModalOwner::General);
     l->addWidget(label(FirewallClient::fileName(path), "heading"));
     l->addWidget(label(wrappablePath(path), "link", true));
     definition(l, "Current policy", rule ? (rule->allow ? "Allow" : "Block")
-                                         : firewall_.status().ask ? "Ask · blocked until you decide" : "No rule");
+                                    : covering ? (covering->allow ? "Allow" : "Block")
+                                    : firewall_.status().ask ? "Ask · blocked until you decide" : "No rule");
+    if (covering) {
+        if (const auto *owner = firewall_.ruleById(covering->name))
+            definition(l, "Set by", owner->allow ? "Allow " + FirewallClient::describe(*owner)
+                                                 : "Block " + FirewallClient::describe(*owner));
+    }
     if (rule) {
         definition(l, "Created", firewallTime(rule->created));
         definition(l, "Last blocked attempt", firewallTime(rule->lastBlock));
@@ -3684,7 +3733,6 @@ void MainWindow::editFirewallRule(const QString &path) {
                        "Without a rule, the application asks again.",
                        "muted", true));
     auto *actions = line(l);
-    const bool can = firewall_.status().connected && firewall_.status().control && !firewall_.busy();
     if (rule) {
         auto *remove = button("Remove rule", "remove-rule", "ghost");
         remove->setEnabled(can);
