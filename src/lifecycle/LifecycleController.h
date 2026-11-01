@@ -31,6 +31,8 @@ class TraySurface : public QObject {
     virtual void setToolTip(const QString &text) = 0;
     virtual void show() = 0;
     virtual void hide() = 0;
+    // Aviso breve del sistema; un clic en el aviso pide abrir la ventana.
+    virtual void showMessage(const QString &, const QString &) {}
   signals:
     void openRequested();
 };
@@ -53,6 +55,7 @@ class LifecycleController final : public QObject {
     // El dueño llama QApplication::quit() luego, desde su punto de composición.
     void finishGuiShutdown();
     bool recoverableTray() const;
+    void notify(const QString &title, const QString &text);
     bool quitPending() const { return quitPending_; }
     QMenu *menu() const { return menu_.get(); }
     QString statusText() const;

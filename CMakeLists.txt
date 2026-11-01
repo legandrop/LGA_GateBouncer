@@ -5,7 +5,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_AUTOGEN_PARALLEL 1)
-find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 6.8 REQUIRED COMPONENTS Widgets Network)
 qt_standard_project_setup(REQUIRES 6.8)
 add_subdirectory(src/data)
 add_subdirectory(src/assistance)
@@ -42,10 +42,12 @@ qt_add_library(GateBouncerGuiStage SHARED
     src/engine/EngineViewClient.h
     src/engine/ReviewGateway.cpp
     src/engine/ReviewGateway.h
+    src/engine/FirewallClient.cpp
+    src/engine/FirewallClient.h
     resources/app.rc
 )
 set_source_files_properties(src/main.cpp PROPERTIES COMPILE_DEFINITIONS "main=GateBouncerGuiMain")
-target_link_libraries(GateBouncerGuiStage PRIVATE Qt6::Widgets gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle advapi32)
+target_link_libraries(GateBouncerGuiStage PRIVATE Qt6::Widgets Qt6::Network gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle advapi32)
 target_include_directories(GateBouncerGuiStage PRIVATE src common)
 target_compile_options(GateBouncerGuiStage PRIVATE -Wall -Wextra -Wpedantic)
 qt_add_resources(GateBouncerGuiStage "gatebouncer_assets"
@@ -71,7 +73,7 @@ if(GATEBOUNCER_OBSERVER_SOURCE)
         controller/deployment_observer_main.cpp "${GATEBOUNCER_OBSERVER_SOURCE}")
     target_compile_definitions(GateBouncerObserver PRIVATE GATEBOUNCER_OBSERVER)
     target_include_directories(GateBouncerObserver PRIVATE src common)
-    target_link_libraries(GateBouncerObserver PRIVATE Qt6::Widgets gatebouncer_data gatebouncer_assistance
+    target_link_libraries(GateBouncerObserver PRIVATE Qt6::Widgets Qt6::Network gatebouncer_data gatebouncer_assistance
         gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire
         gatebouncer_lifecycle gatebouncer_native_ii advapi32 shell32 fwpuclnt)
 endif()
@@ -118,3 +120,27 @@ if(GATEBOUNCER_REVIEW_TEST_SOURCE)
 endif()
 
 set_target_properties(GateBouncerGuiStage PROPERTIES PREFIX "" AUTOMOC ON)
+
+# GateBouncer.exe común: la misma interfaz sin el lanzador de la instalación protegida.
+get_target_property(gatebouncer_app_sources GateBouncerGuiStage SOURCES)
+list(FILTER gatebouncer_app_sources EXCLUDE REGEX "deployment_ordinary_stage.cpp|src/main.cpp")
+qt_add_executable(GateBouncer WIN32 ${gatebouncer_app_sources} src/app_main.cpp)
+target_include_directories(GateBouncer PRIVATE src common)
+target_link_libraries(GateBouncer PRIVATE Qt6::Widgets Qt6::Network gatebouncer_data gatebouncer_assistance
+    gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire
+    gatebouncer_lifecycle gatebouncer_native_ii advapi32 shell32 fwpuclnt)
+target_compile_options(GateBouncer PRIVATE -Wall -Wextra -Wpedantic)
+qt_add_resources(GateBouncer "gatebouncer_app_assets"
+    PREFIX "/gatebouncer"
+    FILES
+        resources/fonts/Inter-Regular.ttf
+        resources/fonts/Inter-Medium.ttf
+        resources/fonts/Inter-SemiBold.ttf
+        resources/icons/LGA_GateBouncer.png
+        resources/icons/tray/tray_16.png
+        resources/icons/tray/tray_20.png
+        resources/icons/tray/tray_24.png
+        resources/icons/tray/tray_32.png
+        resources/icons/tray/tray_40.png
+        resources/icons/tray/tray_48.png
+)

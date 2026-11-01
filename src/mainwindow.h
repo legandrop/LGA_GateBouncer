@@ -4,6 +4,7 @@
 #include "lifecycle/LifecycleController.h"
 #include "lifecycle/StartupPreference.h"
 #include "engine/ReviewGateway.h"
+#include "engine/FirewallClient.h"
 #include <QMainWindow>
 #include <QPointer>
 #include "assistance/ui/GeneralSession.h"
@@ -90,6 +91,13 @@ class MainWindow final : public QMainWindow {
     void about();
     void updateLifecycle();
     void openEngineRequest(const QString &rowId);
+    // Motor sin driver: Processes, Pending, Activity y Rules en modo Live.
+    bool firewallView() const;
+    void renderFirewall();
+    void openFirewallRequest(const QString &path);
+    void renderFirewallNotice();
+    void editFirewallRule(const QString &path);
+    void onNewFirewallPending(const QString &path);
     void finishShutdownWhenIdle();
     enum class ModalOwner { General, Simulation, Live, ImportedDraft, ImportedReview, ImportedActivation, FileRule, FileBackup };
     QVBoxLayout *modal(const QString &title, ModalOwner owner = ModalOwner::General);
@@ -132,6 +140,10 @@ class MainWindow final : public QMainWindow {
     QPointer<QLabel> count_;
     QPointer<QLabel> emptyState_;
     QPointer<QFrame> detail_, notice_, modalOverlay_, message_;
+    FirewallClient firewall_;
+    QPointer<QFrame> firewallNotice_;
+    QString firewallNoticePath_;
+    QByteArray firewallNoticeKey_;
     QByteArray ordinaryNoticeKey_;
     QByteArray tableSourceKey_;
     QPointer<Assistance::Ui::ExplanationWidget> ordinaryExplanation_;

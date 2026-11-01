@@ -467,6 +467,19 @@ class Spinner final : public QWidget {
   private:
     int angle_ = 90;
 };
+QString firewallTime(qint64 seconds) {
+    return seconds > 0 ? QDateTime::fromSecsSinceEpoch(seconds).toString("yyyy-MM-dd HH:mm:ss") : QString("—");
+}
+QString firewallDestination(const QString &remote, int port, int protocol) {
+    if (remote.isEmpty()) return "—";
+    return (remote.contains(':') ? "[" + remote + "]" : remote) + (port ? ":" + QString::number(port) : QString()) +
+           " · " + FirewallClient::protocolName(protocol);
+}
+QString firewallId(const QString &path) { return "fw:" + path; }
+QString firewallPath(const QString &id) { return id.startsWith("fw:") ? id.mid(3) : QString(); }
+// Una ruta larga sólo se parte en espacios: se le dan puntos de corte invisibles después de cada barra.
+QString wrappablePath(const QString &path) { return QString(path).replace("\\", QString("\\") + QChar(0x200B)); }
+
 } // namespace
 
 class RowsModel final : public QAbstractTableModel {
@@ -602,6 +615,23 @@ MainWindow::MainWindow(QWidget *parent, bool isolatedQa, const QString &qaRoot,
     connect(&product_, &ProductController::changed, this, &MainWindow::renderOrdinaryNotice);
     connect(&product_, &ProductController::importedViewsInvalidated, this, &MainWindow::closeStaleModal);
     connect(&model_, &Simulation::changed, this, &MainWindow::updateLifecycle);
+    connect(&firewall_, &FirewallClient::changed, this, [this] {
+        if (product_.simulation()) return;
+        // El estado del motor cambia los botones de la página: se rearma sólo si cambió la conexión o el modo.
+        const auto &s = firewall_.status();
+        const QString shape = QString("%1%2%3%4").arg(s.connected).arg(s.ask).arg(s.allApps).arg(s.control);
+        if (firewallView() && shape != property("firewall-shape").toString()) {
+            setProperty("firewall-shape", shape);
+            buildPage();
+        } else {
+            refresh();
+        }
+    });
+    connect(&firewall_, &FirewallClient::newPending, this, &MainWindow::onNewFirewallPending);
+    connect(&firewall_, &FirewallClient::commandFinished, this, [this](bool, const QString &text) {
+        if (!closing_) message(text);
+    });
+    if (!isolatedQa) firewall_.setActive(true);
     connect(&reviewer_, &ReviewGateway::changed, this, [this] {
         // Las páginas anteriores se retiran con deleteLater; actualizar también el aviso actual.
         for (auto *status : findChildren<QLabel *>("reviewer-status")) status->setText(reviewer_.status());
@@ -868,8 +898,15 @@ void MainWindow::buildPage() {
             {"rules", {"Rules", "Service policy records and inactive local review candidates."}},
             {"import", {"Import from NetLimiter", "Structural analysis only · compatibility not validated."}},
             {"settings", {"Settings", "Engine status and assistance configuration with separate consents."}}};
-        title_->setText(liveHeadings[view_][0]); subtitle_->setText(liveHeadings[view_][1]);
-        renderLive(); updatePageState(); refreshing_ = false; refreshTable(true); restoreFocus(); positionOverlays(); return;
+        const QMap<QString, QStringList> firewallHeadings{
+            {"processes", {"Applications", "Running applications and every application with a rule or a request."}},
+            {"pending", {"Pending requests", "Applications blocked until you allow or block them."}},
+            {"activity", {"Activity", "Blocked attempts and rule changes recorded by the engine."}},
+            {"rules", {"Rules", "Saved Allow and Block rules for each application."}}};
+        const auto &headings = firewallView() ? firewallHeadings : liveHeadings;
+        title_->setText(headings[view_][0]); subtitle_->setText(headings[view_][1]);
+        if (firewallView()) renderFirewall(); else renderLive();
+        updatePageState(); refreshing_ = false; refreshTable(true); restoreFocus(); renderFirewallNotice(); positionOverlays(); return;
     }
     const QMap<QString, QStringList> headings{
         {"processes",
@@ -1030,6 +1067,20 @@ void MainWindow::updatePageState() {
             if (!product_.reviewError().isEmpty()) messages << product_.reviewError();
             text->setText(messages.join('\n')); text->setVisible(!messages.isEmpty());
         }
+        // El motor sin driver manda sobre el estado visible del modo Live.
+        const auto &s = firewall_.status();
+        pendingCount_->setText(s.connected ? QString::number(firewall_.pending().size()) : "—");
+        pendingCount_->setVisible(!s.connected || !firewall_.pending().isEmpty());
+        sideStatus_->setText(!s.connected ? "Engine not running\nNo new requests"
+            : !s.ask ? "Unknown applications allowed\nRules still apply"
+            : s.allApps ? "Protection on\nUnknown applications ask first" : "Test session\nOnly test applications ask");
+        status_->setText(!s.connected ? "Firewall engine not running" : s.control ? "Firewall engine connected"
+            : "Firewall engine connected · view only");
+        if (banner) banner->setText(!s.connected ? "Live · firewall engine not running"
+            : s.ask ? "Live · unknown applications are blocked until you decide" : "Live · unknown applications allowed");
+        if (firewallView())
+            footer_->setText(s.connected ? QString("%1 rules · %2 pending · engine started %3").arg(firewall_.rules().size())
+                .arg(firewall_.pending().size()).arg(firewallTime(s.started)) : "No engine connection · retrying every second");
     }
 }
 void MainWindow::refresh() {
@@ -1037,6 +1088,7 @@ void MainWindow::refresh() {
     refreshTable();
     if (detail_ && !selected_.isEmpty()) openDetail(selected_);
     renderNotice();
+    renderFirewallNotice();
     closeStaleModal();
 }
 QTableView *MainWindow::makeTable(const QStringList &headers, const QVector<int> &widths,
@@ -1078,7 +1130,7 @@ QTableView *MainWindow::makeTable(const QStringList &headers, const QVector<int>
     connect(table_, &QTableView::clicked, this, [this](const QModelIndex &index) {
         if (view_ == "processes" ||
             (view_ == "pending" && (index.column() == 0 || index.column() == 3)) ||
-            (view_ == "rules" && index.column() == 5) ||
+            (view_ == "rules" && index.column() == (firewallView() ? 4 : 5)) ||
             (view_ == "import" && !product_.simulation()))
             tableAction(index);
     });
@@ -1301,7 +1353,67 @@ void MainWindow::refreshTable(bool newPage) {
     const auto current = table_->currentIndex().isValid() ? table_->currentIndex().data(IdRole).toString() : saved.selectedId;
     QVector<Row> result;
     const auto &state = model_.state();
-    if (!product_.simulation()) {
+    if (firewallView()) {
+        const auto policyCell = [this](const QString &path) -> Cell {
+            if (const auto *r = firewall_.ruleFor(path)) return r->allow ? Cell{"Allow", "Allow", {}} : Cell{"Block", "Block", {}};
+            if (firewall_.pendingFor(path)) return {"Waiting", "AskPending", {}};
+            return firewall_.status().ask ? Cell{"Ask", "Ask", {}} : Cell{"No rule", "inactive", {}};
+        };
+        const auto lastBlocked = [this](const QString &path) -> qint64 {
+            if (const auto *p = firewall_.pendingFor(path)) return p->last;
+            if (const auto *r = firewall_.ruleFor(path)) return r->lastBlock;
+            return 0;
+        };
+        const auto appCell = [](const QString &path) -> Cell {
+            const auto name = FirewallClient::fileName(path);
+            return {name + "\n" + path, "glyph:" + name.left(2).toUpper(), name.toLower()};
+        };
+        if (view_ == "processes") {
+            QMap<QString, QString> apps; // clave en minúsculas -> ruta mostrada
+            QSet<QString> running;
+            for (const auto &p : product_.catalog().processes)
+                if (!p.imagePath.isEmpty()) { apps.insert(p.imagePath.toLower(), p.imagePath); running.insert(p.imagePath.toLower()); }
+            for (const auto &r : firewall_.rules()) apps.insert(r.path.toLower(), r.path);
+            for (const auto &p : firewall_.pending()) apps.insert(p.path.toLower(), p.path);
+            for (auto it = apps.cbegin(); it != apps.cend(); ++it) {
+                const auto &path = it.value();
+                if (!query_.isEmpty() && !path.contains(query_, Qt::CaseInsensitive)) continue;
+                const auto policy = policyCell(path);
+                const QString filterName = policy.kind == "AskPending" ? "Ask" : policy.kind == "inactive" ? "Allow" : policy.text;
+                if (policyFilter_ != "All" && filterName != policyFilter_) continue;
+                const auto blocked = lastBlocked(path);
+                result.push_back({firewallId(path), {appCell(path), policy, {firewallTime(blocked), {}, blocked},
+                    {running.contains(it.key()) ? "Running" : "Not running", {}, {}}}});
+            }
+            if (count_) count_->setText(QString("%1 of %2 applications").arg(result.size()).arg(apps.size()));
+        } else if (view_ == "pending") {
+            for (const auto &p : firewall_.pending())
+                result.push_back({firewallId(p.path), {appCell(p.path),
+                    {firewallDestination(p.remote, p.port, p.protocol) + "\n" + QString::number(p.attempts) + " blocked attempts", "strong", {}},
+                    {firewallTime(p.last), {}, p.last}, {"Review request   →", "action", {}}}});
+        } else if (view_ == "activity") {
+            const auto &events = firewall_.activity();
+            for (int i = 0; i < events.size(); ++i) {
+                const auto &e = events[i];
+                const QString app = e.path.isEmpty() ? QString("GateBouncer") : FirewallClient::fileName(e.path) + "\n" + e.path;
+                const QString destination = firewallDestination(e.remote, e.port, e.protocol);
+                if (!activityQuery_.isEmpty() && !(app + " " + e.kind + " " + destination).contains(activityQuery_, Qt::CaseInsensitive)) continue;
+                result.push_back({"fw-event:" + QString::number(i), {{firewallTime(e.time), {}, e.time},
+                    {app, "strong", app.toLower()}, {e.kind, e.kind.startsWith("Blocked") ? "Block" : QString(), {}},
+                    {destination, {}, {}}}});
+            }
+        } else {
+            int allow = 0;
+            for (const auto &r : firewall_.rules()) {
+                allow += r.allow;
+                if (!query_.isEmpty() && !r.path.contains(query_, Qt::CaseInsensitive)) continue;
+                result.push_back({firewallId(r.path), {appCell(r.path), policyCell(r.path),
+                    {firewallTime(r.created), {}, r.created}, {firewallTime(r.lastBlock), {}, r.lastBlock}, {"Edit", "action", {}}}});
+            }
+            if (auto *count = pageControl<QLabel>(page_, "firewall-rule-count"))
+                count->setText(QString("%1 Allow rules · %2 Block rules").arg(allow).arg(firewall_.rules().size() - allow));
+        }
+    } else if (!product_.simulation()) {
         if (view_ == "processes") for (const auto &p : product_.catalog().processes) {
             if (!(p.name + " " + p.imagePath).contains(query_, Qt::CaseInsensitive)) continue;
             const QString status = p.status == Data::FieldStatus::Known ? "Observed"
@@ -1549,7 +1661,13 @@ void MainWindow::refreshTable(bool newPage) {
         empty ? "No matching sample rows. Change the search or filter."
               : "Synthetic fixtures only. Enter opens the selected row where available.");
     if (emptyState_) {
-        emptyState_->setText(!product_.simulation()
+        emptyState_->setText(firewallView()
+            ? !firewall_.status().connected ? "GateBouncer engine is not running\nStart the engine to see applications, requests and rules."
+                : view_ == "pending" ? "No pending requests\nEvery blocked application has a decision."
+                : view_ == "activity" ? "No recorded activity yet"
+                : view_ == "rules" ? "No rules yet\nRules appear when you allow or block an application."
+                : "No matching applications"
+            : !product_.simulation()
             ? view_ == "pending" ? product_.ordinary()->current() ? "No requests awaiting a decision" : "Requests unavailable · refresh to check the connection"
                 : view_ == "activity" ? (activityQuery_.isEmpty() ? "No retained activity records\nSee monitoring coverage below; missing records do not establish inactivity." : "No matching recorded activity\nChange or clear the search.")
                 : view_ == "rules" ? QString(query_.isEmpty() ? "No rules or saved review candidates" : "No matching rules or saved review candidates\nChange or clear the search.")
@@ -1569,6 +1687,12 @@ void MainWindow::tableAction(const QModelIndex &index) {
         return;
     const QString id = index.data(IdRole).toString();
     if (!product_.simulation()) {
+        if (firewallView()) {
+            const auto path = firewallPath(id);
+            if (view_ == "pending" || firewall_.pendingFor(path)) openFirewallRequest(path);
+            else if (!path.isEmpty()) editFirewallRule(path);
+            return;
+        }
         if (view_ == "processes") renderLiveDetail(id);
         else if (view_ == "pending") openEngineRequest(id);
         else if (view_ == "rules" && id.startsWith("principal-rule:")) cleanupLiveRule();
@@ -3264,6 +3388,11 @@ void MainWindow::positionOverlays() {
                            !product_.simulation() || model_.review(explanation_.visibleId()).expanded ? 625 : 541);
         notice_->setGeometry(root_->width() - w - 20, root_->height() - h - 20, w, h);
     }
+    if (firewallNotice_) {
+        const int w = small ? 400 : 420;
+        const int h = qMin(root_->height() - 105, qMax(360, firewallNotice_->sizeHint().height()));
+        firewallNotice_->setGeometry(root_->width() - w - 20, root_->height() - h - 20, w, h);
+    }
     if (modalOverlay_)
         modalOverlay_->setGeometry(0, 36, root_->width(), root_->height() - 36);
     if (message_) {
@@ -3300,6 +3429,10 @@ bool MainWindow::eventFilter(QObject *object, QEvent *event) {
         if (key->key() == Qt::Key_Escape) {
             if (modalOverlay_)
                 closeModal();
+            else if (firewallNotice_) {
+                firewallNoticePath_.clear();
+                renderFirewallNotice();
+            }
             else if (notice_)
                 product_.simulation() ? explanation_.close() : product_.ordinary()->closeNotice();
             else if (detail_) {
@@ -3328,5 +3461,253 @@ bool MainWindow::eventFilter(QObject *object, QEvent *event) {
         }
     }
     return QMainWindow::eventFilter(object, event);
+}
+// ---------------------------------------------------------------------------------------------
+// Motor sin driver. En modo Live, Processes, Pending, Activity y Rules leen GateBouncerEngine por su
+// canal local. El primer intento de una app sin regla ya quedó bloqueado; Allow vale para el siguiente.
+
+bool MainWindow::firewallView() const {
+    return !product_.simulation() &&
+           (view_ == "processes" || view_ == "pending" || view_ == "activity" || view_ == "rules");
+}
+
+void MainWindow::renderFirewall() {
+    const auto &s = firewall_.status();
+    {
+        QString text;
+        if (!s.connected)
+            text = "GateBouncer engine is not running. If it is installed, saved rules and the block on unknown "
+                   "applications stay active, but no new requests appear until it starts. To install it, run "
+                   "GateBouncerEngine.exe --install from an administrator command prompt.";
+        else if (!s.ask)
+            text = "Unknown applications can connect. Saved Allow and Block rules still apply.";
+        else if (!s.allApps)
+            text = "Test session: only the selected test applications ask before connecting. Rules disappear when "
+                   "the engine stops.";
+        auto *n = note(text, s.connected && s.ask);
+        n->setObjectName("firewall-state");
+        n->setVisible(!text.isEmpty());
+        pageLayout_->addWidget(n);
+    }
+    if (view_ == "processes") {
+        auto *toolbar = line(pageLayout_);
+        auto *search = new QLineEdit(query_);
+        search->setObjectName("process-search");
+        search->setAccessibleName("Search applications or paths");
+        search->setPlaceholderText("Search applications or paths…");
+        search->addAction(navigationIcon(6), QLineEdit::LeadingPosition);
+        toolbar->addWidget(search, 1);
+        auto *policy = combo({"All policies", "Ask", "Allow", "Block"}, "policy-filter");
+        policy->setCurrentIndex(policyFilter_ == "All" ? 0 : qMax(0, policy->findText(policyFilter_)));
+        policy->setFixedWidth(113);
+        toolbar->addWidget(policy);
+        makeTable({"Application", "Policy", "Last blocked attempt", "State"}, {44, 20, 20, 16});
+        auto *foot = line(pageLayout_);
+        count_ = label({}, "faint");
+        foot->addWidget(count_);
+        foot->addWidget(label("Allowed connections are not recorded; only blocked attempts are.", "faint"));
+        foot->addStretch();
+        connect(search, &QLineEdit::textChanged, this, [this](const QString &v) {
+            query_ = v;
+            refreshTable();
+        });
+        connect(policy, &QComboBox::currentIndexChanged, this, [this, policy](int i) {
+            policyFilter_ = i ? policy->currentText() : "All";
+            refreshTable();
+        });
+    } else if (view_ == "pending") {
+        auto *summary = line(pageLayout_);
+        summary->addWidget(label("Blocked until you decide", "warning"));
+        summary->addWidget(label("Allow lets the application's next attempt connect", "muted"));
+        summary->addStretch();
+        makeTable({"Application", "Latest destination", "Last attempt", "Decision"}, {34, 30, 16, 20}, 57);
+        auto *foot = line(pageLayout_);
+        foot->addWidget(label("Closing a request keeps the application blocked and pending.", "faint"));
+        foot->addStretch();
+        auto *review = button("Review selected request", "review-selected");
+        foot->addWidget(review);
+        connect(review, &QPushButton::clicked, this, [this] {
+            if (table_ && table_->currentIndex().isValid())
+                openFirewallRequest(firewallPath(table_->currentIndex().data(IdRole).toString()));
+        });
+    } else if (view_ == "activity") {
+        auto *toolbar = line(pageLayout_);
+        auto *search = new QLineEdit(activityQuery_);
+        search->setObjectName("activity-search");
+        search->setAccessibleName("Search activity");
+        search->setPlaceholderText("Search activity…");
+        toolbar->addWidget(search, 1);
+        makeTable({"Time", "Application", "Event", "Destination"}, {18, 34, 24, 24}, 42);
+        table_->sortByColumn(0, Qt::DescendingOrder);
+        pageLayout_->addWidget(label("The engine keeps the latest 2,000 events while it runs.", "faint", true));
+        connect(search, &QLineEdit::textChanged, this, [this](const QString &v) {
+            activityQuery_ = v;
+            refreshTable();
+        });
+    } else {
+        auto *toolbar = line(pageLayout_);
+        auto *summary = label({}, "muted");
+        summary->setObjectName("firewall-rule-count");
+        toolbar->addWidget(summary);
+        toolbar->addStretch();
+        auto *mode = button(s.ask ? "Allow unknown applications" : "Ask for unknown applications", "firewall-mode",
+                            "ghost");
+        mode->setEnabled(s.connected && s.control && !firewall_.busy());
+        toolbar->addWidget(mode);
+        connect(mode, &QPushButton::clicked, this, [this] { firewall_.setAsk(!firewall_.status().ask); });
+        makeTable({"Application", "Policy", "Created", "Last blocked attempt", "Rule"}, {40, 14, 17, 19, 10});
+        auto *foot = line(pageLayout_);
+        foot->addWidget(label("Rules cover all outbound destinations and protocols for that executable.", "faint"));
+        foot->addStretch();
+        auto *edit = button("Edit selected", "edit-selected", "ghost");
+        foot->addWidget(edit);
+        connect(edit, &QPushButton::clicked, this, [this] {
+            if (table_ && table_->currentIndex().isValid())
+                editFirewallRule(firewallPath(table_->currentIndex().data(IdRole).toString()));
+        });
+    }
+}
+
+void MainWindow::onNewFirewallPending(const QString &path) {
+    const QString name = FirewallClient::fileName(path);
+    if (lifecycle_ && (!isVisible() || isMinimized()))
+        lifecycle_->notify("GateBouncer blocked " + name,
+                           "It is waiting for your decision. Open GateBouncer to allow or block it.");
+    if (firewallNoticePath_.isEmpty()) openFirewallRequest(path);
+}
+
+void MainWindow::openFirewallRequest(const QString &path) {
+    if (path.isEmpty()) return;
+    if (!firewall_.pendingFor(path)) {
+        editFirewallRule(path);
+        return;
+    }
+    firewallNoticePath_ = path;
+    firewallNoticeKey_.clear();
+    renderFirewallNotice();
+}
+
+void MainWindow::renderFirewallNotice() {
+    const auto *p = product_.simulation() ? nullptr : firewall_.pendingFor(firewallNoticePath_);
+    if (!p) firewallNoticePath_.clear();
+    QByteArray key;
+    if (p) {
+        QDataStream stamp(&key, QIODevice::WriteOnly);
+        stamp << p->path << p->remote << p->port << p->protocol << p->attempts << p->last << firewall_.status().control
+              << firewall_.busy() << int(firewall_.pending().size());
+    }
+    if (firewallNotice_ && key == firewallNoticeKey_) return;
+    firewallNoticeKey_ = key;
+    if (firewallNotice_) {
+        dispose(firewallNotice_);
+        firewallNotice_.clear();
+    }
+    if (!p) {
+        positionOverlays();
+        return;
+    }
+    const QString path = p->path;
+    firewallNotice_ = new QFrame(root_);
+    firewallNotice_->setObjectName("access-notice");
+    firewallNotice_->setAccessibleName("Access request");
+    auto *l = new QVBoxLayout(firewallNotice_);
+    l->setContentsMargins(15, 12, 15, 12);
+    l->setSpacing(9);
+    auto *head = line(l);
+    head->addWidget(label("LGA   GateBouncer · access request", "faint"), 1);
+    auto *close = button("×", "close-request", "ghost");
+    close->setFixedSize(25, 25);
+    close->setAccessibleName("Close request and keep it pending");
+    head->addWidget(close);
+    l->addWidget(label(FirewallClient::fileName(path), "heading"));
+    l->addWidget(label(wrappablePath(path), "link", true));
+    l->addWidget(label("Blocked · waiting for your decision", "warning"));
+    definition(l, "Destination", firewallDestination(p->remote, p->port, p->protocol) + " · outbound");
+    definition(l, "Last attempt", firewallTime(p->last));
+    definition(l, "Blocked attempts", QString::number(p->attempts));
+    divider(l);
+    l->addWidget(label("This attempt was already blocked. Allow saves a permanent rule and the application's next "
+                       "attempt connects; most applications retry on their own. Block keeps it blocked without asking "
+                       "again.",
+                       "muted", true));
+    l->addStretch();
+    auto *actions = line(l);
+    auto *keep = button("Keep pending", "keep-access-pending", "ghost");
+    actions->addWidget(keep);
+    actions->addStretch();
+    auto *block = button("Block", "decide-block", "danger");
+    auto *allow = button("Allow", "decide-allow", "primary");
+    const bool can = firewall_.status().control && !firewall_.busy();
+    block->setEnabled(can);
+    allow->setEnabled(can);
+    if (!firewall_.status().control)
+        l->addWidget(label("This window cannot change rules. Run the installed GateBouncer.", "faint", true));
+    actions->addWidget(block);
+    actions->addWidget(allow);
+    const auto keepPending = [this] {
+        firewallNoticePath_.clear();
+        renderFirewallNotice();
+    };
+    connect(close, &QPushButton::clicked, this, keepPending);
+    connect(keep, &QPushButton::clicked, this, keepPending);
+    for (auto *b : {block, allow})
+        connect(b, &QPushButton::clicked, this, [this, path, allowed = b == allow] {
+            firewall_.decide(path, allowed);
+            firewallNoticePath_.clear();
+            renderFirewallNotice();
+        });
+    auto *pendingLine = line(l);
+    pendingLine->addWidget(label(QString::number(firewall_.pending().size()) + " pending applications", "faint"));
+    pendingLine->addStretch();
+    auto *list = button("View pending list", "view-pending-list", "link");
+    pendingLine->addWidget(list);
+    connect(list, &QPushButton::clicked, this, [this] { selectView("pending"); });
+    positionOverlays();
+    firewallNotice_->show();
+    firewallNotice_->raise();
+    if (modalOverlay_) modalOverlay_->raise();
+}
+
+void MainWindow::editFirewallRule(const QString &path) {
+    if (path.isEmpty()) return;
+    const auto *rule = firewall_.ruleFor(path);
+    auto *l = modal(rule ? "Edit rule" : "Add rule", ModalOwner::General);
+    l->addWidget(label(FirewallClient::fileName(path), "heading"));
+    l->addWidget(label(wrappablePath(path), "link", true));
+    definition(l, "Current policy", rule ? (rule->allow ? "Allow" : "Block")
+                                         : firewall_.status().ask ? "Ask · blocked until you decide" : "No rule");
+    if (rule) {
+        definition(l, "Created", firewallTime(rule->created));
+        definition(l, "Last blocked attempt", firewallTime(rule->lastBlock));
+    }
+    l->addWidget(label("A rule covers all outbound destinations and protocols for this executable path. "
+                       "Without a rule, the application asks again.",
+                       "muted", true));
+    auto *actions = line(l);
+    const bool can = firewall_.status().connected && firewall_.status().control && !firewall_.busy();
+    if (rule) {
+        auto *remove = button("Remove rule", "remove-rule", "ghost");
+        remove->setEnabled(can);
+        actions->addWidget(remove);
+        connect(remove, &QPushButton::clicked, this, [this, path] {
+            firewall_.removeRule(path);
+            closeModal();
+        });
+    }
+    actions->addStretch();
+    auto *cancel = button("Cancel", "cancel-rule", "ghost");
+    auto *block = button("Block", "rule-block", "danger");
+    auto *allow = button("Allow", "rule-allow", "primary");
+    block->setEnabled(can && (!rule || rule->allow));
+    allow->setEnabled(can && (!rule || !rule->allow));
+    actions->addWidget(cancel);
+    actions->addWidget(block);
+    actions->addWidget(allow);
+    connect(cancel, &QPushButton::clicked, this, &MainWindow::closeModal);
+    for (auto *b : {block, allow})
+        connect(b, &QPushButton::clicked, this, [this, path, allowed = b == allow] {
+            firewall_.decide(path, allowed);
+            closeModal();
+        });
 }
 } // namespace Gate

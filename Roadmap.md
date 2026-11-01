@@ -1,20 +1,31 @@
 # Roadmap
 
-**No validated firewall release.** Updated October 10, 2026.
+**No release yet.** Updated November 1, 2026.
 
-**First usable version:** hold unknown outbound connections for explicit Allow/Block, support permanent and scoped rules, and provide searchable processes, distinct history dates and reversible rule cleanup. Include safe NetLimiter import review and optional NVIDIA explanations with cited file/IP evidence. Unknown imports stay inactive; advice never authorizes traffic. Installation, coverage and recovery must pass before release. No bandwidth control.
+**First usable version:** block unknown outbound connections and ask Allow/Block, keep permanent rules per application,
+and provide searchable applications, activity and rule cleanup. Include safe NetLimiter import review and optional
+NVIDIA explanations. Unknown imports stay inactive; advice never authorizes traffic. No bandwidth control.
 
-Checkboxes mean **verified acceptance tests**, not code or successful builds. **Implemented** means source exists; **partial** means remaining implementation or coverage gaps. Windows validation is blocked; simulation and local tests do not complete these checks.
+The engine is driverless (Windows Filtering Platform from an elevated service). A decision applies to the
+application's next attempt; the attempt that produced the request has already been blocked.
 
-- [ ] **Processes, search, history and cleanup — implemented; unverified live.** Done when real observations keep attempt, authorization and traffic distinct, search finds the process, and selected old rules can be removed/restored without treating missing observations as inactivity.
-- [ ] **Connection notice and Allow/Block — implemented; blocked on Windows.** Done when an original connection produces the notice, dismissing leaves it unresolved, and independent traffic observation verifies both decisions and another firewall's effect.
-- [ ] **Permanent rules — implemented; blocked on Windows.** Done when saved Allow/Block survives service restart and matches future connections; changed identities and recovery cannot resurrect stale permissions.
-- [ ] **Once, instance and duration — implemented subset; unverified.** Done when real TCP/UDP tests verify exact scope, expiry, process exit and late responses. Unsupported callbacks remain limits.
-- [ ] **Coverage and failure recovery — partial; Windows tests blocked.** Done after IPv4/IPv6, TCP/UDP, SYSTEM/services, AppContainers, boot, service/BFE failure, indirect egress and sustained-load tests. UDP generation/capacity gaps remain open.
-- [ ] **NetLimiter migration — partial; semantics unresolved.** Done when an original export preserves action, scope and precedence, and unsupported constraints stay visible/inactive. Nil SID, zones, tags and equal weights remain unresolved.
-- [ ] **NVIDIA assistance — partial; provider workflow unverified.** Done when secure key setup, consent, research, cited IP/service/purpose evidence, uncertainty and cancellation work in the original notice, with applicable provider rights confirmed.
-- [ ] **Install, update and uninstall — implemented source; distribution incomplete.** Done when a genuine signed package installs/loads and maintenance/recovery passes in isolated Windows. No release installer is available.
+Checkboxes mean **verified on Windows**, not only implemented.
 
-**Current stage:** acceptance criteria defined; integral Windows validation blocked. **Next result:** real connection → notice → Allow/Block → persistent rule, observed independently. Deployment/start validation, signed-package and Windows-environment prerequisites remain outstanding. Linux does not validate Windows filtering.
+- [x] **Block, notify, Allow/Block.** Verified on Windows 11 with a test application in a dynamic WFP session: the
+  unknown attempt is blocked, the drop event names the executable, the request appears in the window, Allow lets the
+  next attempt connect, Block blocks it again, and removing the rule makes it ask again.
+- [ ] **Ask mode for every application.** Implemented: default block with loopback and Windows services permitted.
+  Done when it runs as the installed service on a clean machine without breaking DNS, DHCP or updates.
+- [ ] **Permanent rules across restarts.** Implemented: persistent filters rebuilt from the saved rules at startup.
+  Done when rules survive a service restart and a reboot on an installed system.
+- [ ] **Install, uninstall and recovery.** Implemented: `--install`, `--uninstall` and the `--remove-filters`
+  emergency switch. Done when they pass on a clean machine. No installer yet.
+- [ ] **Coexistence.** Done when tests with Windows Defender Firewall and NetLimiter show the expected result.
+- [ ] **NetLimiter migration.** Inactive import review exists; converting reviewed candidates into engine rules is
+  pending. Nil SID, zones, tags and equal weights remain unresolved.
+- [ ] **NVIDIA assistance.** Exists in Simulation and Settings; not yet connected to engine requests.
+- [ ] **Scoped decisions.** Once, per-process and timed decisions were designed for the paused driver; a driverless
+  equivalent (temporary rules that expire) is pending.
 
-No release-time estimate is justified until those external blockers are resolved and the integral test runs. [Component details](docs/index.md).
+**Next result:** install the engine as a service on a clean Windows machine and use it day to day.
+[Component details](docs/index.md).

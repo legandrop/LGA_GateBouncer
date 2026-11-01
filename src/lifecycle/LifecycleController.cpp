@@ -16,6 +16,7 @@ class NativeTraySurface final : public TraySurface {
             if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick)
                 emit openRequested();
         });
+        connect(&tray_, &QSystemTrayIcon::messageClicked, this, &TraySurface::openRequested);
     }
     bool available() const override { return QSystemTrayIcon::isSystemTrayAvailable(); }
     bool visible() const override { return tray_.isVisible() && !tray_.icon().isNull(); }
@@ -24,6 +25,9 @@ class NativeTraySurface final : public TraySurface {
     void setToolTip(const QString &text) override { tray_.setToolTip(text); }
     void show() override { if (available() && !tray_.icon().isNull()) tray_.show(); }
     void hide() override { tray_.hide(); }
+    void showMessage(const QString &title, const QString &text) override {
+        if (visible()) tray_.showMessage(title, text, QSystemTrayIcon::Warning, 8000);
+    }
   private:
     QSystemTrayIcon tray_;
 };
@@ -84,6 +88,9 @@ LifecycleController::~LifecycleController() {
 }
 bool LifecycleController::recoverableTray() const {
     return started_ && !finished_ && tray_ && tray_->available() && tray_->visible();
+}
+void LifecycleController::notify(const QString &title, const QString &text) {
+    if (recoverableTray()) tray_->showMessage(title, text);
 }
 void LifecycleController::start(bool startMinimized) {
     if (finished_ || started_) return;
