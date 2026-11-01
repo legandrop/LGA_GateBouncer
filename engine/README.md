@@ -17,7 +17,7 @@ other driverless Windows firewalls.
   attempt that produced the request has already failed. Most applications retry on their own.
 - **Rules by signature.** Besides the exact path, a rule can cover an app in any folder (same signer and file name) or
   every app from a signer. WFP only matches paths, so these rules live in the engine: when an executable without a
-  path rule is blocked, the engine checks its embedded Authenticode signature (offline, no revocation lookup) and, if
+  path rule is blocked, the engine checks its signature (offline, no revocation lookup; see Limits) and, if
   a signature rule matches, adds the filter for that path. The first attempt is still lost; the next one uses the rule.
   These paths are saved with the rule and verified again at every engine start.
 - **Temporary rules.** A decision can last from one minute to a week, or until the engine restarts. The engine checks
@@ -93,9 +93,12 @@ service; `--pipe <name>` gives the console engine its own channel name.
   replaced file keeps the filter, and a connection opened in that time stays open. Software already running under
   your account can also start the window and decide for you (see Local channel). Inbound connections are left to
   Windows Defender Firewall.
-- Only embedded signatures count. Windows tools signed only through a catalog (such as `powershell.exe`) are treated as
-  unsigned, and signers whose name starts with Microsoft do not accept a whole-publisher rule, because it would
-  include Windows tools that download files.
+- Three kinds of signature count, all checked offline: the signature embedded in the file; a Windows catalog that
+  lists the file (most Windows tools, such as `powershell.exe`, are signed this way); and, for Microsoft Store and
+  other packaged apps under `C:\Program Files\WindowsApps`, the package publisher from the package's
+  `AppxManifest.xml`. Windows verifies a package signature at installation and only the system writes to that folder,
+  so **This app, any version** survives package updates. Signers whose name starts with Microsoft do not accept a
+  whole-publisher rule, because it would include Windows tools that download files.
 - Another WFP provider with a hard permit can override a block. An administrator, or software running as
   administrator, can remove the filters.
 - Ask mode for every application has not yet been validated on a clean machine.

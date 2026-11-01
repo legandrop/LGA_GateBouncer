@@ -453,7 +453,10 @@ int send(int argc, wchar_t **argv) {
     while (reply.find("END\n") == std::string::npos && ReadFile(pipe, buffer, sizeof(buffer), &done, nullptr) && done)
         reply.append(buffer, done);
     CloseHandle(pipe);
-    fwrite(reply.data(), 1, reply.size(), stdout);
+    // La consola está en _O_U8TEXT: un fwrite de bytes la corta con 0xC0000409. Se imprime como texto ancho.
+    std::wstring text(std::size_t(MultiByteToWideChar(CP_UTF8, 0, reply.data(), int(reply.size()), nullptr, 0)), L'\0');
+    if (!text.empty()) MultiByteToWideChar(CP_UTF8, 0, reply.data(), int(reply.size()), text.data(), int(text.size()));
+    fputws(text.c_str(), stdout);
     return reply.rfind("OK", 0) == 0 ? 0 : 1;
 }
 
@@ -547,7 +550,7 @@ int wmain(int argc, wchar_t **argv) {
     if (mode == L"--console") return console(argc, argv);
     if (mode == L"--signer" && argc == 3) {
         const std::wstring signer = gbe::signerOf(argv[2]);
-        wprintf(L"%ls\n", signer.empty() ? L"(no valid embedded signature)" : signer.c_str());
+        wprintf(L"%ls\n", signer.empty() ? L"(no valid signature)" : signer.c_str());
         return signer.empty() ? 1 : 0;
     }
     fwprintf(stderr, L"Usage: GateBouncerEngine.exe --install [--ui <exe>] [--allow-unprotected-folder] | --uninstall | "

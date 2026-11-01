@@ -5,11 +5,21 @@
 #include <QSet>
 #include <QXmlStreamReader>
 #include <memory>
+#include <windows.h>
 
 namespace Gate {
 namespace {
 constexpr qint64 SizeLimit = 32 * 1024 * 1024;
 constexpr int DepthLimit = 64;
+
+// NetLimiter guarda a veces la ruta corta (C:\PROGRA~2\...\VCTIP.EXE); el motor recibe siempre la larga, así que
+// una regla con la corta nunca coincide. Si el archivo existe se usa su forma larga.
+QString longPath(const QString &path) {
+    const std::wstring shortPath = QDir::toNativeSeparators(path).toStdWString();
+    wchar_t buffer[2048];
+    const DWORD n = GetLongPathNameW(shortPath.c_str(), buffer, DWORD(std::size(buffer)));
+    return n > 0 && n < std::size(buffer) ? QString::fromWCharArray(buffer, int(n)) : path;
+}
 
 struct Node {
     QString name, type, text;
@@ -131,15 +141,15 @@ QVector<NetLimiterRule> NetLimiterRules::read(QIODevice &input, QString &error) 
         const QStringList paths = filter != byId.constEnd() && !filter->paths.isEmpty() ? filter->paths : QStringList{QString()};
         for (const QString &path : paths) {
             NetLimiterRule item;
-            item.path = path;
+            item.path = longPath(path);
             item.ruleName = filter != byId.constEnd() ? filter->name : QString();
             item.action = action == "Block" ? QStringLiteral("Deny") : action;
             item.allow = action == "Allow";
             item.reason = reason;
-            if (reason.isEmpty() && !QFileInfo::exists(path)) item.reason = "File not found on this PC";
+            if (reason.isEmpty() && !QFileInfo::exists(item.path)) item.reason = "File not found on this PC";
             item.importable = item.reason.isEmpty();
             if (item.importable) {
-                const QString key = path.toLower();
+                const QString key = item.path.toLower();
                 const auto seen = decided.constFind(key);
                 if (conflicted.contains(key)) {
                     // Ya hubo Allow y Deny para esta app: ninguna regla posterior suya se importa.

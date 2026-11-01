@@ -15,12 +15,21 @@ In **Settings → AI explanations**:
 3. Optionally choose the model and the language, and **Explain automatically when a notice appears**. **Test with
    Notepad** checks the key and the model.
 
+The default model is `nvidia/nemotron-3-ultra-550b-a55b`. In a comparison on real blocked applications it gave sound
+advice in about 10 seconds; `deepseek-ai/deepseek-v4.1-flash` answered as well or better but took up to two minutes,
+and faster models suggested allowing telemetry. The models NVIDIA offers change over time: if one stops answering,
+choose another and use **Test with Notepad**.
+
+The answer says what the application is, whether it is the application itself or a helper such as an updater, what
+its folder and signature indicate about it, and what you lose by blocking it. It suggests blocking telemetry, crash
+reporting, advertising and news feeds, and mentions a temporary Allow when blocking could get in the way later.
+
 ## What is sent
 
 Only when you ask (or when automatic explanations are on), for the application on the notice:
 
 - the file name and its folder, with your user folder replaced by `%USERPROFILE%` and your account name removed;
-- the signer of its embedded signature, as verified by the engine, or that it has none;
+- the signer of its signature (embedded, Windows catalog or app package), as verified by the engine, or that it has none;
 - the product name, description, company and version stored in the file;
 - the public address and port it tried to reach. Addresses on your local network are not sent.
 

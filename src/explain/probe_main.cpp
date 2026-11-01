@@ -21,6 +21,17 @@ int main(int argc, char **argv) {
     QCoreApplication app(argc, argv);
     const QStringList args = app.arguments();
     QTextStream out(stdout);
+    // Guarda en el vault la key de una variable de entorno (la del archivo .env del usuario), sin pasarla por la
+    // línea de comandos ni imprimirla. Es lo mismo que pegarla en Settings.
+    if (const auto i = args.indexOf("--store-key-from-env"); i >= 0 && i + 1 < args.size()) {
+        QString key = qEnvironmentVariable(args[i + 1].toLocal8Bit().constData()).trimmed();
+        QString error;
+        const bool ok = KeyStore::plausible(key) && KeyStore::save(key, error);
+        key.fill(QChar(0));
+        out << (ok ? "Key saved for this account.\n"
+                   : "Key not saved: " + (error.isEmpty() ? QStringLiteral("not an NVIDIA API key") : error) + "\n");
+        return ok ? 0 : 1;
+    }
     if (!KeyStore::has()) {
         out << "No NVIDIA API key saved for this account. Save it in GateBouncer Settings first.\n";
         return 3;
