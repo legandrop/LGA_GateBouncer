@@ -22,6 +22,10 @@ Checkboxes mean **verified on Windows**, not only implemented.
   decide, and Allow with **This app, any version** let a blocked application connect on its next attempt.
 - [x] **Temporary decisions.** Verified on Windows 11 with the installed service and a test application: a one-minute
   Allow connected, expired on time and the application asked again; an until-restart rule is not saved.
+- [x] **Destination on the notice and local network without asking.** Verified on Windows 11 with the installed
+  service and a test application: a request carries the server name the application looked up, a direct connection to
+  an address has no name, Tailscale and the router connect without asking, they ask when that option is off, and a
+  Block rule still wins on the local network.
 - [ ] **Ask mode for every application.** In daily use on one Windows 11 computer with DNS, DHCP and updates working.
   Done when it also runs on a clean machine.
 - [ ] **Permanent rules across restarts.** Rules survive a service restart (verified with `--update`). Done when they
@@ -32,8 +36,9 @@ Checkboxes mean **verified on Windows**, not only implemented.
 - [ ] **NetLimiter import.** Implemented: NetLimiter firewall rules for single applications become GateBouncer rules;
   rules with destination, port, zone or schedule conditions are listed and not imported. Done when it is checked
   against a real NetLimiter settings file.
-- [ ] **AI explanations.** Implemented: notice button, key kept with DPAPI, HTTPS-only exception for the window, plain
-  text answers that never decide. Done when real answers from the chosen model have been compared on real requests.
+- [x] **AI explanations.** Verified on Windows 11: ten NVIDIA models were compared on eleven real requests and the
+  default answers in about ten seconds when the service is not busy. NVIDIA's free service is shared and its speed
+  varies a lot by hour; a slow answer never holds the decision.
 
 **Next result:** use the installed engine day to day, reboot it, and run the clean-machine checks.
 [Component details](docs/index.md).

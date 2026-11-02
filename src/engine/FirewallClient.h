@@ -15,6 +15,7 @@ class FirewallClient final : public QObject {
   public:
     struct Status {
         bool connected = false, ask = true, dynamic = false, allApps = true, control = false;
+        bool localNetwork = true; // la red local pasa sin preguntar
         qint64 started = 0;
         QString lastError;
     };
@@ -23,6 +24,7 @@ class FirewallClient final : public QObject {
         qint64 first = 0, last = 0;
         int attempts = 0, port = 0, protocol = 0;
         QString signer; // vacío: sin firma embebida válida (la verifica el motor)
+        QString host;   // el nombre que la app resolvió para esa dirección; vacío si no se sabe
     };
     // Alcances del motor: "path" (ruta exacta), "app" (firmante + nombre del exe, cualquier carpeta), "publisher"
     // (todo lo del firmante) y "covered" (una ruta que una regla app/publisher ya permitió o bloqueó).
@@ -59,10 +61,13 @@ class FirewallClient final : public QObject {
     void decide(const QString &path, bool allow, const QString &scope = "path", const QString &duration = "always");
     void removeRule(const QString &id);
     void setAsk(bool ask);
+    void setLocalNetwork(bool allow);
     void refreshNow();
 
     static QString fileName(const QString &path);
     static QString protocolName(int protocol);
+    // "Internet", "Local network", "Tailscale" o "This PC"; vacío si no es una dirección.
+    static QString destinationKind(const QString &address);
     // Texto de una regla por firma: "any version of node.exe from OpenJS Foundation".
     static QString describe(const RuleItem &rule);
     // Igual que el motor: un firmante de Microsoft no admite «All apps from».

@@ -10,6 +10,7 @@
 // WFP no sabe de firmas: las reglas App y Publisher viven en el motor. Cuando una app sin regla de ruta se bloquea,
 // el motor verifica su firma y, si coincide con una de esas reglas, agrega el filtro de esa ruta (una «cobertura»).
 // El primer intento igual se pierde; el siguiente pasa sin preguntar.
+#include "dns_names.h"
 #include "wfp_engine.h"
 #include <condition_variable>
 #include <deque>
@@ -64,6 +65,7 @@ struct Pending {
     std::wstring remoteAddress;
     std::uint16_t remotePort = 0;
     std::uint8_t protocol = 0;
+    std::wstring host; // el nombre que la app resolvió para esa dirección; vacío si no se sabe
 };
 
 struct Activity {
@@ -94,6 +96,8 @@ class FirewallCore {
 
     // Modo ask: lo desconocido se bloquea y se pregunta. Modo off: sin bloqueo por defecto (las reglas siguen).
     bool setAsk(bool ask, std::wstring &error);
+    // Red local (redes privadas, enlace local, multicast, Tailscale) sin preguntar. Por defecto, sí.
+    bool setLocalNetwork(bool allow, std::wstring &error);
     // La firma se lee del archivo en el motor: nunca se confía en un editor que mande la ventana.
     // expires: 0 permanente, >0 momento Unix en que vence, UntilRestart hasta que el motor se reinicie.
     bool decide(const std::wstring &path, Action action, Scope scope, std::wstring &error, std::int64_t expires = 0);
@@ -101,10 +105,11 @@ class FirewallCore {
     bool removeRule(const std::wstring &id, std::wstring &error);
 
     struct Status {
-        bool ask = true, dynamic = false, allApps = true;
+        bool ask = true, dynamic = false, allApps = true, localNetwork = true;
         std::int64_t started = 0;
         std::size_t pending = 0, rules = 0;
         std::wstring lastError;
+        std::wstring names; // estado de la escucha de DNS (diagnóstico)
     };
     Status status();
     std::vector<Pending> pending();
@@ -141,6 +146,9 @@ class FirewallCore {
     WfpEngine wfp_;
     std::mutex mutex_;
     bool ask_ = true;
+    bool localNetwork_ = true;
+    std::vector<std::uint64_t> localFilters_;
+    DnsNames dns_;
     std::int64_t started_ = 0;
     std::wstring lastError_;
     std::vector<std::uint64_t> askFilters_, systemFilters_;

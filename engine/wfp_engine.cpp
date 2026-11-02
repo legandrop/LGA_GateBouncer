@@ -283,6 +283,44 @@ bool WfpEngine::addHttpsPermit(const std::wstring &path, std::vector<std::uint64
     return true;
 }
 
+bool WfpEngine::addLocalNetworkPermit(std::vector<std::uint64_t> &ids, std::wstring &error) {
+    // Varias condiciones sobre el mismo campo se combinan con O: una sola por capa alcanza.
+    FWP_V4_ADDR_AND_MASK v4[] = {{0x0A000000, 0xFF000000},  // 10.0.0.0/8
+                                 {0xAC100000, 0xFFF00000},  // 172.16.0.0/12
+                                 {0xC0A80000, 0xFFFF0000},  // 192.168.0.0/16
+                                 {0xA9FE0000, 0xFFFF0000},  // 169.254.0.0/16, enlace local
+                                 {0x64400000, 0xFFC00000},  // 100.64.0.0/10, Tailscale
+                                 {0xE0000000, 0xF0000000},  // 224.0.0.0/4, multicast
+                                 {0xFFFFFFFF, 0xFFFFFFFF}}; // difusión
+    FWP_V6_ADDR_AND_MASK v6[] = {{{0xfe, 0x80}, 10}, {{0xfc}, 7}, {{0xff}, 8}}; // enlace local, ULA (Tailscale), multicast
+    std::vector<FWPM_FILTER_CONDITION0> c4(std::size(v4)), c6(std::size(v6));
+    for (std::size_t i = 0; i < c4.size(); ++i) {
+        c4[i].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+        c4[i].matchType = FWP_MATCH_EQUAL;
+        c4[i].conditionValue.type = FWP_V4_ADDR_MASK;
+        c4[i].conditionValue.v4AddrMask = &v4[i];
+    }
+    for (std::size_t i = 0; i < c6.size(); ++i) {
+        c6[i].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+        c6[i].matchType = FWP_MATCH_EQUAL;
+        c6[i].conditionValue.type = FWP_V6_ADDR_MASK;
+        c6[i].conditionValue.v6AddrMask = &v6[i];
+    }
+    if (!begin(error)) return false;
+    std::uint64_t id4 = 0, id6 = 0;
+    if (!addFilter(FWPM_LAYER_ALE_AUTH_CONNECT_V4, L"LGA GateBouncer local network", FWP_ACTION_PERMIT, WeightSystem,
+                   c4.data(), UINT32(c4.size()), id4, error) ||
+        !addFilter(FWPM_LAYER_ALE_AUTH_CONNECT_V6, L"LGA GateBouncer local network", FWP_ACTION_PERMIT, WeightSystem,
+                   c6.data(), UINT32(c6.size()), id6, error)) {
+        abort();
+        return false;
+    }
+    if (!commit(error)) return false;
+    ids.push_back(id4);
+    ids.push_back(id6);
+    return true;
+}
+
 bool WfpEngine::addSystemAllowances(std::vector<std::uint64_t> &ids, std::wstring &error) {
     // Loopback: tráfico interno de la PC, nunca sale a la red.
     FWPM_FILTER_CONDITION0 loopback{};

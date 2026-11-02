@@ -20,6 +20,15 @@ other driverless Windows firewalls.
   path rule is blocked, the engine checks its signature (offline, no revocation lookup; see Limits) and, if
   a signature rule matches, adds the filter for that path. The first attempt is still lost; the next one uses the rule.
   These paths are saved with the rule and verified again at every engine start.
+- **Local network without asking** (on by default): an outbound permit filter for private ranges (10/8, 172.16/12,
+  192.168/16), link-local, multicast and broadcast, 100.64/10 (Tailscale) and fc00::/7, with the same weight as the
+  Windows services permit, so an explicit Block rule still wins. Saved as `lan allow|ask` in `rules.tsv`.
+- **Destination names.** The engine listens to the Microsoft-Windows-DNS-Client ETW provider (query completed events)
+  and remembers which name each executable resolved to which addresses, in memory only. A pending request carries the
+  name its application looked up for the blocked address. Windows delivers these events up to a second late, so a name
+  missing when the attempt is blocked is filled in when the request is read. Applications that connect to an address
+  directly or resolve names themselves (for example DNS over HTTPS) get no name. If the ETW session cannot start, the
+  engine runs without names and reports it in `lastError`.
 - **Temporary rules.** A decision can last from one minute to a week, or until the engine restarts. The engine checks
   expiry every ten seconds; an expired rule is removed (with the paths it covered) and the application asks again.
   Until-restart rules are never written to the rules file.
@@ -67,7 +76,9 @@ that path asks again.
 The desktop window talks to the engine over the named pipe `\\.\pipe\LGA.GateBouncer.Engine`: one UTF-8 request
 line, tab-separated fields, and a reply terminated by `END`. Interactive users can read status, pending requests,
 rules and activity, but cannot create instances of the pipe. Only the installed `GateBouncer.exe` next to the engine,
-or an elevated process, can change rules (`DECIDE`, `REMOVE`, `MODE`). `DECIDE` takes the reach of the rule (`path`,
+or an elevated process, can change rules (`DECIDE`, `REMOVE`, `MODE`, `LAN allow|ask`). `PENDING` rows end with the
+destination name (empty when unknown); `STATUS` reports `lan` and a `names` line with DNS listener counters.
+`DECIDE` takes the reach of the rule (`path`,
 `app` or `publisher`), the executable and optionally how long it lasts (`always`, `restart` or a number of seconds,
 from 60 to 604800); the engine reads the signer from the file itself and never trusts a signer sent by the client.
 `RULES` reports each rule's expiry (0 permanent, -1 until restart, otherwise Unix time). That check uses the client's

@@ -1,4 +1,5 @@
 #include "accesstoast.h"
+#include "engine/FirewallClient.h"
 #include <QComboBox>
 #include <QDir>
 #include <QEvent>
@@ -217,6 +218,17 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     path_ = new QLabel(this);
     path_->setObjectName("toastPath");
     layout->addWidget(path_);
+    layout->addSpacing(8);
+    // A dónde quería conectarse: el nombre que resolvió la app (si se sabe), la dirección y si sale a internet.
+    destination_ = new QLabel(this);
+    destination_->setObjectName("toastSignature");
+    destination_->setTextFormat(Qt::PlainText);
+    layout->addWidget(destination_);
+    layout->addSpacing(2);
+    destinationDetail_ = new QLabel(this);
+    destinationDetail_->setObjectName("toastPath");
+    destinationDetail_->setTextFormat(Qt::PlainText);
+    layout->addWidget(destinationDetail_);
     layout->addSpacing(10);
 
     // Explicación con IA. El enlace la pide; la respuesta va en un recuadro aparte y nunca toca la decisión.
@@ -352,8 +364,28 @@ void AccessToast::setRequest(const Request &request) {
             updateCounters();
         });
     }
+    // Fuera del bloque anterior: un intento nuevo de la misma app puede ir a otro destino.
+    renderDestination();
     updateCounters();
     adjustSize();
+}
+
+void AccessToast::renderDestination() {
+    const QString kind = FirewallClient::destinationKind(request_.remote);
+    const bool known = !kind.isEmpty();
+    destination_->setVisible(known);
+    destinationDetail_->setVisible(known);
+    if (!known) return;
+    const QString target = request_.host.isEmpty() ? request_.remote : request_.host;
+    destination_->setText(elideMiddle(destination_, "To " + target + " · " + kind, Width - 32));
+    // El destino entero sólo cuando el texto visible quedó recortado.
+    destination_->setToolTip(destination_->text().contains(QChar(0x2026)) ? target : QString());
+    const QString port = request_.port ? FirewallClient::protocolName(request_.protocol) + " " +
+                                             QString::number(request_.port)
+                                       : FirewallClient::protocolName(request_.protocol);
+    // Sin nombre: la app se conectó directo a la IP o resolvió por su cuenta, y eso también es un dato.
+    destinationDetail_->setText(request_.host.isEmpty() ? "No server name seen · " + port
+                                                        : request_.remote + " · " + port);
 }
 
 void AccessToast::rebuildScopes() {

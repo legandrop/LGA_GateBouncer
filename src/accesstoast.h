@@ -26,6 +26,8 @@ class AccessToast final : public QWidget {
         int attempts = 0;
         int othersWaiting = 0;
         bool canDecide = true;
+        QString remote, host; // destino del último intento; host vacío si no se sabe el nombre
+        int port = 0, protocol = 0;
     };
 
     explicit AccessToast(QWidget *parent = nullptr);
@@ -52,6 +54,7 @@ class AccessToast final : public QWidget {
     void rebuildScopes();
     void updateCounters();
     void renderExplanation();
+    void renderDestination();
 
     Request request_;
     // Los botones se habilitan un instante después de mostrar otra app: un clic que iba al aviso anterior (doble clic,
@@ -59,6 +62,7 @@ class AccessToast final : public QWidget {
     bool armed_ = false;
     QLabel *icon_ = nullptr, *title_ = nullptr, *signature_ = nullptr, *signatureMark_ = nullptr, *path_ = nullptr;
     QLabel *note_ = nullptr, *footer_ = nullptr;
+    QLabel *destination_ = nullptr, *destinationDetail_ = nullptr;
     QComboBox *scope_ = nullptr, *duration_ = nullptr;
     Explanation explanation_;
     QScreen *screen_ = nullptr;

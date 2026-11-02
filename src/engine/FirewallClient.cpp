@@ -1,6 +1,7 @@
 #include "FirewallClient.h"
 #include <QDateTime>
 #include <QFileInfo>
+#include <QHostAddress>
 #include <QLocalSocket>
 
 namespace Gate {
@@ -25,6 +26,21 @@ QString FirewallClient::fileName(const QString &path) { return QFileInfo(path).f
 QString FirewallClient::protocolName(int protocol) {
     return protocol == 6 ? "TCP" : protocol == 17 ? "UDP" : protocol == 1 ? "ICMP" : protocol == 58 ? "ICMPv6"
          : protocol ? "IP " + QString::number(protocol) : QString("Unknown");
+}
+
+QString FirewallClient::destinationKind(const QString &address) {
+    QHostAddress a(address);
+    if (a.isNull()) return {};
+    bool mapped = false;
+    const QHostAddress v4(a.toIPv4Address(&mapped));
+    if (mapped) a = v4;
+    if (a.isLoopback()) return "This PC";
+    // Igual que el permiso de red local del motor: 100.64.0.0/10 y fd7a:115c:a1e0::/48 son las de Tailscale.
+    if (a.isInSubnet(QHostAddress("100.64.0.0"), 10) || a.isInSubnet(QHostAddress("fd7a:115c:a1e0::"), 48))
+        return "Tailscale";
+    if (a.isPrivateUse() || a.isLinkLocal() || a.isMulticast() || a.isBroadcast() || a.isUniqueLocalUnicast())
+        return "Local network";
+    return "Internet";
 }
 
 void FirewallClient::setActive(bool active) {
@@ -114,6 +130,13 @@ void FirewallClient::removeRule(const QString &id) {
     const QString what = r ? describe(*r) : fileName(id);
     enqueue("REMOVE\t" + id, Request::Command,
             QString("Rule removed for %1. The next connection will be blocked and ask again.").arg(what));
+    poll();
+}
+
+void FirewallClient::setLocalNetwork(bool allow) {
+    enqueue(QString("LAN\t%1").arg(allow ? "allow" : "ask"), Request::Command,
+            allow ? QString("Local network connections no longer ask.")
+                  : QString("Local network connections ask like any other."));
     poll();
 }
 
@@ -210,6 +233,7 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
         for (const auto &row : rows) {
             const auto name = row.section('\t', 0, 0), value = row.section('\t', 1);
             if (name == "mode") s.ask = value != "off";
+            else if (name == "lan") s.localNetwork = value != "ask";
             else if (name == "scope") s.allApps = value == "all";
             else if (name == "dynamic") s.dynamic = value == "1";
             else if (name == "started") s.started = value.toLongLong();
@@ -224,9 +248,10 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
         QSet<QString> now;
         for (const auto &row : rows) {
             const auto f = row.split('\t');
-            if (f.size() != 8) continue;
+            // El motor anterior manda 8 campos; desde los nombres de destino, 9 (el nombre, o vacío).
+            if (f.size() != 8 && f.size() != 9) continue;
             pending_.push_back({f[7], f[3], f[0].toLongLong(), f[1].toLongLong(), f[2].toInt(), f[4].toInt(),
-                                f[5].toInt(), f[6]});
+                                f[5].toInt(), f[6], f.size() == 9 ? f[8] : QString()});
             now.insert(key(f[7]));
             // También los que ya esperaban al conectar: la ventana arranca con la sesión y tiene que avisarlos.
             if (!knownPending_.contains(key(f[7]))) emit newPending(f[7]);

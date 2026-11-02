@@ -99,7 +99,9 @@ QString systemPrompt(const QString &language) {
                "\"why\": one or two sentences on why this program would connect to the internet, and what stops "
                "working if it cannot. Say whether it is the application itself or a helper of it (an updater, a "
                "crash reporter, a background service): blocking an updater does not stop the application from "
-               "working, it only stops its updates.\n"
+               "working, it only stops its updates. When server_name is present it is the server name the program "
+               "looked up just before connecting: use it to tell what the connection is for (telemetry, updates, "
+               "licensing, sign-in, content) and mention it.\n"
                "\"risk\": one or two sentences judging whether the program looks legitimate, from the folder, the "
                "signature and the name together. Folders only Windows or an administrator can write to "
                "(C:\\Windows\\System32, C:\\Windows\\SystemApps, C:\\Program Files, C:\\Program Files (x86)) fit "
@@ -168,7 +170,7 @@ QString Settings::languageName(const QString &code) {
 }
 
 Facts collectFacts(const QString &path, const QString &signer, const QString &remote, int port, int protocol,
-                   int attempts) {
+                   int attempts, const QString &host) {
     Facts f;
     f.path = path;
     f.fileName = plain(QFileInfo(path).fileName(), 120);
@@ -180,9 +182,13 @@ Facts collectFacts(const QString &path, const QString &signer, const QString &re
     const QString proto = protocol == 6 ? "TCP" : protocol == 17 ? "UDP" : QString("protocol %1").arg(protocol);
     // 100.64.0.0/10 (red compartida, la que usa Tailscale) tampoco es pública: no se manda.
     const bool shared = address.isInSubnet(QHostAddress("100.64.0.0"), 10);
-    if (!address.isNull() && address.isGlobal() && !address.isPrivateUse() && !shared)
+    if (!address.isNull() && address.isGlobal() && !address.isPrivateUse() && !shared) {
         f.destination = QString("%1 port %2 (%3)").arg(address.toString()).arg(port).arg(proto);
-    else if (!address.isNull())
+        // El nombre sólo acompaña a un destino público, y sólo si es un nombre DNS común.
+        static const QRegularExpression dnsName("^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$");
+        const QString name = host.trimmed().toLower();
+        if (name.size() <= 253 && dnsName.match(name).hasMatch()) f.serverName = name;
+    } else if (!address.isNull())
         f.destination = QString("a device on the local network, port %1 (%2)").arg(port).arg(proto);
     return f;
 }
@@ -197,6 +203,7 @@ QByteArray buildRequest(const Facts &f, const QString &model, const QString &lan
     if (!f.company.isEmpty()) facts["company_name"] = f.company;
     if (!f.version.isEmpty()) facts["file_version"] = f.version;
     if (!f.destination.isEmpty()) facts["destination"] = f.destination;
+    if (!f.serverName.isEmpty()) facts["server_name"] = f.serverName;
     if (f.attempts > 0) facts["blocked_attempts"] = f.attempts;
     QJsonObject body{{"model", model},
                      {"temperature", 0.2},

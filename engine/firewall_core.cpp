@@ -151,6 +151,7 @@ bool FirewallCore::start(std::wstring &error) {
     if (!wfp_.begin(error)) return false;
     bool ok = options_.dynamic || wfp_.removeAllOwnFilters(error);
     if (ok && options_.scope.empty()) ok = wfp_.addSystemAllowances(systemFilters_, error);
+    if (ok && localNetwork_) ok = wfp_.addLocalNetworkPermit(localFilters_, error);
     std::size_t skipped = 0;
     for (auto &[k, rule] : rules_) {
         if (!ok) break;
@@ -213,6 +214,12 @@ bool FirewallCore::start(std::wstring &error) {
     if (skipped)
         lastError_ += (lastError_.empty() ? L"" : L"; ") + std::to_wstring(skipped) +
                       L" rules skipped: executable not found";
+    // Nombres de destino: si ETW no está disponible el motor funciona igual, sólo sin nombres en el aviso.
+    std::wstring dnsError;
+    const std::wstring dnsSession = options_.dynamic ? TestSessionPrefix + std::to_wstring(GetCurrentProcessId())
+                                                     : std::wstring(L"LGA GateBouncer DNS");
+    if (!dns_.start(dnsSession, dnsError))
+        lastError_ += (lastError_.empty() ? L"" : L"; ") + std::wstring(L"Destination names unavailable: ") + dnsError;
     verifyStop_ = false;
     verifyThread_ = std::thread([this] { verifyLoop(); });
     if (!wfp_.subscribeDrops([this](const DropEvent &d) { onDrop(d); }, error)) return false;
@@ -229,10 +236,12 @@ void FirewallCore::stop() {
     }
     verifyWake_.notify_all();
     if (verifyThread_.joinable()) verifyThread_.join();
+    dns_.stop();
     wfp_.close();
     std::lock_guard<std::mutex> lock(mutex_);
     askFilters_.clear();
     systemFilters_.clear();
+    localFilters_.clear();
     for (auto &[k, rule] : rules_) rule.filters.clear();
     for (auto &[k, c] : covered_) c.filters.clear();
 }
@@ -287,6 +296,29 @@ bool FirewallCore::setAsk(bool ask, std::wstring &error) {
     }
     ask_ = ask;
     addActivity({now(), L"", ask ? L"Asking for unknown applications" : L"Unknown applications allowed", L"", 0, 0});
+    return save(error);
+}
+
+bool FirewallCore::setLocalNetwork(bool allow, std::wstring &error) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (allow == localNetwork_) return true;
+    if (allow) {
+        if (!wfp_.addLocalNetworkPermit(localFilters_, error)) return false;
+    } else {
+        if (!wfp_.begin(error)) return false;
+        for (auto id : localFilters_)
+            if (!wfp_.removeFilter(id)) {
+                // Todo o nada: un filtro que no se pudo quitar seguiría permitiendo la red local sin que se sepa.
+                wfp_.abort();
+                error = L"Could not remove the local network permit";
+                return false;
+            }
+        if (!wfp_.commit(error)) return false;
+        localFilters_.clear();
+    }
+    localNetwork_ = allow;
+    addActivity({now(), L"", allow ? L"Local network allowed without asking" : L"Asking for local network connections",
+                 L"", 0, 0});
     return save(error);
 }
 
@@ -670,6 +702,7 @@ void FirewallCore::classify(const DropEvent &drop, const std::wstring &cached) {
     p.remoteAddress = drop.remoteAddress;
     p.remotePort = drop.remotePort;
     p.protocol = drop.protocol;
+    p.host = dns_.nameFor(drop.remoteAddress, k);
     addActivity({t, p.path, L"Blocked · waiting for decision", drop.remoteAddress, drop.remotePort, drop.protocol});
 }
 
@@ -682,6 +715,8 @@ FirewallCore::Status FirewallCore::status() {
     std::lock_guard<std::mutex> lock(mutex_);
     Status s;
     s.ask = ask_;
+    s.localNetwork = localNetwork_;
+    s.names = dns_.stats();
     s.dynamic = options_.dynamic;
     s.allApps = options_.scope.empty();
     s.started = started_;
@@ -693,6 +728,10 @@ FirewallCore::Status FirewallCore::status() {
 
 std::vector<Pending> FirewallCore::pending() {
     std::lock_guard<std::mutex> lock(mutex_);
+    // Windows entrega la consulta DNS hasta un segundo después de que la app ya se conectó: el nombre que faltaba al
+    // bloquear se completa acá, cuando la ventana vuelve a preguntar.
+    for (auto &[k, p] : pending_)
+        if (p.host.empty()) p.host = dns_.nameFor(p.remoteAddress, k);
     std::vector<Pending> out;
     for (const auto &[k, p] : pending_) out.push_back(p);
     return out;
@@ -721,6 +760,7 @@ void FirewallCore::load() {
     rules_.clear();
     covered_.clear();
     ask_ = true;
+    localNetwork_ = true;
     lastError_.clear();
     if (options_.dataDir.empty()) return;
     std::ifstream in(options_.dataDir + L"\\rules.tsv", std::ios::binary);
@@ -737,6 +777,8 @@ void FirewallCore::load() {
         const auto action = [](const std::string &s) { return s == "allow" ? Action::Allow : Action::Block; };
         if (f[0] == "mode" && f.size() == 2) {
             ask_ = f[1] != "off";
+        } else if (f[0] == "lan" && f.size() == 2) {
+            localNetwork_ = f[1] != "ask";
         } else if (f[0] == "rule" && (f.size() == 5 || f.size() == 6) && (f[1] == "allow" || f[1] == "block")) {
             Rule r;
             r.action = action(f[1]);
@@ -781,6 +823,7 @@ bool FirewallCore::save(std::wstring &error) {
     std::ostringstream out;
     out << "# LGA GateBouncer rules v2\n";
     out << "mode\t" << (ask_ ? "ask" : "off") << "\n";
+    out << "lan\t" << (localNetwork_ ? "allow" : "ask") << "\n";
     for (const auto &[k, r] : rules_) {
         // «Hasta reiniciar» no se guarda: el arranque siguiente ya no la encuentra. Las temporales llevan su vencimiento
         // como último campo; las permanentes quedan con el formato de siempre.

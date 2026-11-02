@@ -216,19 +216,22 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     const std::string &command = f[0];
     std::ostringstream out;
     if (command == "HELLO") {
-        out << "OK\tGateBouncerEngine\t2\t" << (mayChange ? "control" : "view") << "\nEND\n";
+        // Versión 3: PENDING con el nombre del destino, STATUS con lan y names, comando LAN.
+        out << "OK\tGateBouncerEngine\t3\t" << (mayChange ? "control" : "view") << "\nEND\n";
         return out.str();
     }
     if (command == "STATUS") {
         const auto s = core_.status();
         out << "OK\n"
             << "mode\t" << (s.ask ? "ask" : "off") << "\n"
+            << "lan\t" << (s.localNetwork ? "allow" : "ask") << "\n"
             << "scope\t" << (s.allApps ? "all" : "apps") << "\n"
             << "dynamic\t" << (s.dynamic ? 1 : 0) << "\n"
             << "started\t" << s.started << "\n"
             << "pending\t" << s.pending << "\n"
             << "rules\t" << s.rules << "\n"
             << "control\t" << (mayChange ? 1 : 0) << "\n"
+            << "names\t" << field(s.names) << "\n"
             << "lastError\t" << field(s.lastError) << "\nEND\n";
         return out.str();
     }
@@ -236,7 +239,8 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         out << "OK\n";
         for (const auto &p : core_.pending())
             out << p.first << "\t" << p.last << "\t" << p.attempts << "\t" << field(p.remoteAddress) << "\t"
-                << p.remotePort << "\t" << int(p.protocol) << "\t" << field(p.signer) << "\t" << field(p.path) << "\n";
+                << p.remotePort << "\t" << int(p.protocol) << "\t" << field(p.signer) << "\t" << field(p.path) << "\t"
+                << field(p.host) << "\n";
         out << "END\n";
         return out.str();
     }
@@ -270,7 +274,7 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         out << "END\n";
         return out.str();
     }
-    const bool changes = command == "DECIDE" || command == "REMOVE" || command == "MODE";
+    const bool changes = command == "DECIDE" || command == "REMOVE" || command == "MODE" || command == "LAN";
     if (!changes) return err(L"Unknown command");
     if (!mayChange) return err(L"Only GateBouncer or an administrator can change rules");
     std::wstring error;
@@ -300,6 +304,8 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         ok = core_.removeRule(wide(f[1]), error);
     else if (command == "MODE" && f.size() == 2 && (f[1] == "ask" || f[1] == "off"))
         ok = core_.setAsk(f[1] == "ask", error);
+    else if (command == "LAN" && f.size() == 2 && (f[1] == "allow" || f[1] == "ask"))
+        ok = core_.setLocalNetwork(f[1] == "allow", error);
     else
         error = L"Invalid arguments";
     return ok ? "OK\nEND\n" : err(error);

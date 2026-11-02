@@ -19,6 +19,12 @@ In **Live** mode, the Processes, Pending, Activity and Rules views read the engi
 - **Pending** lists blocked applications waiting for a decision. A new request also shows a notice in the bottom-right
   corner of the screen, even when the window is hidden in the tray. It stays until you choose Allow or Block, and it
   does not take focus. Closing it keeps the application blocked and pending.
+- The notice shows where the application tried to connect: the server name it looked up just before (when Windows
+  resolved it), the address and port, and whether that is the **Internet**, your **Local network** or **Tailscale**.
+  No name means the application connected straight to an address or resolved it on its own.
+- Connections to the local network (other computers, printers and storage at home or at the office, and Tailscale
+  devices) are allowed without asking by default. A Block rule for an application still applies there. You can turn
+  this off in Settings.
 - The notice's **Apply to** list sets the rule's reach: **This app, any version** (same signed publisher and file name,
   in any folder, so updates don't ask again), **This file only** (the exact path), or **All apps from** the publisher.
   Applications without a valid signature can only get a rule for the exact file.
@@ -33,7 +39,8 @@ In **Live** mode, the Processes, Pending, Activity and Rules views read the engi
 - **Import** reads NetLimiter's settings file (`nl_settings.xml`) and turns its firewall rules for single applications
   into GateBouncer rules. Rules limited to addresses, ports, zones or schedules, Ask rules and incoming-only rules are
   listed with the reason and not imported.
-- **Settings** switches between asking for unknown applications and letting them connect, and holds the AI
+- **Settings** switches between asking for unknown applications and letting them connect, sets whether the local
+  network asks, and holds the AI
   explanation setup: the key, what is sent, the model, the language and whether notices ask automatically.
 
 A separate **Simulation** mode shows the views with synthetic data that stays in session memory.

@@ -1424,7 +1424,9 @@ void MainWindow::refreshTable(bool newPage) {
         } else if (view_ == "pending") {
             for (const auto &p : firewall_.pending())
                 result.push_back({firewallId(p.path), {appCell(p.path),
-                    {firewallDestination(p.remote, p.port, p.protocol) + "\n" + QString::number(p.attempts) + " blocked attempts", "strong", {}},
+                    {(p.host.isEmpty() ? firewallDestination(p.remote, p.port, p.protocol) + "\n"
+                                       : p.host + "\n" + firewallDestination(p.remote, p.port, p.protocol) + " · ") +
+                         QString::number(p.attempts) + " blocked attempts", "strong", {}},
                     {firewallTime(p.last), {}, p.last}, {"Review request   →", "action", {}}}});
         } else if (view_ == "activity") {
             const auto &events = firewall_.activity();
@@ -3727,8 +3729,17 @@ void MainWindow::updateFirewallToast() {
     for (const auto &p : pending)
         if (showable(p) && p.path.compare(current->path, Qt::CaseInsensitive) != 0) ++others;
     const bool newApp = firewallToast_->path().compare(current->path, Qt::CaseInsensitive) != 0;
-    firewallToast_->setRequest({current->path, current->signer, current->attempts, others,
-                                firewall_.status().control && !firewall_.busy()});
+    AccessToast::Request request;
+    request.path = current->path;
+    request.signer = current->signer;
+    request.attempts = current->attempts;
+    request.othersWaiting = others;
+    request.canDecide = firewall_.status().control && !firewall_.busy();
+    request.remote = current->remote;
+    request.host = current->host;
+    request.port = current->port;
+    request.protocol = current->protocol;
+    firewallToast_->setRequest(request);
     if (newApp) explainFirewallRequest(current->path, true);
     if (!firewallToast_->isVisible()) {
         firewallToast_->placeOn(isVisible() ? screen() : nullptr);
@@ -3753,7 +3764,8 @@ void MainWindow::explainFirewallRequest(const QString &path, bool automatic) {
     } else {
         const auto *p = firewall_.pendingFor(path);
         const auto facts = Explain::collectFacts(path, p ? p->signer : QString(), p ? p->remote : QString(),
-                                                 p ? p->port : 0, p ? p->protocol : 0, p ? p->attempts : 0);
+                                                 p ? p->port : 0, p ? p->protocol : 0, p ? p->attempts : 0,
+                                                 p ? p->host : QString());
         QString error;
         if (explainer_.request(facts, error)) {
             e.state = AccessToast::Explanation::Working;
@@ -3870,8 +3882,16 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
     ask->setEnabled(can);
     ep->addWidget(ask);
     connect(ask, &QCheckBox::toggled, this, [this](bool on) { firewall_.setAsk(on); });
-    ep->addWidget(label("Windows services, DNS and local connections are always permitted. To turn GateBouncer off "
-                        "completely, run GateBouncerEngine.exe --remove-filters from an administrator command prompt.",
+    auto *lan = new QCheckBox("Allow the local network without asking");
+    lan->setObjectName("firewall-lan");
+    lan->setChecked(s.localNetwork);
+    lan->setEnabled(can);
+    ep->addWidget(lan);
+    connect(lan, &QCheckBox::toggled, this, [this](bool on) { firewall_.setLocalNetwork(on); });
+    ep->addWidget(label("Local network: other computers, printers and storage at home or at the office, and devices "
+                        "on Tailscale. A Block rule for an application still applies there. Windows services, DNS and "
+                        "connections inside this PC are always permitted. To turn GateBouncer off completely, run "
+                        "GateBouncerEngine.exe --remove-filters from an administrator command prompt.",
                         "faint", true));
     l->addWidget(engine);
 
@@ -3907,7 +3927,8 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
     consent->setChecked(settings.consent);
     ap->addWidget(consent);
     ap->addWidget(label("Sent: the file name, its folder (with your account name removed), its signature and version "
-                        "details, and the public address it tried to reach. Never the file itself, its command line, "
+                        "details, and the public address it tried to reach with the server name it looked up. Never "
+                        "the file itself, its command line, "
                         "or addresses on your local network. Requests use your NVIDIA account and its terms; up to "
                         "100 explanations a day.",
                         "faint", true));

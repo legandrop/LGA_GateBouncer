@@ -64,6 +64,9 @@ class WfpEngine {
     bool addSystemAllowances(std::vector<std::uint64_t> &ids, std::wstring &error);
     // La ventana de GateBouncer sale sólo por TCP 443 (las explicaciones con IA): HTTPS y nada más.
     bool addHttpsPermit(const std::wstring &path, std::vector<std::uint64_t> &ids, std::wstring &error);
+    // Red local sin preguntar: redes privadas, enlace local, multicast y Tailscale (100.64.0.0/10), salientes.
+    // Mismo peso que los permisos de base: un Block explícito de una app le gana.
+    bool addLocalNetworkPermit(std::vector<std::uint64_t> &ids, std::wstring &error);
     bool removeFilter(std::uint64_t id);
     // Borra todos los filtros del proveedor propio (desinstalar o reconstruir).
     bool removeAllOwnFilters(std::wstring &error);

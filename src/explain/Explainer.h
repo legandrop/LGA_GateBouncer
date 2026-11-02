@@ -16,6 +16,7 @@ namespace Gate::Explain {
 struct Facts {
     QString path; // ruta local: no se manda tal cual
     QString fileName, folder, signer, product, description, company, version, destination;
+    QString serverName; // el nombre DNS que resolvió la app, sólo con destino público
     int attempts = 0;
 };
 
@@ -35,9 +36,10 @@ struct Settings {
     static QString languageName(const QString &code);
 };
 
-// Datos locales del ejecutable. remote: la dirección que intentó; sólo se incluye si es pública.
+// Datos locales del ejecutable. remote: la dirección que intentó; sólo se incluye si es pública, y con ella host (el
+// nombre que la app resolvió para esa dirección).
 Facts collectFacts(const QString &path, const QString &signer, const QString &remote, int port, int protocol,
-                   int attempts);
+                   int attempts, const QString &host = {});
 
 // Partes sincrónicas, compartidas con la sonda de comparación de modelos.
 QByteArray buildRequest(const Facts &facts, const QString &model, const QString &language, bool extras);
