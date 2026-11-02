@@ -157,11 +157,19 @@ bool WfpEngine::addAppFilter(const std::wstring &path, Action action, Direction 
         error = L"FwpmGetAppIdFromFileName0: " + errorText(r);
         return false;
     }
-    FWPM_FILTER_CONDITION0 condition{};
-    condition.fieldKey = FWPM_CONDITION_ALE_APP_ID;
-    condition.matchType = FWP_MATCH_EQUAL;
-    condition.conditionValue.type = FWP_BYTE_BLOB_TYPE;
-    condition.conditionValue.byteBlob = appId;
+    FWPM_FILTER_CONDITION0 conditions[2]{};
+    conditions[0].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+    conditions[0].matchType = FWP_MATCH_EQUAL;
+    conditions[0].conditionValue.type = FWP_BYTE_BLOB_TYPE;
+    conditions[0].conditionValue.byteBlob = appId;
+    // Un Block nunca corta el tráfico dentro de la PC (loopback): no sale a la red, y apps como Nuke hablan consigo
+    // mismas por 127.0.0.1 (Frame Server). El permiso de loopback no le gana a un Block de peso 15, así que se excluye
+    // en el propio Block.
+    conditions[1].fieldKey = FWPM_CONDITION_FLAGS;
+    conditions[1].matchType = FWP_MATCH_FLAGS_NONE_SET;
+    conditions[1].conditionValue.type = FWP_UINT32;
+    conditions[1].conditionValue.uint32 = FWP_CONDITION_FLAG_IS_LOOPBACK;
+    const UINT32 conditionCount = action == Action::Block ? 2 : 1;
     const wchar_t *name = action == Action::Allow ? L"LGA GateBouncer allow" : L"LGA GateBouncer block";
     // Todo o nada: una regla a medias por capa sería engañosa.
     const bool began = begin(error);
@@ -170,8 +178,8 @@ bool WfpEngine::addAppFilter(const std::wstring &path, Action action, Direction 
     for (const GUID &layer : layersFor(direction)) {
         if (!ok) break;
         std::uint64_t id = 0;
-        ok = addFilter(layer, name, action == Action::Allow ? FWP_ACTION_PERMIT : FWP_ACTION_BLOCK, weight, &condition,
-                       1, id, error);
+        ok = addFilter(layer, name, action == Action::Allow ? FWP_ACTION_PERMIT : FWP_ACTION_BLOCK, weight, conditions,
+                       conditionCount, id, error);
         if (ok) created.push_back(id);
     }
     if (ok) ok = commit(error);

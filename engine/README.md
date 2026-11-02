@@ -11,6 +11,8 @@ other driverless Windows firewalls.
   services running as SYSTEM, LocalService or NetworkService are permitted, so DNS, DHCP and updates keep working.
 - Each application rule is a filter on the executable path (`FWPM_CONDITION_ALE_APP_ID`): Allow outweighs the default
   block, and an explicit Block outweighs everything else in the sublayer, including the Windows services permit.
+  A Block never applies to loopback (`FWP_CONDITION_FLAG_IS_LOOPBACK` excluded): an application that talks to itself
+  on `127.0.0.1`, such as Nuke's Frame Server, keeps working while its internet access is blocked.
 - The engine subscribes to WFP drop events. A drop caused by the default block becomes a **pending request** for that
   executable; a drop caused by a Block rule is recorded as activity.
 - **Allow and Block apply to the next attempt.** Without a driver, a connection cannot be held while you decide: the
