@@ -3,10 +3,10 @@
 #include "assistance/ui/SettingsWidget.h"
 #include "assistance/ui/ExplanationWidget.h"
 #include "assistance/ui/ObservationSelection.h"
+#include "toggleswitch.h"
 #include <QAbstractTableModel>
 #include <QApplication>
 #include <QButtonGroup>
-#include <QCheckBox>
 #include <QFileInfo>
 #include <QFile>
 #include <QTableWidget>
@@ -181,6 +181,15 @@ QPushButton *button(const QString &text, const QString &name, const QString &rol
     if (text == "×")
         w->setProperty("compact-close", true);
     return w;
+}
+// Opción de encendido y apagado: agrega la fila (texto + switch) al layout y devuelve el switch, que lleva el
+// objectName y se usa como antes el QCheckBox (toggled, isChecked, setEnabled).
+ToggleSwitch *switchRow(QBoxLayout *layout, const QString &text, const QString &name = {}) {
+    auto *row = new SwitchRow(text);
+    if (!name.isEmpty())
+        row->toggle()->setObjectName(name);
+    layout->addWidget(row);
+    return row->toggle();
 }
 class ChevronCombo final : public QComboBox {
   protected:
@@ -1987,14 +1996,15 @@ void MainWindow::renderOrdinaryNotice() {
         "UDP, QUIC, ICMP and startup coverage have not been validated."
         : futureScope.connections;
     l->addWidget(label(QString(client->state() == OrdinaryDecisionClient::State::Recorded ? "Recorded connections: " : submitted ? "Submitted connections: " : "Will cover: ") + network, "muted", true));
-    auto *consent = new QCheckBox("I accept the effective scope shown above.");
+    auto *consentRow = new SwitchRow("I accept the effective scope shown above.");
+    consentRow->textLabel()->setStyleSheet("font-size: 11px;"); l->addWidget(consentRow);
+    auto *consent = consentRow->toggle();
     consent->setObjectName("ordinary-consent"); consent->setEnabled(client->ready());
-    consent->setStyleSheet("QCheckBox { font-size: 11px; }"); l->addWidget(consent);
     auto *actions = line(l); auto *keep = button(submitted || client->state() == OrdinaryDecisionClient::State::Uncertain ? "Close" : "Keep pending", "keep-access-pending", "ghost"); actions->addWidget(keep);
     connect(keep, &QPushButton::clicked, client, &OrdinaryDecisionClient::closeNotice); actions->addStretch();
     auto *block = button("Block", "decide-block", "danger"); auto *allow = button("Allow", "decide-allow", "primary");
     block->setEnabled(false); allow->setEnabled(false); actions->addWidget(block); actions->addWidget(allow);
-    connect(consent, &QCheckBox::toggled, this, [client, selection, block, allow](bool checked) {
+    connect(consent, &ToggleSwitch::toggled, this, [client, selection, block, allow](bool checked) {
         const bool enabled = checked && selection == client->selection() && client->ready();
         block->setEnabled(enabled); allow->setEnabled(enabled);
     });
@@ -2343,21 +2353,17 @@ void MainWindow::renderSettings() {
              "those details even while the app remains blocked.\nNo data leaves this preview. "
              "Service, privacy, transport and key storage conditions remain unresolved.",
              true));
-    auto *consent = new QCheckBox("I consent to the local sample demo · no data sent");
-    consent->setObjectName("lookup-consent");
+    auto *consent = switchRow(lookup, "I consent to the local sample demo · no data sent", "lookup-consent");
     consent->setChecked(explanation_.consent());
     consent->setEnabled(explanation_.configured());
-    lookup->addWidget(consent);
-    connect(consent, &QCheckBox::toggled, this, [this](bool on) {
+    connect(consent, &ToggleSwitch::toggled, this, [this](bool on) {
         explanation_.setConsent(on);
         buildPage();
     });
-    auto *automatic = new QCheckBox("Automatically explain new requests");
-    automatic->setObjectName("lookup-automatic");
+    auto *automatic = switchRow(lookup, "Automatically explain new requests", "lookup-automatic");
     automatic->setChecked(explanation_.automatic());
     automatic->setEnabled(explanation_.configured() && explanation_.consent());
-    lookup->addWidget(automatic);
-    connect(automatic, &QCheckBox::toggled, &explanation_, &Explanation::setAutomatic);
+    connect(automatic, &ToggleSwitch::toggled, &explanation_, &Explanation::setAutomatic);
     lookup->addWidget(label("A real connection requires separate authorization. An explanation "
                             "never allows an app or verifies safety.",
                             "muted", true));
@@ -2835,8 +2841,7 @@ void MainWindow::prepareImportedRule(const QString &candidate) {
     auto *scopeContent = new QWidget; auto *scopeLayout = new QVBoxLayout(scopeContent);
     scopeLayout->setContentsMargins(0,0,0,0); scopeLayout->addWidget(status);
     auto *scopeScroll = scrollArea(scopeContent); scopeScroll->setMinimumHeight(100); scopeScroll->setMaximumHeight(200); l->addWidget(scopeScroll);
-    auto *consent = new QCheckBox("I accept the scope shown above.");
-    consent->setObjectName("imported-rule-consent"); consent->setEnabled(false); l->addWidget(consent);
+    auto *consent = switchRow(l, "I accept the scope shown above.", "imported-rule-consent"); consent->setEnabled(false);
     auto *actions = line(l);
     auto *prepare = button("Check original evidence", "check-imported-rule", "ghost"); actions->addWidget(prepare);
     auto *confirm = button("Activate " + policy + " rule", "confirm-imported-rule", "primary"); confirm->setEnabled(false); actions->addWidget(confirm);
@@ -2857,7 +2862,7 @@ void MainWindow::prepareImportedRule(const QString &candidate) {
     connect(prepare, &QPushButton::clicked, status, [this,candidate,processes,update] {
         product_.prepareImportedRule(candidate, processes->currentData().toString()); update();
     });
-    connect(consent, &QCheckBox::toggled, status, [this,consentToken,confirm](bool checked) {
+    connect(consent, &ToggleSwitch::toggled, status, [this,consentToken,confirm](bool checked) {
         const auto &view = product_.importedActivation(); *consentToken = checked && view.ready ? view.token : 0;
         confirm->setEnabled(checked && view.ready && *consentToken == view.token);
     });
@@ -3026,12 +3031,10 @@ void MainWindow::cleanup() {
     auto *cl = new QVBoxLayout(checks);
     cl->setContentsMargins(0, 0, 0, 0);
     cl->setSpacing(8);
-    QVector<QCheckBox *> boxes;
+    QVector<ToggleSwitch *> boxes;
     for (const auto &r : candidates) {
-        auto *b = new QCheckBox(r.name + " · " + policyText(r.policy));
-        b->setObjectName("cleanup-" + r.id);
+        auto *b = switchRow(cl, r.name + " · " + policyText(r.policy), "cleanup-" + r.id);
         b->setProperty("rule-id", r.id);
-        cl->addWidget(b);
         cl->addWidget(label((r.missing ? "Executable missing · " : "Executable present · ") +
                                 QString::number(r.days) +
                                 " days since rule creation\nLast attempt: " + timestamp(r.last),
@@ -3054,7 +3057,7 @@ void MainWindow::cleanup() {
     actions->addWidget(remove);
     connect(cancel, &QPushButton::clicked, this, &MainWindow::closeModal);
     for (auto *b : boxes)
-        connect(b, &QCheckBox::toggled, remove, [boxes, remove] {
+        connect(b, &ToggleSwitch::toggled, remove, [boxes, remove] {
             bool selected = false;
             for (const auto *box : boxes)
                 selected |= box->isChecked();
@@ -3186,9 +3189,9 @@ void MainWindow::reviewOlderLiveRules() {
         if (ids.empty() || ids.size() > 128) return;
         auto *body = modal("Back up reviewed rules",ModalOwner::FileRule);
         body->addWidget(note(QString("Save %1 selected application and account rules as an inactive backup. No rule is changed and no permission is restored automatically.").arg(ids.size()),true));
-        auto *consent = new QCheckBox("Save these selected rules as an inactive backup"); body->addWidget(consent);
+        auto *consent = switchRow(body, "Save these selected rules as an inactive backup");
         auto *save = button("Save inactive backup","save-old-rule-backup","primary"); save->setEnabled(false); body->addWidget(save);
-        connect(consent,&QCheckBox::toggled,save,&QPushButton::setEnabled);
+        connect(consent,&ToggleSwitch::toggled,save,&QPushButton::setEnabled);
         connect(save,&QPushButton::clicked,this,[this,ids,selection,consent,current] {
             if (!current() || !product_.backupSelectedRules(ids,selection,consent->isChecked())) { message("The selection changed or the stored review is unavailable."); return; }
             closeModal(); message("Saving the selected inactive backup in the background. No rule was changed.");
@@ -3216,11 +3219,10 @@ void MainWindow::cleanupLiveRule(const QString &ruleId, quint64 selection) {
     definition(layout,"Rule",(rule.action == 2 ? QString("Allow") : QString("Block")) + " · " + scope.connections);
     layout->addWidget(note("Removing this rule changes future policy for this application and account. Other rules still apply. No recorded requests does not prove inactivity. Protection coverage has not been validated.",true));
     layout->addWidget(label("An inactive backup preserves the original application and account target. Restoring it requires the selected file to match again; it does not restore permissions automatically.","faint",true));
-    auto *backupConsent = new QCheckBox("Save this selected rule as an inactive backup");
-    backupConsent->setObjectName("consent-rule-backup"); layout->addWidget(backupConsent);
+    auto *backupConsent = switchRow(layout, "Save this selected rule as an inactive backup", "consent-rule-backup");
     auto *backup = button("Save selected backup","save-selected-rule-backup","ghost");
     backup->setEnabled(false); layout->addWidget(backup,0,Qt::AlignLeft);
-    connect(backupConsent,&QCheckBox::toggled,backup,[this,backup](bool checked) {
+    connect(backupConsent,&ToggleSwitch::toggled,backup,[this,backup](bool checked) {
         backup->setEnabled(checked && !product_.ruleBackupBusy() && product_.reviewWritable());
     });
     connect(backup,&QPushButton::clicked,this,[this,rule,selection,backupConsent] {
@@ -3228,13 +3230,12 @@ void MainWindow::cleanupLiveRule(const QString &ruleId, quint64 selection) {
         closeModal(); message(saved ? "Saving the selected inactive rule backup in the background. No rule was changed."
             : "Backup was not queued. Refresh your rules and check the stored review status.");
     });
-    auto *consent = new QCheckBox("Remove this selected application and account rule");
-    consent->setObjectName("consent-rule-removal"); layout->addWidget(consent);
+    auto *consent = switchRow(layout, "Remove this selected application and account rule", "consent-rule-removal");
     auto *actions = line(layout); auto *cancel = button("Cancel","cancel-rule-removal","ghost");
     actions->addWidget(cancel); actions->addStretch();
     auto *remove = button("Remove selected rule","confirm-rule-removal","danger");
     remove->setEnabled(false); actions->addWidget(remove);
-    connect(consent,&QCheckBox::toggled,remove,&QPushButton::setEnabled);
+    connect(consent,&ToggleSwitch::toggled,remove,&QPushButton::setEnabled);
     connect(cancel,&QPushButton::clicked,this,&MainWindow::closeModal);
     connect(remove,&QPushButton::clicked,this,[this,rule,selection,consent] {
         if (!product_.ordinary()->revokeRule(rule.rule,selection,consent->isChecked())) {
@@ -3267,9 +3268,9 @@ void MainWindow::backupSelectedFileRules() {
     const auto selection = product_.ordinary()->selection();
     auto *layout = modal("Back up selected rules",ModalOwner::FileRule);
     layout->addWidget(note(QString("Save %1 selected rules, including their original application and account targets, as an inactive backup. No rule will be changed. A backup cannot restore permissions automatically.").arg(selected.size()),true));
-    auto *consent = new QCheckBox("Save these selected rules as an inactive backup"); layout->addWidget(consent);
+    auto *consent = switchRow(layout, "Save these selected rules as an inactive backup");
     auto *save = button("Save inactive backup","save-rule-backup","primary"); save->setEnabled(false); layout->addWidget(save);
-    connect(consent,&QCheckBox::toggled,save,&QPushButton::setEnabled);
+    connect(consent,&ToggleSwitch::toggled,save,&QPushButton::setEnabled);
     connect(save,&QPushButton::clicked,this,[this,selected,selection,consent] {
         if (!product_.backupSelectedRules(selected,selection,consent->isChecked())) { message("The original selection changed or a stored review write is unavailable."); return; }
         closeModal(); message("Saving selected inactive rules in the background. No rule was changed.");
@@ -3340,7 +3341,7 @@ void MainWindow::prepareFileRules(const QStringList &candidates, const std::opti
     auto *status = label("Choose an executable. It will be retained under your original account while the service prepares its own draft.","muted",true);
     status->setObjectName("file-rule-scope"); auto *content = new QWidget; auto *body = new QVBoxLayout(content); body->setContentsMargins(0,0,0,0); body->addWidget(status);
     auto *scroll = scrollArea(content); scroll->setMinimumHeight(120); scroll->setMaximumHeight(240); layout->addWidget(scroll);
-    auto *consent = new QCheckBox("I accept this exact decision and the scope shown above."); consent->setObjectName("file-rule-consent"); consent->setEnabled(false); layout->addWidget(consent);
+    auto *consent = switchRow(layout, "I accept this exact decision and the scope shown above.", "file-rule-consent"); consent->setEnabled(false);
     auto *actions = line(layout); auto *prepare = button("Check original file and draft","prepare-file-rule","ghost"); actions->addWidget(prepare);
     auto *confirm = button(editing ? "Replace selected rule" : "Create reviewed rule","confirm-file-rule","primary"); confirm->setEnabled(false); actions->addWidget(confirm);
     auto token = std::make_shared<quint64>(0); auto consentToken = std::make_shared<quint64>(0);
@@ -3374,7 +3375,7 @@ void MainWindow::prepareFileRules(const QStringList &candidates, const std::opti
         const auto scope = direction->currentIndex() == 0 ? Data::Direction::Out : direction->currentIndex() == 1 ? Data::Direction::In : Data::Direction::Both;
         if (!product_.prepareApplicationFile(path->text(),action,scope,editing,selection,sources->currentData().toString(),backupIndex)) message("The original file review could not start. Check the current selection and wait for any previous operation to finish."); update();
     });
-    connect(consent,&QCheckBox::toggled,status,[this,consentToken,confirm](bool checked) { const auto &view = product_.fileRuleView(); *consentToken = checked && view.ready ? view.token : 0; confirm->setEnabled(checked && view.ready && *consentToken == view.token); });
+    connect(consent,&ToggleSwitch::toggled,status,[this,consentToken,confirm](bool checked) { const auto &view = product_.fileRuleView(); *consentToken = checked && view.ready ? view.token : 0; confirm->setEnabled(checked && view.ready && *consentToken == view.token); });
     connect(confirm,&QPushButton::clicked,status,[this,consent,consentToken,update] { product_.confirmApplicationFile(*consentToken,consent->isChecked()); update(); });
     update();
 }
@@ -3876,18 +3877,14 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
                                   "blocked and a notice asks you to allow or block it."
                                 : "Not asking: unknown applications connect. Saved Allow and Block rules still apply.",
                         "muted", true));
-    auto *ask = new QCheckBox("Ask before unknown applications connect");
-    ask->setObjectName("firewall-ask");
+    auto *ask = switchRow(ep, "Ask before unknown applications connect", "firewall-ask");
     ask->setChecked(s.ask);
     ask->setEnabled(can);
-    ep->addWidget(ask);
-    connect(ask, &QCheckBox::toggled, this, [this](bool on) { firewall_.setAsk(on); });
-    auto *lan = new QCheckBox("Allow the local network without asking");
-    lan->setObjectName("firewall-lan");
+    connect(ask, &ToggleSwitch::toggled, this, [this](bool on) { firewall_.setAsk(on); });
+    auto *lan = switchRow(ep, "Allow the local network without asking", "firewall-lan");
     lan->setChecked(s.localNetwork);
     lan->setEnabled(can);
-    ep->addWidget(lan);
-    connect(lan, &QCheckBox::toggled, this, [this](bool on) { firewall_.setLocalNetwork(on); });
+    connect(lan, &ToggleSwitch::toggled, this, [this](bool on) { firewall_.setLocalNetwork(on); });
     ep->addWidget(label("Local network: other computers, printers and storage at home or at the office, and devices "
                         "on Tailscale. A Block rule for an application still applies there. Windows services, DNS and "
                         "connections inside this PC are always permitted. To turn GateBouncer off completely, run "
@@ -3927,10 +3924,9 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
     auto *removeKey = button("Remove key", "explain-remove-key", "ghost");
     removeKey->setEnabled(hasKey);
     keyRow->addWidget(removeKey);
-    auto *consent = new QCheckBox("Send app details to " + providerName + " when an explanation is requested");
-    consent->setObjectName("explain-consent");
+    auto *consent = switchRow(ap, "Send app details to " + providerName + " when an explanation is requested",
+                              "explain-consent");
     consent->setChecked(settings.consent);
-    ap->addWidget(consent);
     ap->addWidget(label("Sent: the file name, its folder (with your account name removed), its signature and version "
                         "details, and the public address it tried to reach with the server name it looked up. Never "
                         "the file itself, its command line, "
@@ -3950,10 +3946,8 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
     language->setCurrentIndex(settings.language == "es" ? 1 : 0);
     options->addWidget(language);
     options->addStretch();
-    auto *automatic = new QCheckBox("Explain automatically when a notice appears");
-    automatic->setObjectName("explain-automatic");
+    auto *automatic = switchRow(ap, "Explain automatically when a notice appears", "explain-automatic");
     automatic->setChecked(settings.automatic);
-    ap->addWidget(automatic);
     auto *testRow = line(ap);
     auto *test = button("Test with Notepad", "explain-test", "ghost");
     test->setEnabled(hasKey && settings.consent);
@@ -3976,11 +3970,11 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
         next.automatic = automatic->isChecked();
         next.save();
     };
-    connect(consent, &QCheckBox::toggled, this, [store, test, provider](bool on) {
+    connect(consent, &ToggleSwitch::toggled, this, [store, test, provider](bool on) {
         store();
         test->setEnabled(on && Explain::KeyStore::has(provider));
     });
-    connect(automatic, &QCheckBox::toggled, this, store);
+    connect(automatic, &ToggleSwitch::toggled, this, store);
     connect(model, &QComboBox::currentTextChanged, this, [this, store, provider](const QString &chosen) {
         // Otro proveedor tiene su propia key y su propio consentimiento: la página se rearma para mostrarlos. El
         // consentimiento del proveedor nuevo se lee, no se copia del anterior.
