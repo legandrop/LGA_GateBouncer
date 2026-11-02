@@ -254,8 +254,19 @@ int install(const std::vector<std::wstring> &uiPaths, bool allowUnprotected) {
     }
     SERVICE_DESCRIPTIONW description{const_cast<wchar_t *>(L"Per-application firewall: asks before unknown applications connect.")};
     ChangeServiceConfig2W(service, SERVICE_CONFIG_DESCRIPTION, &description);
-    const bool started = StartServiceW(service, 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING;
+    bool started = StartServiceW(service, 0, nullptr) || GetLastError() == ERROR_SERVICE_ALREADY_RUNNING;
     if (!started) fwprintf(stderr, L"StartService: %ls\n", gbe::WfpEngine::errorText(GetLastError()).c_str());
+    // StartService vuelve con el servicio todavía arrancando: se espera a que el motor ponga sus filtros (RUNNING) o se
+    // rinda (STOPPED), para que el instalador sepa si de verdad quedó funcionando.
+    SERVICE_STATUS status{};
+    for (int i = 0; started && i < 300; ++i) {
+        if (!QueryServiceStatus(service, &status) || status.dwCurrentState == SERVICE_STOPPED) started = false;
+        else if (status.dwCurrentState == SERVICE_RUNNING) break;
+        else Sleep(100);
+    }
+    if (started && status.dwCurrentState != SERVICE_RUNNING) started = false;
+    if (!started && status.dwCurrentState == SERVICE_STOPPED)
+        fwprintf(stderr, L"The service stopped while starting (see %ls\\engine.log).\n", dir.c_str());
     CloseServiceHandle(service);
     CloseServiceHandle(scm);
     wprintf(started ? L"Service installed and running.\n" : L"Service installed, but it did not start.\n");
