@@ -23,8 +23,10 @@ bool matchesDestination(const QString &pattern, const QString &host) {
 const std::vector<Entry> &entries() {
     static const std::vector<Entry> list = [] {
         std::vector<Entry> out;
-        // QA: un catálogo de prueba en lugar del que viaja con la app.
-        const QString qa = qEnvironmentVariable("GATEBOUNCER_QA_CATALOG");
+        // QA: un catálogo de prueba en lugar del que viaja con la app, sólo en un recorrido de QA (como el resto de
+        // los ganchos de QA de app_main.cpp): la ventana instalada no lee un catálogo de otro lado.
+        const QString qa = qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") ? QString()
+                                                                              : qEnvironmentVariable("GATEBOUNCER_QA_CATALOG");
         QFile file(qa.isEmpty() ? QStringLiteral(":/gatebouncer/resources/catalog/known_apps.json") : qa);
         if (!file.open(QIODevice::ReadOnly)) return out;
         for (const auto &v : QJsonDocument::fromJson(file.readAll()).object().value("apps").toArray()) {

@@ -55,6 +55,13 @@ Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 Type: files; Name: "{app}\*.old"
 Type: files; Name: "{app}\*.new"
 Type: files; Name: "{app}\emergencia.ps1"
+Type: files; Name: "{app}\generic\*.old"
+Type: files; Name: "{app}\iconengines\*.old"
+Type: files; Name: "{app}\imageformats\*.old"
+Type: files; Name: "{app}\networkinformation\*.old"
+Type: files; Name: "{app}\platforms\*.old"
+Type: files; Name: "{app}\styles\*.old"
+Type: files; Name: "{app}\tls\*.old"
 Type: dirifempty; Name: "{app}"
 
 [Run]
@@ -65,8 +72,10 @@ const
   ServiceName = 'LGAGateBouncer';
 
 var
-  // PrepareToInstall detuvo el servicio y todavía nadie lo volvió a arrancar.
-  ServiceStopped: Boolean;
+  // PrepareToInstall detuvo el servicio; PostInstallReached: ya se intentó --install con los archivos nuevos.
+  ServiceStopped, PostInstallReached: Boolean;
+  // El motor ya quitó el servicio y sus filtros; UninstallStarted: el usuario confirmó y empezó el borrado.
+  EngineRemoved, UninstallStarted: Boolean;
 
 procedure CloseWindows(const ScriptPath: String);
 var
@@ -101,38 +110,59 @@ var
   ResultCode: Integer;
 begin
   if CurStep <> ssPostInstall then Exit;
+  PostInstallReached := True;
   WizardForm.StatusLabel.Caption := 'Starting the GateBouncer service...';
   if not Exec(ExpandConstant('{app}\{#EngineExeName}'), '--install', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
      or (ResultCode <> 0) then
     MsgBox('The GateBouncer service did not start. Saved rules still apply, but new applications cannot ask for ' +
-           'access until it runs. Restart Windows or run the installer again.', mbError, MB_OK)
-  else
-    ServiceStopped := False;
+           'access until it runs. Restart Windows or run the installer again.', mbError, MB_OK);
 end;
 
-// Instalación cancelada o fallida después de detener el servicio: se vuelve a arrancar el que ya estaba.
+// Instalación cancelada antes de copiar los archivos nuevos: se vuelve a arrancar el servicio que ya estaba. Si
+// --install falló no se fuerza nada: el motor pudo negarse por una razón de seguridad (carpeta no protegida).
 procedure DeinitializeSetup();
 var
   ResultCode: Integer;
 begin
-  if ServiceStopped then
+  if ServiceStopped and not PostInstallReached then
     Exec(ExpandConstant('{sys}\net.exe'), 'start ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
-// Ya confirmada la desinstalación y antes de borrar archivos, el motor quita el servicio, sus filtros y el inicio de
-// la ventana. Si el servicio no se detiene, el motor no toca nada y sigue administrando sus filtros (su exe queda en
-// uso y no se borra): se avisa cómo recuperar la red.
-// Las reglas quedan por defecto (una reinstalación las recupera); se borran sólo si el usuario lo pide.
-procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+// Antes de borrar nada, el motor quita el servicio, sus filtros y el inicio de la ventana. Si no puede (el servicio
+// no se detiene, los filtros no se quitan), la desinstalación no sigue: borrar los archivos dejaría filtros sin nadie
+// que los administre y sin el exe para quitarlos.
+function InitializeUninstall(): Boolean;
 var
   ResultCode: Integer;
 begin
-  if (CurUninstallStep = usUninstall) and FileExists(ExpandConstant('{app}\{#EngineExeName}')) then begin
-    if not Exec(ExpandConstant('{app}\{#EngineExeName}'), '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
-       or (ResultCode <> 0) then
-      MsgBox('GateBouncer could not remove its service and filters.' + #13#10 + 'Run "' +
-             ExpandConstant('{app}\{#EngineExeName}') + ' --remove-filters" as administrator to restore network ' +
-             'access, then uninstall again.', mbError, MB_OK);
+  Result := True;
+  if not FileExists(ExpandConstant('{app}\{#EngineExeName}')) then Exit;
+  if not Exec(ExpandConstant('{app}\{#EngineExeName}'), '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+     or (ResultCode <> 0) then begin
+    MsgBox('GateBouncer could not remove its service and filters, so nothing was uninstalled.' + #13#10 + 'Run "' +
+           ExpandConstant('{app}\{#EngineExeName}') + ' --remove-filters" as administrator to restore network ' +
+           'access, then try again.', mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  EngineRemoved := True;
+end;
+
+// Si después de eso el usuario contesta «No» a la confirmación, nada se borró: el motor vuelve a instalarse tal cual
+// estaba, con sus reglas, así que no queda una PC sin firewall por arrepentirse.
+procedure DeinitializeUninstall();
+var
+  ResultCode: Integer;
+begin
+  if EngineRemoved and not UninstallStarted then
+    Exec(ExpandConstant('{app}\{#EngineExeName}'), '--install', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+// Las reglas quedan por defecto (una reinstalación las recupera); se borran sólo si el usuario lo pide.
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then begin
+    UninstallStarted := True;
     CloseWindows(ExpandConstant('{app}\tools\close_by_path.ps1'));
   end;
   if (CurUninstallStep = usPostUninstall) and not UninstallSilent and

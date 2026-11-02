@@ -237,11 +237,14 @@ int install(const std::vector<std::wstring> &uiPaths, bool allowUnprotected) {
     SC_HANDLE service = CreateServiceW(scm, ServiceName, L"LGA GateBouncer", SERVICE_ALL_ACCESS,
                                        SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
                                        command.c_str(), nullptr, nullptr, L"BFE\0\0", nullptr, nullptr);
+    bool configured = true;
     if (!service && GetLastError() == ERROR_SERVICE_EXISTS) {
         // Ya registrado (otra instalación, quizás en otra carpeta): pasa a correr este motor.
         service = OpenServiceW(scm, ServiceName, SERVICE_ALL_ACCESS);
-        if (service && !ChangeServiceConfigW(service, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
-                                             command.c_str(), nullptr, nullptr, L"BFE\0\0", nullptr, nullptr, nullptr))
+        configured = service && ChangeServiceConfigW(service, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
+                                                     command.c_str(), nullptr, nullptr, L"BFE\0\0", nullptr, nullptr,
+                                                     nullptr);
+        if (service && !configured)
             fwprintf(stderr, L"ChangeServiceConfig: %ls\n", gbe::WfpEngine::errorText(GetLastError()).c_str());
     }
     if (!service) {
@@ -271,7 +274,7 @@ int install(const std::vector<std::wstring> &uiPaths, bool allowUnprotected) {
     } else {
         fwprintf(stderr, L"%ls not found: the window will not start at sign-in.\n", window.c_str());
     }
-    return started ? 0 : 1;
+    return started && configured ? 0 : 1;
 }
 
 int removeFilters(bool deleteObjects) {
