@@ -33,6 +33,7 @@ class AccessToast final : public QWidget {
         bool canDecide = true;
         QString remote, host; // destino del último intento; host vacío si no se sabe el nombre
         int port = 0, protocol = 0;
+        QString known; // lo que dice el catálogo de apps conocidas; vacío si no está
     };
 
     explicit AccessToast(QWidget *parent = nullptr);
@@ -83,7 +84,7 @@ class AccessToast final : public QWidget {
     bool armed_ = false;
     QLabel *icon_ = nullptr, *title_ = nullptr, *signature_ = nullptr, *signatureMark_ = nullptr, *path_ = nullptr;
     QLabel *note_ = nullptr, *footer_ = nullptr;
-    QLabel *destination_ = nullptr, *destinationDetail_ = nullptr;
+    QLabel *destination_ = nullptr, *destinationDetail_ = nullptr, *known_ = nullptr;
     QComboBox *scope_ = nullptr, *duration_ = nullptr, *target_ = nullptr;
     QLabel *body_ = nullptr;
     bool targetChosen_ = false; // el usuario tocó «Destination»

@@ -267,6 +267,14 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     destinationDetail_->setTextFormat(Qt::PlainText);
     layout->addWidget(destinationDetail_);
     layout->addSpacing(10);
+    // Catálogo de apps conocidas: al instante, sin pedir nada a nadie. Como la explicación, sólo ayuda a decidir.
+    known_ = new QLabel(this);
+    known_->setObjectName("toastSignature");
+    known_->setTextFormat(Qt::PlainText);
+    known_->setWordWrap(true);
+    known_->setFixedWidth(Width - 32);
+    known_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
+    layout->addWidget(known_);
 
     // Explicación con IA. El enlace la pide; la respuesta va en un recuadro aparte y nunca toca la decisión.
     explainAction_ = new QPushButton(this);
@@ -427,6 +435,10 @@ void AccessToast::setRequest(const Request &request) {
     }
     // Fuera del bloque anterior: un intento nuevo de la misma app puede ir a otro destino.
     renderDestination();
+    known_->setText(request.known);
+    known_->setVisible(!request.known.isEmpty());
+    known_->ensurePolished();
+    known_->setFixedHeight(request.known.isEmpty() ? 0 : known_->heightForWidth(known_->width()) + 6);
     updateCounters();
     adjustSize();
 }
@@ -578,6 +590,8 @@ void AccessToast::applyWidth(int width) {
     width_ = qBound(Width, width, MaxWidth);
     setFixedWidth(width_);
     explainStatus_->setFixedWidth(width_ - 32);
+    known_->setFixedWidth(width_ - 32);
+    if (!known_->text().isEmpty()) known_->setFixedHeight(known_->heightForWidth(width_ - 32) + 6);
     for (auto *label : {what_, why_, risk_, suggestion_, explainFoot_}) label->setFixedWidth(width_ - 32 - 22);
     renderDestination();
     if (explanation_.state == Explanation::Ready) renderExplanation();

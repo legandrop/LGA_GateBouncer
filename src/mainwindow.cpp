@@ -1,5 +1,6 @@
 #include "mainwindow.h"
 #include "explain/KeyStore.h"
+#include "explain/KnownApps.h"
 #include "assistance/ui/SettingsWidget.h"
 #include "assistance/ui/ExplanationWidget.h"
 #include "assistance/ui/ObservationSelection.h"
@@ -3757,6 +3758,7 @@ void MainWindow::updateFirewallToast() {
     request.host = current->host;
     request.port = current->port;
     request.protocol = current->protocol;
+    request.known = KnownApps::hint(current->signer, current->path, current->host);
     firewallToast_->setRequest(request);
     // El nombre del servidor llega por DNS un instante después del bloqueo: sin él, se espera antes de preguntar.
     if (newApp && current->host.isEmpty())

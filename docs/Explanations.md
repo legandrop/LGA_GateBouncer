@@ -43,6 +43,14 @@ Only when you ask (or when automatic explanations are on), for the application o
 
 Never the file itself, its command line, your account name or anything else on your computer.
 
+## Known applications
+
+Before any model is asked, the notice checks a small catalog that ships with GateBouncer
+(`resources/catalog/known_apps.json`). Each entry is a signer, a file name, optionally a destination, the usual
+decision and one sentence about the application; every entry was reviewed by hand before it was published. A match
+shows **Known app · usually Allow** (or Block) on the notice right away. Unsigned applications never match, because
+anyone can use a file name. Like the explanations, the catalog never allows or blocks anything by itself.
+
 ## How the keys are kept
 
 Each key is encrypted with Windows DPAPI for your Windows account and stored in

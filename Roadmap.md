@@ -1,10 +1,11 @@
 # Roadmap
 
-**No release yet.** Updated November 1, 2026.
+**No release yet.** Updated November 2, 2026.
 
 **First usable version:** block unknown outbound connections and ask Allow/Block, keep permanent or temporary rules per
-application, provide searchable applications, activity and rule cleanup, import NetLimiter rules, and offer optional
-AI explanations with your own NVIDIA key. Advice never authorizes traffic. No bandwidth control.
+application or per destination, provide searchable applications, activity and rule cleanup, import NetLimiter rules,
+and offer optional AI explanations with your own Anthropic or NVIDIA key. Advice never authorizes traffic. No
+bandwidth control.
 
 The engine is driverless (Windows Filtering Platform from an elevated service). A decision applies to the
 application's next attempt; the attempt that produced the request has already been blocked.
@@ -28,17 +29,24 @@ Checkboxes mean **verified on Windows**, not only implemented.
   Block rule still wins on the local network.
 - [ ] **Ask mode for every application.** In daily use on one Windows 11 computer with DNS, DHCP and updates working.
   Done when it also runs on a clean machine.
-- [ ] **Permanent rules across restarts.** Rules survive a service restart (verified with `--update`). Done when they
-  also survive a reboot on an installed system.
+- [x] **Permanent rules across restarts.** Verified on Windows 11 with the installed service: after a reboot the service
+  started on its own, the window came back once in the tray, every rule was loaded, an unknown application was blocked
+  and asked, and a destination rule still let its application reach only its server. Filters are persistent, so
+  Windows enforces them from the moment its filtering service starts, before any user signs in.
+- [x] **Destination rules.** Verified on Windows 11 with the installed service: an application limited to its own
+  servers reached them, and a new server asked separately.
 - [ ] **Install, update, uninstall and recovery.** `--install`, `--update`, `--uninstall` and the `--remove-filters`
-  emergency switch work on one computer. Done when they pass on a clean machine. No installer package yet.
+  emergency switch work on one computer. An installer package (`instalador.bat --no-run`) installs into Program
+  Files and lets the engine register itself. Done when installing, updating and uninstalling pass on a clean machine.
+- [ ] **Known applications.** The notice can show a reviewed decision for a known application right away, without
+  asking an AI model. Done when the first reviewed catalog ships.
 - [ ] **Coexistence.** Done when tests with Windows Defender Firewall and NetLimiter show the expected result.
 - [ ] **NetLimiter import.** Implemented: NetLimiter firewall rules for single applications become GateBouncer rules;
   rules with destination, port, zone or schedule conditions are listed and not imported. Done when it is checked
   against a real NetLimiter settings file.
-- [x] **AI explanations.** Verified on Windows 11: ten NVIDIA models were compared on eleven real requests and the
-  default answers in about ten seconds when the service is not busy. NVIDIA's free service is shared and its speed
-  varies a lot by hour; a slow answer never holds the decision.
+- [x] **AI explanations.** Verified on Windows 11: Anthropic and NVIDIA models were compared on real requests; the
+  default, `claude-haiku-5-5`, answers in about four seconds. The request includes the server name the application
+  looked up and the program that started it. A slow answer never holds the decision.
 
-**Next result:** use the installed engine day to day, reboot it, and run the clean-machine checks.
+**Next result:** run the installer and ask mode on a clean machine, and ship the first reviewed catalog.
 [Component details](docs/index.md).

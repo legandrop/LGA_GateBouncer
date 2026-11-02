@@ -33,6 +33,8 @@ qt_add_library(gatebouncer_explain STATIC
     src/explain/KeyStore.h
     src/explain/Explainer.cpp
     src/explain/Explainer.h
+    src/explain/KnownApps.cpp
+    src/explain/KnownApps.h
 )
 target_include_directories(gatebouncer_explain PUBLIC src)
 target_link_libraries(gatebouncer_explain PUBLIC Qt6::Core Qt6::Network PRIVATE winhttp crypt32 version advapi32 shell32 ole32)
@@ -160,6 +162,7 @@ target_compile_options(GateBouncer PRIVATE -Wall -Wextra -Wpedantic)
 qt_add_resources(GateBouncer "gatebouncer_app_assets"
     PREFIX "/gatebouncer"
     FILES
+        resources/catalog/known_apps.json
         resources/fonts/Inter-Regular.ttf
         resources/fonts/Inter-Medium.ttf
         resources/fonts/Inter-SemiBold.ttf
