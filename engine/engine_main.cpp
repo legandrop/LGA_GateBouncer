@@ -237,7 +237,13 @@ int install(const std::vector<std::wstring> &uiPaths, bool allowUnprotected) {
     SC_HANDLE service = CreateServiceW(scm, ServiceName, L"LGA GateBouncer", SERVICE_ALL_ACCESS,
                                        SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
                                        command.c_str(), nullptr, nullptr, L"BFE\0\0", nullptr, nullptr);
-    if (!service && GetLastError() == ERROR_SERVICE_EXISTS) service = OpenServiceW(scm, ServiceName, SERVICE_ALL_ACCESS);
+    if (!service && GetLastError() == ERROR_SERVICE_EXISTS) {
+        // Ya registrado (otra instalación, quizás en otra carpeta): pasa a correr este motor.
+        service = OpenServiceW(scm, ServiceName, SERVICE_ALL_ACCESS);
+        if (service && !ChangeServiceConfigW(service, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
+                                             command.c_str(), nullptr, nullptr, L"BFE\0\0", nullptr, nullptr, nullptr))
+            fwprintf(stderr, L"ChangeServiceConfig: %ls\n", gbe::WfpEngine::errorText(GetLastError()).c_str());
+    }
     if (!service) {
         fwprintf(stderr, L"CreateService: %ls\n", gbe::WfpEngine::errorText(GetLastError()).c_str());
         CloseServiceHandle(scm);
@@ -422,7 +428,7 @@ int update(const std::wstring &from) {
     CloseServiceHandle(service);
     CloseServiceHandle(scm);
     wprintf(L"%ls %ls\n", copied ? L"Updated" : L"Update incomplete:", to.c_str());
-    wprintf(started ? L"Service running.\n" : L"The service did not start. Use emergencia.ps1 or --remove-filters.\n");
+    wprintf(started ? L"Service running.\n" : L"The service did not start. Use --remove-filters to restore network access.\n");
     return copied && started ? 0 : 1;
 }
 

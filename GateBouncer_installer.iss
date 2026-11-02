@@ -49,14 +49,24 @@ Source: "tools\close_by_path.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 
+; Lo que el motor o la ventana dejan en la carpeta (copias .old de una actualización en uso, el script de emergencia
+; de una instalación a mano). Las reglas viven en ProgramData y se tratan aparte, abajo.
+[UninstallDelete]
+Type: files; Name: "{app}\*.old"
+Type: files; Name: "{app}\*.new"
+Type: files; Name: "{app}\emergencia.ps1"
+Type: dirifempty; Name: "{app}"
+
 [Run]
-; Registra y arranca el servicio, y la ventana al iniciar sesión. Con el servicio ya registrado sólo lo arranca.
-Filename: "{app}\{#EngineExeName}"; Parameters: "--install"; StatusMsg: "Starting the GateBouncer service..."; Flags: runhidden waituntilterminated
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent runasoriginaluser
 
 [Code]
 const
   ServiceName = 'LGAGateBouncer';
+
+var
+  // PrepareToInstall detuvo el servicio y todavía nadie lo volvió a arrancar.
+  ServiceStopped: Boolean;
 
 procedure CloseWindows(const ScriptPath: String);
 var
@@ -78,37 +88,60 @@ var
   ResultCode: Integer;
 begin
   Result := '';
-  Exec(ExpandConstant('{sys}\net.exe'), 'stop ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  ServiceStopped := Exec(ExpandConstant('{sys}\net.exe'), 'stop ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated,
+                         ResultCode) and (ResultCode = 0);
   ExtractTemporaryFile('close_by_path.ps1');
   CloseWindows(ExpandConstant('{tmp}\close_by_path.ps1'));
 end;
 
-// Antes de borrar nada: el motor quita el servicio, sus filtros y el inicio de la ventana. Si no puede (el servicio
-// no se detiene), la desinstalación no sigue: borrar los archivos dejaría filtros sin nadie que los administre.
-function InitializeUninstall(): Boolean;
+// Con los archivos nuevos: el motor registra y arranca el servicio (o sólo lo arranca, si ya estaba) y la ventana al
+// iniciar sesión. Si falla se avisa: sin servicio, las apps nuevas no pueden pedir permiso.
+procedure CurStepChanged(CurStep: TSetupStep);
 var
   ResultCode: Integer;
 begin
-  Result := True;
-  if not FileExists(ExpandConstant('{app}\{#EngineExeName}')) then Exit;
-  if not Exec(ExpandConstant('{app}\{#EngineExeName}'), '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
-     or (ResultCode <> 0) then begin
-    MsgBox('GateBouncer could not remove its service and filters, so nothing was uninstalled.' + #13#10 +
-           'Run "' + ExpandConstant('{app}\{#EngineExeName}') + ' --remove-filters" as administrator to restore ' +
-           'network access, then try again.', mbError, MB_OK);
-    Result := False;
-    Exit;
-  end;
-  CloseWindows(ExpandConstant('{app}\tools\close_by_path.ps1'));
+  if CurStep <> ssPostInstall then Exit;
+  WizardForm.StatusLabel.Caption := 'Starting the GateBouncer service...';
+  if not Exec(ExpandConstant('{app}\{#EngineExeName}'), '--install', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+     or (ResultCode <> 0) then
+    MsgBox('The GateBouncer service did not start. Saved rules still apply, but new applications cannot ask for ' +
+           'access until it runs. Restart Windows or run the installer again.', mbError, MB_OK)
+  else
+    ServiceStopped := False;
 end;
 
+// Instalación cancelada o fallida después de detener el servicio: se vuelve a arrancar el que ya estaba.
+procedure DeinitializeSetup();
+var
+  ResultCode: Integer;
+begin
+  if ServiceStopped then
+    Exec(ExpandConstant('{sys}\net.exe'), 'start ' + ServiceName, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;
+
+// Ya confirmada la desinstalación y antes de borrar archivos, el motor quita el servicio, sus filtros y el inicio de
+// la ventana. Si el servicio no se detiene, el motor no toca nada y sigue administrando sus filtros (su exe queda en
+// uso y no se borra): se avisa cómo recuperar la red.
 // Las reglas quedan por defecto (una reinstalación las recupera); se borran sólo si el usuario lo pide.
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  ResultCode: Integer;
 begin
+  if (CurUninstallStep = usUninstall) and FileExists(ExpandConstant('{app}\{#EngineExeName}')) then begin
+    if not Exec(ExpandConstant('{app}\{#EngineExeName}'), '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+       or (ResultCode <> 0) then
+      MsgBox('GateBouncer could not remove its service and filters.' + #13#10 + 'Run "' +
+             ExpandConstant('{app}\{#EngineExeName}') + ' --remove-filters" as administrator to restore network ' +
+             'access, then uninstall again.', mbError, MB_OK);
+    CloseWindows(ExpandConstant('{app}\tools\close_by_path.ps1'));
+  end;
   if (CurUninstallStep = usPostUninstall) and not UninstallSilent and
      (MsgBox('Also delete your saved GateBouncer rules and settings?', mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES) then begin
     DelTree(ExpandConstant('{commonappdata}\LGA GateBouncer'), True, True, True);
+    // Datos de la ventana (Qt usa el nombre de la app) y las keys de las explicaciones.
+    DelTree(ExpandConstant('{localappdata}\LGA\LGA GateBouncer'), True, True, True);
     DelTree(ExpandConstant('{localappdata}\LGA\GateBouncer'), True, True, True);
     RegDeleteKeyIncludingSubkeys(HKCU, 'Software\LGA\GateBouncer');
+    RegDeleteKeyIncludingSubkeys(HKCU, 'Software\LGA\LGA GateBouncer');
   end;
 end;

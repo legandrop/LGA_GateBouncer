@@ -3963,7 +3963,8 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
                               "explain-consent");
     consent->setChecked(settings.consent);
     ap->addWidget(label("Sent: the file name, its folder (with your account name removed), its signature and version "
-                        "details, and the public address it tried to reach with the server name it looked up. Never "
+                        "details, the public address it tried to reach with the server name it looked up, and the file "
+                        "name of the program that started it. Never "
                         "the file itself, its command line, "
                         "or addresses on your local network. Requests use your " + providerName +
                             " account and its terms; up to 100 explanations a day.",
