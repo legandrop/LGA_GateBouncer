@@ -24,7 +24,9 @@
 
 namespace Gate::Explain {
 namespace {
-constexpr wchar_t Host[] = L"integrate.api.nvidia.com";
+// Únicos hosts a los que viaja una key: el de su proveedor, fijo en el código.
+const wchar_t *hostOf(Provider p) { return p == Provider::Anthropic ? L"api.anthropic.com" : L"integrate.api.nvidia.com"; }
+constexpr char AnthropicVersion[] = "2026-10-21";
 constexpr int ResponseLimit = 512 * 1024;
 constexpr int DailyLimit = 100; // tope de pedidos por día: una app que reintenta sin parar no gasta la cuenta
 constexpr int DefaultDeadlineMs = 45000;
@@ -120,19 +122,30 @@ QString systemPrompt(const QString &language) {
                "now and then, an updater the app may later demand), say that they can choose Allow with a "
                "temporary duration, such as 1 hour, when that happens.\n"
                "Never state that a program is safe, verified or free of malware: you cannot check that. Plain text "
-               "only, no markdown, no links. Write the values in %1.")
+               "only, no markdown, no links. Write the values in %1, but keep the button names Allow and Block in "
+               "English, as they appear on screen.")
         .arg(Settings::languageName(language));
 }
 
-QString statusError(int status) {
-    if (status == 401 || status == 403) return "NVIDIA rejected the API key. Check it in Settings.";
-    if (status == 404) return "This model is not available for your NVIDIA key. Choose another one in Settings.";
-    if (status == 429) return "NVIDIA's rate limit was reached. Try again in a minute.";
-    if (status == 202) return "The model is busy. Try again in a moment.";
-    if (status >= 500) return "NVIDIA is not answering right now. Try again later.";
-    return QString("NVIDIA answered with an error (HTTP %1).").arg(status);
+QString statusError(Provider p, int status) {
+    const QString name = providerName(p);
+    if (status == 401 || status == 403) return name + " rejected the API key. Check it in Settings.";
+    if (status == 404) return QString("This model is not available for your %1 key. Choose another one in Settings.").arg(name);
+    if (status == 429) return name + "'s rate limit was reached. Try again in a minute.";
+    if (status == 202 || status == 529) return "The model is busy. Try again in a moment.";
+    if (status >= 500) return name + " is not answering right now. Try again later.";
+    return QString("%1 answered with an error (HTTP %2).").arg(name).arg(status);
 }
+
+// El consentimiento es por proveedor: aceptar mandar datos a NVIDIA no vale para Anthropic.
+QString consentKey(Provider p) { return p == Provider::Anthropic ? "explain/consent_anthropic" : "explain/consent"; }
 } // namespace
+
+Provider providerOf(const QString &model) {
+    return model.startsWith("claude-") ? Provider::Anthropic : Provider::Nvidia;
+}
+
+QString providerName(Provider provider) { return provider == Provider::Anthropic ? "Anthropic" : "NVIDIA"; }
 
 Settings Settings::load() {
     auto s = store();
@@ -142,7 +155,7 @@ Settings Settings::load() {
     out.language = s.value("explain/language", system).toString();
     if (out.language != "en" && out.language != "es") out.language = system;
     out.automatic = s.value("explain/automatic", false).toBool();
-    out.consent = s.value("explain/consent", false).toBool();
+    out.consent = s.value(consentKey(providerOf(out.model)), false).toBool();
     return out;
 }
 
@@ -151,17 +164,21 @@ void Settings::save() const {
     s.setValue("explain/model", model);
     s.setValue("explain/language", language);
     s.setValue("explain/automatic", automatic);
-    s.setValue("explain/consent", consent);
+    s.setValue(consentKey(providerOf(model)), consent);
 }
+
+void Settings::saveModel(const QString &model) { store().setValue("explain/model", model); }
 
 QStringList Settings::models() {
-    // Comparación del 2026-11-01 con apps reales: nemotron-3-ultra respondió bien en ~10 s; deepseek, mejor pero en
-    // ~2 min; lightning, rápido pero recomendaba dejar pasar telemetría. Los que no estaban o no respondían, fuera.
-    return {"nvidia/nemotron-3-ultra-550b-a55b", "deepseek-ai/deepseek-v4.1-flash",
-            "nvidia/nemotron-3.5-lightning-30b-a3b", "openai/gpt-oss-20b"};
+    // Comparación del 2026-11-02 con 13 apps reales: Haiku 5.5 acertó con ~3,6 s por respuesta; Opus 5.5, algo más
+    // fino (relaciona un curl con la app que lo lanzó) en ~7 s; Sonnet 5.5 en medio. En NVIDIA (2026-11-01):
+    // nemotron-3-ultra ~10 s pero a veces 35 s o sin respuesta; deepseek mejor pero ~2 min; lightning rápido pero
+    // recomendaba dejar pasar telemetría. Los que no estaban o no respondían, fuera.
+    return {"claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5", "nvidia/nemotron-3-ultra-550b-a55b",
+            "deepseek-ai/deepseek-v4.1-flash", "nvidia/nemotron-3.5-lightning-30b-a3b", "openai/gpt-oss-20b"};
 }
 
-QString Settings::defaultModel() { return "nvidia/nemotron-3-ultra-550b-a55b"; }
+QString Settings::defaultModel() { return "claude-haiku-5-5"; }
 
 bool qaFixture() { return !qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_EXPLAIN"); }
 
@@ -205,23 +222,47 @@ QByteArray buildRequest(const Facts &f, const QString &model, const QString &lan
     if (!f.destination.isEmpty()) facts["destination"] = f.destination;
     if (!f.serverName.isEmpty()) facts["server_name"] = f.serverName;
     if (f.attempts > 0) facts["blocked_attempts"] = f.attempts;
+    const QString user = QString::fromUtf8(QJsonDocument(facts).toJson(QJsonDocument::Compact));
+    if (providerOf(model) == Provider::Anthropic) {
+        // Salida con esquema: la respuesta es siempre el objeto pedido. Esfuerzo bajo: alcanza para reconocer un
+        // programa y contesta en pocos segundos. Sin temperature ni top_p (la versión de la API los rechaza).
+        QJsonObject properties;
+        for (const char *name : {"what", "why", "risk", "reason"}) properties[name] = QJsonObject{{"type", "string"}};
+        properties["suggestion"] = QJsonObject{{"type", "string"}, {"enum", QJsonArray{"allow", "block", "either"}}};
+        QJsonObject body{
+            {"model", model},
+            {"max_tokens", 4000},
+            {"system", systemPrompt(language)},
+            {"messages", QJsonArray{QJsonObject{{"role", "user"}, {"content", user}}}},
+            {"output_config",
+             QJsonObject{{"effort", "low"},
+                         {"format", QJsonObject{{"type", "json_schema"},
+                                                {"schema", QJsonObject{{"type", "object"},
+                                                                       {"properties", properties},
+                                                                       {"required", QJsonArray{"what", "why", "risk",
+                                                                                               "suggestion", "reason"}},
+                                                                       {"additionalProperties", false}}}}}}}};
+        // Sonnet y Opus: si un filtro de seguridad rechaza el pedido, el servidor lo pasa a otro modelo en vez de
+        // devolver un rechazo. Haiku no tiene esa opción.
+        if (extras && !model.startsWith("claude-haiku")) body["fallbacks"] = "default";
+        return QJsonDocument(body).toJson(QJsonDocument::Compact);
+    }
     QJsonObject body{{"model", model},
                      {"temperature", 0.2},
                      {"top_p", 0.9},
                      {"max_tokens", 900},
                      {"stream", false},
                      {"messages", QJsonArray{QJsonObject{{"role", "system"}, {"content", systemPrompt(language)}},
-                                             QJsonObject{{"role", "user"},
-                                                         {"content", QString::fromUtf8(QJsonDocument(facts).toJson(
-                                                                         QJsonDocument::Compact))}}}}};
+                                             QJsonObject{{"role", "user"}, {"content", user}}}}};
     // Modelos con razonamiento: se pide la respuesta directa. Si un modelo rechaza el campo, se reintenta sin él.
     if (extras) body["chat_template_kwargs"] = QJsonObject{{"enable_thinking", false}, {"thinking", false}};
     return QJsonDocument(body).toJson(QJsonDocument::Compact);
 }
 
-HttpResult nvidiaRequest(const char *method, const wchar_t *path, const QByteArray &body, const std::string &key,
-                         int deadlineMs) {
+HttpResult providerRequest(Provider provider, const char *method, const wchar_t *path, const QByteArray &body,
+                           const std::string &key, int deadlineMs) {
     HttpResult result;
+    const QString name = providerName(provider);
     QElapsedTimer clock;
     clock.start();
     HINTERNET session = WinHttpOpen(L"LGA-GateBouncer/1", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
@@ -236,7 +277,7 @@ HttpResult nvidiaRequest(const char *method, const wchar_t *path, const QByteArr
         WinHttpSetOption(session, WINHTTP_OPTION_SECURE_PROTOCOLS, &protocols, sizeof(protocols));
     }
     WinHttpSetTimeouts(session, 10000, 10000, 15000, deadlineMs);
-    HINTERNET connection = WinHttpConnect(session, Host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+    HINTERNET connection = WinHttpConnect(session, hostOf(provider), INTERNET_DEFAULT_HTTPS_PORT, 0);
     HINTERNET request = connection ? WinHttpOpenRequest(connection, QString::fromLatin1(method).toStdWString().c_str(),
                                                         path, nullptr, WINHTTP_NO_REFERER,
                                                         WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)
@@ -249,7 +290,7 @@ HttpResult nvidiaRequest(const char *method, const wchar_t *path, const QByteArr
         return result;
     };
     if (!request) {
-        result.error = "Windows could not prepare the request to NVIDIA.";
+        result.error = "Windows could not prepare the request to " + name + ".";
         return finish();
     }
     // La key sólo viaja a este host: una redirección a otro lado se rechaza, no se sigue.
@@ -257,8 +298,14 @@ HttpResult nvidiaRequest(const char *method, const wchar_t *path, const QByteArr
     WinHttpSetOption(request, WINHTTP_OPTION_DISABLE_FEATURE, &disable, sizeof(disable));
     DWORD policy = WINHTTP_OPTION_REDIRECT_POLICY_NEVER;
     WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, &policy, sizeof(policy));
-    std::wstring headers = L"Authorization: Bearer " + std::wstring(key.begin(), key.end()) +
-                           L"\r\nAccept: application/json\r\n";
+    std::wstring headers;
+    if (provider == Provider::Anthropic) {
+        headers = L"x-api-key: " + std::wstring(key.begin(), key.end()) + L"\r\nanthropic-version: " +
+                  QString(AnthropicVersion).toStdWString() + L"\r\nAccept: application/json\r\n";
+        if (body.contains("\"fallbacks\":\"default\"")) headers += L"anthropic-beta: server-side-fallback-2026-07-01\r\n";
+    } else {
+        headers = L"Authorization: Bearer " + std::wstring(key.begin(), key.end()) + L"\r\nAccept: application/json\r\n";
+    }
     if (!body.isEmpty()) headers += L"Content-Type: application/json\r\n";
     const BOOL sent = WinHttpSendRequest(request, headers.c_str(), DWORD(-1L),
                                          body.isEmpty() ? WINHTTP_NO_REQUEST_DATA : const_cast<char *>(body.data()),
@@ -266,11 +313,11 @@ HttpResult nvidiaRequest(const char *method, const wchar_t *path, const QByteArr
     SecureZeroMemory(headers.data(), headers.size() * sizeof(wchar_t));
     if (!sent || !WinHttpReceiveResponse(request, nullptr)) {
         const DWORD e = GetLastError();
-        result.error = e == ERROR_WINHTTP_TIMEOUT ? "NVIDIA did not answer in time."
-                       : e == ERROR_WINHTTP_SECURE_FAILURE ? "The secure connection to NVIDIA could not be verified."
+        result.error = e == ERROR_WINHTTP_TIMEOUT ? name + " did not answer in time."
+                       : e == ERROR_WINHTTP_SECURE_FAILURE ? "The secure connection to " + name + " could not be verified."
                        : e == ERROR_WINHTTP_NAME_NOT_RESOLVED || e == ERROR_WINHTTP_CANNOT_CONNECT
-                           ? "NVIDIA could not be reached. Check the internet connection."
-                           : QString("The request to NVIDIA failed (error %1).").arg(e);
+                           ? name + " could not be reached. Check the internet connection."
+                           : QString("The request to %1 failed (error %2).").arg(name).arg(e);
         return finish();
     }
     DWORD status = 0, size = sizeof(status);
@@ -279,24 +326,24 @@ HttpResult nvidiaRequest(const char *method, const wchar_t *path, const QByteArr
     result.status = int(status);
     for (;;) {
         if (clock.elapsed() > deadlineMs) {
-            result.error = "NVIDIA did not answer in time.";
+            result.error = name + " did not answer in time.";
             return finish();
         }
         DWORD available = 0;
         if (!WinHttpQueryDataAvailable(request, &available)) {
-            result.error = "The answer from NVIDIA was cut off.";
+            result.error = "The answer from " + name + " was cut off.";
             return finish();
         }
         if (available == 0) break;
         if (result.body.size() + qsizetype(available) > ResponseLimit) {
-            result.error = "The answer from NVIDIA was too large.";
+            result.error = "The answer from " + name + " was too large.";
             return finish();
         }
         const auto offset = result.body.size();
         result.body.resize(offset + qsizetype(available));
         DWORD read = 0;
         if (!WinHttpReadData(request, result.body.data() + offset, available, &read)) {
-            result.error = "The answer from NVIDIA was cut off.";
+            result.error = "The answer from " + name + " was cut off.";
             return finish();
         }
         result.body.resize(offset + qsizetype(read));
@@ -305,10 +352,26 @@ HttpResult nvidiaRequest(const char *method, const wchar_t *path, const QByteArr
 }
 
 bool parseAnswer(const QByteArray &body, Answer &answer, QString &error) {
-    const auto doc = QJsonDocument::fromJson(body);
-    const auto choices = doc.object().value("choices").toArray();
-    QString content = choices.isEmpty() ? QString()
-                                        : choices.first().toObject().value("message").toObject().value("content").toString();
+    const auto root = QJsonDocument::fromJson(body).object();
+    QString content;
+    if (root.contains("content")) {
+        // Anthropic: bloques de contenido; el texto es la respuesta (los de razonamiento vienen vacíos y se saltean).
+        const QString stop = root.value("stop_reason").toString();
+        if (stop == "refusal") {
+            error = "The model declined to explain this program.";
+            return false;
+        }
+        if (stop == "max_tokens") {
+            error = "The answer was cut off. Try again.";
+            return false;
+        }
+        for (const auto &block : root.value("content").toArray())
+            if (block.toObject().value("type").toString() == "text") content += block.toObject().value("text").toString();
+    } else {
+        const auto choices = root.value("choices").toArray();
+        content = choices.isEmpty() ? QString()
+                                    : choices.first().toObject().value("message").toObject().value("content").toString();
+    }
     content.remove(QRegularExpression("<think>.*</think>", QRegularExpression::DotMatchesEverythingOption));
     const auto open = content.indexOf('{'), close = content.lastIndexOf('}');
     if (open < 0 || close <= open) {
@@ -332,13 +395,17 @@ bool parseAnswer(const QByteArray &body, Answer &answer, QString &error) {
 bool explainNow(const Facts &facts, const QString &model, const QString &language, Answer &answer, QString &error,
                 qint64 *milliseconds) {
     HttpResult result;
+    const Provider provider = providerOf(model);
+    const wchar_t *path = provider == Provider::Anthropic ? L"/v1/messages" : L"/v1/chat/completions";
     const bool keyRead = KeyStore::withKey(
+        provider,
         [&](const std::string &key) {
-            result = nvidiaRequest("POST", L"/v1/chat/completions", buildRequest(facts, model, language, true), key,
-                                   deadlineMs());
-            if (result.error.isEmpty() && (result.status == 400 || result.status == 422))
-                result = nvidiaRequest("POST", L"/v1/chat/completions", buildRequest(facts, model, language, false),
-                                       key, deadlineMs());
+            const QByteArray full = buildRequest(facts, model, language, true);
+            const QByteArray plainBody = buildRequest(facts, model, language, false);
+            result = providerRequest(provider, "POST", path, full, key, deadlineMs());
+            // Sólo se reintenta si quitar los campos opcionales cambia algo (con Haiku el pedido es el mismo).
+            if (result.error.isEmpty() && (result.status == 400 || result.status == 422) && plainBody != full)
+                result = providerRequest(provider, "POST", path, plainBody, key, deadlineMs());
         },
         error);
     if (milliseconds) *milliseconds = result.milliseconds;
@@ -348,7 +415,11 @@ bool explainNow(const Facts &facts, const QString &model, const QString &languag
         return false;
     }
     if (result.status != 200) {
-        error = statusError(result.status);
+        error = statusError(provider, result.status);
+        // El motivo que da el servidor (texto plano y recortado) ayuda a entender un pedido rechazado.
+        const QString detail = plain(QJsonDocument::fromJson(result.body).object().value("error").toObject()
+                                         .value("message").toString(), 200);
+        if (result.status == 400 && !detail.isEmpty()) error += " " + detail;
         return false;
     }
     answer.model = model;

@@ -3751,7 +3751,7 @@ void MainWindow::explainFirewallRequest(const QString &path, bool automatic) {
     if (!firewallToast_) return;
     AccessToast::Explanation e;
     const auto settings = Explain::Settings::load();
-    if (!Explain::qaFixture() && (!Explain::KeyStore::has() || !settings.consent)) {
+    if (!Explain::qaFixture() && (!Explain::KeyStore::has(Explain::providerOf(settings.model)) || !settings.consent)) {
         e.state = AccessToast::Explanation::NoKey;
     } else if (const auto *hit = explainer_.cached(path)) {
         e = {AccessToast::Explanation::Ready, hit->what, hit->why, hit->risk, hit->suggestion, hit->reason, hit->model, {}};
@@ -3900,13 +3900,16 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
     ap->setContentsMargins(16, 16, 16, 16);
     ap->setSpacing(8);
     ap->addWidget(label("AI explanations", "heading"));
-    ap->addWidget(label("When an application is blocked, the notice can ask NVIDIA what it is and why it connects. The "
-                        "answer only helps you decide: it never allows or blocks anything, and it can be wrong.",
+    ap->addWidget(label("When an application is blocked, the notice can ask an AI model what it is and why it connects. "
+                        "The answer only helps you decide: it never allows or blocks anything, and it can be wrong.",
                         "muted", true));
     const auto settings = Explain::Settings::load();
-    const bool hasKey = Explain::KeyStore::has();
-    auto *keyState = label(hasKey ? "NVIDIA API key saved for this Windows account (encrypted)."
-                                  : "No NVIDIA API key saved.",
+    // Key, consentimiento y textos son del proveedor del modelo elegido (Anthropic para claude-*, si no NVIDIA).
+    const auto provider = Explain::providerOf(settings.model);
+    const QString providerName = Explain::providerName(provider);
+    const bool hasKey = Explain::KeyStore::has(provider);
+    auto *keyState = label(hasKey ? providerName + " API key saved for this Windows account (encrypted)."
+                                  : "No " + providerName + " API key saved.",
                            hasKey ? "muted" : "warning", true);
     keyState->setObjectName("explain-key-state");
     ap->addWidget(keyState);
@@ -3914,7 +3917,9 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
     auto *key = new QLineEdit;
     key->setObjectName("explain-key");
     key->setEchoMode(QLineEdit::Password);
-    key->setPlaceholderText(hasKey ? "Paste a new key to replace the saved one" : "Paste your NVIDIA API key (nvapi-...)");
+    key->setPlaceholderText(hasKey ? "Paste a new key to replace the saved one"
+                                   : QString("Paste your %1 API key (%2...)")
+                                         .arg(providerName, provider == Explain::Provider::Anthropic ? "sk-ant-" : "nvapi-"));
     key->setClearButtonEnabled(true);
     keyRow->addWidget(key, 1);
     auto *saveKey = button("Save key", "explain-save-key", "primary");
@@ -3922,15 +3927,15 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
     auto *removeKey = button("Remove key", "explain-remove-key", "ghost");
     removeKey->setEnabled(hasKey);
     keyRow->addWidget(removeKey);
-    auto *consent = new QCheckBox("Send app details to NVIDIA when an explanation is requested");
+    auto *consent = new QCheckBox("Send app details to " + providerName + " when an explanation is requested");
     consent->setObjectName("explain-consent");
     consent->setChecked(settings.consent);
     ap->addWidget(consent);
     ap->addWidget(label("Sent: the file name, its folder (with your account name removed), its signature and version "
                         "details, and the public address it tried to reach with the server name it looked up. Never "
                         "the file itself, its command line, "
-                        "or addresses on your local network. Requests use your NVIDIA account and its terms; up to "
-                        "100 explanations a day.",
+                        "or addresses on your local network. Requests use your " + providerName +
+                            " account and its terms; up to 100 explanations a day.",
                         "faint", true));
     auto *options = line(ap);
     options->addWidget(label("Model", "muted"));
@@ -3960,7 +3965,10 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
     ap->addWidget(testResult);
     l->addWidget(ai);
 
-    const auto store = [consent, model, language, automatic] {
+    const auto store = [consent, model, language, automatic, provider] {
+        // Con el desplegable ya en otro proveedor (la página se está rearmando), estos controles son del anterior:
+        // no se guarda nada, para no escribir su consentimiento bajo el proveedor nuevo.
+        if (Explain::providerOf(model->currentText()) != provider) return;
         auto next = Explain::Settings::load();
         next.consent = consent->isChecked();
         next.model = model->currentText();
@@ -3968,43 +3976,61 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
         next.automatic = automatic->isChecked();
         next.save();
     };
-    connect(consent, &QCheckBox::toggled, this, [store, test](bool on) {
+    connect(consent, &QCheckBox::toggled, this, [store, test, provider](bool on) {
         store();
-        test->setEnabled(on && Explain::KeyStore::has());
+        test->setEnabled(on && Explain::KeyStore::has(provider));
     });
     connect(automatic, &QCheckBox::toggled, this, store);
-    connect(model, &QComboBox::currentTextChanged, this, store);
+    connect(model, &QComboBox::currentTextChanged, this, [this, store, provider](const QString &chosen) {
+        // Otro proveedor tiene su propia key y su propio consentimiento: la página se rearma para mostrarlos. El
+        // consentimiento del proveedor nuevo se lee, no se copia del anterior.
+        if (Explain::providerOf(chosen) != provider) {
+            Explain::Settings::saveModel(chosen);
+            QTimer::singleShot(0, this, [this] { buildPage(); });
+            return;
+        }
+        store();
+    });
     connect(language, &QComboBox::currentIndexChanged, this, store);
-    connect(saveKey, &QPushButton::clicked, this, [this, key] {
+    connect(saveKey, &QPushButton::clicked, this, [this, key, provider, providerName] {
         QString error;
-        if (!Explain::KeyStore::save(key->text().trimmed(), error)) {
+        if (!Explain::KeyStore::save(provider, key->text().trimmed(), error)) {
             message(error);
             return;
         }
         key->clear();
-        message("NVIDIA API key saved for this Windows account.");
+        message(providerName + " API key saved for this Windows account.");
         buildPage();
     });
-    connect(removeKey, &QPushButton::clicked, this, [this] {
+    connect(removeKey, &QPushButton::clicked, this, [this, provider, providerName] {
         QString error;
-        if (!Explain::KeyStore::clear(error)) {
+        if (!Explain::KeyStore::clear(provider, error)) {
             message(error);
             return;
         }
-        message("NVIDIA API key removed.");
+        message(providerName + " API key removed.");
         buildPage();
     });
-    connect(test, &QPushButton::clicked, this, [test, testResult] {
+    connect(test, &QPushButton::clicked, this, [test, testResult, providerName] {
+        // La prueba también manda datos: exige el consentimiento y la key vigentes, no los de cuando se armó la página.
+        const auto current = Explain::Settings::load();
+        const auto allowed = [] {
+            const auto s = Explain::Settings::load();
+            return s.consent && Explain::KeyStore::has(Explain::providerOf(s.model));
+        };
+        if (!allowed()) {
+            test->setEnabled(false);
+            return;
+        }
         test->setEnabled(false);
         testResult->show();
-        testResult->setText("Asking NVIDIA about notepad.exe...");
+        testResult->setText("Asking " + providerName + " about notepad.exe...");
         const QString notepad = QDir::fromNativeSeparators(qEnvironmentVariable("SystemRoot") + "\\System32\\notepad.exe");
         const auto facts = Explain::collectFacts(notepad, "Microsoft Windows", {}, 0, 6, 1);
-        const auto current = Explain::Settings::load();
         QPointer<QLabel> result(testResult);
         QPointer<QPushButton> again(test);
         // Hilo suelto, como las explicaciones: salir de la app no espera esta prueba.
-        std::thread([facts, current, result, again] {
+        std::thread([facts, current, result, again, allowed] {
             Explain::Answer answer;
             QString error;
             qint64 ms = 0;
@@ -4012,8 +4038,8 @@ void MainWindow::buildFirewallSettings(QVBoxLayout *l) {
             if (!QCoreApplication::instance()) return;
             QMetaObject::invokeMethod(
                 QCoreApplication::instance(),
-                [ok, answer, error, ms, result, again] {
-                    if (again) again->setEnabled(true);
+                [ok, answer, error, ms, result, again, allowed] {
+                    if (again) again->setEnabled(allowed());
                     if (!result) return;
                     result->setText(ok ? QString("Working · %1 s · %2").arg(ms / 1000.0, 0, 'f', 1).arg(answer.what)
                                        : "Not working: " + error);

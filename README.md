@@ -30,8 +30,8 @@ In **Live** mode, the Processes, Pending, Activity and Rules views read the engi
   Applications without a valid signature can only get a rule for the exact file.
 - The notice's **For** list makes the decision temporary: 1, 5, 10, 15 or 30 minutes, 1 hour, or until the engine
   restarts. When it expires the rule is removed and the application asks again.
-- **What is this? Ask AI** on the notice asks NVIDIA, with your own NVIDIA API key, what the application is, why it
-  connects and what you gain or lose by allowing it. The answer only helps you decide: it never allows or blocks
+- **What is this? Ask AI** on the notice asks an AI model (Anthropic's Claude or NVIDIA's catalog, with your own API
+  key) what the application is, why it connects and what you gain or lose by allowing it. The answer only helps you decide: it never allows or blocks
   anything and it can be wrong. See [AI explanations](docs/Explanations.md) for exactly what is sent.
 - **Activity** shows blocked attempts and rule changes recorded by the engine. Allowed connections are not recorded.
 - **Rules** lists saved Allow and Block rules, including rules for an app in any version or for a whole publisher, and

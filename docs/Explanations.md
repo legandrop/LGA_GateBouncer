@@ -1,24 +1,30 @@
 # AI explanations
 
-When an application is blocked, the desktop notice can ask NVIDIA what the application is, why it would connect, and
-what you gain or lose by allowing it. The answer only helps you decide. It never allows or blocks anything, it can be
-wrong, and it never states that an application is safe.
+When an application is blocked, the desktop notice can ask an AI model what the application is, why it would connect,
+and what you gain or lose by allowing it. The answer only helps you decide. It never allows or blocks anything, it can
+be wrong, and it never states that an application is safe.
+
+Two providers are supported, each with your own API key: **Anthropic** (Claude models) and **NVIDIA** (its API
+catalog). The provider follows the model you choose: models named `claude-...` use Anthropic, the others NVIDIA.
 
 ## Setup
 
 In **Settings → AI explanations**:
 
-1. Paste your NVIDIA API key (it starts with `nvapi-`) and choose **Save key**. You can create one in NVIDIA's API
-   catalog. Requests use your NVIDIA account and its terms.
-2. Check **Send app details to NVIDIA when an explanation is requested**. Without it, the notice only offers to open
-   Settings.
-3. Optionally choose the model and the language, and **Explain automatically when a notice appears**. **Test with
-   Notepad** checks the key and the model.
+1. Choose the model. The key field, the consent and the texts below it switch to that model's provider.
+2. Paste the provider's API key and choose **Save key**: an Anthropic key starts with `sk-ant-` (create it in the
+   Claude Console), an NVIDIA key with `nvapi-` (create it in NVIDIA's API catalog). Requests use your account with
+   that provider and its terms.
+3. Check **Send app details to <provider> when an explanation is requested**. Consent is kept per provider: agreeing
+   to send details to one does not cover the other. Without it, the notice only offers to open Settings.
+4. Optionally choose the language and **Explain automatically when a notice appears**. **Test with Notepad** checks
+   the key and the model.
 
-The default model is `nvidia/nemotron-3-ultra-550b-a55b`. In a comparison on real blocked applications it gave sound
-advice in about 10 seconds; `deepseek-ai/deepseek-v4.1-flash` answered as well or better but took up to two minutes,
-and faster models suggested allowing telemetry. The models NVIDIA offers change over time: if one stops answering,
-choose another and use **Test with Notepad**.
+The default model is `claude-haiku-5-5`. In a comparison on 13 real blocked applications it gave sound advice in about
+3.5 seconds per answer; `claude-opus-5-5` was slightly sharper (for example, it linked a `curl.exe` download to the
+application that ran it) in about 7 seconds, and `claude-sonnet-5-5` sat in between. On NVIDIA,
+`nvidia/nemotron-3-ultra-550b-a55b` answered in 10 to 35 seconds or not at all at busy times. The models a provider
+offers change over time: if one stops answering, choose another and use **Test with Notepad**.
 
 The answer says what the application is, whether it is the application itself or a helper such as an updater, what
 its folder and signature indicate about it, and what you lose by blocking it. It suggests blocking telemetry, crash
@@ -36,16 +42,20 @@ Only when you ask (or when automatic explanations are on), for the application o
 
 Never the file itself, its command line, your account name or anything else on your computer.
 
-## How the key is kept
+## How the keys are kept
 
-The key is encrypted with Windows DPAPI for your Windows account and stored in
-`%LOCALAPPDATA%\LGA\GateBouncer\Explain`, a folder only your account and SYSTEM can open. It is decrypted only to send a
-request and is never shown, logged or passed to the engine. Like saved browser passwords, this does not protect it
-from software already running under your account or from an administrator. **Remove key** deletes it.
+Each key is encrypted with Windows DPAPI for your Windows account and stored in
+`%LOCALAPPDATA%\LGA\GateBouncer\Explain` (`anthropic.key`, `nvidia.key`), a folder only your account and SYSTEM can
+open. A key is decrypted only to send a request to its own provider and is never shown, logged or passed to the
+engine. Like saved browser passwords, this does not protect it from software already running under your account or
+from an administrator. **Remove key** deletes the key of the selected model's provider.
 
 ## Requests
 
-- They go only to `https://integrate.api.nvidia.com`, with TLS 1.2 or later; redirects are refused.
+- They go only to the provider's fixed address, `https://api.anthropic.com` or `https://integrate.api.nvidia.com`, with
+  TLS 1.2 or later; redirects are refused, so a key never reaches another host.
+- Anthropic requests ask for low effort and a fixed answer shape, so the reply is always the expected fields. On
+  Sonnet and Opus, a request declined by a safety filter is answered by a fallback model instead.
 - The engine lets the installed window connect to TCP port 443 only, so explanations work while every other unknown
   application is blocked.
 - One request per application at a time, answers are reused for the rest of the session, and there are at most 100
@@ -54,4 +64,4 @@ from software already running under your account or from an administrator. **Rem
   answer is ignored if the notice already shows another application.
 
 `GateBouncerExplainProbe.exe` (built with the window) asks several models about a list of executables with the saved
-key and writes the answers and times to a JSON file, to compare models.
+keys and writes the answers and times to a JSON file, to compare models.

@@ -2,9 +2,11 @@
 // Explicación con IA de una app bloqueada: qué es, por qué se conecta y una sugerencia. Sólo ayuda a decidir: nunca
 // permite ni bloquea nada, y su respuesta se trata como texto no confiable (se valida, se recorta y se muestra plano).
 //
-// Lo que se manda a NVIDIA son datos locales del ejecutable: nombre, carpeta (con la carpeta del usuario reemplazada
-// por %USERPROFILE%), firma verificada por el motor, datos de versión del archivo y el destino público que intentó.
-// Nunca el contenido del archivo, la línea de comandos, el nombre de la cuenta ni direcciones de la red local.
+// Lo que se manda al proveedor (NVIDIA o Anthropic, según el modelo elegido) son datos locales del ejecutable: nombre,
+// carpeta (con la carpeta del usuario reemplazada por %USERPROFILE%), firma verificada por el motor, datos de versión
+// del archivo y el destino público que intentó. Nunca el contenido del archivo, la línea de comandos, el nombre de la
+// cuenta ni direcciones de la red local.
+#include "KeyStore.h"
 #include <QObject>
 #include <QPointer>
 #include <QSet>
@@ -12,6 +14,10 @@
 #include <QStringList>
 
 namespace Gate::Explain {
+
+// El proveedor sale del modelo: los de Anthropic empiezan con «claude-», el resto es del catálogo de NVIDIA.
+Provider providerOf(const QString &model);
+QString providerName(Provider provider);
 
 struct Facts {
     QString path; // ruta local: no se manda tal cual
@@ -28,9 +34,10 @@ struct Settings {
     QString model;
     QString language; // "en" o "es"
     bool automatic = false;
-    bool consent = false; // el usuario aceptó qué se manda, al guardar la key
+    bool consent = false; // el usuario aceptó qué se manda al proveedor del modelo elegido (se guarda por proveedor)
     static Settings load();
     void save() const;
+    static void saveModel(const QString &model); // sólo el modelo: no toca el consentimiento de ningún proveedor
     static QStringList models();
     static QString defaultModel();
     static QString languageName(const QString &code);
@@ -41,7 +48,8 @@ struct Settings {
 Facts collectFacts(const QString &path, const QString &signer, const QString &remote, int port, int protocol,
                    int attempts, const QString &host = {});
 
-// Partes sincrónicas, compartidas con la sonda de comparación de modelos.
+// Partes sincrónicas, compartidas con la sonda de comparación de modelos. extras: campos opcionales del proveedor
+// (razonamiento apagado en NVIDIA, modelo de respaldo ante un rechazo en Anthropic); sin ellos si el pedido falla.
 QByteArray buildRequest(const Facts &facts, const QString &model, const QString &language, bool extras);
 struct HttpResult {
     int status = 0;
@@ -49,9 +57,10 @@ struct HttpResult {
     QString error;
     qint64 milliseconds = 0;
 };
-// POST a https://integrate.api.nvidia.com/v1/<path>: TLS 1.2+, sin redirecciones, plazo total y tope de tamaño.
-HttpResult nvidiaRequest(const char *method, const wchar_t *path, const QByteArray &body, const std::string &key,
-                         int deadlineMs);
+// Pedido HTTPS al host fijo del proveedor (integrate.api.nvidia.com o api.anthropic.com): TLS 1.2+, sin
+// redirecciones, plazo total y tope de tamaño.
+HttpResult providerRequest(Provider provider, const char *method, const wchar_t *path, const QByteArray &body,
+                           const std::string &key, int deadlineMs);
 bool parseAnswer(const QByteArray &body, Answer &answer, QString &error);
 // Recorridos de QA: respuesta fija, sin red ni key (variable GATEBOUNCER_QA_EXPLAIN).
 bool qaFixture();

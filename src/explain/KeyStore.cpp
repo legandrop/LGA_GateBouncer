@@ -7,13 +7,24 @@
 #include <dpapi.h>
 #include <sddl.h>
 #include <shlobj.h>
+#include <cstring>
 #include <vector>
 
 namespace Gate::Explain {
 namespace {
-// Entropía fija: un blob de DPAPI de otra app de esta cuenta no se descifra acá por error.
-constexpr char Entropy[] = "LGA.GateBouncer.NvidiaKey.v1";
-constexpr wchar_t FileName[] = L"\\nvidia.key";
+// Entropía fija por proveedor: un blob de DPAPI de otra app (o del otro proveedor) no se descifra acá por error.
+struct Spec {
+    const char *entropy;
+    const wchar_t *file, *description;
+    const char *prefix, *name;
+};
+const Spec &spec(Provider p) {
+    static const Spec nvidia{"LGA.GateBouncer.NvidiaKey.v1", L"\\nvidia.key", L"LGA GateBouncer NVIDIA key", "nvapi-",
+                             "NVIDIA"};
+    static const Spec anthropic{"LGA.GateBouncer.AnthropicKey.v1", L"\\anthropic.key", L"LGA GateBouncer Anthropic key",
+                                "sk-ant-", "Anthropic"};
+    return p == Provider::Anthropic ? anthropic : nvidia;
+}
 
 std::wstring folderPath() {
     PWSTR base = nullptr;
@@ -92,45 +103,46 @@ bool ensureFolder(const std::wstring &dir, QString &error) {
     return true;
 }
 
-DATA_BLOB entropyBlob() {
-    return DATA_BLOB{DWORD(sizeof(Entropy) - 1), reinterpret_cast<BYTE *>(const_cast<char *>(Entropy))};
+DATA_BLOB entropyBlob(Provider p) {
+    const char *e = spec(p).entropy;
+    return DATA_BLOB{DWORD(strlen(e)), reinterpret_cast<BYTE *>(const_cast<char *>(e))};
 }
 } // namespace
 
 QString KeyStore::folder() { return QString::fromStdWString(folderPath()); }
 
-bool KeyStore::plausible(const QString &key) {
-    if (!key.startsWith("nvapi-") || key.size() < 20 || key.size() > 200) return false;
+bool KeyStore::plausible(Provider provider, const QString &key) {
+    if (!key.startsWith(spec(provider).prefix) || key.size() < 20 || key.size() > 300) return false;
     for (const QChar c : key)
         if (c.unicode() <= 0x20 || c.unicode() >= 0x7f) return false;
     return true;
 }
 
-bool KeyStore::has() {
-    const std::wstring file = folderPath() + FileName;
+bool KeyStore::has(Provider provider) {
+    const std::wstring file = folderPath() + spec(provider).file;
     const DWORD a = GetFileAttributesW(file.c_str());
     return !folderPath().empty() && a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
-bool KeyStore::save(const QString &key, QString &error) {
-    if (!plausible(key)) {
-        error = "This does not look like an NVIDIA API key (it starts with nvapi-).";
+bool KeyStore::save(Provider provider, const QString &key, QString &error) {
+    const Spec &s = spec(provider);
+    if (!plausible(provider, key)) {
+        error = QString("This does not look like an %1 API key (it starts with %2).").arg(s.name, s.prefix);
         return false;
     }
     const std::wstring dir = folderPath();
     if (!ensureFolder(dir, error)) return false;
     std::string plain = key.toStdString();
     DATA_BLOB in{DWORD(plain.size()), reinterpret_cast<BYTE *>(plain.data())};
-    DATA_BLOB entropy = entropyBlob();
+    DATA_BLOB entropy = entropyBlob(provider);
     DATA_BLOB out{};
-    const BOOL sealed = CryptProtectData(&in, L"LGA GateBouncer NVIDIA key", &entropy, nullptr, nullptr,
-                                         CRYPTPROTECT_UI_FORBIDDEN, &out);
+    const BOOL sealed = CryptProtectData(&in, s.description, &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out);
     SecureZeroMemory(plain.data(), plain.size());
     if (!sealed) {
         error = "Windows could not encrypt the key.";
         return false;
     }
-    const std::wstring file = dir + FileName, temp = file + L".tmp";
+    const std::wstring file = dir + s.file, temp = file + L".tmp";
     HANDLE h = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     DWORD written = 0;
     const bool ok = h != INVALID_HANDLE_VALUE && WriteFile(h, out.pbData, out.cbData, &written, nullptr) &&
@@ -145,8 +157,8 @@ bool KeyStore::save(const QString &key, QString &error) {
     return true;
 }
 
-bool KeyStore::clear(QString &error) {
-    const std::wstring file = folderPath() + FileName;
+bool KeyStore::clear(Provider provider, QString &error) {
+    const std::wstring file = folderPath() + spec(provider).file;
     if (!DeleteFileW(file.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
         error = "Could not remove the key file.";
         return false;
@@ -154,16 +166,17 @@ bool KeyStore::clear(QString &error) {
     return true;
 }
 
-bool KeyStore::withKey(const std::function<void(const std::string &)> &use, QString &error) {
+bool KeyStore::withKey(Provider provider, const std::function<void(const std::string &)> &use, QString &error) {
     const std::wstring dir = folderPath();
+    const QString missing = QString("No %1 API key is saved.").arg(spec(provider).name);
     if (dir.empty() || isReparse(dir)) {
-        error = "No NVIDIA API key is saved.";
+        error = missing;
         return false;
     }
-    HANDLE h = CreateFileW((dir + FileName).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+    HANDLE h = CreateFileW((dir + spec(provider).file).c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                            FILE_ATTRIBUTE_NORMAL, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
-        error = "No NVIDIA API key is saved.";
+        error = missing;
         return false;
     }
     LARGE_INTEGER size{};
@@ -178,7 +191,7 @@ bool KeyStore::withKey(const std::function<void(const std::string &)> &use, QStr
         return false;
     }
     DATA_BLOB in{DWORD(blob.size()), blob.data()};
-    DATA_BLOB entropy = entropyBlob();
+    DATA_BLOB entropy = entropyBlob(provider);
     DATA_BLOB out{};
     if (!CryptUnprotectData(&in, nullptr, &entropy, nullptr, nullptr, CRYPTPROTECT_UI_FORBIDDEN, &out)) {
         error = "The saved key belongs to another Windows account or is damaged. Save it again.";

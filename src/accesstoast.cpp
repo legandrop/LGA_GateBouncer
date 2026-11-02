@@ -1,5 +1,6 @@
 #include "accesstoast.h"
 #include "engine/FirewallClient.h"
+#include "explain/Explainer.h"
 #include <QComboBox>
 #include <QDir>
 #include <QEvent>
@@ -96,6 +97,9 @@ QPixmap dot(const QColor &color) {
     p.drawEllipse(QRectF(0, 0, 8, 8));
     return pixmap;
 }
+
+// «Asking NVIDIA» o «Asking Anthropic», según el proveedor del modelo elegido en Settings.
+QString asking() { return "Asking " + Explain::providerName(Explain::providerOf(Explain::Settings::load().model)); }
 } // namespace
 
 AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
@@ -268,7 +272,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     dots_->setInterval(450);
     connect(dots_, &QTimer::timeout, this, [this] {
         dotCount_ = (dotCount_ + 1) % 4;
-        explainStatus_->setText("Asking NVIDIA" + QString(dotCount_, QChar('.')));
+        explainStatus_->setText(asking() + QString(dotCount_, QChar('.')));
     });
     connect(explainAction_, &QPushButton::clicked, this, [this] {
         if (explanation_.state == Explanation::NoKey) emit settingsRequested();
@@ -434,7 +438,7 @@ void AccessToast::renderExplanation() {
                             : e.state == Explanation::Failed ? "Try again"
                                                              : "What is this? Ask AI");
     explainStatus_->setVisible(working || e.state == Explanation::Failed);
-    if (working) explainStatus_->setText("Asking NVIDIA");
+    if (working) explainStatus_->setText(asking());
     else if (e.state == Explanation::Failed) explainStatus_->setText(e.error);
     explainBox_->setVisible(e.state == Explanation::Ready);
     if (e.state != Explanation::Ready) return;
