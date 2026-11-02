@@ -76,6 +76,8 @@ var
   ServiceStopped, PostInstallReached: Boolean;
   // El motor ya quitó el servicio y sus filtros; UninstallStarted: el usuario confirmó y empezó el borrado.
   EngineRemoved, UninstallStarted: Boolean;
+  // El servicio corría antes de desinstalar: sólo entonces se restaura si el usuario se arrepiente.
+  ServiceWasRunning: Boolean;
 
 procedure CloseWindows(const ScriptPath: String);
 var
@@ -137,6 +139,10 @@ var
 begin
   Result := True;
   if not FileExists(ExpandConstant('{app}\{#EngineExeName}')) then Exit;
+  ServiceWasRunning := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+                            '-NoProfile -NonInteractive -Command "if ((Get-Service ' + ServiceName +
+                            ' -ErrorAction Stop).Status -eq ''Running'') { exit 0 } else { exit 1 }"',
+                            '', SW_HIDE, ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
   if not Exec(ExpandConstant('{app}\{#EngineExeName}'), '--uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
      or (ResultCode <> 0) then begin
     MsgBox('GateBouncer could not remove its service and filters, so nothing was uninstalled.' + #13#10 + 'Run "' +
@@ -148,14 +154,17 @@ begin
   EngineRemoved := True;
 end;
 
-// Si después de eso el usuario contesta «No» a la confirmación, nada se borró: el motor vuelve a instalarse tal cual
-// estaba, con sus reglas, así que no queda una PC sin firewall por arrepentirse.
+// Si después de eso el usuario contesta «No» a la confirmación, nada se borró: si el servicio corría, el motor vuelve a
+// instalarse con sus reglas, así que no queda una PC sin firewall por arrepentirse. Si no corría, queda apagado.
 procedure DeinitializeUninstall();
 var
   ResultCode: Integer;
 begin
-  if EngineRemoved and not UninstallStarted then
-    Exec(ExpandConstant('{app}\{#EngineExeName}'), '--install', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  if EngineRemoved and ServiceWasRunning and not UninstallStarted then
+    if not Exec(ExpandConstant('{app}\{#EngineExeName}'), '--install', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+       or (ResultCode <> 0) then
+      MsgBox('GateBouncer was not uninstalled, but its service could not be started again. Saved rules are kept; ' +
+             'run the installer again to turn the firewall back on.', mbError, MB_OK);
 end;
 
 // Las reglas quedan por defecto (una reinstalación las recupera); se borran sólo si el usuario lo pide.
