@@ -138,6 +138,14 @@ if(GATEBOUNCER_REVIEW_TEST_SOURCE)
     target_include_directories(GateBouncerReviewTests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
+if(GATEBOUNCER_TOAST_TEST_SOURCE)
+    find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
+    qt_add_executable(GateBouncerToastTests "${GATEBOUNCER_TOAST_TEST_SOURCE}" src/accesstoast.cpp src/accesstoast.h
+        src/engine/FirewallClient.cpp src/engine/FirewallClient.h)
+    target_include_directories(GateBouncerToastTests PRIVATE src)
+    target_link_libraries(GateBouncerToastTests PRIVATE Qt6::Widgets Qt6::Network Qt6::Test gatebouncer_explain)
+endif()
+
 set_target_properties(GateBouncerGuiStage PROPERTIES PREFIX "" AUTOMOC ON)
 
 # GateBouncer.exe común: la misma interfaz sin el lanzador de la instalación protegida.

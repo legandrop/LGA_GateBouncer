@@ -3758,7 +3758,12 @@ void MainWindow::updateFirewallToast() {
     request.port = current->port;
     request.protocol = current->protocol;
     firewallToast_->setRequest(request);
-    if (newApp) explainFirewallRequest(current->id, true);
+    // El nombre del servidor llega por DNS un instante después del bloqueo: sin él, se espera antes de preguntar.
+    if (newApp && current->host.isEmpty())
+        QTimer::singleShot(1500, this, [this, id = current->id] {
+            if (firewallToast_ && firewallToast_->id().compare(id, Qt::CaseInsensitive) == 0) explainFirewallRequest(id, true);
+        });
+    else if (newApp) explainFirewallRequest(current->id, true);
     if (!firewallToast_->isVisible()) {
         firewallToast_->placeOn(isVisible() ? screen() : nullptr);
         firewallToast_->show();

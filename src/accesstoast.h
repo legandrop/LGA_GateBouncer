@@ -64,6 +64,7 @@ class AccessToast final : public QWidget {
     void mouseReleaseEvent(QMouseEvent *event) override;
     void leaveEvent(QEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
   private:
     void rebuildScopes();

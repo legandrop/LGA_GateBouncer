@@ -38,7 +38,8 @@ Only when you ask (or when automatic explanations are on), for the application o
 - the signer of its signature (embedded, Windows catalog or app package), as verified by the engine, or that it has none;
 - the product name, description, company and version stored in the file;
 - the public address and port it tried to reach, and the server name the application looked up for that address
-  when the engine saw it. Addresses on your local network, and their names, are not sent.
+  when the engine saw it. Addresses on your local network, and their names, are not sent;
+- the file name of the program that started it, when it is still running (for example `Code.exe` for a `node.exe`).
 
 Never the file itself, its command line, your account name or anything else on your computer.
 

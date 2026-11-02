@@ -1,8 +1,11 @@
 #include "accesstoast.h"
 #include "engine/FirewallClient.h"
 #include "explain/Explainer.h"
+#include <QAbstractItemView>
 #include <QComboBox>
+#include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QEvent>
 #include <QFileIconProvider>
 #include <QFileInfo>
@@ -44,6 +47,15 @@ constexpr int Margin = 15;
 constexpr int Edge = 6; // franja de los bordes izquierdo y derecho que ensancha
 
 QSettings store() { return QSettings(QSettings::NativeFormat, QSettings::UserScope, "LGA", "GateBouncer"); }
+
+// shortcut: registro temporal de los desplegables del aviso (una elección que no queda); se quita al cerrar ese error.
+void trace(const QString &line) {
+    QFile f(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/toast-trace.log");
+    if (f.size() > 512 * 1024) f.remove();
+    QDir().mkpath(QFileInfo(f).absolutePath());
+    if (f.open(QIODevice::Append | QIODevice::Text))
+        f.write((QDateTime::currentDateTime().toString("HH:mm:ss.zzz ") + line + "\n").toUtf8());
+}
 
 // «*.dominio» que conviene ofrecer para un nombre: el dominio de arriba si tiene al menos dos partes propias
 // («*.shotgrid.autodesk.com» para «wanka.shotgrid.autodesk.com»). Para «bbc.co.uk» no se sube a «*.co.uk».
@@ -336,6 +348,12 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     target_->setAccessibleName("Destination");
     layout->addWidget(target_);
     connect(target_, qOverload<int>(&QComboBox::activated), this, [this] { targetChosen_ = true; });
+    for (auto *combo : {scope_, duration_, target_}) combo->installEventFilter(this);
+    duration_->view()->window()->installEventFilter(this);
+    connect(duration_, qOverload<int>(&QComboBox::activated), this,
+            [this](int index) { trace(QString("toastDuration elegido=%1").arg(duration_->itemText(index))); });
+    connect(duration_, qOverload<int>(&QComboBox::currentIndexChanged), this,
+            [this](int index) { trace(QString("toastDuration ahora=%1").arg(duration_->itemText(index))); });
     note_ = new QLabel("Unsigned apps can only get a rule for this exact file.", this);
     note_->setObjectName("toastNote");
     note_->setWordWrap(true);
@@ -378,6 +396,7 @@ void AccessToast::setRequest(const Request &request) {
     // rehacen las opciones de destino.
     const bool newHost = request.host != request_.host || (request.host.isEmpty() && request.remote != request_.remote);
     request_ = request;
+    if (!samePath) trace("pedido nuevo: " + request.id + " firma=" + request.signer);
     if (!samePath) {
         const QFileInfo file(request.path);
         title_->setText(file.fileName() + " was blocked");
@@ -628,6 +647,21 @@ void AccessToast::mouseReleaseEvent(QMouseEvent *event) {
     dragging_ = false;
     edge_ = 0;
     QWidget::mouseReleaseEvent(event);
+}
+
+bool AccessToast::eventFilter(QObject *watched, QEvent *event) {
+    // El aviso aparece sin activarse; un desplegable de una ventana inactiva abre su lista a medias y pierde la
+    // elección. El clic del usuario lo activa antes de que el desplegable lo procese.
+    if (event->type() == QEvent::MouseButtonPress && !isActiveWindow()) activateWindow();
+    const auto t = event->type();
+    if (t == QEvent::MouseButtonPress || t == QEvent::Show || t == QEvent::Hide)
+        trace(QString("%1 %2 activo=%3 habilitado=%4 indice=%5")
+                  .arg(watched->objectName().isEmpty() ? QString("lista") : watched->objectName())
+                  .arg(t == QEvent::MouseButtonPress ? "clic" : t == QEvent::Show ? "abre" : "cierra")
+                  .arg(isActiveWindow())
+                  .arg(duration_->isEnabled())
+                  .arg(duration_->currentIndex()));
+    return QWidget::eventFilter(watched, event);
 }
 
 void AccessToast::leaveEvent(QEvent *event) {

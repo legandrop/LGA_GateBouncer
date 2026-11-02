@@ -56,6 +56,12 @@ int main(int argc, char **argv) {
         const auto i = args.indexOf(name);
         return i >= 0 && i + 1 < args.size() ? args[i + 1] : QString();
     };
+    // Sólo los datos locales que se mandarían, sin pedir nada a ningún proveedor.
+    if (!value("--facts").isEmpty()) {
+        const auto f = collectFacts(value("--facts"), {}, {}, 0, 0, 0);
+        out << "file_name: " << f.fileName << "\nfolder: " << f.folder << "\nlaunched_by: " << f.launchedBy << "\n";
+        return 0;
+    }
     QStringList models = value("--models").isEmpty() ? Settings::models() : value("--models").split(',');
     const QString language = value("--language").isEmpty() ? QStringLiteral("es") : value("--language");
     QFile list(value("--apps"));

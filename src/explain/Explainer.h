@@ -27,6 +27,7 @@ struct Facts {
     QString requestId() const { return id.isEmpty() ? path : id; }
     QString fileName, folder, signer, product, description, company, version, destination;
     QString serverName; // el nombre DNS que resolvió la app, sólo con destino público
+    QString launchedBy; // nombre de archivo de los programas que lanzaron a la app (procesos vivos)
     int attempts = 0;
 };
 

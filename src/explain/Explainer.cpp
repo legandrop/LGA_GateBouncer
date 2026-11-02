@@ -19,6 +19,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #include <winhttp.h>
 #include <vector>
 
@@ -88,6 +89,50 @@ QString anonymousFolder(const QString &path) {
     return plain(folder, 260);
 }
 
+std::uint64_t startOf(DWORD pid) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return 0;
+    FILETIME created{}, exited{}, kernel{}, user{};
+    const bool ok = GetProcessTimes(process, &created, &exited, &kernel, &user);
+    CloseHandle(process);
+    return ok ? (std::uint64_t(created.dwHighDateTime) << 32) | created.dwLowDateTime : 0;
+}
+
+// Los programas que lanzaron a los procesos vivos de ese ejecutable (el aviso del motor no trae el número de
+// proceso). Sólo el nombre de archivo; un padre que nació después del hijo es otro proceso con el número reciclado.
+QString launchersOf(const QString &path) {
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return {};
+    std::vector<PROCESSENTRY32W> all;
+    PROCESSENTRY32W entry{};
+    entry.dwSize = sizeof(entry);
+    for (bool more = Process32FirstW(snapshot, &entry); more; more = Process32NextW(snapshot, &entry)) all.push_back(entry);
+    CloseHandle(snapshot);
+    const QString target = QDir::toNativeSeparators(QFileInfo(path).absoluteFilePath());
+    const QString name = QFileInfo(path).fileName();
+    QStringList launchers;
+    for (const auto &child : all) {
+        if (QString::fromWCharArray(child.szExeFile).compare(name, Qt::CaseInsensitive) != 0) continue;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, child.th32ProcessID);
+        if (!process) continue;
+        wchar_t image[MAX_PATH * 2];
+        DWORD size = DWORD(std::size(image));
+        const bool same = QueryFullProcessImageNameW(process, 0, image, &size) &&
+                          QString::fromWCharArray(image, int(size)).compare(target, Qt::CaseInsensitive) == 0;
+        CloseHandle(process);
+        if (!same) continue;
+        for (const auto &parent : all) {
+            if (parent.th32ProcessID != child.th32ParentProcessID) continue;
+            const auto born = startOf(parent.th32ProcessID), childBorn = startOf(child.th32ProcessID);
+            const QString launcher = plain(QString::fromWCharArray(parent.szExeFile), 120);
+            if (born && childBorn && born <= childBorn && !launchers.contains(launcher, Qt::CaseInsensitive))
+                launchers << launcher;
+        }
+        if (launchers.size() >= 3) break;
+    }
+    return launchers.join(", ");
+}
+
 QString systemPrompt(const QString &language) {
     return QString(
                "You help a person decide whether to let a Windows program connect to the internet. A firewall blocked "
@@ -103,7 +148,9 @@ QString systemPrompt(const QString &language) {
                "crash reporter, a background service): blocking an updater does not stop the application from "
                "working, it only stops its updates. When server_name is present it is the server name the program "
                "looked up just before connecting: use it to tell what the connection is for (telemetry, updates, "
-               "licensing, sign-in, content) and mention it.\n"
+               "licensing, sign-in, content) and mention it. When launched_by is present it names the program that "
+               "started this one (for example a code editor running node.exe, or a script running curl.exe): the "
+               "connection usually serves that program, so say so.\n"
                "\"risk\": one or two sentences judging whether the program looks legitimate, from the folder, the "
                "signature and the name together. Folders only Windows or an administrator can write to "
                "(C:\\Windows\\System32, C:\\Windows\\SystemApps, C:\\Program Files, C:\\Program Files (x86)) fit "
@@ -195,6 +242,7 @@ Facts collectFacts(const QString &path, const QString &signer, const QString &re
     f.signer = plain(signer, 160);
     f.attempts = attempts;
     readVersion(path, f);
+    f.launchedBy = launchersOf(path);
     const QHostAddress address(remote);
     const QString proto = protocol == 6 ? "TCP" : protocol == 17 ? "UDP" : QString("protocol %1").arg(protocol);
     // 100.64.0.0/10 (red compartida, la que usa Tailscale) tampoco es pública: no se manda.
@@ -221,6 +269,7 @@ QByteArray buildRequest(const Facts &f, const QString &model, const QString &lan
     if (!f.version.isEmpty()) facts["file_version"] = f.version;
     if (!f.destination.isEmpty()) facts["destination"] = f.destination;
     if (!f.serverName.isEmpty()) facts["server_name"] = f.serverName;
+    if (!f.launchedBy.isEmpty()) facts["launched_by"] = f.launchedBy;
     if (f.attempts > 0) facts["blocked_attempts"] = f.attempts;
     const QString user = QString::fromUtf8(QJsonDocument(facts).toJson(QJsonDocument::Compact));
     if (providerOf(model) == Provider::Anthropic) {
