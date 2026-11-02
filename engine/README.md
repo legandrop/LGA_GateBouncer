@@ -130,6 +130,5 @@ service; `--pipe <name>` gives the console engine its own channel name.
   whole-publisher rule, because it would include Windows tools that download files.
 - Another WFP provider with a hard permit can override a block. An administrator, or software running as
   administrator, can remove the filters.
-- Ask mode for every application has not yet been validated on a clean machine.
 
 Build with `compilar.bat --no-run` (Visual Studio 2022 or its Build Tools and the Windows SDK).

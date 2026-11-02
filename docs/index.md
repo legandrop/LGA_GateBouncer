@@ -1,7 +1,7 @@
 # Documentation
 
-Start with the one-page [Roadmap](../Roadmap.md): scope, verified work and what is pending. GateBouncer has no release
-installer yet.
+Start with the one-page [Roadmap](../Roadmap.md): scope, verified work and what is pending. GateBouncer has no published
+release yet; `instalador.bat --no-run` builds a local installer package.
 
 - [Overview and desktop build](../README.md)
 - [Driverless firewall engine: how it works, install, update, recovery and limits](../engine/README.md)

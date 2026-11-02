@@ -27,17 +27,20 @@ Checkboxes mean **verified on Windows**, not only implemented.
   service and a test application: a request carries the server name the application looked up, a direct connection to
   an address has no name, Tailscale and the router connect without asking, they ask when that option is off, and a
   Block rule still wins on the local network.
-- [ ] **Ask mode for every application.** In daily use on one Windows 11 computer with DNS, DHCP and updates working.
-  Done when it also runs on a clean machine.
+- [x] **Ask mode for every application.** In daily use on one Windows 11 computer with DNS, DHCP and updates working.
+  Verified on a clean Windows 11 (Windows Sandbox) after installing: unknown applications were blocked and asked, the
+  notice appeared, and an Allow let only that application connect.
 - [x] **Permanent rules across restarts.** Verified on Windows 11 with the installed service: after a reboot the service
   started on its own, the window came back once in the tray, every rule was loaded, an unknown application was blocked
   and asked, and a destination rule still let its application reach only its server. Filters are persistent, so
   Windows enforces them from the moment its filtering service starts, before any user signs in.
 - [x] **Destination rules.** Verified on Windows 11 with the installed service: an application limited to its own
   servers reached them, and a new server asked separately.
-- [ ] **Install, update, uninstall and recovery.** `--install`, `--update`, `--uninstall` and the `--remove-filters`
-  emergency switch work on one computer. An installer package (`instalador.bat --no-run`) installs into Program
-  Files and lets the engine register itself. Done when installing, updating and uninstalling pass on a clean machine.
+- [x] **Install, update, uninstall and recovery.** `--install`, `--update`, `--uninstall` and the `--remove-filters`
+  emergency switch work on one computer. The installer package (`instalador.bat --no-run`) was verified on a clean
+  Windows 11 (Windows Sandbox): install, update over an open window with rules kept, uninstall cancelled at the
+  confirmation (the firewall stays on), silent and interactive uninstall with no filters left behind, and reinstall
+  recovering the saved rules.
 - [ ] **Known applications.** The notice can show a reviewed decision for a known application right away, without
   asking an AI model. Done when the first reviewed catalog ships.
 - [ ] **Coexistence.** Done when tests with Windows Defender Firewall and NetLimiter show the expected result.
@@ -48,5 +51,5 @@ Checkboxes mean **verified on Windows**, not only implemented.
   default, `claude-haiku-5-5`, answers in about four seconds. The request includes the server name the application
   looked up and the program that started it. A slow answer never holds the decision.
 
-**Next result:** run the installer and ask mode on a clean machine, and ship the first reviewed catalog.
+**Next result:** ship the first reviewed catalog.
 [Component details](docs/index.md).

@@ -69,8 +69,9 @@ engine\compilar.bat --no-run
 The first builds `GateBouncer.exe` and the other desktop components without starting them; set `GATEBOUNCER_BUILD_DIR`
 to choose another build directory. The second builds `GateBouncerEngine.exe` with Visual Studio 2022 (or its Build
 Tools) and the Windows SDK; set `GATEBOUNCER_ENGINE_BUILD_DIR` to choose its build directory. Qt runtime libraries and
-the Windows platform plugin are required to run the window. There is no installer package yet: copy both programs and
-the Qt runtime to a protected folder and run `GateBouncerEngine.exe --install`; later versions are applied with
+the Windows platform plugin are required to run the window. `instalador.bat --no-run` builds both programs and an
+installer package with Inno Setup 6 (it runs nothing). Without the package, copy both programs and the Qt runtime to a
+protected folder and run `GateBouncerEngine.exe --install`; later versions are applied with
 `GateBouncerEngine.exe --update <folder>` (see the [engine documentation](engine/README.md)).
 
 ## Earlier driver-based design
