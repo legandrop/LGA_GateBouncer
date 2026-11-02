@@ -2,6 +2,8 @@
 // Aviso fijo de una solicitud de acceso, como el aviso de disco de Mighty Tools: ventana propia sin marco, siempre
 // encima y sin robar el foco, abajo a la derecha de la pantalla. Queda hasta que se decide o se cierra; cerrarlo no
 // decide nada y la app sigue bloqueada en Pending.
+#include <QPointer>
+#include <QScreen>
 #include <QWidget>
 
 class QComboBox;
@@ -21,6 +23,9 @@ class AccessToast final : public QWidget {
         QString what, why, risk, suggestion, reason, model, error;
     };
     struct Request {
+        // El pedido: la ruta, o en modo por destino «ruta|dirección» (un pedido por cada destino nuevo).
+        QString id;
+        bool perDestination = false;
         QString path;
         QString signer; // vacío: sin firma válida, sólo «This file only»
         int attempts = 0;
@@ -31,27 +36,42 @@ class AccessToast final : public QWidget {
     };
 
     explicit AccessToast(QWidget *parent = nullptr);
-    // Con la misma ruta sólo actualiza contadores y botones: el desplegable conserva lo elegido.
+    // Con el mismo pedido sólo actualiza contadores y botones: los desplegables conservan lo elegido.
     void setRequest(const Request &request);
+    QString id() const { return request_.id; }
     QString path() const { return request_.path; }
+    // Abajo a la derecha de la pantalla, o donde el usuario lo dejó la última vez. Siempre entero dentro del área
+    // visible: nunca debajo de la barra de tareas, aunque crezca con la explicación.
     void placeOn(QScreen *screen);
-    // Se ignora si el aviso ya muestra otra app: una respuesta tardía nunca cae sobre otra solicitud.
-    void setExplanation(const QString &path, const Explanation &explanation);
+    // Se ignora si el aviso ya muestra otro pedido: una respuesta tardía nunca cae sobre otra solicitud.
+    void setExplanation(const QString &id, const Explanation &explanation);
 
   signals:
-    // duration: "always", "restart" o segundos ("900").
-    void decided(const QString &path, bool allow, const QString &scope, const QString &duration);
-    void explainRequested(const QString &path);
+    // duration: "always", "restart" o segundos ("900"). destination: vacío para la app entera; si no, el destino.
+    void decided(const QString &id, bool allow, const QString &scope, const QString &duration,
+                 const QString &destination);
+    void explainRequested(const QString &id);
     void settingsRequested();
-    void dismissed(const QString &path);
+    void dismissed(const QString &id);
     void openRequested();
     void pendingListRequested();
 
   protected:
     void paintEvent(QPaintEvent *event) override;
+    // Se arrastra desde cualquier parte que no sea un control y se ensancha desde los bordes izquierdo y derecho.
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void mouseReleaseEvent(QMouseEvent *event) override;
+    void leaveEvent(QEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 
   private:
     void rebuildScopes();
+    void rebuildTargets();
+    void applyWidth(int width);
+    void keepInside();
+    void remember();
+    int edgeAt(const QPoint &pos) const;
     void updateCounters();
     void renderExplanation();
     void renderDestination();
@@ -63,9 +83,19 @@ class AccessToast final : public QWidget {
     QLabel *icon_ = nullptr, *title_ = nullptr, *signature_ = nullptr, *signatureMark_ = nullptr, *path_ = nullptr;
     QLabel *note_ = nullptr, *footer_ = nullptr;
     QLabel *destination_ = nullptr, *destinationDetail_ = nullptr;
-    QComboBox *scope_ = nullptr, *duration_ = nullptr;
+    QComboBox *scope_ = nullptr, *duration_ = nullptr, *target_ = nullptr;
+    QLabel *body_ = nullptr;
+    bool targetChosen_ = false; // el usuario tocó «Destination»
+    // Esquina de abajo a la derecha, en coordenadas de pantalla: el aviso crece hacia arriba desde ahí.
+    QPoint anchor_;
+    bool anchored_ = false;
+    int width_ = 0;
+    int edge_ = 0; // -1 izquierda, 1 derecha mientras se ensancha
+    bool dragging_ = false;
+    QPoint pressGlobal_, pressAnchor_;
+    int pressWidth_ = 0;
     Explanation explanation_;
-    QScreen *screen_ = nullptr;
+    QPointer<QScreen> screen_; // la pantalla puede desaparecer (monitor desconectado, sesión remota)
     QWidget *explainBox_ = nullptr;
     QLabel *explainStatus_ = nullptr, *what_ = nullptr, *why_ = nullptr, *risk_ = nullptr, *suggestion_ = nullptr;
     QLabel *explainFoot_ = nullptr;

@@ -58,6 +58,9 @@ class WfpEngine {
     // Filtro por ejecutable. Devuelve los ids de WFP creados (uno por capa).
     bool addAppFilter(const std::wstring &path, Action action, Direction direction, std::uint8_t weight,
                       std::vector<std::uint64_t> &ids, std::wstring &error);
+    // Filtro de un ejecutable hacia una sola dirección remota (reglas por destino), saliente, en la capa de su familia.
+    bool addAppAddressFilter(const std::wstring &path, const std::wstring &address, Action action, std::uint8_t weight,
+                             std::vector<std::uint64_t> &ids, std::wstring &error);
     // Filtro sin condición de app: bloquea todo lo que no tenga una regla de peso mayor.
     bool addDefaultBlock(Direction direction, std::vector<std::uint64_t> &ids, std::wstring &error);
     // Permisos de base para que el bloqueo por defecto no rompa la PC: loopback y servicios del sistema.

@@ -10,8 +10,15 @@
 // WFP no sabe de firmas: las reglas App y Publisher viven en el motor. Cuando una app sin regla de ruta se bloquea,
 // el motor verifica su firma y, si coincide con una de esas reglas, agrega el filtro de esa ruta (una «cobertura»).
 // El primer intento igual se pierde; el siguiente pasa sin preguntar.
+//
+// Reglas por destino: cualquiera de los tres alcances puede llevar un destino (un host, «*.dominio» o una IP). Una app
+// con reglas por destino está en «modo por destino»: no tiene filtro de app entera y cada servidor nuevo pregunta por
+// separado. WFP filtra por IP, no por nombre: el motor ve qué nombre resolvió la app (DnsNames) y abre o cierra sólo
+// esas IPs para esa app (un «permiso de destino»). Una regla de la app entera y las reglas por destino de esa misma
+// identidad se excluyen: decidir una reemplaza a las otras.
 #include "dns_names.h"
 #include "wfp_engine.h"
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -28,6 +35,8 @@ struct Rule {
     std::wstring path;          // Path: la ruta; App/Publisher: vacío
     std::wstring signer;        // App/Publisher: el firmante tal como lo muestra Windows
     std::wstring name;          // App: nombre del ejecutable en minúsculas
+    // Vacío: la app entera. Si no: «host.ejemplo.com», «*.ejemplo.com» (el dominio y sus subdominios) o una IP.
+    std::wstring destination;
     Action action = Action::Allow;
     std::int64_t created = 0;   // segundos Unix UTC
     std::int64_t lastBlock = 0; // último bloqueo atribuido a la regla (sólo reglas Block)
@@ -66,6 +75,25 @@ struct Pending {
     std::uint16_t remotePort = 0;
     std::uint8_t protocol = 0;
     std::wstring host; // el nombre que la app resolvió para esa dirección; vacío si no se sabe
+    // La app está en modo por destino: la decisión es sobre este destino, no sobre la app entera. Hay un pendiente
+    // por cada dirección nueva.
+    bool perDestination = false;
+};
+
+// Permiso de destino: el filtro de una app hacia una IP, puesto por una regla por destino. Se guarda para el próximo
+// arranque y se retira si esa app no vuelve a esa IP en una semana.
+struct Grant {
+    std::wstring path, address, ruleKey;
+    Action action = Action::Allow;
+    std::vector<std::uint64_t> filters;
+    FileStamp stamp; // reglas por firma: el archivo verificado
+    std::int64_t lastSeen = 0;
+};
+
+// Una consulta DNS terminada: con reglas por destino, el permiso se pone antes de que la app se conecte.
+struct DnsHint {
+    std::wstring app, host;
+    std::vector<std::wstring> addresses;
 };
 
 struct Activity {
@@ -100,7 +128,9 @@ class FirewallCore {
     bool setLocalNetwork(bool allow, std::wstring &error);
     // La firma se lee del archivo en el motor: nunca se confía en un editor que mande la ventana.
     // expires: 0 permanente, >0 momento Unix en que vence, UntilRestart hasta que el motor se reinicie.
-    bool decide(const std::wstring &path, Action action, Scope scope, std::wstring &error, std::int64_t expires = 0);
+    // destination vacío: la app entera; si no, sólo ese destino (y la app pasa a modo por destino).
+    bool decide(const std::wstring &path, Action action, Scope scope, std::wstring &error, std::int64_t expires = 0,
+                const std::wstring &destination = {});
     // id: la ruta de una regla Path o la clave de una regla App/Publisher.
     bool removeRule(const std::wstring &id, std::wstring &error);
 
@@ -115,10 +145,15 @@ class FirewallCore {
     std::vector<Pending> pending();
     std::vector<Rule> rules();
     std::vector<Covered> covered();
+    std::vector<Grant> grants();
     std::vector<Activity> activity();
 
     static std::wstring key(const std::wstring &path);
     static std::wstring ruleKey(const Rule &rule);
+    // La clave de la app entera de esa identidad (sin destino).
+    static std::wstring identityKey(const Rule &rule);
+    // Destino en forma canónica, o vacío si no es válido.
+    static std::wstring normalizeDestination(const std::wstring &destination);
     static std::wstring fileName(const std::wstring &path); // en minúsculas
     static std::int64_t now();
 
@@ -126,6 +161,7 @@ class FirewallCore {
     void onDrop(const DropEvent &drop);
     void verifyLoop();
     void classify(const DropEvent &drop, const std::wstring &signer);
+    void classifyDestination(const DropEvent &drop, const std::wstring &cached);
     void recheckCoverage(bool full);
     void expireRules();
     // Retira los filtros de la regla (o de sus coberturas) y la borra. Con mutex_ tomado.
@@ -133,6 +169,23 @@ class FirewallCore {
     std::wstring cachedSigner(const std::wstring &path);
     const Rule *signerRuleFor(const std::wstring &path, const std::wstring &signer) const;
     bool matches(const Rule &rule, const std::wstring &path, const std::wstring &signer) const;
+    // Modo por destino. any: la app tiene alguna regla por destino. Devuelve la regla que corresponde a ese destino
+    // (la más específica; a igual especificidad, Block), o nada.
+    const Rule *destinationRuleFor(const std::wstring &path, const std::wstring &signer, const std::wstring &host,
+                                   const std::wstring &address, bool &any) const;
+    bool identityMatches(const Rule &rule, const std::wstring &path, const std::wstring &signer) const;
+    bool decideDestination(const std::wstring &path, Action action, Scope scope, const std::wstring &destination,
+                           std::int64_t expires, std::wstring &error);
+    // Pone el permiso de destino de una app hacia una dirección. Con mutex_ tomado.
+    // changed: si se puso o cambió un filtro (no sólo se refrescó el último uso).
+    bool grant(const std::wstring &path, const std::wstring &address, const Rule &rule, const FileStamp &stamp,
+               std::wstring &error, bool *changed = nullptr);
+    void eraseGrantsOf(const std::wstring &ruleKey);
+    // Quita las reglas por destino de una identidad (cuando se decide sobre la app entera). Con mutex_ tomado.
+    void dropDestinationRulesOf(const std::wstring &identity);
+    void erasePendingOf(const std::wstring &pathKey);
+    void applyHint(const DnsHint &hint);
+    void onResolved(const std::wstring &app, const std::wstring &host, const std::vector<std::wstring> &addresses);
     bool cover(const std::wstring &path, const std::wstring &ruleKey, Action action, std::wstring &error);
     void uncover(const std::wstring &pathKey);
     bool applyAskFilters(std::wstring &error);
@@ -154,7 +207,9 @@ class FirewallCore {
     std::vector<std::uint64_t> askFilters_, systemFilters_;
     std::map<std::wstring, Rule> rules_;       // clave: ruta en minúsculas o ruleKey()
     std::map<std::wstring, Covered> covered_;  // clave: ruta en minúsculas
-    std::map<std::wstring, Pending> pending_;  // clave: ruta en minúsculas
+    std::map<std::wstring, Pending> pending_;  // clave: ruta en minúsculas (+ \x1f + dirección en modo por destino)
+    std::map<std::wstring, Grant> grants_;     // clave: ruta en minúsculas + \x1f + dirección
+    std::atomic<int> destinationRules_{0};     // cuántas reglas por destino hay (para ignorar el DNS si no hay)
     std::deque<Activity> activity_;
 
     // Los bloqueos sin regla de ruta pasan por un hilo propio: verificar la firma lleva tiempo y el aviso de WFP no
@@ -167,6 +222,7 @@ class FirewallCore {
     std::mutex verifyMutex_;
     std::condition_variable verifyWake_;
     std::deque<DropEvent> verifyQueue_;
+    std::deque<DnsHint> hintQueue_;
     bool verifyStop_ = false;
     std::thread verifyThread_;
     int recheckRound_ = 0; // sólo lo usa el hilo de verificación

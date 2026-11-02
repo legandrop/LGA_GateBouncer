@@ -28,13 +28,21 @@ In **Live** mode, the Processes, Pending, Activity and Rules views read the engi
 - The notice's **Apply to** list sets the rule's reach: **This app, any version** (same signed publisher and file name,
   in any folder, so updates don't ask again), **This file only** (the exact path), or **All apps from** the publisher.
   Applications without a valid signature can only get a rule for the exact file.
+- The notice's **Destination** list limits a rule to where the application tried to go: **Only** that server, **Only
+  \*.domain** (the server's domain and its subdomains) or, without a name, **Only** that address. An application with
+  destination rules asks again for every new destination, so you can allow a tool to reach your own services and
+  block everything else it tries. **Any destination** decides for the whole application and replaces its destination
+  rules.
+- The notice can be dragged anywhere and widened from its left or right edge; it remembers where you left it. It always
+  stays above the taskbar, even when an explanation makes it taller.
 - The notice's **For** list makes the decision temporary: 1, 5, 10, 15 or 30 minutes, 1 hour, or until the engine
   restarts. When it expires the rule is removed and the application asks again.
 - **What is this? Ask AI** on the notice asks an AI model (Anthropic's Claude or NVIDIA's catalog, with your own API
   key) what the application is, why it connects and what you gain or lose by allowing it. The answer only helps you decide: it never allows or blocks
   anything and it can be wrong. See [AI explanations](docs/Explanations.md) for exactly what is sent.
 - **Activity** shows blocked attempts and rule changes recorded by the engine. Allowed connections are not recorded.
-- **Rules** lists saved Allow and Block rules, including rules for an app in any version or for a whole publisher, and
+- **Rules** lists saved Allow and Block rules, including rules for an app in any version, for a whole publisher or for
+  one destination, and
   how long a temporary rule has left. You can change or remove a rule.
 - **Import** reads NetLimiter's settings file (`nl_settings.xml`) and turns its firewall rules for single applications
   into GateBouncer rules. Rules limited to addresses, ports, zones or schedules, Ask rules and incoming-only rules are

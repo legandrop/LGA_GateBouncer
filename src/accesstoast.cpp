@@ -14,8 +14,11 @@
 #include <QMenu>
 #include <QPainter>
 #include <QPainterPath>
+#include <QMouseEvent>
 #include <QPushButton>
 #include <QScreen>
+#include <QSettings>
+#include <QSignalBlocker>
 #include <QStandardPaths>
 #include <QTimer>
 #include <QVBoxLayout>
@@ -35,8 +38,24 @@ constexpr char ButtonBorder[] = "#404040";
 constexpr char ButtonHover[] = "#383838";
 constexpr char HeaderIcon[] = "#aaaaaa";
 constexpr char Link[] = "#b9b4f0";
-constexpr int Width = 352;
+constexpr int Width = 352; // ancho inicial y mínimo
+constexpr int MaxWidth = 760;
 constexpr int Margin = 15;
+constexpr int Edge = 6; // franja de los bordes izquierdo y derecho que ensancha
+
+QSettings store() { return QSettings(QSettings::NativeFormat, QSettings::UserScope, "LGA", "GateBouncer"); }
+
+// «*.dominio» que conviene ofrecer para un nombre: el dominio de arriba si tiene al menos dos partes propias
+// («*.shotgrid.autodesk.com» para «wanka.shotgrid.autodesk.com»). Para «bbc.co.uk» no se sube a «*.co.uk».
+QString parentWildcard(const QString &host) {
+    const QStringList labels = host.split('.', Qt::SkipEmptyParts);
+    if (labels.size() < 2) return {};
+    if (labels.size() == 2) return "*." + host;
+    const QStringList parent = labels.mid(1);
+    static const QStringList second{"co", "com", "net", "org", "gov", "edu", "ac", "or", "ne", "go"};
+    if (parent.size() == 2 && parent[1].size() == 2 && second.contains(parent[0])) return "*." + host;
+    return "*." + parent.join('.');
+}
 
 QString elideMiddle(const QLabel *label, const QString &text, int width) {
     return label->fontMetrics().elidedText(text, Qt::ElideMiddle, width);
@@ -110,6 +129,8 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     setAttribute(Qt::WA_TranslucentBackground);
     setObjectName("accessToast");
     setAccessibleName("Access request");
+    setMouseTracking(true);
+    width_ = Width;
     setFixedWidth(Width);
 #ifdef Q_OS_WIN
     // Offscreen (capturas de QA) no enumera las fuentes de Windows: usa el mismo archivo que el escritorio real.
@@ -185,7 +206,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     menu->addAction("Open GateBouncer", this, [this] { emit openRequested(); });
     menu->addAction("Pending list", this, [this] { emit pendingListRequested(); });
     connect(more, &QPushButton::clicked, this, [more, menu] { menu->popup(more->mapToGlobal(QPoint(0, more->height()))); });
-    connect(close, &QPushButton::clicked, this, [this] { emit dismissed(request_.path); });
+    connect(close, &QPushButton::clicked, this, [this] { emit dismissed(request_.id); });
 
     auto *summary = new QHBoxLayout;
     summary->setSpacing(12);
@@ -201,10 +222,10 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     title_ = new QLabel(this);
     title_->setObjectName("toastTitle");
     text->addWidget(title_);
-    auto *body = new QLabel("Its first attempt to connect was blocked. If you allow it, the next attempt connects.", this);
-    body->setObjectName("toastBody");
-    body->setWordWrap(true);
-    text->addWidget(body);
+    body_ = new QLabel(this);
+    body_->setObjectName("toastBody");
+    body_->setWordWrap(true);
+    text->addWidget(body_);
     summary->addLayout(text, 1);
     layout->addLayout(summary);
     layout->addSpacing(12);
@@ -276,7 +297,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     });
     connect(explainAction_, &QPushButton::clicked, this, [this] {
         if (explanation_.state == Explanation::NoKey) emit settingsRequested();
-        else emit explainRequested(request_.path);
+        else emit explainRequested(request_.id);
     });
     layout->addSpacing(12);
 
@@ -306,6 +327,15 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     durationColumn->addWidget(duration_);
     choices->addLayout(durationColumn);
     layout->addLayout(choices);
+    // Destino: la app entera o sólo el servidor al que quería ir. Elegir un destino pasa la app a modo por destino.
+    layout->addSpacing(10);
+    layout->addWidget(new QLabel("Destination", this));
+    layout->addSpacing(7);
+    target_ = new ScopeCombo(this);
+    target_->setObjectName("toastTarget");
+    target_->setAccessibleName("Destination");
+    layout->addWidget(target_);
+    connect(target_, qOverload<int>(&QComboBox::activated), this, [this] { targetChosen_ = true; });
     note_ = new QLabel("Unsigned apps can only get a rule for this exact file.", this);
     note_->setObjectName("toastNote");
     note_->setWordWrap(true);
@@ -325,7 +355,8 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     layout->addSpacing(10);
     for (auto *b : {block_, allow_})
         connect(b, &QPushButton::clicked, this, [this, allowed = b == allow_] {
-            emit decided(request_.path, allowed, scope_->currentData().toString(), duration_->currentData().toString());
+            emit decided(request_.id, allowed, scope_->currentData().toString(), duration_->currentData().toString(),
+                         target_->currentData().toString());
         });
 
     auto *foot = new QHBoxLayout;
@@ -341,32 +372,39 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
 }
 
 void AccessToast::setRequest(const Request &request) {
-    const bool samePath = request.path.compare(request_.path, Qt::CaseInsensitive) == 0 &&
-                          request.signer == request_.signer && !request_.path.isEmpty();
+    const bool samePath = request.id.compare(request_.id, Qt::CaseInsensitive) == 0 &&
+                          request.signer == request_.signer && !request_.id.isEmpty();
+    // El nombre puede llegar un segundo después del bloqueo, y un intento nuevo puede ir a otra dirección: entonces se
+    // rehacen las opciones de destino.
+    const bool newHost = request.host != request_.host || (request.host.isEmpty() && request.remote != request_.remote);
     request_ = request;
     if (!samePath) {
         const QFileInfo file(request.path);
         title_->setText(file.fileName() + " was blocked");
+        body_->setText(request.perDestination
+                           ? "This app asks per destination and this one is new. If you allow it, the next attempt "
+                             "connects."
+                           : "Its first attempt to connect was blocked. If you allow it, the next attempt connects.");
         QIcon appIcon = QFileIconProvider().icon(file);
         if (appIcon.isNull()) appIcon = QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png");
         icon_->setPixmap(appIcon.pixmap(48, 48));
         const bool signedApp = !request.signer.isEmpty();
         signature_->setText(signedApp ? request.signer + " · valid signature" : QString("No valid signature"));
         signatureMark_->setPixmap(dot(signedApp ? QColor("#8fcf6a") : QColor("#e8b46f")));
-        path_->setText(elideMiddle(path_, QDir::toNativeSeparators(request.path), Width - 32));
-        // La ruta entera sólo cuando no entra: el texto visible ya la muestra si es corta.
-        path_->setToolTip(path_->text() != QDir::toNativeSeparators(request.path) ? QDir::toNativeSeparators(request.path)
-                                                                                   : QString());
         rebuildScopes();
+        targetChosen_ = false;
+        rebuildTargets();
         duration_->setCurrentIndex(0);
         explanation_ = {};
         renderExplanation();
         armed_ = false;
-        QTimer::singleShot(600, this, [this, path = request.path] {
-            if (request_.path != path) return;
+        QTimer::singleShot(600, this, [this, id = request.id] {
+            if (request_.id != id) return;
             armed_ = true;
             updateCounters();
         });
+    } else if (newHost) {
+        rebuildTargets();
     }
     // Fuera del bloque anterior: un intento nuevo de la misma app puede ir a otro destino.
     renderDestination();
@@ -374,14 +412,44 @@ void AccessToast::setRequest(const Request &request) {
     adjustSize();
 }
 
+void AccessToast::rebuildTargets() {
+    // Lo que eligió el usuario se conserva si sigue estando (el nombre llegó tarde y se agregan opciones). Si ya no
+    // está, se cae a la opción más estrecha, nunca a la app entera.
+    const QString chosen = target_->currentData().toString();
+    const QSignalBlocker quiet(target_);
+    target_->clear();
+    const QString host = request_.host;
+    const QString kind = FirewallClient::destinationKind(request_.remote);
+    QStringList targets;
+    if (!host.isEmpty()) {
+        targets << host;
+        const QString wide = parentWildcard(host);
+        if (!wide.isEmpty()) targets << wide;
+    } else if (!kind.isEmpty() && kind != "This PC") {
+        targets << request_.remote;
+    }
+    // En modo por destino la decisión es sobre este destino; la app entera queda como última opción.
+    if (!request_.perDestination) target_->addItem("Any destination", QString());
+    for (const auto &t : targets) target_->addItem("Only " + t, t);
+    if (request_.perDestination) target_->addItem("Any destination (whole app)", QString());
+    const int keep = targetChosen_ ? target_->findData(chosen) : -1;
+    const int narrowest = targets.isEmpty() ? 0 : target_->findData(targets.first());
+    target_->setCurrentIndex(keep >= 0 ? keep : targetChosen_ ? narrowest : 0);
+    target_->setEnabled(target_->count() > 1);
+}
+
 void AccessToast::renderDestination() {
     const QString kind = FirewallClient::destinationKind(request_.remote);
     const bool known = !kind.isEmpty();
     destination_->setVisible(known);
     destinationDetail_->setVisible(known);
+    path_->setText(elideMiddle(path_, QDir::toNativeSeparators(request_.path), width_ - 32));
+    // La ruta entera sólo cuando no entra: el texto visible ya la muestra si es corta.
+    path_->setToolTip(path_->text() != QDir::toNativeSeparators(request_.path) ? QDir::toNativeSeparators(request_.path)
+                                                                                : QString());
     if (!known) return;
     const QString target = request_.host.isEmpty() ? request_.remote : request_.host;
-    destination_->setText(elideMiddle(destination_, "To " + target + " · " + kind, Width - 32));
+    destination_->setText(elideMiddle(destination_, "To " + target + " · " + kind, width_ - 32));
     // El destino entero sólo cuando el texto visible quedó recortado.
     destination_->setToolTip(destination_->text().contains(QChar(0x2026)) ? target : QString());
     const QString port = request_.port ? FirewallClient::protocolName(request_.protocol) + " " +
@@ -413,6 +481,7 @@ void AccessToast::updateCounters() {
     allow_->setEnabled(request_.canDecide && armed_);
     scope_->setEnabled(request_.canDecide && armed_ && scope_->count() > 1);
     duration_->setEnabled(request_.canDecide && armed_);
+    target_->setEnabled(request_.canDecide && armed_ && target_->count() > 1);
     QStringList parts;
     if (request_.attempts > 1) parts << QString("%1 attempts").arg(request_.attempts);
     if (request_.othersWaiting > 0) parts << QString("%1 more waiting").arg(request_.othersWaiting);
@@ -420,13 +489,13 @@ void AccessToast::updateCounters() {
     footer_->setText(parts.join(" · "));
 }
 
-void AccessToast::setExplanation(const QString &path, const Explanation &explanation) {
-    if (path.compare(request_.path, Qt::CaseInsensitive) != 0) return;
+void AccessToast::setExplanation(const QString &id, const Explanation &explanation) {
+    if (id.compare(request_.id, Qt::CaseInsensitive) != 0) return;
     explanation_ = explanation;
     renderExplanation();
-    // Crece hacia arriba: el borde de abajo queda en su lugar.
-    if (screen_ && isVisible()) placeOn(screen_);
-    else adjustSize();
+    // Crece hacia arriba desde su esquina de abajo (resizeEvent): los botones nunca quedan bajo la barra de tareas.
+    if (layout()) layout()->activate();
+    adjustSize();
 }
 
 void AccessToast::renderExplanation() {
@@ -447,10 +516,19 @@ void AccessToast::renderExplanation() {
     why_->setVisible(!e.why.isEmpty());
     risk_->setText(e.risk);
     risk_->setVisible(!e.risk.isEmpty());
-    const QString verdict = e.suggestion == "allow" ? "Suggestion: Allow" : e.suggestion == "block" ? "Suggestion: Block"
-                                                                                                  : "Suggestion: Your call";
+    // Los rótulos del recuadro van en el idioma de la explicación, para que no quede mitad en cada idioma. Allow y
+    // Block quedan como en los botones.
+    const bool es = Explain::Settings::load().language == "es";
+    const QString lead = es ? "Sugerencia: " : "Suggestion: ";
+    const QString verdict = lead + (e.suggestion == "allow"   ? QStringLiteral("Allow")
+                                    : e.suggestion == "block" ? QStringLiteral("Block")
+                                    : es                      ? QStringLiteral("a tu criterio")
+                                                              : QStringLiteral("Your call"));
     suggestion_->setText(e.reason.isEmpty() ? verdict : verdict + " · " + e.reason);
-    explainFoot_->setText("AI explanation · " + e.model.section('/', -1) + " · it can be wrong and never decides for you");
+    explainFoot_->setText(es ? "Explicación con IA · " + e.model.section('/', -1) +
+                                   " · puede equivocarse y nunca decide por vos"
+                             : "AI explanation · " + e.model.section('/', -1) +
+                                   " · it can be wrong and never decides for you");
     // El alto de cada párrafo se fija con la fuente ya aplicada: el recuadro estaba oculto y no se había calculado.
     for (auto *label : {what_, why_, risk_, suggestion_, explainFoot_}) {
         label->ensurePolished();
@@ -459,12 +537,108 @@ void AccessToast::renderExplanation() {
 }
 
 void AccessToast::placeOn(QScreen *screen) {
+    // Donde el usuario lo dejó, si esa esquina sigue en alguna pantalla; si no, abajo a la derecha.
+    auto s = store();
+    const QPoint saved(s.value("toast/right", -1).toInt(), s.value("toast/bottom", -1).toInt());
+    const int savedWidth = s.value("toast/width", Width).toInt();
+    QScreen *home = s.contains("toast/right") ? QGuiApplication::screenAt(saved) : nullptr;
+    if (home) screen = home;
     if (!screen) screen = QGuiApplication::primaryScreen();
     if (!screen) return;
     screen_ = screen;
-    adjustSize();
+    applyWidth(savedWidth);
     const QRect area = screen->availableGeometry();
-    move(area.right() - width() - Margin, area.bottom() - height() - Margin);
+    anchor_ = home ? saved : QPoint(area.right() - Margin, area.bottom() - Margin);
+    anchored_ = true;
+    if (layout()) layout()->activate();
+    adjustSize();
+    keepInside();
+}
+
+void AccessToast::applyWidth(int width) {
+    width_ = qBound(Width, width, MaxWidth);
+    setFixedWidth(width_);
+    explainStatus_->setFixedWidth(width_ - 32);
+    for (auto *label : {what_, why_, risk_, suggestion_, explainFoot_}) label->setFixedWidth(width_ - 32 - 22);
+    renderDestination();
+    if (explanation_.state == Explanation::Ready) renderExplanation();
+    if (layout()) layout()->activate();
+}
+
+void AccessToast::keepInside() {
+    if (!anchored_) return;
+    QScreen *screen = QGuiApplication::screenAt(anchor_);
+    if (!screen) screen = screen_ ? screen_.data() : QGuiApplication::primaryScreen();
+    if (!screen) return;
+    const QRect area = screen->availableGeometry();
+    // La esquina se corre lo justo para que el aviso entero quede dentro del área visible (sin la barra de tareas).
+    const int right = qBound(area.left() + width() - 1, anchor_.x(), area.right());
+    const int bottom = qBound(qMin(area.top() + height() - 1, area.bottom()), anchor_.y(), area.bottom());
+    move(right - width() + 1, bottom - height() + 1);
+}
+
+void AccessToast::remember() {
+    auto s = store();
+    s.setValue("toast/right", anchor_.x());
+    s.setValue("toast/bottom", anchor_.y());
+    s.setValue("toast/width", width_);
+}
+
+int AccessToast::edgeAt(const QPoint &pos) const {
+    if (pos.x() < Edge) return -1;
+    if (pos.x() >= width() - Edge) return 1;
+    return 0;
+}
+
+void AccessToast::mousePressEvent(QMouseEvent *event) {
+    if (event->button() != Qt::LeftButton) return QWidget::mousePressEvent(event);
+    edge_ = edgeAt(event->position().toPoint());
+    dragging_ = edge_ == 0;
+    pressGlobal_ = event->globalPosition().toPoint();
+    pressAnchor_ = anchor_;
+    pressWidth_ = width_;
+    event->accept();
+}
+
+void AccessToast::mouseMoveEvent(QMouseEvent *event) {
+    const QPoint delta = event->globalPosition().toPoint() - pressGlobal_;
+    if (event->buttons() & Qt::LeftButton) {
+        if (edge_ != 0) {
+            // Borde derecho: crece hacia la derecha; borde izquierdo: hacia la izquierda, con el derecho quieto.
+            applyWidth(pressWidth_ + (edge_ > 0 ? delta.x() : -delta.x()));
+            if (edge_ > 0) anchor_.setX(pressAnchor_.x() + (width_ - pressWidth_));
+            keepInside();
+        } else if (dragging_) {
+            anchor_ = pressAnchor_ + delta;
+            keepInside();
+        }
+        return;
+    }
+    setCursor(edgeAt(event->position().toPoint()) ? Qt::SizeHorCursor : Qt::ArrowCursor);
+}
+
+void AccessToast::mouseReleaseEvent(QMouseEvent *event) {
+    // Sólo si se movió o se ensanchó de verdad: un clic suelto no guarda la posición.
+    const bool moved = (event->globalPosition().toPoint() - pressGlobal_).manhattanLength() > 2;
+    if (event->button() == Qt::LeftButton && (dragging_ || edge_) && moved) {
+        // La esquina queda donde se ve el aviso (keepInside pudo correrla).
+        anchor_ = geometry().bottomRight();
+        remember();
+    }
+    dragging_ = false;
+    edge_ = 0;
+    QWidget::mouseReleaseEvent(event);
+}
+
+void AccessToast::leaveEvent(QEvent *event) {
+    if (!dragging_ && !edge_) unsetCursor();
+    QWidget::leaveEvent(event);
+}
+
+void AccessToast::resizeEvent(QResizeEvent *event) {
+    QWidget::resizeEvent(event);
+    // Cualquier cambio de alto (la explicación, un destino con nombre) crece hacia arriba y queda en pantalla.
+    if (isVisible() && !dragging_) keepInside();
 }
 
 void AccessToast::paintEvent(QPaintEvent *) {

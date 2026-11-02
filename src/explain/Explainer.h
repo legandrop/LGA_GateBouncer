@@ -21,6 +21,10 @@ QString providerName(Provider provider);
 
 struct Facts {
     QString path; // ruta local: no se manda tal cual
+    // El pedido al que pertenece la respuesta (caché y aviso): la ruta, o en modo por destino «ruta|destino», así la
+    // explicación de un servidor no aparece en el aviso de otro. Vacío: la ruta.
+    QString id;
+    QString requestId() const { return id.isEmpty() ? path : id; }
     QString fileName, folder, signer, product, description, company, version, destination;
     QString serverName; // el nombre DNS que resolvió la app, sólo con destino público
     int attempts = 0;

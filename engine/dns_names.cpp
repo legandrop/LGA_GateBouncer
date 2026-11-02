@@ -259,6 +259,12 @@ void DnsNames::handle(PEVENT_RECORD record) {
     if (addresses.empty()) return;
     const std::wstring app = imageOf(record->EventHeader.ProcessId);
     const ULONGLONG tick = GetTickCount64();
+    store(name, app, addresses, tick);
+    if (listener_ && !app.empty()) listener_(app, name, addresses);
+}
+
+void DnsNames::store(const std::wstring &name, const std::wstring &app, const std::vector<std::wstring> &addresses,
+                     ULONGLONG tick) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (byAddress_.size() > AddressLimit || tick - lastPrune_ > PruneEveryMs) {
         lastPrune_ = tick;

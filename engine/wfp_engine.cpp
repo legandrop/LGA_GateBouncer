@@ -191,6 +191,50 @@ bool WfpEngine::addAppFilter(const std::wstring &path, Action action, Direction 
     return true;
 }
 
+bool WfpEngine::addAppAddressFilter(const std::wstring &path, const std::wstring &address, Action action,
+                                    std::uint8_t weight, std::vector<std::uint64_t> &ids, std::wstring &error) {
+    IN_ADDR v4{};
+    IN6_ADDR v6{};
+    const bool isV4 = InetPtonW(AF_INET, address.c_str(), &v4) == 1;
+    if (!isV4 && InetPtonW(AF_INET6, address.c_str(), &v6) != 1) {
+        error = L"Invalid address: " + address;
+        return false;
+    }
+    FWP_BYTE_BLOB *appId = nullptr;
+    const DWORD r = FwpmGetAppIdFromFileName0(path.c_str(), &appId);
+    if (r != ERROR_SUCCESS || !appId) {
+        error = L"FwpmGetAppIdFromFileName0: " + errorText(r);
+        return false;
+    }
+    FWP_BYTE_ARRAY16 bytes16{};
+    std::memcpy(bytes16.byteArray16, &v6, 16);
+    FWPM_FILTER_CONDITION0 conditions[2]{};
+    conditions[0].fieldKey = FWPM_CONDITION_ALE_APP_ID;
+    conditions[0].matchType = FWP_MATCH_EQUAL;
+    conditions[0].conditionValue.type = FWP_BYTE_BLOB_TYPE;
+    conditions[0].conditionValue.byteBlob = appId;
+    conditions[1].fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+    conditions[1].matchType = FWP_MATCH_EQUAL;
+    if (isV4) {
+        conditions[1].conditionValue.type = FWP_UINT32;
+        conditions[1].conditionValue.uint32 = ntohl(v4.S_un.S_addr); // WFP compara en orden de host
+    } else {
+        conditions[1].conditionValue.type = FWP_BYTE_ARRAY16_TYPE;
+        conditions[1].conditionValue.byteArray16 = &bytes16;
+    }
+    std::uint64_t id = 0;
+    const bool ok = addFilter(isV4 ? FWPM_LAYER_ALE_AUTH_CONNECT_V4 : FWPM_LAYER_ALE_AUTH_CONNECT_V6,
+                              action == Action::Allow ? L"LGA GateBouncer allow destination"
+                                                      : L"LGA GateBouncer block destination",
+                              action == Action::Allow ? FWP_ACTION_PERMIT : FWP_ACTION_BLOCK, weight, conditions, 2, id,
+                              error);
+    FwpmFreeMemory0(reinterpret_cast<void **>(&appId));
+    if (!ok) return false;
+    ids.push_back(id);
+    if (action == Action::Block) trackOwnFilters({id});
+    return true;
+}
+
 bool WfpEngine::begin(std::wstring &error) {
     if (txnDepth_++ > 0) return true;
     const DWORD r = FwpmTransactionBegin0(engine_, 0);

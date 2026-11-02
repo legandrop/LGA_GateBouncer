@@ -62,10 +62,16 @@ const FirewallClient::PendingItem *FirewallClient::pendingFor(const QString &pat
     return nullptr;
 }
 
+const FirewallClient::PendingItem *FirewallClient::pendingById(const QString &id) const {
+    for (const auto &p : pending_)
+        if (key(p.id) == key(id)) return &p;
+    return nullptr;
+}
+
 const FirewallClient::RuleItem *FirewallClient::ruleFor(const QString &path) const {
     if (path.isEmpty()) return nullptr;
     for (const auto &r : rules_)
-        if (key(r.path) == key(path)) return &r;
+        if (r.destination.isEmpty() && key(r.path) == key(path)) return &r;
     return nullptr;
 }
 
@@ -82,9 +88,10 @@ const FirewallClient::RuleItem *FirewallClient::ruleById(const QString &id) cons
 }
 
 QString FirewallClient::describe(const RuleItem &rule) {
-    if (rule.scope == "app") return QString("any version of %1 from %2").arg(rule.name, rule.signer);
-    if (rule.scope == "publisher") return "all apps from " + rule.signer;
-    return fileName(rule.path);
+    const QString who = rule.scope == "app"         ? QString("any version of %1 from %2").arg(rule.name, rule.signer)
+                        : rule.scope == "publisher" ? "all apps from " + rule.signer
+                                                    : fileName(rule.path);
+    return rule.destination.isEmpty() ? who : who + " to " + rule.destination;
 }
 
 bool FirewallClient::publisherRuleAllowed(const QString &signer) {
@@ -108,14 +115,17 @@ QString FirewallClient::remaining(const RuleItem &rule) {
                         : QString("%1 h %2 min left").arg(minutes / 60).arg(minutes % 60);
 }
 
-void FirewallClient::decide(const QString &path, bool allow, const QString &scope, const QString &duration) {
+void FirewallClient::decide(const QString &path, bool allow, const QString &scope, const QString &duration,
+                            const QString &destination) {
     const auto *p = pendingFor(path);
     const QString signer = p ? p->signer : QString();
     QString what = fileName(path);
     if (scope == "app") what = QString("any version of %1 from %2").arg(fileName(path), signer);
     else if (scope == "publisher") what = "all apps from " + signer;
+    if (!destination.isEmpty()) what += " to " + destination;
     QString line = QString("DECIDE\t%1\t%2\t%3").arg(allow ? "allow" : "block", scope, path);
-    if (duration != "always") line += "\t" + duration;
+    if (duration != "always" || !destination.isEmpty()) line += "\t" + duration;
+    if (!destination.isEmpty()) line += "\t" + destination;
     const QString span = duration == "restart" ? QStringLiteral(" until restart")
                          : duration == "always" ? QString()
                                                 : " for " + describeDuration(duration.toLongLong());
@@ -248,13 +258,24 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
         QSet<QString> now;
         for (const auto &row : rows) {
             const auto f = row.split('\t');
-            // El motor anterior manda 8 campos; desde los nombres de destino, 9 (el nombre, o vacío).
-            if (f.size() != 8 && f.size() != 9) continue;
-            pending_.push_back({f[7], f[3], f[0].toLongLong(), f[1].toLongLong(), f[2].toInt(), f[4].toInt(),
-                                f[5].toInt(), f[6], f.size() == 9 ? f[8] : QString()});
-            now.insert(key(f[7]));
+            // El motor anterior manda 8 campos; con los nombres de destino, 9; con las reglas por destino, 10 (modo).
+            if (f.size() < 8 || f.size() > 10) continue;
+            PendingItem p;
+            p.path = f[7];
+            p.remote = f[3];
+            p.first = f[0].toLongLong();
+            p.last = f[1].toLongLong();
+            p.attempts = f[2].toInt();
+            p.port = f[4].toInt();
+            p.protocol = f[5].toInt();
+            p.signer = f[6];
+            p.host = f.size() >= 9 ? f[8] : QString();
+            p.perDestination = f.size() == 10 && f[9] == "destination";
+            p.id = p.perDestination ? p.path + "|" + p.remote : p.path;
+            pending_.push_back(p);
+            now.insert(key(p.id));
             // También los que ya esperaban al conectar: la ventana arranca con la sesión y tiene que avisarlos.
-            if (!knownPending_.contains(key(f[7]))) emit newPending(f[7]);
+            if (!knownPending_.contains(key(p.id))) emit newPending(p.id);
         }
         knownPending_ = now;
         break;
@@ -263,8 +284,9 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
         rules_.clear();
         for (const auto &row : rows) {
             const auto f = row.split('\t');
-            // El motor anterior manda 7 campos; desde las reglas temporales, 8 (vencimiento).
-            if (f.size() != 7 && f.size() != 8) continue;
+            // El motor anterior manda 7 campos; con las reglas temporales, 8 (vencimiento); con las reglas por
+            // destino, 10 (destino y ruta).
+            if (f.size() != 7 && f.size() != 8 && f.size() != 10) continue;
             RuleItem r;
             r.allow = f[0] == "allow";
             r.created = f[1].toLongLong();
@@ -273,8 +295,9 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
             r.signer = f[4];
             r.name = f[5];
             r.id = f[6];
-            r.expires = f.size() == 8 ? f[7].toLongLong() : 0;
-            if (r.scope == "path" || r.scope == "covered") r.path = r.id;
+            r.expires = f.size() >= 8 ? f[7].toLongLong() : 0;
+            r.destination = f.size() == 10 ? f[8] : QString();
+            if (r.scope == "path" || r.scope == "covered") r.path = f.size() == 10 ? f[9] : r.id;
             rules_.push_back(r);
         }
         break;

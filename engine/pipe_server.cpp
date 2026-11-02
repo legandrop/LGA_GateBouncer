@@ -216,8 +216,8 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     const std::string &command = f[0];
     std::ostringstream out;
     if (command == "HELLO") {
-        // Versión 3: PENDING con el nombre del destino, STATUS con lan y names, comando LAN.
-        out << "OK\tGateBouncerEngine\t3\t" << (mayChange ? "control" : "view") << "\nEND\n";
+        // Versión 4: reglas por destino (PENDING y RULES con un campo más, DECIDE con destino).
+        out << "OK\tGateBouncerEngine\t4\t" << (mayChange ? "control" : "view") << "\nEND\n";
         return out.str();
     }
     if (command == "STATUS") {
@@ -240,7 +240,7 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         for (const auto &p : core_.pending())
             out << p.first << "\t" << p.last << "\t" << p.attempts << "\t" << field(p.remoteAddress) << "\t"
                 << p.remotePort << "\t" << int(p.protocol) << "\t" << field(p.signer) << "\t" << field(p.path) << "\t"
-                << field(p.host) << "\n";
+                << field(p.host) << "\t" << (p.perDestination ? "destination" : "app") << "\n";
         out << "END\n";
         return out.str();
     }
@@ -248,21 +248,23 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         // acción, creada, último bloqueo, alcance (path/app/publisher/covered), firmante, nombre, id, vencimiento.
         // id: la ruta (path y covered) o la clave de la regla (app y publisher). Una fila covered es la ruta que
         // una regla de firma ya permitió o bloqueó; su nombre es la clave de esa regla. Vencimiento: 0 permanente,
-        // -1 hasta reiniciar el motor, o el momento Unix en que se retira.
+        // -1 hasta reiniciar el motor, o el momento Unix en que se retira. Versión 4 suma destino (vacío: la app
+        // entera) y la ruta de las reglas de ruta. Una regla por destino tiene como id su clave, incluso si es de ruta.
         out << "OK\n";
         const auto rules = core_.rules();
         for (const auto &r : rules) {
             const char *scope = r.scope == Scope::App ? "app" : r.scope == Scope::Publisher ? "publisher" : "path";
             out << (r.action == Action::Allow ? "allow" : "block") << "\t" << r.created << "\t" << r.lastBlock << "\t"
                 << scope << "\t" << field(r.signer) << "\t" << field(r.name) << "\t"
-                << field(r.scope == Scope::Path ? r.path : FirewallCore::ruleKey(r)) << "\t" << r.expires << "\n";
+                << field(r.scope == Scope::Path && r.destination.empty() ? r.path : FirewallCore::ruleKey(r)) << "\t"
+                << r.expires << "\t" << field(r.destination) << "\t" << field(r.path) << "\n";
         }
         for (const auto &c : core_.covered())
             for (const auto &r : rules)
-                if (r.scope != Scope::Path && FirewallCore::ruleKey(r) == c.ruleKey)
+                if (r.scope != Scope::Path && r.destination.empty() && FirewallCore::ruleKey(r) == c.ruleKey)
                     out << (r.action == Action::Allow ? "allow" : "block") << "\t" << r.created << "\t" << r.lastBlock
                         << "\tcovered\t" << field(r.signer) << "\t" << field(c.ruleKey) << "\t" << field(c.path) << "\t"
-                        << r.expires << "\n";
+                        << r.expires << "\t\t" << field(c.path) << "\n";
         out << "END\n";
         return out.str();
     }
@@ -279,11 +281,12 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     if (!mayChange) return err(L"Only GateBouncer or an administrator can change rules");
     std::wstring error;
     bool ok = false;
-    // DECIDE <allow|block> <ruta> (sólo esa ruta) o DECIDE <allow|block> <path|app|publisher> <ruta> [duración].
-    // Duración: "always", "restart" (hasta que el motor se reinicie) o segundos, de un minuto a una semana.
+    // DECIDE <allow|block> <ruta> (sólo esa ruta) o DECIDE <allow|block> <path|app|publisher> <ruta> [duración
+    // [destino]]. Duración: "always", "restart" (hasta que el motor se reinicie) o segundos, de un minuto a una semana.
+    // Destino: un host, «*.dominio» o una IP; sin destino, la app entera.
     std::int64_t expires = 0;
     bool durationOk = true;
-    if (command == "DECIDE" && f.size() == 5) {
+    if (command == "DECIDE" && (f.size() == 5 || f.size() == 6)) {
         if (f[4] == "restart") {
             expires = UntilRestart;
         } else if (f[4] != "always") {
@@ -295,11 +298,11 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     }
     if (command == "DECIDE" && f.size() == 3 && (f[1] == "allow" || f[1] == "block"))
         ok = core_.decide(wide(f[2]), f[1] == "allow" ? Action::Allow : Action::Block, Scope::Path, error);
-    else if (command == "DECIDE" && (f.size() == 4 || f.size() == 5) && durationOk &&
+    else if (command == "DECIDE" && (f.size() == 4 || f.size() == 5 || f.size() == 6) && durationOk &&
              (f[1] == "allow" || f[1] == "block") && (f[2] == "path" || f[2] == "app" || f[2] == "publisher"))
         ok = core_.decide(wide(f[3]), f[1] == "allow" ? Action::Allow : Action::Block,
                           f[2] == "app" ? Scope::App : f[2] == "publisher" ? Scope::Publisher : Scope::Path, error,
-                          expires);
+                          expires, f.size() == 6 ? wide(f[5]) : std::wstring());
     else if (command == "REMOVE" && f.size() == 2)
         ok = core_.removeRule(wide(f[1]), error);
     else if (command == "MODE" && f.size() == 2 && (f[1] == "ask" || f[1] == "off"))

@@ -25,6 +25,9 @@ class FirewallClient final : public QObject {
         int attempts = 0, port = 0, protocol = 0;
         QString signer; // vacío: sin firma embebida válida (la verifica el motor)
         QString host;   // el nombre que la app resolvió para esa dirección; vacío si no se sabe
+        // Modo por destino: la decisión es sobre este destino. Un pedido por dirección nueva.
+        bool perDestination = false;
+        QString id; // la ruta, o «ruta|dirección» en modo por destino
     };
     // Alcances del motor: "path" (ruta exacta), "app" (firmante + nombre del exe, cualquier carpeta), "publisher"
     // (todo lo del firmante) y "covered" (una ruta que una regla app/publisher ya permitió o bloqueó).
@@ -34,6 +37,7 @@ class FirewallClient final : public QObject {
         qint64 created = 0, lastBlock = 0;
         QString scope = "path", signer, name, id; // id: lo que se manda en REMOVE
         qint64 expires = 0; // 0 permanente, -1 hasta reiniciar el motor, si no el momento Unix en que vence
+        QString destination; // vacío: la app entera; si no, un host, «*.dominio» o una IP
     };
     struct ActivityItem {
         qint64 time = 0;
@@ -50,15 +54,19 @@ class FirewallClient final : public QObject {
     const QVector<RuleItem> &rules() const { return rules_; }
     int ruleCount() const;
     const QVector<ActivityItem> &activity() const { return activity_; }
+    // El primer pedido de esa app (cualquier destino).
     const PendingItem *pendingFor(const QString &path) const;
-    // Regla de la ruta o cobertura de una regla por firma.
+    const PendingItem *pendingById(const QString &id) const;
+    // Regla de la app entera de esa ruta o cobertura de una regla por firma (las reglas por destino no cuentan).
     const RuleItem *ruleFor(const QString &path) const;
     const RuleItem *ruleById(const QString &id) const;
     bool busy() const { return commandsInFlight_ > 0; }
 
     // scope: "path", "app" o "publisher". La firma la verifica el motor, no la ventana.
     // duration: "always", "restart" (hasta que el motor se reinicie) o segundos ("900").
-    void decide(const QString &path, bool allow, const QString &scope = "path", const QString &duration = "always");
+    // destination: vacío para la app entera; si no, sólo ese destino (la app pasa a modo por destino).
+    void decide(const QString &path, bool allow, const QString &scope = "path", const QString &duration = "always",
+                const QString &destination = {});
     void removeRule(const QString &id);
     void setAsk(bool ask);
     void setLocalNetwork(bool allow);
@@ -79,7 +87,7 @@ class FirewallClient final : public QObject {
 
   signals:
     void changed();
-    void newPending(const QString &path);
+    void newPending(const QString &id);
     void commandFinished(bool ok, const QString &message);
 
   private:

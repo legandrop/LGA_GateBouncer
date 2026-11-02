@@ -441,7 +441,7 @@ const Answer *Explainer::cached(const QString &path) const {
 }
 
 bool Explainer::request(const Facts &facts, QString &error) {
-    const QString running = facts.path.toLower();
+    const QString running = facts.requestId().toLower();
     if (running_.contains(running)) return true;
     if (qaFixture()) {
         // QA sin red ni key: una respuesta fija, con la demora de un pedido real.
@@ -453,14 +453,14 @@ bool Explainer::request(const Facts &facts, QString &error) {
                      "It connects to check the layout of a real answer; nothing is sent in this test.",
                      "Nothing in these facts looks unusual.", "either",
                      "Allowing or blocking it has no effect outside this test.", "qa/sample-model"};
-            cache_.insert(cacheKey(facts.path), a);
-            emit finished(facts.path, true, a, {});
+            cache_.insert(cacheKey(facts.requestId()), a);
+            emit finished(facts.requestId(), true, a, {});
         });
         return true;
     }
-    if (const auto *hit = cached(facts.path)) {
+    if (const auto *hit = cached(facts.requestId())) {
         const Answer copy = *hit;
-        QMetaObject::invokeMethod(this, [this, path = facts.path, copy] { emit finished(path, true, copy, {}); },
+        QMetaObject::invokeMethod(this, [this, path = facts.requestId(), copy] { emit finished(path, true, copy, {}); },
                                   Qt::QueuedConnection);
         return true;
     }
@@ -474,7 +474,7 @@ bool Explainer::request(const Facts &facts, QString &error) {
     s.setValue("explain/day", today);
     s.setValue("explain/count", count + 1);
     const auto settings = Settings::load();
-    const QString key = cacheKey(facts.path);
+    const QString key = cacheKey(facts.requestId());
     running_.insert(running);
     QPointer<Explainer> self(this);
     // Hilo suelto, no del pool: al salir, la app no espera un pedido en curso (hasta 45 s).
@@ -491,7 +491,7 @@ bool Explainer::request(const Facts &facts, QString &error) {
                 if (!self) return;
                 self->running_.remove(running);
                 if (ok) self->cache_.insert(key, answer);
-                emit self->finished(facts.path, ok, answer, failure);
+                emit self->finished(facts.requestId(), ok, answer, failure);
             },
             Qt::QueuedConnection);
     }).detach();

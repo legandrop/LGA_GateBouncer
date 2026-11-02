@@ -31,6 +31,16 @@ other driverless Windows firewalls.
   missing when the attempt is blocked is filled in when the request is read. Applications that connect to an address
   directly or resolve names themselves (for example DNS over HTTPS) get no name. If the ETW session cannot start, the
   engine runs without names and reports it in `lastError`.
+- **Destination rules.** Any rule (path, app or publisher) can carry a destination: an exact server name,
+  `*.domain` (the domain and its subdomains; at least two labels, so `*.com` is rejected) or an IP address. An
+  application with destination rules has no whole-application filter: each new destination is blocked and asked
+  separately (one pending request per address). WFP matches addresses, not names, so the engine adds a filter for that
+  application and that remote address ("destination permit": Allow weight 12, Block weight 15) when the application
+  resolves a matching name (the DNS listener) or when a blocked attempt matches. A permit from a signature rule that
+  allows is granted only after verifying the file's signature again, and is rechecked like a covered path. When one
+  address serves an allowed and a blocked name, the Block stays. Permits unused for a week are removed. Deciding the
+  whole application replaces its destination rules, and the other way round. Saved as `dest` and `grant` lines in
+  `rules.tsv`.
 - **Temporary rules.** A decision can last from one minute to a week, or until the engine restarts. The engine checks
   expiry every ten seconds; an expired rule is removed (with the paths it covered) and the application asks again.
   Until-restart rules are never written to the rules file.
@@ -82,8 +92,9 @@ or an elevated process, can change rules (`DECIDE`, `REMOVE`, `MODE`, `LAN allow
 destination name (empty when unknown); `STATUS` reports `lan` and a `names` line with DNS listener counters.
 `DECIDE` takes the reach of the rule (`path`,
 `app` or `publisher`), the executable and optionally how long it lasts (`always`, `restart` or a number of seconds,
-from 60 to 604800); the engine reads the signer from the file itself and never trusts a signer sent by the client.
-`RULES` reports each rule's expiry (0 permanent, -1 until restart, otherwise Unix time). That check uses the client's
+from 60 to 604800) and a destination; the engine reads the signer from the file itself and never trusts a signer sent by the client.
+`RULES` reports each rule's expiry (0 permanent, -1 until restart, otherwise Unix time), destination and path.
+Protocol version 4 (`HELLO`) adds a last `PENDING` field, `app` or `destination`, for applications in destination mode. That check uses the client's
 executable path:
 it keeps other programs from changing rules by accident, but it is not a boundary against malicious software already
 running under your account, which could start the window and inject code into it.
@@ -99,7 +110,12 @@ service; `--pipe <name>` gives the console engine its own channel name.
 
 ## Limits
 
-- The first attempt of an unknown application fails; there is no waiting connection.
+- The first attempt of an unknown application fails; there is no waiting connection. With destination rules, the
+  first attempt to a new address of an allowed name can also fail when Windows reports the name lookup after the
+  connection (up to a second).
+- Destination rules match names the application resolved through Windows. An application that resolves names itself
+  (DNS over HTTPS) or connects straight to an address only matches IP destinations. Services that share an address
+  (content delivery networks) share the decision for that address.
 - Path rules match the executable path, not its content. A path covered by a signature rule is checked every minute:
   if the file changed (NTFS change time, file ID or size), its signature is verified again and the filter is withdrawn
   when it no longer matches. Every ten minutes all covered files are verified again regardless. Between checks a

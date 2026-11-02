@@ -1399,6 +1399,9 @@ void MainWindow::refreshTable(bool newPage) {
     if (firewallView()) {
         const auto policyCell = [this](const QString &path) -> Cell {
             if (const auto *r = firewall_.ruleFor(path)) return r->allow ? Cell{"Allow", "Allow", {}} : Cell{"Block", "Block", {}};
+            for (const auto &r : firewall_.rules())
+                if (!r.destination.isEmpty() && r.scope == "path" && r.path.compare(path, Qt::CaseInsensitive) == 0)
+                    return {"Per destination", "Ask", {}};
             if (firewall_.pendingFor(path)) return {"Waiting", "AskPending", {}};
             return firewall_.status().ask ? Cell{"Ask", "Ask", {}} : Cell{"No rule", "inactive", {}};
         };
@@ -1432,7 +1435,7 @@ void MainWindow::refreshTable(bool newPage) {
             if (count_) count_->setText(QString("%1 of %2 applications").arg(result.size()).arg(apps.size()));
         } else if (view_ == "pending") {
             for (const auto &p : firewall_.pending())
-                result.push_back({firewallId(p.path), {appCell(p.path),
+                result.push_back({firewallId(p.id), {appCell(p.path),
                     {(p.host.isEmpty() ? firewallDestination(p.remote, p.port, p.protocol) + "\n"
                                        : p.host + "\n" + firewallDestination(p.remote, p.port, p.protocol) + " · ") +
                          QString::number(p.attempts) + " blocked attempts", "strong", {}},
@@ -1454,7 +1457,7 @@ void MainWindow::refreshTable(bool newPage) {
                 if (r.scope == "covered") continue;
                 allow += r.allow;
                 // Reglas por firma: una fila por regla, con lo que cubre en vez de una ruta.
-                const QString searchable = r.scope == "path" ? r.path : FirewallClient::describe(r);
+                const QString searchable = (r.scope == "path" ? r.path : FirewallClient::describe(r)) + " " + r.destination;
                 if (!query_.isEmpty() && !searchable.contains(query_, Qt::CaseInsensitive)) continue;
                 Cell app = appCell(r.path);
                 if (r.scope == "app")
@@ -1462,6 +1465,12 @@ void MainWindow::refreshTable(bool newPage) {
                 else if (r.scope == "publisher")
                     app = {"All apps from " + r.signer + "\nAny application with this signature",
                            "glyph:" + r.signer.left(2).toUpper(), r.signer.toLower()};
+                // Regla por destino: el destino va en la primera línea, junto a la app.
+                if (!r.destination.isEmpty()) {
+                    const int cut = app.text.indexOf(QChar('\n'));
+                    app.text = cut < 0 ? app.text + " to " + r.destination
+                                       : app.text.left(cut) + " to " + r.destination + app.text.mid(cut);
+                }
                 const Cell policy = r.allow ? Cell{"Allow", "Allow", {}} : Cell{"Block", "Block", {}};
                 // Una regla temporal muestra cuánto le queda debajo de su fecha.
                 const QString left = FirewallClient::remaining(r);
@@ -3638,16 +3647,20 @@ void MainWindow::onNewFirewallPending(const QString &) {
     QTimer::singleShot(0, this, &MainWindow::updateFirewallToast);
 }
 
-void MainWindow::openFirewallRequest(const QString &path) {
-    if (path.isEmpty()) return;
-    if (!firewall_.pendingFor(path)) {
-        editFirewallRule(path);
+// pathOrId: una ruta (el primer pedido de esa app) o el id de un pedido por destino.
+void MainWindow::openFirewallRequest(const QString &pathOrId) {
+    if (pathOrId.isEmpty()) return;
+    const auto *p = firewall_.pendingById(pathOrId);
+    if (!p) p = firewall_.pendingFor(pathOrId);
+    if (!p) {
+        editFirewallRule(pathOrId);
         return;
     }
     // Pedido a mano desde Pending: vuelve a avisar aunque se hubiera cerrado, y le gana al aviso actual.
-    dismissedRequests_.remove(path.toLower());
-    preferredRequest_ = path;
-    if (firewallToast_ && firewallToast_->path().compare(path, Qt::CaseInsensitive) != 0) {
+    const QString id = p->id;
+    dismissedRequests_.remove(id.toLower());
+    preferredRequest_ = id;
+    if (firewallToast_ && firewallToast_->id().compare(id, Qt::CaseInsensitive) != 0) {
         firewallToast_->close();
         firewallToast_->deleteLater();
         firewallToast_.clear();
@@ -3667,19 +3680,19 @@ void MainWindow::updateFirewallToast() {
     }
     // Lo cerrado que ya no está pendiente se olvida: si la app vuelve a pedir, se avisa de nuevo.
     QSet<QString> waiting;
-    for (const auto &p : pending) waiting.insert(p.path.toLower());
+    for (const auto &p : pending) waiting.insert(p.id.toLower());
     dismissedRequests_.intersect(waiting);
     const auto showable = [this](const FirewallClient::PendingItem &p) {
-        return !dismissedRequests_.contains(p.path.toLower());
+        return !dismissedRequests_.contains(p.id.toLower());
     };
-    if (firewallToast_ && !firewall_.pendingFor(firewallToast_->path())) {
+    if (firewallToast_ && !firewall_.pendingById(firewallToast_->id())) {
         firewallToast_->close();
         firewallToast_->deleteLater();
         firewallToast_.clear();
     }
-    const FirewallClient::PendingItem *current = firewallToast_ ? firewall_.pendingFor(firewallToast_->path()) : nullptr;
+    const FirewallClient::PendingItem *current = firewallToast_ ? firewall_.pendingById(firewallToast_->id()) : nullptr;
     if (!current) {
-        const auto *preferred = firewall_.pendingFor(preferredRequest_);
+        const auto *preferred = firewall_.pendingById(preferredRequest_);
         if (preferred && showable(*preferred)) current = preferred;
         else
             for (const auto &p : pending)
@@ -3690,23 +3703,25 @@ void MainWindow::updateFirewallToast() {
     if (!firewallToast_) {
         firewallToast_ = new AccessToast;
         connect(firewallToast_, &AccessToast::decided, this,
-                [this](const QString &path, bool allow, const QString &scope, const QString &duration) {
-            firewall_.decide(path, allow, scope, duration);
+                [this](const QString &id, bool allow, const QString &scope, const QString &duration,
+                       const QString &destination) {
+            const auto *p = firewall_.pendingById(id);
+            if (p) firewall_.decide(p->path, allow, scope, duration, destination);
             // Se oculta ya: si la decisión falla, el pedido sigue pendiente y vuelve a aparecer.
             if (firewallToast_) {
                 firewallToast_->close();
                 firewallToast_->deleteLater();
                 firewallToast_.clear();
             }
-            dismissedRequests_.insert(path.toLower());
-            QTimer::singleShot(1500, this, [this, path] {
-                dismissedRequests_.remove(path.toLower());
+            dismissedRequests_.insert(id.toLower());
+            QTimer::singleShot(1500, this, [this, id] {
+                dismissedRequests_.remove(id.toLower());
                 updateFirewallToast();
             });
             updateFirewallToast();
         });
-        connect(firewallToast_, &AccessToast::dismissed, this, [this](const QString &path) {
-            dismissedRequests_.insert(path.toLower());
+        connect(firewallToast_, &AccessToast::dismissed, this, [this](const QString &id) {
+            dismissedRequests_.insert(id.toLower());
             if (firewallToast_) {
                 firewallToast_->close();
                 firewallToast_->deleteLater();
@@ -3720,7 +3735,7 @@ void MainWindow::updateFirewallToast() {
             selectView("pending");
         });
         connect(firewallToast_, &AccessToast::explainRequested, this,
-                [this](const QString &path) { explainFirewallRequest(path, false); });
+                [this](const QString &id) { explainFirewallRequest(id, false); });
         connect(firewallToast_, &AccessToast::settingsRequested, this, [this] {
             bringToFront();
             selectView("settings");
@@ -3728,9 +3743,11 @@ void MainWindow::updateFirewallToast() {
     }
     int others = 0;
     for (const auto &p : pending)
-        if (showable(p) && p.path.compare(current->path, Qt::CaseInsensitive) != 0) ++others;
-    const bool newApp = firewallToast_->path().compare(current->path, Qt::CaseInsensitive) != 0;
+        if (showable(p) && p.id.compare(current->id, Qt::CaseInsensitive) != 0) ++others;
+    const bool newApp = firewallToast_->id().compare(current->id, Qt::CaseInsensitive) != 0;
     AccessToast::Request request;
+    request.id = current->id;
+    request.perDestination = current->perDestination;
     request.path = current->path;
     request.signer = current->signer;
     request.attempts = current->attempts;
@@ -3741,32 +3758,35 @@ void MainWindow::updateFirewallToast() {
     request.port = current->port;
     request.protocol = current->protocol;
     firewallToast_->setRequest(request);
-    if (newApp) explainFirewallRequest(current->path, true);
+    if (newApp) explainFirewallRequest(current->id, true);
     if (!firewallToast_->isVisible()) {
         firewallToast_->placeOn(isVisible() ? screen() : nullptr);
         firewallToast_->show();
     }
 }
 
-void MainWindow::explainFirewallRequest(const QString &path, bool automatic) {
+// id: el pedido (la ruta, o «ruta|dirección» en modo por destino): la explicación de un destino no se usa para otro.
+void MainWindow::explainFirewallRequest(const QString &id, bool automatic) {
     if (!firewallToast_) return;
+    const auto *p = firewall_.pendingById(id);
+    const QString path = p ? p->path : id;
     AccessToast::Explanation e;
     const auto settings = Explain::Settings::load();
     if (!Explain::qaFixture() && (!Explain::KeyStore::has(Explain::providerOf(settings.model)) || !settings.consent)) {
         e.state = AccessToast::Explanation::NoKey;
-    } else if (const auto *hit = explainer_.cached(path)) {
+    } else if (const auto *hit = explainer_.cached(id)) {
         e = {AccessToast::Explanation::Ready, hit->what, hit->why, hit->risk, hit->suggestion, hit->reason, hit->model, {}};
-    } else if (explainer_.busy(path)) {
+    } else if (explainer_.busy(id)) {
         e.state = AccessToast::Explanation::Working;
     } else if (automatic && !settings.automatic) {
         // Al aparecer el aviso sólo se pregunta solo si el usuario lo eligió; si no, queda el enlace.
-        const auto failed = explainErrors_.constFind(path.toLower());
+        const auto failed = explainErrors_.constFind(id.toLower());
         if (failed != explainErrors_.constEnd()) e = {AccessToast::Explanation::Failed, {}, {}, {}, {}, {}, {}, *failed};
     } else {
-        const auto *p = firewall_.pendingFor(path);
-        const auto facts = Explain::collectFacts(path, p ? p->signer : QString(), p ? p->remote : QString(),
-                                                 p ? p->port : 0, p ? p->protocol : 0, p ? p->attempts : 0,
-                                                 p ? p->host : QString());
+        auto facts = Explain::collectFacts(path, p ? p->signer : QString(), p ? p->remote : QString(),
+                                           p ? p->port : 0, p ? p->protocol : 0, p ? p->attempts : 0,
+                                           p ? p->host : QString());
+        facts.id = id;
         QString error;
         if (explainer_.request(facts, error)) {
             e.state = AccessToast::Explanation::Working;
@@ -3775,27 +3795,35 @@ void MainWindow::explainFirewallRequest(const QString &path, bool automatic) {
             e.error = error;
         }
     }
-    firewallToast_->setExplanation(path, e);
+    firewallToast_->setExplanation(id, e);
 }
 
 void MainWindow::editFirewallRule(const QString &id) {
     if (id.isEmpty()) return;
     const bool can = firewall_.status().connected && firewall_.status().control && !firewall_.busy();
     const auto *signerRule = firewall_.ruleById(id);
-    if (signerRule && signerRule->scope != "path") {
-        // Regla por firma: se quita o se deja. Cambiarla se hace desde el próximo aviso de una app que coincida.
+    if (signerRule && (signerRule->scope != "path" || !signerRule->destination.isEmpty())) {
+        // Regla por firma o por destino: se quita o se deja. Cambiarla se hace desde el próximo aviso que coincida.
         const QString ruleId = signerRule->id;
+        const bool perDestination = !signerRule->destination.isEmpty();
         auto *l = modal("Edit rule", ModalOwner::General);
-        l->addWidget(label(signerRule->scope == "app" ? signerRule->name + " · any version"
-                                                      : "All apps from " + signerRule->signer, "heading"));
-        definition(l, "Signed by", signerRule->signer);
+        l->addWidget(label(signerRule->scope == "app"         ? signerRule->name + " · any version"
+                           : signerRule->scope == "publisher" ? "All apps from " + signerRule->signer
+                                                              : FirewallClient::fileName(signerRule->path),
+                           "heading"));
+        if (perDestination) definition(l, "Destination", signerRule->destination);
+        if (signerRule->scope == "path") l->addWidget(label(wrappablePath(signerRule->path), "link", true));
+        else definition(l, "Signed by", signerRule->signer);
         definition(l, "Current policy", signerRule->allow ? "Allow" : "Block");
         definition(l, "Created", firewallTime(signerRule->created));
         definition(l, "Last blocked attempt", firewallTime(signerRule->lastBlock));
         int covered = 0;
         for (const auto &r : firewall_.rules()) covered += r.scope == "covered" && r.name == ruleId;
-        definition(l, "Files seen", QString::number(covered));
-        l->addWidget(label(signerRule->scope == "app"
+        if (!perDestination) definition(l, "Files seen", QString::number(covered));
+        l->addWidget(label(perDestination
+                               ? "Applies only to connections to this destination. The app asks for each new "
+                                 "destination; removing the rule makes this one ask again."
+                           : signerRule->scope == "app"
                                ? "Applies to this executable in any folder while it keeps a valid signature from this "
                                  "publisher, so updates don't ask again."
                                : "Applies to any executable with a valid signature from this publisher.",
