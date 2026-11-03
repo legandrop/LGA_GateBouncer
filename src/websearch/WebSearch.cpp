@@ -202,7 +202,7 @@ SearchResult parseResponse(const HttpResponse &response, SearchResult result,
         if (!duplicate) citations.push_back({title,
             text(obj.value(QStringLiteral("content")).toString(), 1200), url,
             (result.provider == Provider::MwmblV2 ? QStringLiteral("Mwmbl / ") : QStringLiteral("SearXNG / "))
-                + text(obj.value(QStringLiteral("engine")).toString(), 64), retrievalUtc.toUTC()});
+                + text(obj.value(QStringLiteral("engine")).toString(), 64), retrievalUtc.toUTC(), 0, {}});
     }
     if(result.input.destination){
         const QRegularExpression literal("(?<![0-9A-Fa-f:.])"+QRegularExpression::escape(result.input.destination->address)+"(?![0-9A-Fa-f:.])",QRegularExpression::CaseInsensitiveOption);
@@ -273,7 +273,7 @@ bool SearchClient::begin(const SearchInput &input,std::function<bool()> current)
     while(!budget_.isEmpty()&&now-budget_.first()>=3600000)budget_.removeFirst();
     if(!completeCache&&(now-lastStart_<10000||budget_.size()>=30||
         (key==lastQuery_&&now>=lastQueryAt_&&now-lastQueryAt_<600000)))return false;
-    active_={input,instance_,binding_,config_.provider,Status::Unavailable,cachedNetwork};
+    active_={input,instance_,binding_,config_.provider,Status::Unavailable,cachedNetwork,{}};
     active_.citations+=cachedSearch;current_=std::move(current);working_=true;requests_=0;
     reusedDestinationCache_=!cachedSearch.isEmpty();resource_=Resource::Search;resourceUrl_=QUrl{};
     deadline_=now+(input.destination?20000:15000);
@@ -341,7 +341,8 @@ void SearchClient::finishEvidence() {
         auto store=[&](QVector<DestinationCache>& cache,const QString& key,const QVector<Citation>& evidence){
             if(evidence.isEmpty())return;
             for(qsizetype n=cache.size();n>0;--n)if(cache[n-1].key==key)cache.removeAt(n-1);
-            if(cache.size()>=32)cache.removeFirst();cache.push_back({key,evidence,now});};
+            if(cache.size()>=32)cache.removeFirst();
+            cache.push_back({key,evidence,now});};
         QVector<Citation> searched;for(const auto& c:result.citations)if(c.kind==2)searched.push_back(c);
         if(!reusedDestinationCache_)store(destinationCache_,result.input.destination->address+'\n'+result.input.publicQuery,searched);
         // Network cache se escribe al recibir cada respuesta válida; leerlo no renueva su fecha.
@@ -379,7 +380,8 @@ void SearchClient::tick()
     if(clock_->milliseconds()>=deadline_){if(!active_.diagnostic.failureObserved){active_.diagnostic.local=LocalHttpFailure::Deadline;active_.diagnostic.failureObserved=true;}complete(Status::Unavailable);return;}
     HttpResponse response;
     const auto operation=exchange_;if(!operation->poll(response))return;
-    if(!self)return;if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return;}if(!self)return;
+    if(!self)return;
+    if(!sourceCurrent()){if(self&&working_)complete(Status::Cancelled);return;}if(!self)return;
     // Conservar la primera falla de una familia, también si etapas posteriores no aportan evidencia.
     if(!active_.diagnostic.failureObserved &&
         (response.diagnostic.failureObserved || !response.transportOk || response.statusCode!=200)){

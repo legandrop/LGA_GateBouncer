@@ -107,7 +107,8 @@ public:
     virtual ~SearchPort()=default;
     virtual bool begin(const FullBinding&,const PublicFields&,Completion)=0;
     virtual bool beginCurrent(const FullBinding& b,const PublicFields& p,Completion completion,std::function<bool()> current){
-        if(p.destination||!current||!current())return false;return begin(b,p,std::move(completion));
+        if(p.destination||!current||!current())return false;
+        return begin(b,p,std::move(completion));
     }
     virtual void cancel()=0;
 };

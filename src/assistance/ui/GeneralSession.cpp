@@ -252,7 +252,7 @@ bool GeneralSession::reviewLocalApplication(const OrdinaryDecisionClient& source
         !(pendingPresentation_->service()==observed->service)||!observed->matches(*binding))return false;
     // Sólo basename entregado por el productor actual; no es ProductName ni publisher verificado.
     const auto& name=observed->record.display.name;
-    G::PublicFields fields{std::string(name.begin(),name.end()),{},std::string(name.begin(),name.end())};
+    G::PublicFields fields{std::string(name.begin(),name.end()),{},std::string(name.begin(),name.end()),std::nullopt};
     const auto after=currentObservation(original.data());
     if(!G::validPublicFields(fields)||!after||!(*after==*observed))return false;
     const bool reviewed=reviewPublicFields(std::move(fields));

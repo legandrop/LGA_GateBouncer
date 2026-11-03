@@ -943,7 +943,8 @@ bool ProductController::prepareApplicationFile(const QString &path, Data::Action
         if (fileWorker_ == worker) fileWorker_ = nullptr;
         worker->deleteLater();
         if (!fileActivation_ || stopped_ || token != fileRuleToken_) {
-            if (Data::SelectedApplicationFile::physicalJobs()) fileDrain_.start(); return;
+            if (Data::SelectedApplicationFile::physicalJobs()) fileDrain_.start();
+            return;
         }
         auto &request = *fileActivation_;
         const bool sourceMatches = !profile || (result->comparison.representable && result->comparison.direction == request.direction &&
@@ -1002,7 +1003,8 @@ void ProductController::checkApplicationFile(bool committing) {
     auto *worker = QThread::create([owner,result] { try { *result = owner && owner->current(); } catch (...) {} });
     fileWorker_ = worker;
     connect(worker,&QThread::finished,this,[this,worker,result,token,committing] {
-        if (fileWorker_ == worker) fileWorker_ = nullptr; worker->deleteLater();
+        if (fileWorker_ == worker) fileWorker_ = nullptr;
+        worker->deleteLater();
         if (!fileActivation_ || stopped_ || token != fileRuleToken_) return;
         auto &request = *fileActivation_; gb::wire::Bytes packed;
         const bool same = *result && ordinary()->ready() && ordinary()->idle() && ordinary()->selection() == request.selection && ordinary()->fileDraft() &&
@@ -1019,7 +1021,8 @@ void ProductController::checkApplicationFile(bool committing) {
             const bool sent = ordinary()->decideFile(request.action == Data::Action::Allow,true,request.selection);
             fileRuleView_.message = sent ? "Rule submitted to the original service. If its outcome is unknown, check the same command; do not repeat it."
                                         : "Inactive: the original draft expired before submission.";
-            if (!sent) cancelApplicationFile(); emit changed(); return;
+            if (!sent) cancelApplicationFile();
+            emit changed(); return;
         }
         request.phase = FileActivation::Ready; fileRuleView_.ready = true;
         const auto &facts = request.owner->facts();
@@ -1066,7 +1069,8 @@ bool ProductController::loadSelectedRuleBackup(const QString &path) {
     });
     fileWorker_ = worker;
     connect(worker,&QThread::finished,this,[this,worker,result,token] {
-        if (fileWorker_ == worker) fileWorker_ = nullptr; worker->deleteLater();
+        if (fileWorker_ == worker) fileWorker_ = nullptr;
+        worker->deleteLater();
         if (stopped_ || token != fileRuleToken_) return;
         fileRuleView_.busy = false;
         if (result->result.ok()) {
@@ -1083,7 +1087,7 @@ QVector<Data::RuleHistoryReview> ProductController::reviewLiveRuleHistory(int da
     if (client->administrative_ && client->session_.administrativeConnection() != client->connection_) return {};
     const auto text = [](const gb::wire::Id &id) { return QString::fromStdString(gb::wire::hex(id)); };
     Data::NativeSourceBinding binding{text(client->epoch_),text(client->boot_),text(client->source_),
-        text(client->source_),client->bindingGeneration_,client->profile_};
+        text(client->source_),client->bindingGeneration_,client->profile_,0,{}};
     if (client->administrative_) { binding.role = 2; binding.connection = text(client->connection_); }
     QVector<Data::RuleHistoryTarget> targets; targets.reserve(qsizetype(client->rules_.size()));
     const auto bytes = [](const gb::wire::Bytes &value) {

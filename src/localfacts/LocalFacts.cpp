@@ -94,7 +94,8 @@ State hashFile(HANDLE file, std::uint64_t size, const Limits& limits, const Canc
     BCRYPT_ALG_HANDLE algorithm = nullptr;
     BCRYPT_HASH_HANDLE hash = nullptr;
     struct Cleanup { BCRYPT_ALG_HANDLE& a; BCRYPT_HASH_HANDLE& h; ~Cleanup() {
-        if (h) BCryptDestroyHash(h); if (a) BCryptCloseAlgorithmProvider(a, 0); } } cleanup{algorithm, hash};
+        if (h) BCryptDestroyHash(h);
+        if (a) BCryptCloseAlgorithmProvider(a, 0); } } cleanup{algorithm, hash};
     if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0
         || BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0) < 0) return State::Unavailable;
     LARGE_INTEGER zero{};

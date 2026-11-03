@@ -5,10 +5,11 @@
 #include <QProgressBar>
 #include <QVBoxLayout>
 #include <QDateTime>
+#include <QTimeZone>
 namespace Gate::Assistance::Ui {
 namespace G=General;
 namespace {
-QString utc(std::uint64_t ms){return ms?QDateTime::fromMSecsSinceEpoch(qint64(ms),Qt::UTC).toString(Qt::ISODateWithMs):QString("Unknown");}
+QString utc(std::uint64_t ms){return ms?QDateTime::fromMSecsSinceEpoch(qint64(ms),QTimeZone::UTC).toString(Qt::ISODateWithMs):QString("Unknown");}
 QString signatureText(G::LocalSignatureStatus status){
     switch(status){
     case G::LocalSignatureStatus::VerifiedOffline:return "Embedded signature accepted by local offline policy";
@@ -136,7 +137,7 @@ void ExplanationWidget::refresh(){
     auto* sources=new QVBoxLayout(citations_);sources->setContentsMargins(0,0,0,0);
     if(result)for(const auto& citation:result->citations){
         auto* label=new QLabel(QString("[%1] %2\n%3\n%4\nChecked: %5 · %6").arg(citation.id).arg(QString::fromUtf8(citation.title),QString::fromUtf8(citation.url),QString::fromUtf8(citation.snippet),
-            QDateTime::fromMSecsSinceEpoch(qint64(citation.retrievedAtMs),Qt::UTC).toString(Qt::ISODateWithMs),
+            QDateTime::fromMSecsSinceEpoch(qint64(citation.retrievedAtMs),QTimeZone::UTC).toString(Qt::ISODateWithMs),
             citation.kind==1?QString("Registration record; service unknown"):citation.kind==2?QString("IP+app search association; service unverified"):citation.kind==3?QString("Announcing ASN from RIS; may lag routing"):QString("Public snippet; uncertain")),citations_);
         label->setTextFormat(Qt::PlainText);label->setWordWrap(true);label->setTextInteractionFlags(Qt::TextSelectableByMouse|Qt::TextSelectableByKeyboard);sources->addWidget(label);
     }

@@ -87,11 +87,12 @@ struct SelectedApplicationFile::Owner {
         if (!GetProcessTimes(process, &created, &exited, &kernel, &user) || selectedFileTime(created) != processCreated) return false;
         using Compare = BOOL (WINAPI *)(HANDLE,HANDLE);
         const auto module = GetModuleHandleW(L"kernelbase.dll");
-        const auto compare = module ? reinterpret_cast<Compare>(GetProcAddress(module, "CompareObjectHandles")) : nullptr;
+        const auto compare = module ? reinterpret_cast<Compare>(reinterpret_cast<void (*)()>(GetProcAddress(module, "CompareObjectHandles"))) : nullptr;
         const auto sameToken = [&] {
         HANDLE threadToken = nullptr;
         if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &threadToken)) {
-            if (!CloseHandle(threadToken)) failedFreshToken = threadToken; return false;
+            if (!CloseHandle(threadToken)) failedFreshToken = threadToken;
+            return false;
         }
         if (GetLastError() != ERROR_NO_TOKEN) return false;
         HANDLE fresh = nullptr;
@@ -172,7 +173,8 @@ std::shared_ptr<SelectedApplicationFile> SelectedApplicationFile::acquire(const 
     owned->directories.reserve(64);
     HANDLE threadToken = nullptr;
     if (OpenThreadToken(GetCurrentThread(),TOKEN_QUERY,TRUE,&threadToken)) {
-        if (!CloseHandle(threadToken)) owned->failedFreshToken = threadToken; return {};
+        if (!CloseHandle(threadToken)) owned->failedFreshToken = threadToken;
+        return {};
     }
     if (GetLastError() != ERROR_NO_TOKEN) return {};
     owned->process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, GetCurrentProcessId());
@@ -194,7 +196,8 @@ std::shared_ptr<SelectedApplicationFile> SelectedApplicationFile::acquire(const 
     if (!openDirectory(prefix)) return {};
     const auto parts = path.mid(3).split('\\');
     for (int index = 0; index + 1 < parts.size(); ++index) {
-        if (!prefix.endsWith('\\')) prefix += '\\'; prefix += parts[index];
+        if (!prefix.endsWith('\\')) prefix += '\\';
+        prefix += parts[index];
         if (!openDirectory(prefix)) return {};
     }
     owned->file = CreateFileW(path.toStdWString().c_str(), FILE_READ_DATA | FILE_READ_ATTRIBUTES,
@@ -498,7 +501,7 @@ std::shared_ptr<NativeOwnBatch> ProcessCatalog::acquireNative() {
         batch->connection = native_->connection; batch->generation = native_->generation;
         pending.swap(native_->pending);
         for (const auto &p : pending) native_->opening.insert(p.first);
-        for (const auto &p : native_->entries) batch->items.push_back({p.first,p.second});
+        for (const auto &p : native_->entries) batch->items.push_back({p.first,p.second,false,false,true,{},{}});
     }
     for (const auto &p : pending) {
         bool acquired = false;
@@ -521,7 +524,7 @@ std::shared_ptr<NativeOwnBatch> ProcessCatalog::acquireNative() {
         if (native_->generation == batch->generation) {
             native_->opening.erase(p.first);
             if (acquired && native_->peer == batch->peer) {
-                native_->entries.emplace(p.first,p.second); batch->items.push_back({p.first,p.second});
+                native_->entries.emplace(p.first,p.second); batch->items.push_back({p.first,p.second,false,false,true,{},{}});
             } else native_->error = "Original process custody is unavailable; dates remain unknown.";
         }
     }

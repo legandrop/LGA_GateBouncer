@@ -61,15 +61,18 @@ std::optional<PendingPresentationContext> pendingPresentationContext(const QByte
     const auto presence=Broker::number(b.mid(140,1));std::optional<Destination> destination;qsizetype end=141;
     if(presence>1)return {};
     if(presence){
-        if(b.size()<153)return {};const auto length=Broker::number(b.mid(141,1));
+        if(b.size()<153)return {};
+        const auto length=Broker::number(b.mid(141,1));
         if(!length||length>45||b.size()<153+qsizetype(length))return {};
         Destination d{b.mid(142,length).toStdString(),std::uint16_t(Broker::number(b.mid(142+length,2))),
             std::uint8_t(Broker::number(b.mid(144+length,1))),Broker::number(b.mid(145+length,8))};
-        if(!validDestination(d))return {};destination=std::move(d);end=153+qsizetype(length);
+        if(!validDestination(d))return {};
+        destination=std::move(d);end=153+qsizetype(length);
     }
     std::optional<LocalFilePresentation> localFile;
     if(version>=3){
-        if(b.size()<end+1)return {};const auto present=Broker::number(b.mid(end,1));++end;
+        if(b.size()<end+1)return {};
+        const auto present=Broker::number(b.mid(end,1));++end;
         if(present>1)return {};
         if(present){
             if(b.size()<end+27)return {};
@@ -78,17 +81,20 @@ std::optional<PendingPresentationContext> pendingPresentationContext(const QByte
             const auto length=Broker::number(b.mid(end+25,2));end+=27;
             if(length>1024||b.size()<end+qsizetype(length))return {};
             f.publisher=b.mid(end,length).toStdString();end+=qsizetype(length);
-            if(!validLocalFilePresentation(f))return {};localFile=std::move(f);
+            if(!validLocalFilePresentation(f))return {};
+            localFile=std::move(f);
         }
     }
     std::optional<PrincipalObservationContext> principal;
     if(version==4){
-        if(b.size()<end+50)return {};PrincipalObservationContext p;p.owner=idAt(b,int(end));
+        if(b.size()<end+50)return {};
+        PrincipalObservationContext p;p.owner=idAt(b,int(end));
         const auto size=Broker::number(b.mid(end+16,2));end+=18;
         if(size>68||b.size()!=end+qsizetype(size)+32)return {};
         const auto sid=b.mid(end,qsizetype(size));p.accountSid.assign(sid.begin(),sid.end());end+=qsizetype(size);
         std::memcpy(p.targetDigest.data(),b.constData()+end,32);end+=32;
-        if(!validPrincipal(p))return {};principal=std::move(p);
+        if(!validPrincipal(p))return {};
+        principal=std::move(p);
     }
     if(b.size()!=end)return {};
     return PendingPresentationContext(s,request,selector,revision,selectorRevision,profile,token,generation,

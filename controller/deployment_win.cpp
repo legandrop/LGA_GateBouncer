@@ -70,7 +70,7 @@ bool compareObjectHandles(HANDLE first, HANDLE second) {
 #pragma warning(push)
 #pragma warning(disable: 4191)
 #endif
-    const auto compare = reinterpret_cast<decltype(&CompareObjectHandles)>(GetProcAddress(module,"CompareObjectHandles"));
+    const auto compare = reinterpret_cast<decltype(&CompareObjectHandles)>(reinterpret_cast<void (*)()>(GetProcAddress(module,"CompareObjectHandles")));
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -258,12 +258,12 @@ bool driverPackageSignature(HANDLE sys, HANDLE inf, const wire::Bytes &catalog) 
         ~Libraries() { if (crypto) FreeLibrary(crypto); if (trust) FreeLibrary(trust); }
     } libraries;
     if (!libraries.trust || !libraries.crypto) return false;
-    const auto verify = reinterpret_cast<decltype(&WinVerifyTrust)>(GetProcAddress(libraries.trust,"WinVerifyTrust"));
-    const auto acquire = reinterpret_cast<decltype(&CryptCATAdminAcquireContext2)>(GetProcAddress(libraries.trust,"CryptCATAdminAcquireContext2"));
-    const auto release = reinterpret_cast<decltype(&CryptCATAdminReleaseContext)>(GetProcAddress(libraries.trust,"CryptCATAdminReleaseContext"));
-    const auto hash = reinterpret_cast<decltype(&CryptCATAdminCalcHashFromFileHandle2)>(GetProcAddress(libraries.trust,"CryptCATAdminCalcHashFromFileHandle2"));
-    const auto context = reinterpret_cast<decltype(&CertCreateCTLContext)>(GetProcAddress(libraries.crypto,"CertCreateCTLContext"));
-    const auto freeContext = reinterpret_cast<decltype(&CertFreeCTLContext)>(GetProcAddress(libraries.crypto,"CertFreeCTLContext"));
+    const auto verify = reinterpret_cast<decltype(&WinVerifyTrust)>(reinterpret_cast<void (*)()>(GetProcAddress(libraries.trust,"WinVerifyTrust")));
+    const auto acquire = reinterpret_cast<decltype(&CryptCATAdminAcquireContext2)>(reinterpret_cast<void (*)()>(GetProcAddress(libraries.trust,"CryptCATAdminAcquireContext2")));
+    const auto release = reinterpret_cast<decltype(&CryptCATAdminReleaseContext)>(reinterpret_cast<void (*)()>(GetProcAddress(libraries.trust,"CryptCATAdminReleaseContext")));
+    const auto hash = reinterpret_cast<decltype(&CryptCATAdminCalcHashFromFileHandle2)>(reinterpret_cast<void (*)()>(GetProcAddress(libraries.trust,"CryptCATAdminCalcHashFromFileHandle2")));
+    const auto context = reinterpret_cast<decltype(&CertCreateCTLContext)>(reinterpret_cast<void (*)()>(GetProcAddress(libraries.crypto,"CertCreateCTLContext")));
+    const auto freeContext = reinterpret_cast<decltype(&CertFreeCTLContext)>(reinterpret_cast<void (*)()>(GetProcAddress(libraries.crypto,"CertFreeCTLContext")));
     if (!verify || !acquire || !release || !hash || !context || !freeContext) return false;
     // El CTL firmado se decodifica desde bytes originales: ningún CAT se reabre por path.
     const auto ctl = context(X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,catalog.data(),DWORD(catalog.size()));
@@ -358,7 +358,8 @@ bool Deployment::DriverRegistration::config(SC_HANDLE service,std::filesystem::p
             if (!p || at < first || at-first >= bytes.size() || at % alignof(wchar_t)) return false;
             const auto count = (bytes.size()-(at-first))/sizeof(wchar_t);
             std::size_t n = 0; while (n < count && p[n]) ++n;
-            if (n == count) return false; out.assign(p,n); return true;
+            if (n == count) return false;
+            out.assign(p,n); return true;
         };
         std::wstring binary, dependencies, group;
         if (row->dwServiceType != SERVICE_KERNEL_DRIVER || row->dwStartType != SERVICE_DEMAND_START ||
@@ -489,7 +490,7 @@ bool Deployment::DriverRegistration::acquire(Deployment &owner,bool removal) {
 #pragma warning(push)
 #pragma warning(disable:4191)
 #endif
-        const auto location = reinterpret_cast<Location>(GetProcAddress(api.value,"SetupGetInfDriverStoreLocationW"));
+        const auto location = reinterpret_cast<Location>(reinterpret_cast<void (*)()>(GetProcAddress(api.value,"SetupGetInfDriverStoreLocationW")));
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif

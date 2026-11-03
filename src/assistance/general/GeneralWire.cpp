@@ -35,7 +35,7 @@ std::optional<FullBinding> readBinding(const QByteArray& bytes,bool pending){
 std::optional<PublicFields> readPublic(const QByteArray& bytes){
     auto j=Retrieval::strictJson(bytes,1024);if(!j||!j->exact({"product","publisher","query","destination"}))return {};
     const auto product=j->get("product")->text(),query=j->get("query")->text();if(!product||!query)return {};
-    PublicFields p{product->toUtf8().toStdString(),{},query->toUtf8().toStdString()};const auto* publisher=j->get("publisher");
+    PublicFields p{product->toUtf8().toStdString(),{},query->toUtf8().toStdString(),std::nullopt};const auto* publisher=j->get("publisher");
     if(publisher->kind!=Retrieval::Json::Kind::Null){auto text=publisher->text();if(!text)return {};p.publisher=text->toUtf8().toStdString();}
     const auto* d=j->get("destination");
     if(d->kind!=Retrieval::Json::Kind::Null){

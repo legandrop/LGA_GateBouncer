@@ -498,7 +498,7 @@ void DecisionViewClient::observation(Frame f) {
             n.routeMask = nativeMask_;
             if (n.presence & 4) { Data::NativeProcessFacts facts; if (!processFacts(f, facts)) { fail("Original process facts rejected"); return; } n.process = std::move(facts); }
             n.direction = quint8(get(f, Tag::FlowDirection)); n.protocol = quint8(get(f, Tag::Protocol));
-            if (n.presence & 1) e.observedAtUtc = QDateTime::fromMSecsSinceEpoch(qint64(n.unixNanoseconds / 1000000ull), Qt::UTC);
+            if (n.presence & 1) e.observedAtUtc = QDateTime::fromMSecsSinceEpoch(qint64(n.unixNanoseconds / 1000000ull), QTimeZone::UTC);
             if (n.presence & 2) e.protocol = n.protocol == 6 ? "TCP" : "UDP";
             e.subjectId = "native:" + e.sourceId + ':' + e.sourceEpoch + ':' + n.observed + ':' + n.captureBinding + ':' + QString::number(n.observedRevision);
             if (f.type == Type::Authorization || f.type == Type::Traffic) {

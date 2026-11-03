@@ -7,6 +7,7 @@
 #include <QRegularExpression>
 #include <QUrlQuery>
 #include <QStringList>
+#include <QTimeZone>
 #include <cmath>
 #include <QStringDecoder>
 #include <algorithm>
@@ -105,7 +106,8 @@ std::optional<QUrl> registryUrl(const QByteArray& bytes,const Destination& d) {
         if(pair.size()!=2||!pair[0].isArray()||!pair[1].isArray())return {};
         const auto ranges=pair[0].toArray(),urls=pair[1].toArray();if(ranges.size()>1024||urls.size()>8)return {};
         for(const auto& range:ranges){if(!range.isString())return {};const auto parts=range.toString().split('/');bool ok=false;
-            if(parts.size()!=2)return {};const auto base=address(parts[0]);const auto bits=parts[1].toUInt(&ok);
+            if(parts.size()!=2)return {};
+            const auto base=address(parts[0]);const auto bits=parts[1].toUInt(&ok);
             if(!base||!ok||bits>base->bits)return {};
             if(!prefix(*value,*base,bits)||int(bits)<longest)continue;
             for(const auto& url:urls){if(!url.isString())return {};const auto encoded=url.toString().toUtf8();
@@ -149,7 +151,7 @@ std::optional<Citation> registrationEvidence(const HttpResponse& r,const Destina
     }
     if(organization.isEmpty())organization="Unknown";
     Citation citation;citation.title="IP network registration";citation.url=url;citation.origin="RDAP / "+url.host();
-    citation.retrievalUtc=QDateTime::fromMSecsSinceEpoch(qint64(checked),Qt::UTC);citation.kind=1;citation.subject=d.address;
+    citation.retrievalUtc=QDateTime::fromMSecsSinceEpoch(qint64(checked),QTimeZone::UTC);citation.kind=1;citation.subject=d.address;
     citation.snippet="Registered organization: "+organization+". Block: "+start->canonical+" – "+end->canonical+
         ". Registration does not identify the final service, routing ASN, telemetry purpose or safety.";
     return citation;
@@ -176,7 +178,7 @@ std::optional<Citation> routingEvidence(const HttpResponse& r,const Destination&
         const auto name="AS"+QString::number(asn);if(names.contains(name))return {};names.push_back(name);
     }
     Citation c;c.title="Announcing ASN (RIPE RIS)";c.url=routingUrl(d);c.origin="RIPEstat / RIS";
-    c.retrievalUtc=QDateTime::fromMSecsSinceEpoch(qint64(checked),Qt::UTC);c.kind=3;c.subject=d.address;
+    c.retrievalUtc=QDateTime::fromMSecsSinceEpoch(qint64(checked),QTimeZone::UTC);c.kind=3;c.subject=d.address;
     c.snippet="Announcing ASN: "+names.join(", ")+". Prefix: "+network->canonical+"/"+QString::number(bits)+
         ". Based on RIS dumps updated about every 8 hours; may lag current routing. This is not the registrant, final service, telemetry purpose or safety.";
     return c;

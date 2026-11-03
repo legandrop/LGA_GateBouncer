@@ -527,7 +527,8 @@ void OrdinaryDecisionClient::received(bool ok, Frame f, Id correlation, quint64 
             rules_ = std::move(rulePageRows_); rulesCurrent_ = true; current_ = false; state_ = State::Closed;
             message_ = administrative_ ? "Administrative rule catalog ready · protection coverage unvalidated"
                 : "Rules for your account ready to review · protection coverage unvalidated"; emit changed();
-            if (automatic_ && !stopping_) poll_.start(quietPollMs_); return;
+            if (automatic_ && !stopping_) poll_.start(quietPollMs_);
+            return;
         }
         if (finalStatus_) {
             // El codec admite 32 por página; el snapshot completo admite 64.
@@ -820,7 +821,7 @@ void OrdinaryDecisionClient::observation(Frame f) {
             if (own.image.toUtf8() != bytes(p.image) || !Data::validNativeProcessFacts(own)) { rejectHistory("Application identity is unavailable."); return; }
             evidence.process = std::move(own);
         }
-        if (evidence.presence & 1) event.observedAtUtc = QDateTime::fromMSecsSinceEpoch(qint64(evidence.unixNanoseconds / 1000000ull),Qt::UTC);
+        if (evidence.presence & 1) event.observedAtUtc = QDateTime::fromMSecsSinceEpoch(qint64(evidence.unixNanoseconds / 1000000ull),QTimeZone::UTC);
         if (evidence.presence & 2) event.protocol = evidence.protocol == 6 ? "TCP" : "UDP";
         event.subjectId = "native:" + event.sourceId + ':' + event.sourceEpoch + ':' + evidence.observed + ':' +
             evidence.captureBinding + ':' + QString::number(evidence.observedRevision);

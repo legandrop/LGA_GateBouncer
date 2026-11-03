@@ -65,7 +65,8 @@ std::optional<ObservationRead> ObservationReader::readPrincipal(gb::ipc::ii::Cli
     auto live=[&source,peer,connection]{const auto current=source.readonlyPeer();
         return current==peer&&current->connection()==connection&&peer->checkLive()==gb::ipc::ii::ReadPeerState::Current;};
     auto result=observe(source,selection.request,connection,live,[&age]{return age.elapsed();},expected,&selection);
-    if(!result||!live())return {};result->peer=peer;return result;
+    if(!result||!live())return {};
+    result->peer=peer;return result;
 }
 std::optional<ObservationRead> ObservationReader::observe(gb::ipc::ii::SessionChannel& source,
     const Id128& request,const Id128& connection,std::function<bool()> live,
@@ -140,7 +141,8 @@ std::optional<ObservationRead> ObservationReader::observe(gb::ipc::ii::SessionCh
         if(W::get(row,W::Tag::AdministrativeMode)!=1||W::idValue(row,W::Tag::PrincipalObservationOwner)!=selection->owner||!sid||!target)return {};
         if(W::iv::unpackOriginalTarget(target->bytes,parsed)!=W::Error::Ok||parsed.packageMode!=records[0].package)return {};
         initial.principal=principalObservationContext(selection->owner,sid->bytes,target->bytes);
-        if(!initial.principal)return {};initial.originalTarget=target->bytes;
+        if(!initial.principal)return {};
+        initial.originalTarget=target->bytes;
         if(prior&&(initial.principal!=prior->principal||initial.originalTarget!=prior->originalTarget))return {};
         // Dos respuestas del productor, correlaciones diferentes, mismo grupo
         // completo. Un digest o snapshot presentado por GUI no suple este READ.

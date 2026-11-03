@@ -1940,7 +1940,7 @@ void MainWindow::renderOrdinaryNotice() {
     if(const auto source=Assistance::Ui::currentObservation(client)){
         const auto& name=source->record.display.name;
         const std::string text(name.begin(),name.end());
-        if(Assistance::General::validPublicFields({text,{},text}))observedApplication=QString::fromUtf8(text);
+        if(Assistance::General::validPublicFields({text,{},text,std::nullopt}))observedApplication=QString::fromUtf8(text);
     }
     ordinaryExplanation_=new Assistance::Ui::ExplanationWidget(assistance_.get(),[this,selection]{
         const auto* current=product_.ordinary();
@@ -3383,7 +3383,8 @@ void MainWindow::prepareFileRules(const QStringList &candidates, const std::opti
     connect(prepare,&QPushButton::clicked,status,[this,path,policy,direction,sources,editing,selection,backupIndex,update] {
         const auto action = policy->currentIndex() == 1 ? Data::Action::Allow : Data::Action::Block;
         const auto scope = direction->currentIndex() == 0 ? Data::Direction::Out : direction->currentIndex() == 1 ? Data::Direction::In : Data::Direction::Both;
-        if (!product_.prepareApplicationFile(path->text(),action,scope,editing,selection,sources->currentData().toString(),backupIndex)) message("The original file review could not start. Check the current selection and wait for any previous operation to finish."); update();
+        if (!product_.prepareApplicationFile(path->text(),action,scope,editing,selection,sources->currentData().toString(),backupIndex)) message("The original file review could not start. Check the current selection and wait for any previous operation to finish.");
+        update();
     });
     connect(consent,&ToggleSwitch::toggled,status,[this,consentToken,confirm](bool checked) { const auto &view = product_.fileRuleView(); *consentToken = checked && view.ready ? view.token : 0; confirm->setEnabled(checked && view.ready && *consentToken == view.token); });
     connect(confirm,&QPushButton::clicked,status,[this,consent,consentToken,update] { product_.confirmApplicationFile(*consentToken,consent->isChecked()); update(); });

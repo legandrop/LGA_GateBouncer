@@ -59,7 +59,9 @@ bool trustedSecurity(HANDLE object,bool ancestor){
         if((mask&FILE_ALL_ACCESS)==FILE_ALL_ACCESS){fullSystem|=EqualSid(sid,system)!=FALSE;fullAdmin|=EqualSid(sid,admin)!=FALSE;}
     }
     if(!ancestor)ok=ok&&fullSystem&&fullAdmin;
-    if(sd)LocalFree(sd);if(installer)LocalFree(installer);return ok;
+    if(sd)LocalFree(sd);
+    if(installer)LocalFree(installer);
+    return ok;
 }
 bool trustedFile(HANDLE file,bool fixture){return objectShape(file,false)&&(fixture||trustedSecurity(file,false));}
 bool existingFile(const std::filesystem::path& path,bool fixture,bool& exists){
@@ -95,7 +97,8 @@ bool parseSnapshot(const Bytes& input,Snapshot& out){
     auto count=r.n(4);if(count>MaxRules||(!s.effectiveKnown&&s.effective!=0)||s.effective>s.desired)return false;
     std::set<Id> ids,selectors;
     for(std::size_t i=0;i<count;++i){Rule x;x.id=r.id();x.selector=r.id();auto decision=r.n(1),n=r.n(4);if(!r.ok||n>32768||n>body.size()-r.p||(decision!=1&&decision!=2))return false;x.decision=static_cast<std::uint8_t>(decision);x.appId=r.take(static_cast<std::size_t>(n));if(zero(x.id)||zero(x.selector)||!ids.insert(x.id).second||!selectors.insert(x.selector).second||!blobValid(x.appId))return false;s.rules.push_back(std::move(x));}
-    if(!r.ok||r.p!=body.size())return false;out=std::move(s);return true;
+    if(!r.ok||r.p!=body.size())return false;
+    out=std::move(s);return true;
 }
 PolicyStore::PolicyStore(std::filesystem::path root,bool fixture):root_(std::move(root)),fixture_(fixture){}
 PolicyStore::~PolicyStore(){for(auto handle:directoryHandles_)CloseHandle(handle);}
@@ -134,11 +137,12 @@ bool PolicyStore::load(Snapshot& out,bool& exists){
     Handle file;file.h=CreateFileW(path.c_str(),GENERIC_READ|READ_CONTROL,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_FLAG_OPEN_REPARSE_POINT,nullptr);
     if(file.h==INVALID_HANDLE_VALUE){if(GetLastError()==ERROR_FILE_NOT_FOUND)return true;return false;}
     exists=true;if(!trustedFile(file.h,fixture_))return false;
-    LARGE_INTEGER size{};if(!GetFileSizeEx(file.h,&size)||size.QuadPart<0||size.QuadPart>MaxStoreBytes)return false;
+    LARGE_INTEGER size{};if(!GetFileSizeEx(file.h,&size)||size.QuadPart<0||static_cast<std::size_t>(size.QuadPart)>MaxStoreBytes)return false;
     Bytes b(static_cast<std::size_t>(size.QuadPart));DWORD read=0;if(!ReadFile(file.h,b.data(),static_cast<DWORD>(b.size()),&read,nullptr)||read!=b.size())return false;return parseSnapshot(b,out);
 }
 bool PolicyStore::save(const Snapshot& s){
-    if(!prepareDirectory())return false;Bytes b;try{b=serializeSnapshot(s);}catch(...){return false;}
+    if(!prepareDirectory())return false;
+    Bytes b;try{b=serializeSnapshot(s);}catch(...){return false;}
     auto final=root_/L"policy.bin",backup=root_/L"policy.previous.bin",temp=root_/std::filesystem::path(L"prepared-"+std::wstring(32,L'0'));
     auto id=hex(randomId());temp=root_/std::filesystem::path(L"prepared-"+std::wstring(id.begin(),id.end())+L".bin");
     bool finalExists=false,backupExists=false;if(!existingFile(final,fixture_,finalExists)||!existingFile(backup,fixture_,backupExists))return false;
@@ -150,7 +154,8 @@ bool PolicyStore::save(const Snapshot& s){
     return ReplaceFileW(final.c_str(),temp.c_str(),backup.c_str(),0,nullptr,nullptr)&&flushCommitted(final,fixture_);
 }
 Id SelectorRegistry::registerNative(const Bytes& blob){
-    if(!blobValid(blob))return{};auto digest=sha256(blob);Id id{};std::copy_n(digest.begin(),16,id.begin());std::lock_guard<std::mutex> guard(mutex_);if(native_.size()>=MaxRules&&!native_.count(id))return{};auto p=native_.find(id);if(p!=native_.end()&&p->second!=blob)return{};native_[id]=blob;return id;
+    if(!blobValid(blob))return{};
+    auto digest=sha256(blob);Id id{};std::copy_n(digest.begin(),16,id.begin());std::lock_guard<std::mutex> guard(mutex_);if(native_.size()>=MaxRules&&!native_.count(id))return{};auto p=native_.find(id);if(p!=native_.end()&&p->second!=blob)return{};native_[id]=blob;return id;
 }
 std::optional<Bytes> SelectorRegistry::lookup(const Id& id)const{std::lock_guard<std::mutex> guard(mutex_);auto p=native_.find(id);if(p==native_.end())return std::nullopt;return p->second;}
 Coordinator::Coordinator(PolicyStore& s,Backend& b,SelectorRegistry& r):store_(s),backend_(b),registry_(r){}

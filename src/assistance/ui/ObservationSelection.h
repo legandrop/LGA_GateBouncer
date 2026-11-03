@@ -49,7 +49,7 @@ template<class T>std::optional<ObservationSelection> currentObservation(const T*
         General::PendingServiceContext context{before->service.serviceEpoch,before->service.boot,
             before->service.engineContext,before->service.engineBindingGeneration};
         if(!General::validPendingService(context))return {};
-        ObservationSelection result{context,before->connection,*row,before->profile,before->desired,before->selection};
+        ObservationSelection result{context,before->connection,*row,before->profile,before->desired,before->selection,std::nullopt};
         if(before->administrative){
             result.principal=General::principalObservationContext(before->connection,before->selectedSid,before->originalTarget);
             if(!result.principal)return {};
@@ -57,7 +57,7 @@ template<class T>std::optional<ObservationSelection> currentObservation(const T*
         const auto after=source->observationContext();const auto second=source->observed();
         if(!after||!second||!source->current()||!source->visible()||after->observedRevision!=second->revision)return {};
         ObservationSelection checked{{after->service.serviceEpoch,after->service.boot,after->service.engineContext,
-            after->service.engineBindingGeneration},after->connection,*second,after->profile,after->desired,after->selection};
+            after->service.engineBindingGeneration},after->connection,*second,after->profile,after->desired,after->selection,std::nullopt};
         if(after->administrative){
             checked.principal=General::principalObservationContext(after->connection,after->selectedSid,after->originalTarget);
             if(!checked.principal)return {};

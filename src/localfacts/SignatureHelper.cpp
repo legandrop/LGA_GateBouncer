@@ -39,10 +39,10 @@ int wmain(int argc, wchar_t** argv) {
     HMODULE trust = LoadLibraryExW(L"wintrust.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     HMODULE crypto = LoadLibraryExW(L"crypt32.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!trust || !crypto) { *wire = response; UnmapViewOfFile(wire); return 0; }
-    auto verify = reinterpret_cast<decltype(&WinVerifyTrust)>(GetProcAddress(trust, "WinVerifyTrust"));
-    auto provider = reinterpret_cast<decltype(&WTHelperProvDataFromStateData)>(GetProcAddress(trust, "WTHelperProvDataFromStateData"));
-    auto signer = reinterpret_cast<decltype(&WTHelperGetProvSignerFromChain)>(GetProcAddress(trust, "WTHelperGetProvSignerFromChain"));
-    auto name = reinterpret_cast<decltype(&CertGetNameStringW)>(GetProcAddress(crypto, "CertGetNameStringW"));
+    auto verify = reinterpret_cast<decltype(&WinVerifyTrust)>(reinterpret_cast<void (*)()>(GetProcAddress(trust, "WinVerifyTrust")));
+    auto provider = reinterpret_cast<decltype(&WTHelperProvDataFromStateData)>(reinterpret_cast<void (*)()>(GetProcAddress(trust, "WTHelperProvDataFromStateData")));
+    auto signer = reinterpret_cast<decltype(&WTHelperGetProvSignerFromChain)>(reinterpret_cast<void (*)()>(GetProcAddress(trust, "WTHelperGetProvSignerFromChain")));
+    auto name = reinterpret_cast<decltype(&CertGetNameStringW)>(reinterpret_cast<void (*)()>(GetProcAddress(crypto, "CertGetNameStringW")));
     if (!verify || !provider || !signer || !name) { *wire = response; UnmapViewOfFile(wire); return 0; }
     LARGE_INTEGER zero{};
     if (!SetFilePointerEx(file, zero, nullptr, FILE_BEGIN)) { *wire = response; UnmapViewOfFile(wire); return 0; }
