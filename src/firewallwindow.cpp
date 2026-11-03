@@ -1,5 +1,6 @@
 #include "firewallwindow.h"
 #include "explain/KnownApps.h"
+#include "platform/WindowFrame.h"
 #include "toggleswitch.h"
 #include <QAbstractButton>
 #include <QApplication>
@@ -13,6 +14,7 @@
 #include <QFileInfo>
 #include <QFrame>
 #include <QGridLayout>
+#include <QHeaderView>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -23,6 +25,10 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QSettings>
+#include <QShowEvent>
+#include <QTableWidget>
+#include <QWindow>
 #include <QVBoxLayout>
 #include <thread>
 #include <windows.h>
@@ -105,13 +111,21 @@ QComboBox:disabled { color: #656565; }
 QComboBox::drop-down { border: 0; width: 22px; }
 QComboBox::down-arrow { image: none; }
 QComboBox QAbstractItemView { background: #1d1d1d; selection-background-color: #393455; border: 1px solid #39333f; }
-QTableWidget { background: transparent; border: 0; gridline-color: #2a2a2a; }
-QTableWidget::item { padding: 6px 8px 6px 0; border-bottom: 1px solid #2a2a2a; color: #c4c4c4; }
-QHeaderView::section { background: transparent; color: #6f6f6f; border: 0; border-bottom: 1px solid #2a2a2a; padding: 0 8px 8px 0; font-size: 11px; }
+QTableWidget#fwTable { background: transparent; border: 0; outline: 0; }
+QTableWidget#fwTable::item { border: 0; border-bottom: 1px solid #272727; padding: 0; }
+QTableWidget#fwTable::item:hover { background: #222222; }
+QHeaderView { background: #191919; border: 0; }
+QHeaderView::section { background: #191919; color: #8d8d8d; border: 0; border-bottom: 1px solid #343434; border-right: 1px solid #292929; padding: 0 12px; min-height: 31px; font-size: 11px; font-weight: 600; }
+QHeaderView::section:hover { background: #202020; color: #c2c2c2; }
+QHeaderView::section:last { border-right: 0; }
 QScrollBar:vertical { width: 8px; background: transparent; margin: 0; }
 QScrollBar::handle:vertical { background: #3c3a41; border-radius: 3px; min-height: 25px; }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical { background: transparent; }
+QScrollBar:horizontal { height: 8px; background: transparent; margin: 0; }
+QScrollBar::handle:horizontal { background: #3c3a41; border-radius: 3px; min-width: 25px; }
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: transparent; }
 )";
 
 QLabel *text(const QString &value, const char *role = "body", bool wrap = false) {
@@ -197,23 +211,163 @@ class Combo final : public QComboBox {
     }
 };
 
-// Fila de lista que se abre con un clic. Botón sin dibujo propio: el alto lo da su layout, no el estilo de botón.
-class ClickRow final : public QAbstractButton {
+// Texto de una línea que se recorta con «…» cuando no entra, en vez de ensanchar la página. Si se recorta, el texto
+// entero queda en el tooltip (es lo único que no se ve).
+class ElideLabel final : public QLabel {
   public:
-    explicit ClickRow(QWidget *parent = nullptr) : QAbstractButton(parent) {
-        setCursor(Qt::PointingHandCursor);
-        setFocusPolicy(Qt::NoFocus);
-        setAttribute(Qt::WA_Hover);
+    explicit ElideLabel(const QString &value, const char *role, Qt::TextElideMode mode = Qt::ElideRight)
+        : QLabel(value), mode_(mode) {
+        setProperty("r", role);
+        setTextFormat(Qt::PlainText);
+        setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
     }
+    QSize minimumSizeHint() const override { return {12, QLabel::minimumSizeHint().height()}; }
+
   protected:
     void paintEvent(QPaintEvent *) override {
-        if (!underMouse()) return;
         QPainter p(this);
-        p.fillRect(rect(), QColor("#202020"));
+        p.setPen(palette().color(foregroundRole()));
+        p.setFont(font());
+        const QRect r = contentsRect();
+        const QString shown = fontMetrics().elidedText(text(), mode_, r.width());
+        p.drawText(r, int(alignment()) | Qt::TextSingleLine, shown);
+        const QString tip = shown == text() ? QString() : text();
+        if (toolTip() != tip) const_cast<ElideLabel *>(this)->setToolTip(tip);
     }
-    void enterEvent(QEnterEvent *) override { update(); }
-    void leaveEvent(QEvent *) override { update(); }
+
+  private:
+    Qt::TextElideMode mode_;
 };
+
+// Tabla de una vista (Apps, Activity): encabezado fijo con columnas que se ensanchan arrastrando, y sólo las filas se
+// desplazan. Los anchos que elige el usuario se guardan por tabla. La última columna toma el espacio que sobra.
+struct Column {
+    QString title;
+    int width;
+    Qt::Alignment align = Qt::AlignLeft;
+};
+QSettings tableStore() { return QSettings(QSettings::NativeFormat, QSettings::UserScope, "LGA", "GateBouncer"); }
+// Los recorridos de QA no guardan tamaños: no pisan las preferencias de quien usa la app.
+bool rememberSizes() { return qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT"); }
+// Al achicar la ventana las columnas anchas ceden (hasta 140 px), así la última no queda tapada ni aparece la barra
+// horizontal. Lo que el usuario ensancha a mano no se toca hasta el próximo cambio de tamaño.
+class TableFitter final : public QObject {
+  public:
+    explicit TableFitter(QTableWidget *table) : QObject(table), table_(table) { table->viewport()->installEventFilter(this); }
+    void fit() {
+        const int n = table_->columnCount();
+        if (n < 2) return;
+        // Se parte siempre de los anchos que eligió el usuario (o los de fábrica): al agrandar la ventana los recuperan.
+        table_->setProperty("fitting", true);
+        const QStringList preferred = table_->property("preferred").toStringList();
+        for (int i = 0; i + 1 < n && i < preferred.size(); ++i) table_->setColumnWidth(i, preferred[i].toInt());
+        const int lastMin = table_->property("lastMinimum").toInt();
+        int used = qMax(lastMin, 90);
+        for (int i = 0; i + 1 < n; ++i) used += table_->columnWidth(i);
+        int overflow = used - table_->viewport()->width();
+        while (overflow > 0) {
+            int widest = -1;
+            for (int i = 0; i + 1 < n; ++i)
+                if (table_->columnWidth(i) > 140 && (widest < 0 || table_->columnWidth(i) > table_->columnWidth(widest)))
+                    widest = i;
+            if (widest < 0) break;
+            const int take = qMin(overflow, table_->columnWidth(widest) - 140);
+            table_->setColumnWidth(widest, table_->columnWidth(widest) - take);
+            overflow -= take;
+        }
+        table_->setProperty("fitting", false);
+    }
+
+  protected:
+    bool eventFilter(QObject *, QEvent *event) override {
+        if (event->type() == QEvent::Resize) QTimer::singleShot(0, this, [this] { fit(); });
+        return false;
+    }
+
+  private:
+    QTableWidget *table_;
+};
+QTableWidget *makeTable(const QString &name, int rowHeight) {
+    auto *t = new QTableWidget;
+    t->setObjectName("fwTable");
+    t->setProperty("tableName", name);
+    t->setFrameShape(QFrame::NoFrame);
+    t->setShowGrid(false);
+    t->setWordWrap(false);
+    t->setFocusPolicy(Qt::NoFocus);
+    t->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    t->setSelectionMode(QAbstractItemView::NoSelection);
+    t->setSelectionBehavior(QAbstractItemView::SelectRows); // el hover pinta la fila entera
+    t->setMouseTracking(true);
+    t->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    t->setHorizontalScrollMode(QAbstractItemView::ScrollPerPixel);
+    t->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    t->verticalHeader()->hide();
+    t->verticalHeader()->setSectionResizeMode(QHeaderView::Fixed);
+    t->verticalHeader()->setDefaultSectionSize(rowHeight);
+    auto *h = t->horizontalHeader();
+    h->setHighlightSections(false);
+    h->setSectionsClickable(false);
+    h->setMinimumSectionSize(60);
+    h->setStretchLastSection(true);
+    h->setFixedHeight(32);
+    t->setProperty("fitter", QVariant::fromValue(static_cast<QObject *>(new TableFitter(t))));
+    return t;
+}
+// Columnas de la tabla; con otro juego de columnas (otro filtro) se guarda aparte.
+void setColumns(QTableWidget *t, const QString &set, const QVector<Column> &columns) {
+    const QString key = "tables/" + t->property("tableName").toString() + "-" + set;
+    if (t->property("columnSet").toString() == key) return;
+    auto *h = t->horizontalHeader();
+    // El guardado de anchos del juego anterior se desconecta borrando su objeto (sin tocar las conexiones de Qt).
+    delete t->findChild<QObject *>("columnSaver", Qt::FindDirectChildrenOnly);
+    auto *saver = new QObject(t);
+    saver->setObjectName("columnSaver");
+    t->setColumnCount(int(columns.size()));
+    for (int i = 0; i < columns.size(); ++i) {
+        auto *item = new QTableWidgetItem(columns[i].title);
+        item->setTextAlignment(columns[i].align | Qt::AlignVCenter);
+        t->setHorizontalHeaderItem(i, item);
+        h->setSectionResizeMode(i, QHeaderView::Interactive);
+        t->setColumnWidth(i, columns[i].width);
+    }
+    const QStringList saved = tableStore().value(key).toStringList();
+    if (saved.size() == columns.size())
+        for (int i = 0; i + 1 < saved.size(); ++i) t->setColumnWidth(i, qMax(60, saved[i].toInt()));
+    QStringList preferred;
+    for (int i = 0; i < t->columnCount(); ++i) preferred << QString::number(t->columnWidth(i));
+    t->setProperty("preferred", preferred);
+    t->setProperty("columnSet", key);
+    t->setProperty("lastMinimum", columns.last().width);
+    if (auto *fitter = static_cast<TableFitter *>(t->property("fitter").value<QObject *>()))
+        QTimer::singleShot(0, fitter, [fitter] { fitter->fit(); });
+    QObject::connect(h, &QHeaderView::sectionResized, saver, [t, key](int section) {
+        // La última columna se estira sola, y lo que ajusta TableFitter tampoco es una elección del usuario.
+        if (t->property("fitting").toBool() || section == t->columnCount() - 1) return;
+        QStringList widths;
+        for (int i = 0; i < t->columnCount(); ++i) widths << QString::number(t->columnWidth(i));
+        t->setProperty("preferred", widths);
+        if (rememberSizes()) tableStore().setValue(key, widths);
+    });
+}
+// Celda: el contenido con aire a los costados, sin capturar el mouse (el clic y el hover son de la fila).
+QWidget *cell(QWidget *content, Qt::Alignment align = Qt::AlignLeft, bool interactive = false) {
+    auto *w = new QWidget;
+    auto *l = new QHBoxLayout(w);
+    l->setContentsMargins(12, 0, 12, 0);
+    l->setSpacing(10);
+    if (align & Qt::AlignRight) l->addStretch();
+    l->addWidget(content, align & (Qt::AlignRight | Qt::AlignHCenter) ? 0 : 1);
+    if (align & Qt::AlignHCenter) l->insertStretch(0);
+    if (!interactive) w->setAttribute(Qt::WA_TransparentForMouseEvents);
+    return w;
+}
+void fillRow(QTableWidget *t, int row, const QVector<QWidget *> &cells) {
+    for (int c = 0; c < cells.size(); ++c) {
+        t->setItem(row, c, new QTableWidgetItem); // vacío: lleva el hover y la línea de abajo
+        t->setCellWidget(row, c, cells[c]);
+    }
+}
 
 // Íconos de línea de la barra lateral y de los encabezados (dibujados en una grilla de 20 x 20).
 void drawIcon(QPainter &p, const QString &name, const QRectF &r, const QColor &color) {
@@ -483,8 +637,8 @@ FirewallWindow::FirewallWindow(QWidget *parent) : QMainWindow(parent) {
     setObjectName("GateBouncer");
     setWindowTitle("LGA GateBouncer");
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
-    resize(1040, 700);
     setMinimumSize(900, 620);
+    resize(tableStore().value("window/size", QSize(1100, 720)).toSize().expandedTo(minimumSize()));
     setStyleSheet(kStyle);
     buildShell();
     connect(&firewall_, &FirewallClient::changed, this, &FirewallWindow::engineChanged);
@@ -528,7 +682,7 @@ void FirewallWindow::buildShell() {
     root->setObjectName("fwRoot");
     setCentralWidget(root);
     auto *rl = new QVBoxLayout(root);
-    rl->setContentsMargins(1, 1, 1, 1);
+    rl->setContentsMargins(0, 0, 0, 0);
     rl->setSpacing(0);
 
     auto *bar = new QFrame;
@@ -687,7 +841,7 @@ void FirewallWindow::engineChanged() {
     }
     const QString key = pageKey();
     if (key == lastKey_) return;
-    if (view_ == "apps" && appsList_) {
+    if (view_ == "apps" && appsTable_) {
         lastKey_ = key;
         fillApps();
         return;
@@ -696,10 +850,19 @@ void FirewallWindow::engineChanged() {
 }
 
 void FirewallWindow::render(bool keepScroll) {
-    if (scroll_area_->widget()) scroll_[lastKey_.section('|', 0, 0)] = scroll_area_->verticalScrollBar()->value();
+    if (auto *current = scroll_area_->widget()) {
+        const QString shownView = lastKey_.section('|', 0, 0);
+        scroll_[shownView] = scroll_area_->verticalScrollBar()->value();
+        if (auto *table = current->findChild<QTableWidget *>("fwTable"))
+            tableScroll_[shownView] = table->verticalScrollBar()->value();
+    }
     const int scroll = keepScroll ? scroll_area_->verticalScrollBar()->value() : scroll_.value(view_, 0);
-    appsList_ = nullptr;
+    appsTable_ = nullptr;
+    appsTip_ = nullptr;
     appsSeg_ = nullptr;
+    // Apps y Activity son una tabla que llena la página: arriba todo queda fijo y sólo se desplazan sus filas.
+    const bool tableView = view_ == "apps" || view_ == "activity";
+    scroll_area_->setVerticalScrollBarPolicy(tableView ? Qt::ScrollBarAlwaysOff : Qt::ScrollBarAsNeeded);
     // La fila que sube bajo el puntero al decidir otra no recibe el clic siguiente: un instante sin decidir.
     if (view_ == "overview" || view_ == "requests" || view_ == "apps") armedAt_ = QDateTime::currentMSecsSinceEpoch() + 600;
     QWidget *page = view_ == "requests"           ? requestsPage()
@@ -721,7 +884,11 @@ void FirewallWindow::render(bool keepScroll) {
         runningTimer_.stop();
     }
     updateSidebar();
-    QTimer::singleShot(0, this, [this, scroll] { scroll_area_->verticalScrollBar()->setValue(scroll); });
+    QPointer<QTableWidget> table = page->findChild<QTableWidget *>("fwTable");
+    QTimer::singleShot(0, this, [this, scroll, table, tableScrolled = tableScroll_.value(view_)] {
+        scroll_area_->verticalScrollBar()->setValue(scroll);
+        if (table) table->verticalScrollBar()->setValue(tableScrolled);
+    });
 }
 
 void FirewallWindow::updateSidebar() {
@@ -887,9 +1054,9 @@ QWidget *FirewallWindow::overviewPage() {
             h->addWidget(appIcon(p.path));
             auto *info = new QVBoxLayout;
             info->setSpacing(2);
-            info->addWidget(text(FirewallClient::fileName(p.path), "strong"));
+            info->addWidget(new ElideLabel(FirewallClient::fileName(p.path), "strong"));
             const QString target = p.host.isEmpty() ? p.remote : p.host;
-            info->addWidget(text("Wants " + target + " · first try " + clock(p.first), "small"));
+            info->addWidget(new ElideLabel("Wants " + target + " · first try " + clock(p.first), "small"));
             h->addLayout(info, 1);
             const auto e = explanationFor(p.id);
             if (e.state == AccessToast::Explanation::Ready)
@@ -1121,7 +1288,7 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
     th->addWidget(appIcon(p.path));
     auto *info = new QVBoxLayout;
     info->setSpacing(2);
-    info->addWidget(text(FirewallClient::fileName(p.path), "strong"));
+    info->addWidget(new ElideLabel(FirewallClient::fileName(p.path), "strong"));
     const QString signature = p.signer.isEmpty() ? QString("<span style='color:#d4a437'>Not signed</span>")
                                                  : "<span style='color:#9bbf73'>✓ " + p.signer.toHtmlEscaped() + "</span>";
     auto *meta = new QLabel(signature + " · " + QDir::toNativeSeparators(QFileInfo(p.path).path()).toHtmlEscaped() +
@@ -1401,13 +1568,14 @@ QStringList FirewallWindow::runningWithoutRule() const {
 QWidget *FirewallWindow::appsPage() {
     auto *page = new QWidget;
     auto *l = column(page, 18, 10);
-    l->setContentsMargins(18, 16, 18, 22);
+    l->setContentsMargins(18, 16, 18, 16);
     l->addWidget(header(headIcon("apps"), "Apps", "Every application with a rule. A signed app keeps its rule across updates."));
     auto *bar = row(8);
     auto *search = new QLineEdit(appsQuery_);
     search->setObjectName("apps-search");
     search->setPlaceholderText("Search apps or publishers");
     search->setClearButtonEnabled(true);
+    search->setMinimumWidth(140);
     bar->addWidget(search, 1);
     appsSeg_ = card("seg");
     auto *sl = new QHBoxLayout(appsSeg_);
@@ -1419,18 +1587,25 @@ QWidget *FirewallWindow::appsPage() {
         appsQuery_ = v;
         fillApps();
     });
+    // La tabla ocupa el resto de la página: el encabezado queda fijo y sólo se desplazan las filas.
     auto *list = card();
-    appsList_ = new QVBoxLayout(list);
-    appsList_->setContentsMargins(14, 10, 14, 4);
-    appsList_->setSpacing(0);
-    l->addWidget(list);
-    l->addStretch();
+    auto *ll = new QVBoxLayout(list);
+    ll->setContentsMargins(0, 0, 0, 0);
+    appsTable_ = makeTable("apps", 52);
+    ll->addWidget(appsTable_);
+    connect(appsTable_, &QTableWidget::cellClicked, this, [this](int row, int) {
+        const QString key = appsTable_->item(row, 0) ? appsTable_->item(row, 0)->data(Qt::UserRole).toString() : QString();
+        if (key.startsWith("rule:")) selectView("detail:" + key.mid(5));
+    });
+    l->addWidget(list, 1);
+    appsTip_ = text({}, "faint", true);
+    l->addWidget(appsTip_);
     fillApps();
     return page;
 }
 
 void FirewallWindow::fillApps() {
-    if (!appsList_ || !appsSeg_) return;
+    if (!appsTable_ || !appsSeg_) return;
     armedAt_ = QDateTime::currentMSecsSinceEpoch() + 600;
     const auto entries = appEntries();
     const QStringList loose = runningWithoutRule();
@@ -1474,157 +1649,106 @@ void FirewallWindow::fillApps() {
         });
         sl->addWidget(b);
     }
-    // Lista.
-    while (auto *item = appsList_->takeAt(0)) {
-        if (auto *w = item->widget()) w->deleteLater();
-        delete item;
-    }
-    auto *head = new QWidget;
-    auto *hh = new QHBoxLayout(head);
-    hh->setContentsMargins(0, 2, 0, 8);
-    hh->setSpacing(11);
-    hh->addSpacing(30);
+
+    // Filas. El desplazamiento se conserva: la tabla se rehace con cada cambio del motor.
+    auto *t = appsTable_;
+    const int scrolled = t->verticalScrollBar()->value();
+    t->setRowCount(0);
+    t->clearSpans();
     const bool runningView = appsFilter_ == "running";
-    for (const auto &[t, w] : runningView ? QVector<QPair<QString, int>>{{"APPLICATION", 0}, {"FOLDER", 300}}
-                                          : QVector<QPair<QString, int>>{{"APPLICATION", 0},
-                                                                         {"DESTINATION", 104},
-                                                                         {"RULE", 140},
-                                                                         {"CREATED / LAST BLOCK", 128}}) {
-        auto *c = text(t, "colhead");
-        if (w) {
-            c->setFixedWidth(w);
-            c->setAlignment(t == "DESTINATION" ? Qt::AlignLeft : Qt::AlignRight);
-        }
-        hh->addWidget(c, w ? 0 : 1);
-    }
-    hh->addSpacing(runningView ? 136 + 11 : 24);
-    appsList_->addWidget(head);
-    appsList_->addWidget(divider());
-    int rows = 0;
     const auto matches = [this](const QString &haystack) {
         return appsQuery_.isEmpty() || haystack.contains(appsQuery_, Qt::CaseInsensitive);
     };
+    const auto nameCell = [](const QString &iconPath, const QString &title, const QString &subtitle,
+                             Qt::TextElideMode mode = Qt::ElideRight) {
+        auto *w = new QWidget;
+        auto *h = new QHBoxLayout(w);
+        h->setContentsMargins(0, 0, 0, 0);
+        h->setSpacing(11);
+        h->addWidget(appIcon(iconPath));
+        auto *v = new QVBoxLayout;
+        v->setSpacing(2);
+        v->addWidget(new ElideLabel(title, "strong"));
+        if (!subtitle.isEmpty()) v->addWidget(new ElideLabel(subtitle, "small", mode));
+        h->addLayout(v, 1);
+        return w;
+    };
     if (runningView) {
+        setColumns(t, "running", {{"APPLICATION", 260}, {"FOLDER", 340}, {"RULE FOR THIS FILE", 170}});
+        t->viewport()->setCursor(Qt::ArrowCursor);
         for (const auto &path : loose) {
             if (!matches(path)) continue;
-            if (rows) appsList_->addWidget(divider());
-            auto *w = new QWidget;
-            w->setMinimumHeight(48);
-            auto *h = new QHBoxLayout(w);
-            h->setContentsMargins(0, 6, 0, 6);
-            h->setSpacing(11);
-            h->addWidget(appIcon(path));
-            auto *name = text(FirewallClient::fileName(path), "strong");
-            h->addWidget(name, 1);
-            auto *folder = text(QDir::toNativeSeparators(QFileInfo(path).path()), "small");
-            folder->setFixedWidth(300);
-            folder->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-            folder->setText(folder->fontMetrics().elidedText(folder->text(), Qt::ElideMiddle, 300));
-            folder->setToolTip(QDir::toNativeSeparators(path));
-            h->addWidget(folder);
+            const int r = t->rowCount();
+            t->insertRow(r);
+            auto *folder = new ElideLabel(QDir::toNativeSeparators(QFileInfo(path).path()), "small", Qt::ElideMiddle);
             // Una regla para este archivo, sin esperar a que pida: como «This file only» en el aviso.
             auto *decide = new QWidget;
-            decide->setFixedWidth(136);
             auto *dh = new QHBoxLayout(decide);
             dh->setContentsMargins(0, 0, 0, 0);
             dh->setSpacing(8);
-            for (const bool allow : {false, true}) {
-                auto *b = button(allow ? "Allow" : "Block", allow ? "allow" : "block", true);
-                b->setObjectName(allow ? "running-allow" : "running-block");
+            for (const bool allowed : {false, true}) {
+                auto *b = button(allowed ? "Allow" : "Block", allowed ? "allow" : "block", true);
+                b->setObjectName(allowed ? "running-allow" : "running-block");
                 b->setFixedWidth(64);
                 b->setEnabled(canDecide());
-                connect(b, &QPushButton::clicked, this, [this, path, allow] {
-                    if (armed()) firewall_.decide(path, allow, "path", "always");
+                connect(b, &QPushButton::clicked, this, [this, path, allowed] {
+                    if (armed()) firewall_.decide(path, allowed, "path", "always");
                 });
                 dh->addWidget(b);
             }
-            h->addWidget(decide);
-            appsList_->addWidget(w);
-            ++rows;
+            dh->addStretch();
+            fillRow(t, r, {cell(nameCell(path, FirewallClient::fileName(path), {})), cell(folder), cell(decide, Qt::AlignLeft, true)});
         }
+        appsTip_->setText("Applications running in your Windows session without a rule. They ask the first time they "
+                          "connect, or Allow and Block here save a rule for that file now.");
     } else {
+        setColumns(t, "rules",
+                   {{"APPLICATION", 330}, {"DESTINATION", 120}, {"RULE", 170, Qt::AlignRight}, {"WHEN", 130, Qt::AlignRight}});
+        t->viewport()->setCursor(Qt::PointingHandCursor);
         for (const auto &e : entries) {
             const QString c = classify(e);
             if (appsFilter_ != "all" && appsFilter_ != c) continue;
             QString hay = e.title + " " + e.subtitle + " " + e.path + " " + e.signer;
             for (const auto &r : e.rules) hay += " " + r.destination;
             if (!matches(hay)) continue;
-            if (rows) appsList_->addWidget(divider());
-            auto *w = new ClickRow;
-            w->setObjectName("app-row");
-            w->setMinimumHeight(52);
-            auto *h = new QHBoxLayout(w);
-            h->setContentsMargins(0, 7, 0, 7);
-            h->setSpacing(11);
-            h->addWidget(appIcon(e.iconPath));
-            auto *info = new QVBoxLayout;
-            info->setSpacing(2);
-            auto *title = text(e.title, "strong");
-            title->setAttribute(Qt::WA_TransparentForMouseEvents);
-            info->addWidget(title);
-            auto *sub = text(e.subtitle, "small");
-            sub->setAttribute(Qt::WA_TransparentForMouseEvents);
-            sub->setMinimumWidth(10);
-            info->addWidget(sub);
-            h->addLayout(info, 1);
+            const int r = t->rowCount();
+            t->insertRow(r);
             const auto &r0 = e.rules.first();
             QWidget *dest = e.perServer ? static_cast<QWidget *>(chip(e.rules.size() == 1 ? QString("1 server")
                                                                                           : QString("%1 servers").arg(e.rules.size())))
-                                        : text("Anywhere", "colhead");
-            auto *dw = new QWidget;
-            dw->setFixedWidth(104);
-            auto *dl = new QHBoxLayout(dw);
-            dl->setContentsMargins(0, 0, 0, 0);
-            dl->addWidget(dest);
-            dl->addStretch();
-            h->addWidget(dw);
+                                        : new ElideLabel("Anywhere", "colhead");
             QLabel *policy = c == "server" ? pill("Per server", "dest")
                              : c == "temp" ? pill(QString(r0.allow ? "Allow" : "Block") + " · " +
                                                       (r0.expires < 0 ? QString("until restart") : "until " + clock(r0.expires)),
                                                   "temp")
                              : c == "allow" ? pill("Allow", "allow")
                                             : pill("Block", "block");
-            auto *pw = new QWidget;
-            pw->setFixedWidth(140);
-            auto *pl = new QHBoxLayout(pw);
-            pl->setContentsMargins(0, 0, 0, 0);
-            pl->addStretch();
-            pl->addWidget(policy);
-            h->addWidget(pw);
             qint64 lastBlock = 0, created = 0;
-            for (const auto &r : e.rules) {
-                lastBlock = qMax(lastBlock, r.allow ? 0 : r.lastBlock);
-                if (!created || r.created < created) created = r.created;
+            for (const auto &x : e.rules) {
+                lastBlock = qMax(lastBlock, x.allow ? 0 : x.lastBlock);
+                if (!created || x.created < created) created = x.created;
             }
-            auto *when = text(lastBlock ? "blocked " + clock(lastBlock) : clock(created), "time");
-            when->setFixedWidth(128);
+            auto *when = new ElideLabel(lastBlock ? "blocked " + clock(lastBlock) : "added " + clock(created), "time");
             when->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-            h->addWidget(when);
-            auto *more = text("›", "time");
-            more->setFixedWidth(24);
-            more->setAlignment(Qt::AlignCenter);
-            h->addWidget(more);
-            for (auto *child : w->findChildren<QWidget *>()) child->setAttribute(Qt::WA_TransparentForMouseEvents);
-            connect(w, &QPushButton::clicked, this, [this, key = e.key] { selectView("detail:" + key); });
-            appsList_->addWidget(w);
-            ++rows;
+            // Una ruta se recorta al medio (se ve el final); un editor, al final.
+            fillRow(t, r, {cell(nameCell(e.iconPath, e.title, e.subtitle, e.scope == "path" ? Qt::ElideMiddle : Qt::ElideRight)),
+                           cell(dest), cell(policy, Qt::AlignRight), cell(when)});
+            t->item(r, 0)->setData(Qt::UserRole, "rule:" + e.key);
         }
+        appsTip_->clear();
     }
-    if (!rows) {
-        auto *empty = text(runningView ? "Every running application of this session has a rule or is waiting."
-                           : appsQuery_.isEmpty() ? "No rules here yet."
-                                                  : "No app matches the search.",
-                           "sub", true);
-        empty->setContentsMargins(0, 12, 0, 12);
-        appsList_->addWidget(empty);
+    if (t->rowCount() == 0) {
+        t->insertRow(0);
+        auto *empty = new ElideLabel(runningView ? "Every running application of this session has a rule or is waiting."
+                                     : appsQuery_.isEmpty() ? "No rules here yet."
+                                                            : "No app matches the search.",
+                                     "sub");
+        fillRow(t, 0, {cell(empty)});
+        t->setSpan(0, 0, 1, t->columnCount());
+        t->viewport()->setCursor(Qt::ArrowCursor);
     }
-    if (runningView) {
-        auto *tip = text("Applications running in your Windows session without a rule. They ask the first time they "
-                         "connect, or Allow and Block here save a rule for that file now.",
-                         "faint", true);
-        tip->setContentsMargins(0, 10, 0, 6);
-        appsList_->addWidget(tip);
-    }
+    appsTip_->setVisible(!appsTip_->text().isEmpty());
+    QTimer::singleShot(0, t, [t, scrolled] { t->verticalScrollBar()->setValue(scrolled); });
 }
 
 QWidget *FirewallWindow::detailPage(const QString &key) {
@@ -1678,7 +1802,7 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
             auto *h = new QHBoxLayout(w);
             h->setContentsMargins(0, 3, 0, 3);
             h->setSpacing(10);
-            h->addWidget(text(r.destination, "body"), 1);
+            h->addWidget(new ElideLabel(r.destination, "body"), 1);
             h->addWidget(text(r.expires == 0 ? QString("Always")
                               : r.expires < 0 ? QString("Until restart")
                                               : "Until " + clock(r.expires),
@@ -1783,7 +1907,7 @@ QWidget *FirewallWindow::activityPage() {
     const auto &s = firewall_.status();
     auto *page = new QWidget;
     auto *l = column(page, 18, 10);
-    l->setContentsMargins(18, 16, 18, 22);
+    l->setContentsMargins(18, 16, 18, 16);
     auto *seg = card("seg");
     auto *sl = new QHBoxLayout(seg);
     sl->setContentsMargins(2, 2, 2, 2);
@@ -1802,61 +1926,65 @@ QWidget *FirewallWindow::activityPage() {
                         (s.started ? "Since the engine started at " + clock(s.started) + ". " : QString()) +
                             "Allowed connections are not recorded.",
                         seg));
+    const bool blockedView = activityFilter_ == "blocked";
     auto *c = card();
-    auto *cl = column(c, 14, 0);
-    cl->setContentsMargins(14, 8, 14, 10);
-    int shown = 0;
+    auto *cl = new QVBoxLayout(c);
+    cl->setContentsMargins(0, 0, 0, 0);
+    auto *t = makeTable("activity", 44);
+    t->viewport()->setCursor(Qt::ArrowCursor);
+    if (blockedView)
+        setColumns(t, "blocked", {{"TIME", 80}, {"APPLICATION", 260}, {"DESTINATION", 200}, {"REASON", 160}});
+    else
+        setColumns(t, "decisions", {{"TIME", 80}, {"APPLICATION", 260}, {"DECISION", 300}});
+    cl->addWidget(t);
     const auto &events = firewall_.activity();
     const auto same = [](const FirewallClient::ActivityItem &a, const FirewallClient::ActivityItem &b) {
         return a.path.compare(b.path, Qt::CaseInsensitive) == 0 && a.remote == b.remote && a.port == b.port &&
                a.kind == b.kind;
     };
-    for (int i = events.size() - 1; i >= 0 && shown < 300; --i) {
+    for (int i = events.size() - 1; i >= 0 && t->rowCount() < 500; --i) {
         const auto &e = events[i];
         const bool blocked = e.kind.startsWith("Blocked");
-        if ((activityFilter_ == "blocked") != blocked) continue;
+        if (blockedView != blocked) continue;
         // Los reintentos seguidos de una misma app al mismo destino van en una sola fila, con la cuenta.
         int repeats = 1;
         while (i > 0 && same(events[i - 1], e)) {
             --i;
             ++repeats;
         }
-        if (shown) cl->addWidget(divider());
-        auto *w = new QWidget;
-        w->setMinimumHeight(40);
-        auto *h = new QHBoxLayout(w);
-        h->setContentsMargins(0, 4, 0, 4);
-        h->setSpacing(10);
-        auto *t = text(clock(e.time), "time");
-        t->setFixedWidth(44);
-        h->addWidget(t);
-        if (!e.path.isEmpty()) h->addWidget(appIcon(e.path, 26));
-        QString what = e.path.isEmpty() ? QString("GateBouncer") : FirewallClient::fileName(e.path);
-        QString detail;
-        if (blocked && !e.remote.isEmpty())
-            detail = " <span style='color:#8a8a8a'>→ " + e.remote.toHtmlEscaped() +
-                     (e.port ? ":" + QString::number(e.port) : QString()) + "</span>";
-        else if (!blocked)
-            detail = " <span style='color:#8a8a8a'>· " + e.kind.toHtmlEscaped() + "</span>";
-        if (repeats > 1) detail += QString(" <span style='color:#6f6f6f'>· %1 times</span>").arg(repeats);
-        auto *label = new QLabel(what.toHtmlEscaped() + detail);
-        label->setProperty("r", "body");
-        label->setMinimumWidth(10);
-        h->addWidget(label, 1);
-        if (blocked) h->addWidget(chip(activityChip(e.kind)));
-        cl->addWidget(w);
-        ++shown;
+        const int r = t->rowCount();
+        t->insertRow(r);
+        auto *when = new ElideLabel(clock(e.time), "time");
+        auto *app = new QWidget;
+        auto *ah = new QHBoxLayout(app);
+        ah->setContentsMargins(0, 0, 0, 0);
+        ah->setSpacing(10);
+        if (!e.path.isEmpty()) ah->addWidget(appIcon(e.path, 26));
+        ah->addWidget(new ElideLabel(e.path.isEmpty() ? QString("GateBouncer") : FirewallClient::fileName(e.path), "body"), 1);
+        if (repeats > 1) ah->addWidget(text(QString("%1 times").arg(repeats), "time"));
+        if (blockedView) {
+            auto *dest = new ElideLabel(e.remote.isEmpty() ? QString("—")
+                                                           : e.remote + (e.port ? ":" + QString::number(e.port) : QString()),
+                                        "sub");
+            auto *reason = new QWidget;
+            auto *rh = new QHBoxLayout(reason);
+            rh->setContentsMargins(0, 0, 0, 0);
+            rh->addWidget(chip(activityChip(e.kind)));
+            rh->addStretch();
+            fillRow(t, r, {cell(when), cell(app), cell(dest), cell(reason)});
+        } else {
+            fillRow(t, r, {cell(when), cell(app), cell(new ElideLabel(e.kind, "sub"))});
+        }
     }
-    if (!shown)
-        cl->addWidget(text(activityFilter_ == "blocked" ? "Nothing blocked since the engine started."
-                                                        : "No decisions since the engine started.",
-                           "sub", true));
-    cl->addSpacing(6);
-    cl->addWidget(divider());
-    cl->addSpacing(8);
-    cl->addWidget(text("The list keeps the latest 2,000 events and starts again when the engine restarts.", "faint", true));
-    l->addWidget(c);
-    l->addStretch();
+    if (t->rowCount() == 0) {
+        t->insertRow(0);
+        fillRow(t, 0, {cell(new ElideLabel(blockedView ? "Nothing blocked since the engine started."
+                                                       : "No decisions since the engine started.",
+                                           "sub"))});
+        t->setSpan(0, 0, 1, t->columnCount());
+    }
+    l->addWidget(c, 1);
+    l->addWidget(text("The list keeps the latest 2,000 events and starts again when the engine restarts.", "faint", true));
     return page;
 }
 
@@ -2409,17 +2537,41 @@ void FirewallWindow::finishQuit() {
 
 bool FirewallWindow::eventFilter(QObject *object, QEvent *event) {
     if (object->objectName() == "fwTitle") {
-        if (event->type() == QEvent::MouseButtonPress) {
-            auto *e = static_cast<QMouseEvent *>(event);
-            if (e->button() == Qt::LeftButton) dragStart_ = e->globalPosition().toPoint() - frameGeometry().topLeft();
-        } else if (event->type() == QEvent::MouseMove) {
-            auto *e = static_cast<QMouseEvent *>(event);
-            if ((e->buttons() & Qt::LeftButton) && !isMaximized()) move(e->globalPosition().toPoint() - dragStart_);
-        } else if (event->type() == QEvent::MouseButtonDblClick) {
+        // El arrastre lo hace Windows: así la ventana se acomoda contra los costados y arriba se maximiza.
+        if (event->type() == QEvent::MouseButtonPress && static_cast<QMouseEvent *>(event)->button() == Qt::LeftButton) {
+            if (windowHandle()) windowHandle()->startSystemMove();
+            return true;
+        }
+        if (event->type() == QEvent::MouseButtonDblClick) {
             isMaximized() ? showNormal() : showMaximized();
+            return true;
         }
     }
     return QMainWindow::eventFilter(object, event);
+}
+
+void FirewallWindow::showEvent(QShowEvent *event) {
+    if (!shownOnce_) {
+        shownOnce_ = true;
+        // La bandera va antes de apply(): WM_NCCALCSIZE llega en el acto.
+        frameApplied_ = true;
+        frameApplied_ = WindowFrame::apply(this, true);
+    }
+    QMainWindow::showEvent(event);
+}
+
+void FirewallWindow::hideEvent(QHideEvent *event) {
+    // El tamaño que dejó el usuario, para la próxima vez (maximizada, el de antes de maximizar).
+    if (shownOnce_ && rememberSizes()) {
+        auto store = tableStore();
+        store.setValue("window/size", normalGeometry().size());
+    }
+    QMainWindow::hideEvent(event);
+}
+
+bool FirewallWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr *result) {
+    if (frameApplied_ && WindowFrame::handleNativeEvent(message, result)) return true;
+    return QMainWindow::nativeEvent(eventType, message, result);
 }
 
 } // namespace Gate

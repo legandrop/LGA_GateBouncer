@@ -6,6 +6,7 @@
 #include <QApplication>
 #include <QLocalServer>
 #include <QLocalSocket>
+#include <QTableWidget>
 #include <QTimer>
 #include <cstdio>
 #include <windows.h>
@@ -13,6 +14,7 @@
 namespace {
 // Recorrido de QA sin abrir nada en el escritorio del usuario (se corre en un escritorio aparte):
 // GATEBOUNCER_QA_SHOT="<vista>;<pasos separados por coma>"; pasos: wait:<ms>, view:<vista>, size:<ancho>x<alto>,
+// row:<fila> (clic en una fila de la tabla),
 // click:<objectName> (botón), shot:<archivo.png>, toastshot:<archivo.png> (el aviso fijo) y
 // toastclick:<objectName> (botón del aviso fijo). Al terminar los pasos sale.
 void runSteps(Gate::FirewallWindow *window, QStringList steps) {
@@ -40,6 +42,12 @@ void runSteps(Gate::FirewallWindow *window, QStringList steps) {
     } else if (step.startsWith("size:")) {
         const auto f = step.mid(5).split('x');
         if (f.size() == 2) window->resize(f[0].toInt(), f[1].toInt());
+    } else if (step.startsWith("row:")) {
+        // Clic en una fila de la tabla de la vista (Apps, Activity).
+        auto *table = window->findChild<QTableWidget *>("fwTable");
+        const int row = step.mid(4).toInt();
+        if (table && row < table->rowCount()) emit table->cellClicked(row, 0);
+        else std::fprintf(stderr, "QA: tabla o fila no encontrada: %s\n", qPrintable(step));
     } else if (step.startsWith("click:")) {
         QAbstractButton *target = nullptr;
         for (auto *b : window->findChildren<QAbstractButton *>(step.mid(6)))

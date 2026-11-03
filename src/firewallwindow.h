@@ -22,6 +22,7 @@ class QScrollArea;
 class QVBoxLayout;
 class QHBoxLayout;
 class QFrame;
+class QTableWidget;
 
 namespace Gate {
 
@@ -43,6 +44,9 @@ class FirewallWindow final : public QMainWindow {
 
   protected:
     bool eventFilter(QObject *object, QEvent *event) override;
+    void showEvent(QShowEvent *event) override;
+    void hideEvent(QHideEvent *event) override;
+    bool nativeEvent(const QByteArray &eventType, void *message, qintptr *result) override;
 
   private:
     // Lo elegido en los desplegables de un pedido en Requests: se conserva aunque la página se rearme.
@@ -109,17 +113,19 @@ class FirewallWindow final : public QMainWindow {
     bool armed() const;
     int explainVersion_ = 0;
     QHash<QString, int> scroll_;
+    QHash<QString, int> tableScroll_; // desplazamiento de la tabla de cada vista, entre rearmados
     QVector<NetLimiterRule> netLimiterRules_;
     QString netLimiterFile_;
     bool closing_ = false;
-    QPoint dragStart_;
+    bool shownOnce_ = false, frameApplied_ = false; // marco nativo: bordes para estirar, sombra, acomodo
 
     QWidget *workspace_ = nullptr;
     QScrollArea *scroll_area_ = nullptr;
     QFrame *message_ = nullptr;
     QLabel *messageText_ = nullptr;
     QTimer messageTimer_;
-    QVBoxLayout *appsList_ = nullptr;
+    QTableWidget *appsTable_ = nullptr;
+    QLabel *appsTip_ = nullptr;
     QWidget *appsSeg_ = nullptr;
     QHash<QString, SideItem *> side_;
 };

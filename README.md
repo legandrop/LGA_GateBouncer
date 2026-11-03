@@ -48,6 +48,7 @@ The window reads the engine and has five sections; the sidebar shows the state o
 - **Apps** lists every application with a rule: for one file, for an app in any version, for a whole publisher, or
   per server. Filters show Allow, Block, per-server and temporary rules, and the applications running in your session
   without a rule. An app's page shows its rule, or each of its server rules, and lets you remove them.
+- Apps and Activity are tables: drag a column edge to widen it (the window remembers it), and only the rows scroll.
 - **Activity** shows blocked attempts and decisions recorded by the engine since it started; repeated attempts by the
   same application to the same address are counted on one line. Allowed connections are not recorded.
 - **Settings** switches between asking for unknown applications and letting them connect, sets whether the local
