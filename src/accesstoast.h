@@ -26,6 +26,7 @@ class AccessToast final : public QWidget {
         // El pedido: la ruta, o en modo por destino «ruta|dirección» (un pedido por cada destino nuevo).
         QString id;
         bool perDestination = false;
+        int serverRules = 0; // modo por destino: cuántos servidores ya tienen regla; 0 si no se sabe
         QString path;
         QString signer; // vacío: sin firma válida, sólo «This file only»
         int attempts = 0;
@@ -33,7 +34,8 @@ class AccessToast final : public QWidget {
         bool canDecide = true;
         QString remote, host; // destino del último intento; host vacío si no se sabe el nombre
         int port = 0, protocol = 0;
-        QString known; // lo que dice el catálogo de apps conocidas; vacío si no está
+        QString known;      // lo que dice el catálogo de apps conocidas; vacío si no está
+        QString launchedBy; // el programa que la lanzó (nombre de archivo); vacío: no se muestra la fila
     };
 
     explicit AccessToast(QWidget *parent = nullptr);
@@ -77,16 +79,29 @@ class AccessToast final : public QWidget {
     void updateCounters();
     void renderExplanation();
     void renderDestination();
+    void renderKnown();
+    // Recalcula anchos y altos de los textos que se parten, los recortes y la fila de la regla, y ajusta el alto.
+    void relayout();
+    void layoutChoices();
 
     Request request_;
     // Los botones se habilitan un instante después de mostrar otra app: un clic que iba al aviso anterior (doble clic,
     // clic tardío) no decide sobre la siguiente.
     bool armed_ = false;
-    QLabel *icon_ = nullptr, *title_ = nullptr, *signature_ = nullptr, *signatureMark_ = nullptr, *path_ = nullptr;
-    QLabel *note_ = nullptr, *footer_ = nullptr;
-    QLabel *destination_ = nullptr, *destinationDetail_ = nullptr, *known_ = nullptr;
+    // Cabecera y datos.
+    QLabel *icon_ = nullptr, *title_ = nullptr, *body_ = nullptr;
+    QWidget *warnBox_ = nullptr, *infoBox_ = nullptr;
+    QLabel *warn_ = nullptr, *info_ = nullptr;
+    QLabel *signature_ = nullptr;
+    QLabel *wantsKey_ = nullptr, *destination_ = nullptr, *destinationDetail_ = nullptr;
+    QLabel *launchedKey_ = nullptr, *launched_ = nullptr;
+    QWidget *knownBox_ = nullptr;
+    QLabel *knownPill_ = nullptr, *knownText_ = nullptr;
+    // Regla y decisión.
+    QWidget *choices_ = nullptr;
     QComboBox *scope_ = nullptr, *duration_ = nullptr, *target_ = nullptr;
-    QLabel *body_ = nullptr;
+    QLabel *footer_ = nullptr;
+    QPushButton *block_ = nullptr, *allow_ = nullptr;
     bool targetChosen_ = false; // el usuario tocó «Destination»
     // Esquina de abajo a la derecha, en coordenadas de pantalla: el aviso crece hacia arriba desde ahí.
     QPoint anchor_;
@@ -96,15 +111,17 @@ class AccessToast final : public QWidget {
     bool dragging_ = false;
     QPoint pressGlobal_, pressAnchor_;
     int pressWidth_ = 0;
-    Explanation explanation_;
     QPointer<QScreen> screen_; // la pantalla puede desaparecer (monitor desconectado, sesión remota)
-    QWidget *explainBox_ = nullptr;
-    QLabel *explainStatus_ = nullptr, *what_ = nullptr, *why_ = nullptr, *risk_ = nullptr, *suggestion_ = nullptr;
+    // Tarjeta de la explicación con IA.
+    Explanation explanation_;
+    bool detailsOpen_ = false;
+    QWidget *explainBox_ = nullptr, *spinner_ = nullptr, *more_ = nullptr;
+    QLabel *explainStatus_ = nullptr, *suggestion_ = nullptr, *what_ = nullptr;
+    QLabel *why_ = nullptr, *reason_ = nullptr, *risk_ = nullptr;
+    QLabel *whyHead_ = nullptr, *reasonHead_ = nullptr, *riskHead_ = nullptr;
     QLabel *explainFoot_ = nullptr;
-    QPushButton *explainAction_ = nullptr;
-    QTimer *dots_ = nullptr;
-    int dotCount_ = 0;
-    QPushButton *block_ = nullptr, *allow_ = nullptr;
+    QPushButton *details_ = nullptr, *explainAction_ = nullptr, *settingsLink_ = nullptr;
+    QTimer *spin_ = nullptr;
 };
 
 } // namespace Gate

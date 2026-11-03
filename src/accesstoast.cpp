@@ -5,24 +5,26 @@
 #include <QComboBox>
 #include <QDateTime>
 #include <QDir>
-#include <QFile>
 #include <QEvent>
+#include <QFile>
 #include <QFileIconProvider>
 #include <QFileInfo>
-#include <QFontDatabase>
+#include <QGridLayout>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
-#include <QLinearGradient>
 #include <QMenu>
+#include <QMouseEvent>
 #include <QPainter>
 #include <QPainterPath>
-#include <QMouseEvent>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QScreen>
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QStandardPaths>
+#include <QStyle>
+#include <QStyledItemDelegate>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWheelEvent>
@@ -30,21 +32,24 @@
 
 namespace Gate {
 namespace {
-// Mismos valores que el aviso de disco de Mighty Tools.
-constexpr char Text[] = "#f5f5f5";
-constexpr char Body[] = "#d0d0d0";
-constexpr char Faint[] = "#8a8a8a";
-constexpr char FieldBorder[] = "#3c3c3c";
-constexpr char Field[] = "#202020";
-constexpr char Button[] = "rgba(255,255,255,8)";
-constexpr char ButtonBorder[] = "#404040";
-constexpr char ButtonHover[] = "#383838";
-constexpr char HeaderIcon[] = "#aaaaaa";
-constexpr char Link[] = "#b9b4f0";
-constexpr int Width = 352; // ancho inicial y mínimo
+// Medidas del diseño aprobado (rediseño 2026-11): aviso de 360 px, secciones con 14 px de margen y la tarjeta de la
+// explicación con 10 px.
+constexpr int Width = 360; // ancho inicial y mínimo
 constexpr int MaxWidth = 760;
 constexpr int Margin = 15;
-constexpr int Edge = 6; // franja de los bordes izquierdo y derecho que ensancha
+constexpr int Edge = 6;          // franja de los bordes izquierdo y derecho que ensancha
+constexpr int Pad = 14;          // margen lateral de las secciones
+constexpr int CardPad = 10;      // margen lateral de la tarjeta de la explicación
+constexpr int CardInset = 11;    // relleno interior de la tarjeta
+constexpr int IconSize = 38;     // ícono del programa
+constexpr int IconGap = 11;
+constexpr int KeyColumn = 70;    // columna de rótulos de la grilla de datos
+constexpr int ColumnGap = 8;
+constexpr int NoteInset = 9;     // relleno lateral de los recuadros de aviso
+constexpr int ChipHeight = 26;
+constexpr int ChipGap = 5;
+constexpr char HeaderIcon[] = "#888888";
+constexpr char HeaderIconActive[] = "#ececec";
 
 QSettings store() { return QSettings(QSettings::NativeFormat, QSettings::UserScope, "LGA", "GateBouncer"); }
 
@@ -69,28 +74,62 @@ QString parentWildcard(const QString &host) {
     return "*." + parent.join('.');
 }
 
-QString elideMiddle(const QLabel *label, const QString &text, int width) {
-    return label->fontMetrics().elidedText(text, Qt::ElideMiddle, width);
+// Texto de una sola línea recortado al ancho; el entero va en el tooltip sólo si quedó recortado.
+void elide(QLabel *label, const QString &text, int width, Qt::TextElideMode mode = Qt::ElideMiddle) {
+    label->ensurePolished();
+    const QString shown = label->fontMetrics().elidedText(text, mode, width);
+    label->setText(shown);
+    label->setToolTip(shown != text ? text : QString());
 }
 
-// Íconos de la cabecera dibujados: los caracteres «···» y «×» no entran en botones de 24 px con Segoe UI.
+// Ancho fijo y alto justo para un texto que se parte en renglones: así el aviso nunca corta un párrafo.
+void fit(QLabel *label, int width) {
+    label->setFixedWidth(qMax(1, width));
+    label->ensurePolished();
+    label->setFixedHeight(label->text().isEmpty() ? 0 : label->heightForWidth(label->width()));
+}
+
+// Cambia una propiedad que usa la hoja de estilo y vuelve a aplicarla.
+void restyle(QWidget *widget, const char *name, const QString &value) {
+    if (widget->property(name).toString() == value) return;
+    widget->setProperty(name, value);
+    widget->style()->unpolish(widget);
+    widget->style()->polish(widget);
+}
+
+// La carpeta del programa sin la unidad, sin «Windows\» y sin la carpeta del usuario: «System32»,
+// «AppData\Local\Temp\is-4K2.tmp», «Program Files\BraveSoftware\Brave-Browser».
+QString shortFolder(const QString &path) {
+    QString dir = QDir::toNativeSeparators(QFileInfo(path).path());
+    static const QRegularExpression drive(R"(^[A-Za-z]:\\)");
+    dir.remove(drive);
+    if (dir.startsWith("Windows\\", Qt::CaseInsensitive)) dir = dir.mid(8);
+    else if (dir.startsWith("Users\\", Qt::CaseInsensitive)) {
+        const int next = dir.indexOf('\\', 6);
+        dir = next < 0 ? QString() : dir.mid(next + 1);
+    }
+    return dir;
+}
+
+// Íconos de la barra dibujados: los caracteres «⋯» y «×» no quedan centrados en botones chicos.
 QIcon headerIcon(bool close) {
     const qreal dpr = qMax(qreal(2), qApp->devicePixelRatio());
     QIcon icon;
-    for (const auto &[mode, color] : {std::pair{QIcon::Normal, QColor(HeaderIcon)}, std::pair{QIcon::Active, QColor(Text)}}) {
+    for (const auto &[mode, color] :
+         {std::pair{QIcon::Normal, QColor(HeaderIcon)}, std::pair{QIcon::Active, QColor(HeaderIconActive)}}) {
         QPixmap pixmap(QSize(14, 14) * dpr);
         pixmap.setDevicePixelRatio(dpr);
         pixmap.fill(Qt::transparent);
         QPainter p(&pixmap);
         p.setRenderHint(QPainter::Antialiasing);
         if (close) {
-            p.setPen(QPen(color, 1.4, Qt::SolidLine, Qt::RoundCap));
-            p.drawLine(QPointF(3, 3), QPointF(11, 11));
-            p.drawLine(QPointF(11, 3), QPointF(3, 11));
+            p.setPen(QPen(color, 1.3, Qt::SolidLine, Qt::RoundCap));
+            p.drawLine(QPointF(3.5, 3.5), QPointF(10.5, 10.5));
+            p.drawLine(QPointF(10.5, 3.5), QPointF(3.5, 10.5));
         } else {
             p.setPen(Qt::NoPen);
             p.setBrush(color);
-            for (const qreal x : {2.5, 7.0, 11.5}) p.drawEllipse(QPointF(x, 7), 1.2, 1.2);
+            for (const qreal x : {3.0, 7.0, 11.0}) p.drawEllipse(QPointF(x, 7), 1.1, 1.1);
         }
         p.end();
         icon.addPixmap(pixmap, mode);
@@ -98,11 +137,16 @@ QIcon headerIcon(bool close) {
     return icon;
 }
 
-// Desplegable del aviso: la rueda nunca cambia lo elegido (el aviso aparece debajo del puntero mientras se trabaja)
-// y la flecha se dibuja, porque la hoja de estilo le saca la del sistema.
+// Desplegable del aviso con forma de «chip»: la rueda nunca cambia lo elegido (el aviso aparece debajo del puntero
+// mientras se trabaja) y la flecha se dibuja, porque la hoja de estilo le saca la del sistema.
 class ScopeCombo final : public QComboBox {
   public:
     using QComboBox::QComboBox;
+    // Ancho justo para el texto elegido: relleno izquierdo, flecha y borde.
+    int chipWidth() {
+        ensurePolished();
+        return fontMetrics().horizontalAdvance(currentText()) + 8 + 22 + 2 + 2;
+    }
 
   protected:
     void wheelEvent(QWheelEvent *event) override { event->ignore(); }
@@ -110,27 +154,48 @@ class ScopeCombo final : public QComboBox {
         QComboBox::paintEvent(event);
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
-        p.setPen(QPen(QColor(isEnabled() ? Body : "#5a5a5a"), 1.5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-        const QPointF c(width() - 18, height() / 2.0 + 1);
-        p.drawPolyline(QPolygonF({c + QPointF(-4.5, -2.5), c + QPointF(0, 2), c + QPointF(4.5, -2.5)}));
+        p.setPen(QPen(QColor(isEnabled() ? "#8a8a8a" : "#4f4f4f"), 1.4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        const QPointF c(width() - 12.5, height() / 2.0 + 0.5);
+        p.drawPolyline(QPolygonF({c + QPointF(-3.2, -1.6), c + QPointF(0, 1.6), c + QPointF(3.2, -1.6)}));
     }
 };
 
-QPixmap dot(const QColor &color) {
-    const qreal dpr = qMax(qreal(1), qApp->devicePixelRatio());
-    QPixmap pixmap(QSize(8, 8) * dpr);
-    pixmap.setDevicePixelRatio(dpr);
-    pixmap.fill(Qt::transparent);
-    QPainter p(&pixmap);
-    p.setRenderHint(QPainter::Antialiasing);
-    p.setPen(Qt::NoPen);
-    p.setBrush(color);
-    p.drawEllipse(QRectF(0, 0, 8, 8));
-    return pixmap;
+// Indicador de «pidiendo»: un aro tenue con un tramo claro que gira.
+class Spinner final : public QWidget {
+  public:
+    using QWidget::QWidget;
+    int angle = 0;
+
+  protected:
+    void paintEvent(QPaintEvent *) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        const QRectF r = QRectF(rect()).adjusted(1, 1, -1, -1);
+        p.setPen(QPen(QColor("#4b4466"), 2));
+        p.drawEllipse(r);
+        p.setPen(QPen(QColor("#b49cf2"), 2, Qt::SolidLine, Qt::FlatCap));
+        p.drawArc(r, (90 - angle) * 16, -90 * 16);
+    }
+};
+
+// Nombre corto del modelo («claude-haiku-5-5», «nemotron-3-ultra-550b-a55b»).
+QString modelName(const QString &model) { return model.section('/', -1); }
+
+QLabel *label(QWidget *parent, const char *name, bool wrap = false) {
+    auto *l = new QLabel(parent);
+    l->setObjectName(name);
+    l->setWordWrap(wrap);
+    l->setTextFormat(Qt::PlainText);
+    return l;
 }
 
-// «Asking NVIDIA» o «Asking Anthropic», según el proveedor del modelo elegido en Settings.
-QString asking() { return "Asking " + Explain::providerName(Explain::providerOf(Explain::Settings::load().model)); }
+QPushButton *link(QWidget *parent, const char *name, const QString &text) {
+    auto *b = new QPushButton(text, parent);
+    b->setObjectName(name);
+    b->setFlat(true);
+    b->setCursor(Qt::PointingHandCursor);
+    return b;
+}
 } // namespace
 
 AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
@@ -144,75 +209,106 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     setMouseTracking(true);
     width_ = Width;
     setFixedWidth(Width);
-#ifdef Q_OS_WIN
-    // Offscreen (capturas de QA) no enumera las fuentes de Windows: usa el mismo archivo que el escritorio real.
-    if (QGuiApplication::platformName() == QLatin1String("offscreen")) {
-        static const int fontId = QFontDatabase::addApplicationFont(
-            QStandardPaths::locate(QStandardPaths::FontsLocation, QStringLiteral("segoeui.ttf")));
-        Q_UNUSED(fontId);
-    }
-#endif
-    setStyleSheet(QString(
-        "#accessToast QLabel, #accessToast QComboBox, #accessToast QPushButton { background:transparent; border:0;"
-        " color:%1; font-family:'Segoe UI'; font-size:13px; font-weight:400; }"
-        "#accessToast QLabel#toastHeader { font-size:12px; color:%2; }"
-        "#accessToast QLabel#toastBody { color:%2; }"
-        "#accessToast QLabel#toastPath, #accessToast QLabel#toastNote, #accessToast QLabel#toastFooter { font-size:11px; color:%3; }"
-        "#accessToast QLabel#toastSignature { font-size:12px; }"
-        "#accessToast QComboBox { background:%4; border:1px solid %5; border-radius:5px; padding:0 10px; min-height:30px; max-height:30px; }"
-        "#accessToast QComboBox:disabled { color:#7a7a7a; }"
-        "#accessToast QComboBox::drop-down { width:28px; border:0; }"
-        "#accessToast QComboBox QAbstractItemView { background:%4; border:1px solid %5; color:%1; font-family:'Segoe UI';"
-        " font-size:13px; selection-background-color:%8; }"
-        "#accessToast QPushButton#toastBlock, #accessToast QPushButton#toastAllow { min-height:32px; max-height:32px;"
-        " background:%6; border:1px solid %7; border-radius:4px; padding:0 10px; }"
-        "#accessToast QPushButton#toastBlock:hover, #accessToast QPushButton#toastAllow:hover { background:%8; }"
-        "#accessToast QPushButton:disabled { color:#6f6f6f; }"
-        "#accessToast QPushButton#toastOpen { font-size:11px; color:%9; }"
-        "#accessToast QPushButton#toastOpen:hover { text-decoration:underline; }"
-        "#accessToast QPushButton#toastMenu, #accessToast QPushButton#toastClose { color:%10; font-size:15px; }"
-        "#accessToast QPushButton#toastMenu:hover, #accessToast QPushButton#toastClose:hover { color:%1; }"
-        "#accessToast QWidget#toastExplainBox { background:%4; border:1px solid %5; border-radius:6px; }"
-        "#accessToast QLabel#toastExplainStatus, #accessToast QLabel#toastExplainFoot, #accessToast QLabel#toastRisk"
-        " { font-size:11px; color:%3; }"
-        "#accessToast QLabel#toastWhat, #accessToast QLabel#toastWhy { font-size:12px; color:%2; }"
-        "#accessToast QLabel#toastSuggestion { font-size:12px; color:%1; }"
-        "#accessToast QPushButton#toastExplain { font-size:12px; color:%9; text-align:left; padding:0; }"
-        "#accessToast QPushButton#toastExplain:hover { text-decoration:underline; }")
-        .arg(Text, Body, Faint, Field, FieldBorder, Button, ButtonBorder, ButtonHover, Link)
-        .arg(HeaderIcon));
+    // Los tamaños con decimales del diseño (14,5 / 12,5 / 11,5 px) van en puntos: la hoja de estilo sólo acepta
+    // píxeles enteros.
+    setStyleSheet(R"(
+        #accessToast QLabel, #accessToast QPushButton, #accessToast QComboBox { background:transparent; border:0;
+            color:#b2b2b2; font-family:'Inter'; font-size:13px; font-weight:400; padding:0; }
+        #accessToast QPushButton { min-height:0; }
+        #accessToast QLabel#toastHeader { font-size:12px; color:#8d8d8d; }
+        #accessToast QPushButton#toastMenu, #accessToast QPushButton#toastClose { border-radius:4px; }
+        #accessToast QPushButton#toastMenu:hover, #accessToast QPushButton#toastClose:hover { background:#2a2a2a; }
+        #accessToast QLabel#toastTitle { font-size:10.875pt; font-weight:600; color:#ececec; }
+        #accessToast QLabel#toastBody { font-size:12px; color:#999999; }
+        #accessToast QWidget#toastWarn { background:#2f2716; border:1px solid #4d3e19; border-radius:6px; }
+        #accessToast QWidget#toastWarn QLabel { font-size:12px; color:#e6c16a; }
+        #accessToast QWidget#toastInfo { background:#20232b; border:1px solid #2f3646; border-radius:6px; }
+        #accessToast QWidget#toastInfo QLabel { font-size:12px; color:#a9bfe0; }
+        #accessToast QWidget#toastLine { background:#2a2a2a; }
+        #accessToast QLabel#toastKey { font-size:12px; color:#777777; }
+        #accessToast QLabel#toastValue { font-size:12px; color:#c6c6c6; }
+        #accessToast QLabel#toastValueDetail { font-size:8.625pt; color:#7c7c7c; }
+        #accessToast QLabel#toastKnownPill { font-size:8.625pt; color:#9cc0ee; border:1px solid #33475f;
+            border-radius:10px; padding:0 8px; }
+        #accessToast QLabel#toastKnownText { font-size:12px; color:#c6c6c6; }
+        #accessToast QWidget#toastExplainBox { background:#222127; border:1px solid #2f2c3a; border-radius:8px; }
+        #accessToast QWidget#toastExplainBox[tone="quiet"] { background:#1f1f1f; border-color:#2c2c2c; }
+        #accessToast QWidget#toastExplainBox[tone="err"] { background:#261d1c; border-color:#43302d; }
+        #accessToast QLabel#toastExplainStatus { font-size:13px; color:#aaaaaa; }
+        #accessToast QLabel#toastExplainStatus[tone="working"] { font-size:9.375pt; color:#b9b0d6; }
+        #accessToast QLabel#toastExplainStatus[tone="err"] { color:#e7a196; }
+        #accessToast QLabel#toastSuggestion { font-size:8.625pt; color:#aaaaaa; border:1px solid #444444;
+            border-radius:10px; padding:0 8px; }
+        #accessToast QLabel#toastSuggestion[kind="block"] { color:#e7a196; border-color:#6a3a33; }
+        #accessToast QLabel#toastSuggestion[kind="allow"] { color:#b5d88b; border-color:#4c6233; }
+        #accessToast QLabel#toastWhat { font-size:9.375pt; color:#c9c9c9; }
+        #accessToast QWidget#toastMoreLine { background:#312e3c; }
+        #accessToast QLabel#toastMoreHead { font-size:11px; font-weight:500; color:#8f88a8; }
+        #accessToast QLabel#toastMoreBody { font-size:12px; color:#aeaeae; }
+        #accessToast QLabel#toastExplainFoot { font-size:11px; color:#6f6c7c; }
+        #accessToast QPushButton#toastDetails, #accessToast QPushButton#toastSettings { font-size:12px; color:#aa95ed; }
+        #accessToast QPushButton#toastOpen { font-size:8.625pt; color:#aa95ed; }
+        #accessToast QPushButton#toastDetails:hover, #accessToast QPushButton#toastSettings:hover,
+            #accessToast QPushButton#toastOpen:hover { text-decoration:underline; }
+        #accessToast QPushButton#toastExplain { background:#2b2b2b; color:#c4c4c4; border-radius:5px; font-size:12px;
+            padding:0 10px; min-height:25px; max-height:25px; }
+        #accessToast QPushButton#toastExplain:hover { background:#333333; color:#e6e6e6; }
+        #accessToast QLabel#toastRuleLabel { font-size:11px; color:#7d7d7d; }
+        #accessToast QComboBox { background:#242424; border:1px solid #363636; border-radius:5px; color:#d0d0d0;
+            font-size:12px; padding:0 0 0 8px; min-height:24px; max-height:26px; }
+        #accessToast QComboBox:hover { background:#292929; border-color:#424242; }
+        #accessToast QComboBox:disabled { color:#8f8f8f; }
+        #accessToast QComboBox::drop-down { width:22px; border:0; }
+        #accessToast QComboBox::down-arrow { image:none; width:0; height:0; }
+        #accessToast QComboBox QAbstractItemView { background:#232323; border:1px solid #3a3a3a; color:#cfcfcf;
+            font-size:12px; outline:0; padding:4px; selection-background-color:#2f2a45; selection-color:#ececec; }
+        #accessToast QComboBox QAbstractItemView::item { min-height:26px; padding:0 8px; border-radius:4px; }
+        #accessToast QPushButton#toastBlock, #accessToast QPushButton#toastAllow { border-radius:5px; font-size:13px;
+            font-weight:600; min-height:32px; max-height:32px; }
+        #accessToast QPushButton#toastBlock { background:#3a2220; color:#f2b2a8; border:1px solid #5e3530; }
+        #accessToast QPushButton#toastBlock:hover { background:#452824; }
+        #accessToast QPushButton#toastAllow { background:#25301c; color:#c9e6a4; border:1px solid #45592f; }
+        #accessToast QPushButton#toastAllow:hover { background:#2d3a22; }
+        #accessToast QPushButton#toastBlock:disabled, #accessToast QPushButton#toastAllow:disabled {
+            background:#212121; color:#5c5c5c; border-color:#2e2e2e; }
+        #accessToast QLabel#toastFooter { font-size:8.625pt; color:#707070; }
+    )");
 
     auto *layout = new QVBoxLayout(this);
-    layout->setContentsMargins(16, 14, 16, 14);
+    layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
 
-    auto *header = new QHBoxLayout;
-    header->setSpacing(8);
-    auto *small = new QLabel(this);
-    small->setFixedSize(16, 16);
-    small->setPixmap(QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png").pixmap(16, 16));
-    header->addWidget(small);
-    auto *name = new QLabel("LGA GateBouncer", this);
+    // Barra: la marca, «⋯» con el menú y «×» que cierra sin decidir.
+    auto *bar = new QWidget(this);
+    bar->setFixedHeight(34);
+    auto *barRow = new QHBoxLayout(bar);
+    barRow->setContentsMargins(12, 0, 6, 0);
+    barRow->setSpacing(8);
+    auto *small = new QLabel(bar);
+    small->setFixedSize(14, 14);
+    small->setPixmap(QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png").pixmap(14, 14));
+    barRow->addWidget(small);
+    auto *name = new QLabel("LGA GateBouncer", bar);
     name->setObjectName("toastHeader");
-    header->addWidget(name, 1);
-    auto *more = new QPushButton(this);
+    barRow->addWidget(name, 1);
+    auto *more = new QPushButton(bar);
     more->setObjectName("toastMenu");
-    more->setFixedSize(24, 24);
+    more->setFixedSize(28, 26);
     more->setIcon(headerIcon(false));
     more->setIconSize(QSize(14, 14));
     more->setAccessibleName("More actions");
     more->setCursor(Qt::PointingHandCursor);
-    header->addWidget(more);
-    auto *close = new QPushButton(this);
+    barRow->addWidget(more);
+    auto *close = new QPushButton(bar);
     close->setObjectName("toastClose");
-    close->setFixedSize(20, 24);
+    close->setFixedSize(28, 26);
     close->setIcon(headerIcon(true));
     close->setIconSize(QSize(14, 14));
-    close->setAccessibleName("Close and keep the application blocked");
+    close->setToolTip("Close and keep it waiting");
+    close->setAccessibleName("Close and keep it waiting");
     close->setCursor(Qt::PointingHandCursor);
-    header->addWidget(close);
-    layout->addLayout(header);
-    layout->addSpacing(12);
+    barRow->addWidget(close);
+    layout->addWidget(bar);
 
     auto *menu = new QMenu(this);
     menu->addAction("Open GateBouncer", this, [this] { emit openRequested(); });
@@ -220,165 +316,243 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     connect(more, &QPushButton::clicked, this, [more, menu] { menu->popup(more->mapToGlobal(QPoint(0, more->height()))); });
     connect(close, &QPushButton::clicked, this, [this] { emit dismissed(request_.id); });
 
-    auto *summary = new QHBoxLayout;
-    summary->setSpacing(12);
+    // Cabecera: ícono del programa, nombre del archivo y qué pasó.
+    auto *head = new QHBoxLayout;
+    head->setContentsMargins(Pad, 2, Pad, 10);
+    head->setSpacing(IconGap);
     icon_ = new QLabel(this);
-    icon_->setFixedSize(48, 48);
-    auto *iconColumn = new QVBoxLayout;
-    iconColumn->addSpacing(2);
-    iconColumn->addWidget(icon_);
-    iconColumn->addStretch();
-    summary->addLayout(iconColumn);
+    icon_->setFixedSize(IconSize, IconSize);
+    icon_->setAlignment(Qt::AlignCenter);
+    head->addWidget(icon_, 0, Qt::AlignTop);
     auto *text = new QVBoxLayout;
-    text->setSpacing(1);
-    title_ = new QLabel(this);
-    title_->setObjectName("toastTitle");
+    text->setSpacing(2);
+    title_ = label(this, "toastTitle");
     text->addWidget(title_);
-    body_ = new QLabel(this);
-    body_->setObjectName("toastBody");
-    body_->setWordWrap(true);
+    body_ = label(this, "toastBody", true);
     text->addWidget(body_);
-    summary->addLayout(text, 1);
-    layout->addLayout(summary);
-    layout->addSpacing(12);
+    text->addStretch();
+    head->addLayout(text, 1);
+    layout->addLayout(head);
 
-    auto *signature = new QHBoxLayout;
-    signature->setSpacing(7);
-    signatureMark_ = new QLabel(this);
-    signatureMark_->setFixedSize(8, 8);
-    signature->addWidget(signatureMark_);
+    // Recuadros de aviso: sin firma (ámbar) y modo por destino (azul).
+    // El margen va en un contenedor que se oculta entero: un layout suelto con el recuadro oculto dejaría su margen.
+    const auto noteBox = [this, layout](const char *name, QLabel *&note, Qt::TextFormat format) {
+        auto *holder = new QWidget(this);
+        auto *wrap = new QHBoxLayout(holder);
+        wrap->setContentsMargins(Pad, 0, Pad, 8);
+        auto *box = new QWidget(holder);
+        box->setObjectName(name);
+        box->setAttribute(Qt::WA_StyledBackground);
+        auto *inner = new QVBoxLayout(box);
+        inner->setContentsMargins(NoteInset, 7, NoteInset, 7);
+        note = new QLabel(box);
+        note->setWordWrap(true);
+        note->setTextFormat(format);
+        inner->addWidget(note);
+        wrap->addWidget(box);
+        layout->addWidget(holder);
+        return holder;
+    };
+    warnBox_ = noteBox("toastWarn", warn_, Qt::PlainText);
+    warn_->setText("No signature: a rule can only cover this exact file. If the file changes, it asks again.");
+    infoBox_ = noteBox("toastInfo", info_, Qt::RichText);
+    info_->setText("Allow or Block applies to this server only. Choose <b>Any destination (whole app)</b> in the menu "
+                   "to replace its server rules.");
+
+    // Datos en grilla: firma, a dónde quería ir y quién la lanzó.
+    auto *line = new QWidget(this);
+    line->setObjectName("toastLine");
+    line->setAttribute(Qt::WA_StyledBackground);
+    line->setFixedHeight(1);
+    auto *lineRow = new QHBoxLayout;
+    lineRow->setContentsMargins(Pad, 0, Pad, 0);
+    lineRow->addWidget(line);
+    layout->addLayout(lineRow);
+    auto *facts = new QGridLayout;
+    facts->setContentsMargins(Pad, 9, Pad, 10);
+    facts->setHorizontalSpacing(ColumnGap);
+    facts->setVerticalSpacing(6);
+    facts->setColumnMinimumWidth(0, KeyColumn);
+    const auto key = [this](const QString &text) {
+        auto *k = label(this, "toastKey");
+        k->setText(text);
+        k->setFixedWidth(KeyColumn);
+        return k;
+    };
+    facts->addWidget(key("Signature"), 0, 0, Qt::AlignTop);
     signature_ = new QLabel(this);
-    signature_->setObjectName("toastSignature");
-    signature->addWidget(signature_, 1);
-    layout->addLayout(signature);
-    layout->addSpacing(2);
-    path_ = new QLabel(this);
-    path_->setObjectName("toastPath");
-    layout->addWidget(path_);
-    layout->addSpacing(8);
-    // A dónde quería conectarse: el nombre que resolvió la app (si se sabe), la dirección y si sale a internet.
-    destination_ = new QLabel(this);
-    destination_->setObjectName("toastSignature");
-    destination_->setTextFormat(Qt::PlainText);
-    layout->addWidget(destination_);
-    layout->addSpacing(2);
-    destinationDetail_ = new QLabel(this);
-    destinationDetail_->setObjectName("toastPath");
-    destinationDetail_->setTextFormat(Qt::PlainText);
-    layout->addWidget(destinationDetail_);
-    layout->addSpacing(10);
-    // Catálogo de apps conocidas: al instante, sin pedir nada a nadie. Como la explicación, sólo ayuda a decidir.
-    known_ = new QLabel(this);
-    known_->setObjectName("toastSignature");
-    known_->setTextFormat(Qt::PlainText);
-    known_->setWordWrap(true);
-    known_->setFixedWidth(Width - 32);
-    known_->setAlignment(Qt::AlignLeft | Qt::AlignTop);
-    layout->addWidget(known_);
+    signature_->setObjectName("toastValue");
+    signature_->setWordWrap(true);
+    signature_->setTextFormat(Qt::RichText);
+    facts->addWidget(signature_, 0, 1, Qt::AlignTop);
+    wantsKey_ = key("Wants");
+    facts->addWidget(wantsKey_, 1, 0, Qt::AlignTop);
+    auto *wants = new QVBoxLayout;
+    wants->setSpacing(0);
+    destination_ = label(this, "toastValue");
+    wants->addWidget(destination_);
+    destinationDetail_ = label(this, "toastValueDetail");
+    wants->addWidget(destinationDetail_);
+    facts->addLayout(wants, 1, 1, Qt::AlignTop);
+    launchedKey_ = key("Started by");
+    facts->addWidget(launchedKey_, 2, 0, Qt::AlignTop);
+    launched_ = label(this, "toastValue");
+    facts->addWidget(launched_, 2, 1, Qt::AlignTop);
+    facts->setColumnStretch(1, 1);
+    layout->addLayout(facts);
 
-    // Explicación con IA. El enlace la pide; la respuesta va en un recuadro aparte y nunca toca la decisión.
-    explainAction_ = new QPushButton(this);
-    explainAction_->setObjectName("toastExplain");
-    explainAction_->setCursor(Qt::PointingHandCursor);
-    explainAction_->setFlat(true);
-    layout->addWidget(explainAction_, 0, Qt::AlignLeft);
-    explainStatus_ = new QLabel(this);
-    explainStatus_->setObjectName("toastExplainStatus");
-    explainStatus_->setWordWrap(true);
-    explainStatus_->setFixedWidth(Width - 32);
-    explainStatus_->setTextFormat(Qt::PlainText);
-    layout->addWidget(explainStatus_);
+    // Catálogo de apps conocidas: al instante, sin pedir nada a nadie. Como la explicación, sólo ayuda a decidir.
+    knownBox_ = new QWidget(this);
+    auto *known = new QVBoxLayout(knownBox_);
+    known->setContentsMargins(Pad, 0, Pad, 8);
+    known->setSpacing(5);
+    knownPill_ = label(knownBox_, "toastKnownPill");
+    knownPill_->setFixedHeight(21);
+    known->addWidget(knownPill_, 0, Qt::AlignLeft);
+    knownText_ = label(knownBox_, "toastKnownText", true);
+    known->addWidget(knownText_);
+    layout->addWidget(knownBox_);
+
+    // Tarjeta de la explicación con IA. Nunca toca la decisión: ningún botón se resalta por la sugerencia.
     explainBox_ = new QWidget(this);
     explainBox_->setObjectName("toastExplainBox");
     explainBox_->setAttribute(Qt::WA_StyledBackground);
-    auto *box = new QVBoxLayout(explainBox_);
-    box->setContentsMargins(11, 9, 11, 9);
-    box->setSpacing(6);
-    for (auto **label : {&what_, &why_, &risk_, &suggestion_, &explainFoot_}) {
-        *label = new QLabel(explainBox_);
-        (*label)->setWordWrap(true);
-        // La respuesta del modelo es texto no confiable: siempre plano, nunca HTML ni enlaces.
-        (*label)->setTextFormat(Qt::PlainText);
-        // Ancho fijo: así el alto de cada párrafo se calcula bien y el recuadro no corta el texto.
-        (*label)->setFixedWidth(Width - 32 - 22);
-        box->addWidget(*label);
+    auto *card = new QVBoxLayout(explainBox_);
+    card->setContentsMargins(CardInset, 10, CardInset, 10);
+    card->setSpacing(0);
+    auto *cardRow = new QHBoxLayout;
+    cardRow->setSpacing(8);
+    spinner_ = new Spinner(explainBox_);
+    spinner_->setFixedSize(13, 13);
+    cardRow->addWidget(spinner_);
+    explainStatus_ = label(explainBox_, "toastExplainStatus");
+    cardRow->addWidget(explainStatus_);
+    suggestion_ = label(explainBox_, "toastSuggestion");
+    suggestion_->setFixedHeight(21);
+    cardRow->addWidget(suggestion_);
+    cardRow->addStretch(1);
+    details_ = link(explainBox_, "toastDetails", "Details");
+    cardRow->addWidget(details_);
+    settingsLink_ = link(explainBox_, "toastSettings", "Set up in Settings");
+    cardRow->addWidget(settingsLink_);
+    explainAction_ = new QPushButton(explainBox_);
+    explainAction_->setObjectName("toastExplain");
+    explainAction_->setCursor(Qt::PointingHandCursor);
+    cardRow->addWidget(explainAction_);
+    card->addLayout(cardRow);
+    // Las separaciones van como margen de cada texto (y no como espaciadores): así desaparecen con el texto oculto.
+    what_ = label(explainBox_, "toastWhat", true);
+    what_->setContentsMargins(0, 7, 0, 0);
+    card->addWidget(what_);
+    more_ = new QWidget(explainBox_);
+    auto *moreLayout = new QVBoxLayout(more_);
+    moreLayout->setContentsMargins(0, 8, 0, 0);
+    moreLayout->setSpacing(0);
+    auto *moreLine = new QWidget(more_);
+    moreLine->setObjectName("toastMoreLine");
+    moreLine->setAttribute(Qt::WA_StyledBackground);
+    moreLine->setFixedHeight(1);
+    moreLayout->addWidget(moreLine);
+    moreLayout->addSpacing(8);
+    // La respuesta del modelo es texto no confiable: siempre plano, nunca HTML ni enlaces.
+    const auto section = [this, moreLayout](const QString &title, QLabel *&head, QLabel *&body, bool last) {
+        head = label(more_, "toastMoreHead");
+        head->setText(title);
+        moreLayout->addWidget(head);
+        moreLayout->addSpacing(1);
+        body = label(more_, "toastMoreBody", true);
+        moreLayout->addWidget(body);
+        if (!last) moreLayout->addSpacing(7);
+    };
+    section("WHY IT CONNECTS", whyHead_, why_, false);
+    section("WHY THIS SUGGESTION", reasonHead_, reason_, false);
+    section("IS IT GENUINE", riskHead_, risk_, true);
+    for (auto *h : {whyHead_, reasonHead_, riskHead_}) {
+        QFont f = h->font();
+        f.setLetterSpacing(QFont::PercentageSpacing, 104);
+        h->setFont(f);
     }
-    what_->setObjectName("toastWhat");
-    why_->setObjectName("toastWhy");
-    risk_->setObjectName("toastRisk");
-    suggestion_->setObjectName("toastSuggestion");
-    explainFoot_->setObjectName("toastExplainFoot");
-    layout->addWidget(explainBox_);
-    dots_ = new QTimer(this);
-    dots_->setInterval(450);
-    connect(dots_, &QTimer::timeout, this, [this] {
-        dotCount_ = (dotCount_ + 1) % 4;
-        explainStatus_->setText(asking() + QString(dotCount_, QChar('.')));
+    card->addWidget(more_);
+    explainFoot_ = label(explainBox_, "toastExplainFoot", true);
+    explainFoot_->setContentsMargins(0, 8, 0, 0);
+    card->addWidget(explainFoot_);
+    auto *cardWrap = new QHBoxLayout;
+    cardWrap->setContentsMargins(CardPad, 0, CardPad, 0);
+    cardWrap->addWidget(explainBox_);
+    layout->addLayout(cardWrap);
+    spin_ = new QTimer(this);
+    spin_->setInterval(40);
+    connect(spin_, &QTimer::timeout, this, [this] {
+        auto *spinner = static_cast<Spinner *>(spinner_);
+        spinner->angle = (spinner->angle + 24) % 360;
+        spinner->update();
     });
     connect(explainAction_, &QPushButton::clicked, this, [this] {
         if (explanation_.state == Explanation::NoKey) emit settingsRequested();
         else emit explainRequested(request_.id);
     });
-    layout->addSpacing(12);
+    connect(settingsLink_, &QPushButton::clicked, this, [this] { emit settingsRequested(); });
+    connect(details_, &QPushButton::clicked, this, [this] {
+        detailsOpen_ = !detailsOpen_;
+        renderExplanation();
+        relayout();
+    });
 
-    auto *choices = new QHBoxLayout;
-    choices->setSpacing(10);
-    auto *scopeColumn = new QVBoxLayout;
-    scopeColumn->setSpacing(7);
-    scopeColumn->addWidget(new QLabel("Apply to", this));
-    scope_ = new ScopeCombo(this);
+    // Regla: los tres desplegables en una fila que se parte en dos si no entra; el primero se estira.
+    auto *rule = new QVBoxLayout;
+    rule->setContentsMargins(Pad, 10, Pad, 0);
+    rule->setSpacing(4);
+    auto *ruleLabel = label(this, "toastRuleLabel");
+    ruleLabel->setText("Rule");
+    rule->addWidget(ruleLabel);
+    choices_ = new QWidget(this);
+    rule->addWidget(choices_);
+    layout->addLayout(rule);
+    scope_ = new ScopeCombo(choices_);
     scope_->setObjectName("toastScope");
     scope_->setAccessibleName("Apply to");
-    scopeColumn->addWidget(scope_);
-    choices->addLayout(scopeColumn, 1);
-    auto *durationColumn = new QVBoxLayout;
-    durationColumn->setSpacing(7);
-    durationColumn->addWidget(new QLabel("For", this));
-    duration_ = new ScopeCombo(this);
+    duration_ = new ScopeCombo(choices_);
     duration_->setObjectName("toastDuration");
     duration_->setAccessibleName("For");
-    duration_->setFixedWidth(120);
     duration_->addItem("Always", "always");
     for (const int minutes : {1, 5, 10, 15, 30})
         duration_->addItem(minutes == 1 ? QStringLiteral("1 minute") : QString("%1 minutes").arg(minutes),
                            QString::number(minutes * 60));
     duration_->addItem("1 hour", "3600");
     duration_->addItem("Until restart", "restart");
-    durationColumn->addWidget(duration_);
-    choices->addLayout(durationColumn);
-    layout->addLayout(choices);
-    // Destino: la app entera o sólo el servidor al que quería ir. Elegir un destino pasa la app a modo por destino.
-    layout->addSpacing(10);
-    layout->addWidget(new QLabel("Destination", this));
-    layout->addSpacing(7);
-    target_ = new ScopeCombo(this);
+    target_ = new ScopeCombo(choices_);
     target_->setObjectName("toastTarget");
     target_->setAccessibleName("Destination");
-    layout->addWidget(target_);
+    for (auto *combo : {scope_, duration_, target_}) {
+        // Con el delegado común la lista toma el estilo de cada fila de la hoja de estilo.
+        combo->setItemDelegate(new QStyledItemDelegate(combo));
+        combo->installEventFilter(this);
+        // El chip cambia de ancho con lo elegido.
+        connect(combo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+            if (request_.id.isEmpty()) return;
+            layoutChoices();
+        });
+    }
     connect(target_, qOverload<int>(&QComboBox::activated), this, [this] { targetChosen_ = true; });
-    for (auto *combo : {scope_, duration_, target_}) combo->installEventFilter(this);
     duration_->view()->window()->installEventFilter(this);
     connect(duration_, qOverload<int>(&QComboBox::activated), this,
             [this](int index) { trace(QString("toastDuration elegido=%1").arg(duration_->itemText(index))); });
     connect(duration_, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int index) { trace(QString("toastDuration ahora=%1").arg(duration_->itemText(index))); });
-    note_ = new QLabel("Unsigned apps can only get a rule for this exact file.", this);
-    note_->setObjectName("toastNote");
-    note_->setWordWrap(true);
-    layout->addSpacing(6);
-    layout->addWidget(note_);
-    layout->addSpacing(14);
 
+    // Block y Allow con el mismo peso.
     auto *buttons = new QHBoxLayout;
-    buttons->setSpacing(10);
+    buttons->setContentsMargins(Pad, 10, Pad, 0);
+    buttons->setSpacing(8);
     block_ = new QPushButton("Block", this);
     block_->setObjectName("toastBlock");
     allow_ = new QPushButton("Allow", this);
     allow_->setObjectName("toastAllow");
-    buttons->addWidget(block_);
-    buttons->addWidget(allow_);
+    // Alto 34: la hoja de estilo fija 32 de contenido más el borde (min-height no cuenta el borde, y un alto fijo en
+    // código lo pisa la hoja global de la app).
+    buttons->addWidget(block_, 1);
+    buttons->addWidget(allow_, 1);
     layout->addLayout(buttons);
-    layout->addSpacing(10);
     for (auto *b : {block_, allow_})
         connect(b, &QPushButton::clicked, this, [this, allowed = b == allow_] {
             emit decided(request_.id, allowed, scope_->currentData().toString(), duration_->currentData().toString(),
@@ -386,12 +560,11 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
         });
 
     auto *foot = new QHBoxLayout;
-    footer_ = new QLabel(this);
-    footer_->setObjectName("toastFooter");
+    foot->setContentsMargins(Pad, 9, Pad, 11);
+    foot->setSpacing(6);
+    footer_ = label(this, "toastFooter");
     foot->addWidget(footer_, 1);
-    auto *open = new QPushButton("Open GateBouncer", this);
-    open->setObjectName("toastOpen");
-    open->setCursor(Qt::PointingHandCursor);
+    auto *open = link(this, "toastOpen", "Open GateBouncer");
     foot->addWidget(open);
     connect(open, &QPushButton::clicked, this, [this] { emit openRequested(); });
     layout->addLayout(foot);
@@ -407,22 +580,15 @@ void AccessToast::setRequest(const Request &request) {
     if (!samePath) trace("pedido nuevo: " + request.id + " firma=" + request.signer);
     if (!samePath) {
         const QFileInfo file(request.path);
-        title_->setText(file.fileName() + " was blocked");
-        body_->setText(request.perDestination
-                           ? "This app asks per destination and this one is new. If you allow it, the next attempt "
-                             "connects."
-                           : "Its first attempt to connect was blocked. If you allow it, the next attempt connects.");
         QIcon appIcon = QFileIconProvider().icon(file);
         if (appIcon.isNull()) appIcon = QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png");
-        icon_->setPixmap(appIcon.pixmap(48, 48));
-        const bool signedApp = !request.signer.isEmpty();
-        signature_->setText(signedApp ? request.signer + " · valid signature" : QString("No valid signature"));
-        signatureMark_->setPixmap(dot(signedApp ? QColor("#8fcf6a") : QColor("#e8b46f")));
+        icon_->setPixmap(appIcon.pixmap(IconSize, IconSize));
         rebuildScopes();
         targetChosen_ = false;
         rebuildTargets();
         duration_->setCurrentIndex(0);
         explanation_ = {};
+        detailsOpen_ = false;
         renderExplanation();
         armed_ = false;
         QTimer::singleShot(600, this, [this, id = request.id] {
@@ -433,14 +599,19 @@ void AccessToast::setRequest(const Request &request) {
     } else if (newHost) {
         rebuildTargets();
     }
-    // Fuera del bloque anterior: un intento nuevo de la misma app puede ir a otro destino.
-    renderDestination();
-    known_->setText(request.known);
-    known_->setVisible(!request.known.isEmpty());
-    known_->ensurePolished();
-    known_->setFixedHeight(request.known.isEmpty() ? 0 : known_->heightForWidth(known_->width()) + 6);
+    const QString exe = QFileInfo(request.path).fileName();
+    body_->setText(!request.perDestination ? QStringLiteral("Blocked. Allow lets its next attempt connect.")
+                   : request.serverRules > 0
+                       ? QString("Blocked: a new server. %1 already has rules for %2 %3.")
+                             .arg(exe)
+                             .arg(request.serverRules)
+                             .arg(request.serverRules == 1 ? "server" : "servers")
+                       : QString("Blocked: a new server for %1.").arg(exe));
+    infoBox_->setVisible(request.perDestination);
+    renderKnown();
     updateCounters();
-    adjustSize();
+    // Fuera del bloque anterior: un intento nuevo de la misma app puede ir a otro destino (relayout lo dibuja).
+    relayout();
 }
 
 void AccessToast::rebuildTargets() {
@@ -469,26 +640,60 @@ void AccessToast::rebuildTargets() {
     target_->setEnabled(target_->count() > 1);
 }
 
+// Firma, destino y quién la lanzó, recortados al ancho actual.
 void AccessToast::renderDestination() {
+    const int value = width_ - 2 * Pad - KeyColumn - ColumnGap;
+    const QString full = QDir::toNativeSeparators(request_.path);
+    // La carpeta corta, recortada al medio si no entra en un renglón; la ruta entera va en el tooltip.
+    QFont small = signature_->font();
+    small.setPointSizeF(8.625);
+    const QString folder = QFontMetrics(small).elidedText(shortFolder(request_.path), Qt::ElideMiddle, value);
+    const QString place = folder.isEmpty() ? QString()
+                                           : QString(" <span style=\"color:#7c7c7c; font-size:8.625pt\">· %1</span>")
+                                                 .arg(folder.toHtmlEscaped());
+    signature_->setText(request_.signer.isEmpty()
+                            ? "<span style=\"color:#d4a437\">None</span>" + place
+                            : "<span style=\"color:#9bbf73\">&#10003;</span> " + request_.signer.toHtmlEscaped() +
+                                  place);
+    signature_->setToolTip(full);
+    fit(signature_, value);
+
     const QString kind = FirewallClient::destinationKind(request_.remote);
     const bool known = !kind.isEmpty();
+    wantsKey_->setVisible(known);
     destination_->setVisible(known);
     destinationDetail_->setVisible(known);
-    path_->setText(elideMiddle(path_, QDir::toNativeSeparators(request_.path), width_ - 32));
-    // La ruta entera sólo cuando no entra: el texto visible ya la muestra si es corta.
-    path_->setToolTip(path_->text() != QDir::toNativeSeparators(request_.path) ? QDir::toNativeSeparators(request_.path)
-                                                                                : QString());
-    if (!known) return;
-    const QString target = request_.host.isEmpty() ? request_.remote : request_.host;
-    destination_->setText(elideMiddle(destination_, "To " + target + " · " + kind, width_ - 32));
-    // El destino entero sólo cuando el texto visible quedó recortado.
-    destination_->setToolTip(destination_->text().contains(QChar(0x2026)) ? target : QString());
-    const QString port = request_.port ? FirewallClient::protocolName(request_.protocol) + " " +
-                                             QString::number(request_.port)
-                                       : FirewallClient::protocolName(request_.protocol);
-    // Sin nombre: la app se conectó directo a la IP o resolvió por su cuenta, y eso también es un dato.
-    destinationDetail_->setText(request_.host.isEmpty() ? "No server name seen · " + port
-                                                        : request_.remote + " · " + port);
+    if (known) {
+        destination_->setFixedWidth(value);
+        destinationDetail_->setFixedWidth(value);
+        elide(destination_, request_.host.isEmpty() ? request_.remote : request_.host, value);
+        const QString port = request_.port ? FirewallClient::protocolName(request_.protocol) + " " +
+                                                 QString::number(request_.port)
+                                           : FirewallClient::protocolName(request_.protocol);
+        // Sin nombre: la app se conectó directo a la IP o resolvió por su cuenta, y eso también es un dato.
+        elide(destinationDetail_,
+              kind + (request_.host.isEmpty() ? QStringLiteral(" · no server name seen") : QString()) + " · " + port,
+              value, Qt::ElideRight);
+    }
+    const bool launched = !request_.launchedBy.isEmpty();
+    launchedKey_->setVisible(launched);
+    launched_->setVisible(launched);
+    if (launched) {
+        launched_->setFixedWidth(value);
+        elide(launched_, request_.launchedBy, value, Qt::ElideRight);
+    }
+}
+
+// «Known app · usually Block · qué es»: la primera parte va en la píldora y el resto como texto debajo.
+void AccessToast::renderKnown() {
+    const QString text = request_.known;
+    knownBox_->setVisible(!text.isEmpty());
+    if (text.isEmpty()) return;
+    const QStringList parts = text.split(" · ");
+    const int head = qMin(2, int(parts.size()));
+    knownPill_->setProperty("full", QStringList(parts.mid(0, head)).join(" · "));
+    knownText_->setText(QStringList(parts.mid(head)).join(" · "));
+    knownText_->setVisible(!knownText_->text().isEmpty());
 }
 
 void AccessToast::rebuildScopes() {
@@ -504,7 +709,7 @@ void AccessToast::rebuildScopes() {
     }
     scope_->setCurrentIndex(0);
     scope_->setEnabled(scope_->count() > 1);
-    note_->setVisible(signer.isEmpty());
+    warnBox_->setVisible(signer.isEmpty());
 }
 
 void AccessToast::updateCounters() {
@@ -514,7 +719,8 @@ void AccessToast::updateCounters() {
     duration_->setEnabled(request_.canDecide && armed_);
     target_->setEnabled(request_.canDecide && armed_ && target_->count() > 1);
     QStringList parts;
-    if (request_.attempts > 1) parts << QString("%1 attempts").arg(request_.attempts);
+    if (request_.attempts > 0)
+        parts << (request_.attempts == 1 ? QStringLiteral("1 attempt") : QString("%1 attempts").arg(request_.attempts));
     if (request_.othersWaiting > 0) parts << QString("%1 more waiting").arg(request_.othersWaiting);
     if (!request_.canDecide) parts << "read only";
     footer_->setText(parts.join(" · "));
@@ -522,49 +728,127 @@ void AccessToast::updateCounters() {
 
 void AccessToast::setExplanation(const QString &id, const Explanation &explanation) {
     if (id.compare(request_.id, Qt::CaseInsensitive) != 0) return;
+    // Una respuesta nueva arranca con los detalles cerrados; la misma que vuelve a llegar conserva lo abierto.
+    if (explanation.state != Explanation::Ready || explanation_.state != Explanation::Ready ||
+        explanation.what != explanation_.what)
+        detailsOpen_ = false;
     explanation_ = explanation;
     renderExplanation();
     // Crece hacia arriba desde su esquina de abajo (resizeEvent): los botones nunca quedan bajo la barra de tareas.
-    if (layout()) layout()->activate();
-    adjustSize();
+    relayout();
 }
 
 void AccessToast::renderExplanation() {
     const auto &e = explanation_;
-    const bool working = e.state == Explanation::Working;
-    working ? dots_->start() : dots_->stop();
-    explainAction_->setVisible(e.state != Explanation::Working && e.state != Explanation::Ready);
-    explainAction_->setText(e.state == Explanation::NoKey   ? "Set up AI explanations in Settings"
-                            : e.state == Explanation::Failed ? "Try again"
-                                                             : "What is this? Ask AI");
-    explainStatus_->setVisible(working || e.state == Explanation::Failed);
-    if (working) explainStatus_->setText(asking());
-    else if (e.state == Explanation::Failed) explainStatus_->setText(e.error);
-    explainBox_->setVisible(e.state == Explanation::Ready);
-    if (e.state != Explanation::Ready) return;
-    what_->setText(e.what);
+    const bool working = e.state == Explanation::Working, ready = e.state == Explanation::Ready;
+    working ? spin_->start() : spin_->stop();
+    spinner_->setVisible(working);
+    restyle(explainBox_, "tone",
+            e.state == Explanation::Failed                                 ? QStringLiteral("err")
+            : e.state == Explanation::Offer || e.state == Explanation::NoKey ? QStringLiteral("quiet")
+                                                                             : QString());
+    explainStatus_->setVisible(!ready);
+    restyle(explainStatus_, "tone",
+            working ? QStringLiteral("working") : e.state == Explanation::Failed ? QStringLiteral("err") : QString());
+    const QString model = modelName(e.model.isEmpty() ? Explain::Settings::load().model : e.model);
+    explainStatus_->setText(working ? "Asking " + (model.isEmpty() ? QStringLiteral("the AI") : model) +
+                                          " what this is" + QChar(0x2026)
+                            : e.state == Explanation::NoKey  ? QStringLiteral("Explanations are off.")
+                            : e.state == Explanation::Failed ? QStringLiteral("The explanation did not arrive.")
+                                                             : QStringLiteral("What is this program?"));
+    settingsLink_->setVisible(e.state == Explanation::NoKey);
+    explainAction_->setVisible(e.state == Explanation::Offer || e.state == Explanation::Failed);
+    explainAction_->setText(e.state == Explanation::Failed ? "Try again" : "Ask AI");
+
+    suggestion_->setVisible(ready);
+    restyle(suggestion_, "kind", e.suggestion == "block" || e.suggestion == "allow" ? e.suggestion : QString());
+    suggestion_->setText(e.suggestion == "block"   ? QStringLiteral("AI suggests Block")
+                         : e.suggestion == "allow" ? QStringLiteral("AI suggests Allow")
+                                                   : QStringLiteral("AI: your call"));
+    const bool hasMore = ready && !(e.why.isEmpty() && e.reason.isEmpty() && e.risk.isEmpty());
+    details_->setVisible(hasMore);
+    details_->setText(detailsOpen_ ? "Less" : "Details");
+    what_->setText(ready ? e.what : QString());
+    what_->setVisible(ready && !e.what.isEmpty());
+    more_->setVisible(hasMore && detailsOpen_);
     why_->setText(e.why);
-    why_->setVisible(!e.why.isEmpty());
+    reason_->setText(e.reason);
     risk_->setText(e.risk);
-    risk_->setVisible(!e.risk.isEmpty());
-    // Los rótulos del recuadro van en el idioma de la explicación, para que no quede mitad en cada idioma. Allow y
-    // Block quedan como en los botones.
-    const bool es = Explain::Settings::load().language == "es";
-    const QString lead = es ? "Sugerencia: " : "Suggestion: ";
-    const QString verdict = lead + (e.suggestion == "allow"   ? QStringLiteral("Allow")
-                                    : e.suggestion == "block" ? QStringLiteral("Block")
-                                    : es                      ? QStringLiteral("a tu criterio")
-                                                              : QStringLiteral("Your call"));
-    suggestion_->setText(e.reason.isEmpty() ? verdict : verdict + " · " + e.reason);
-    explainFoot_->setText(es ? "Explicación con IA · " + e.model.section('/', -1) +
-                                   " · puede equivocarse y nunca decide por vos"
-                             : "AI explanation · " + e.model.section('/', -1) +
-                                   " · it can be wrong and never decides for you");
-    // El alto de cada párrafo se fija con la fuente ya aplicada: el recuadro estaba oculto y no se había calculado.
-    for (auto *label : {what_, why_, risk_, suggestion_, explainFoot_}) {
-        label->ensurePolished();
-        label->setFixedHeight(label->heightForWidth(label->width()));
+    for (auto [head, body] : {std::pair{whyHead_, why_}, std::pair{reasonHead_, reason_}, std::pair{riskHead_, risk_}}) {
+        head->setVisible(!body->text().isEmpty());
+        body->setVisible(!body->text().isEmpty());
     }
+    // Los rótulos van en inglés como el resto de la interfaz; el contenido llega en el idioma elegido en Settings.
+    const QString foot = ready     ? "AI explanation · " + modelName(e.model) + " · may be wrong"
+                         : working ? QStringLiteral("You can decide now; the answer never holds the notice.")
+                         : e.state == Explanation::Failed ? e.error
+                         : e.state == Explanation::Offer && !Explain::Settings::load().automatic
+                             ? QStringLiteral("Automatic explanations are off.")
+                             : QString();
+    explainFoot_->setText(foot);
+    explainFoot_->setVisible(!foot.isEmpty());
+}
+
+void AccessToast::layoutChoices() {
+    const int avail = width_ - 2 * Pad;
+    QList<QComboBox *> combos{scope_, duration_, target_};
+    QList<QRect> rects;
+    int x = 0, y = 0;
+    for (auto *combo : combos) {
+        const int w = qMin(static_cast<ScopeCombo *>(combo)->chipWidth(), avail);
+        if (x > 0 && x + w > avail) {
+            x = 0;
+            y += ChipHeight + ChipGap;
+        }
+        rects << QRect(x, y, w, ChipHeight);
+        x += w + ChipGap;
+    }
+    // El primero se estira hasta llenar su renglón; los que comparten ese renglón quedan a la derecha.
+    int lastInFirst = 0;
+    while (lastInFirst + 1 < rects.size() && rects[lastInFirst + 1].y() == 0) ++lastInFirst;
+    const int extra = avail - (rects[lastInFirst].right() + 1);
+    if (extra > 0) {
+        rects[0].setWidth(rects[0].width() + extra);
+        for (int i = 1; i <= lastInFirst; ++i) rects[i].translate(extra, 0);
+    }
+    for (int i = 0; i < combos.size(); ++i) combos[i]->setGeometry(rects[i]);
+    choices_->setFixedSize(avail, rects.last().bottom() + 1);
+}
+
+void AccessToast::relayout() {
+    const int section = width_ - 2 * Pad;
+    const int card = width_ - 2 * CardPad - 2 - 2 * CardInset;
+    const QString exe = QFileInfo(request_.path).fileName();
+    title_->setFixedWidth(section - IconSize - IconGap);
+    elide(title_, exe, title_->width());
+    fit(body_, section - IconSize - IconGap);
+    fit(warn_, section - 2 - 2 * NoteInset);
+    fit(info_, section - 2 - 2 * NoteInset);
+    renderDestination();
+    if (knownBox_->isVisibleTo(this)) {
+        elide(knownPill_, knownPill_->property("full").toString(), section - 18, Qt::ElideRight);
+        knownPill_->setFixedWidth(knownPill_->sizeHint().width());
+        fit(knownText_, section);
+    }
+    for (auto *l : {what_, why_, reason_, risk_, explainFoot_}) fit(l, card);
+    for (auto *l : {whyHead_, reasonHead_, riskHead_}) l->setFixedWidth(card);
+    // La píldora y el estado van en una sola línea con su enlace o botón a la derecha.
+    suggestion_->setFixedWidth(suggestion_->sizeHint().width());
+    layoutChoices();
+    // Los recuadros internos recalculan su layout recién en el próximo ciclo de eventos: se fuerza ya, de adentro
+    // hacia afuera, para que el alto que sigue (también al achicarse con «Less») sea el nuevo.
+    const auto boxes = findChildren<QWidget *>();
+    for (auto it = boxes.crbegin(); it != boxes.crend(); ++it) {
+        if (!(*it)->layout()) continue;
+        (*it)->layout()->invalidate();
+        (*it)->layout()->activate();
+        (*it)->updateGeometry();
+    }
+    if (layout()) {
+        layout()->invalidate();
+        layout()->activate();
+    }
+    adjustSize();
 }
 
 void AccessToast::placeOn(QScreen *screen) {
@@ -589,13 +873,7 @@ void AccessToast::placeOn(QScreen *screen) {
 void AccessToast::applyWidth(int width) {
     width_ = qBound(Width, width, MaxWidth);
     setFixedWidth(width_);
-    explainStatus_->setFixedWidth(width_ - 32);
-    known_->setFixedWidth(width_ - 32);
-    if (!known_->text().isEmpty()) known_->setFixedHeight(known_->heightForWidth(width_ - 32) + 6);
-    for (auto *label : {what_, why_, risk_, suggestion_, explainFoot_}) label->setFixedWidth(width_ - 32 - 22);
-    renderDestination();
-    if (explanation_.state == Explanation::Ready) renderExplanation();
-    if (layout()) layout()->activate();
+    relayout();
 }
 
 void AccessToast::keepInside() {
@@ -693,12 +971,9 @@ void AccessToast::paintEvent(QPaintEvent *) {
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     QPainterPath path;
-    path.addRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 8, 8);
-    QLinearGradient fill(0, 0, 0, height());
-    fill.setColorAt(0, QColor("#252323"));
-    fill.setColorAt(1, QColor("#202020"));
-    painter.fillPath(path, fill);
-    painter.setPen(QColor("#363636"));
+    path.addRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10);
+    painter.fillPath(path, QColor("#1b1b1b"));
+    painter.setPen(QColor("#333333"));
     painter.drawPath(path);
 }
 

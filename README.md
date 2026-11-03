@@ -13,12 +13,17 @@ See the one-page [Roadmap](Roadmap.md) for verified and pending work, and the [d
 
 ## The window
 
-In **Live** mode, the Processes, Pending, Activity and Rules views read the engine:
+The window reads the engine and has five sections; the sidebar shows the state of each one at a glance.
 
-- **Processes** lists running applications and every application with a rule or a request, with its policy.
-- **Pending** lists blocked applications waiting for a decision. A new request also shows a notice in the bottom-right
-  corner of the screen, even when the window is hidden in the tray. It stays until you choose Allow or Block, and it
-  does not take focus. Closing it keeps the application blocked and pending.
+- **Protection** says whether GateBouncer is protecting the PC, lists the applications waiting for you with Block and
+  Allow, and sums up your rules and what was blocked recently. Block and Allow there use the choices the notice would
+  preselect; open the request to choose another.
+- **Requests** lists blocked applications waiting for a decision, each with its signature, folder, attempts, the server
+  it wanted, the program that started it and the AI explanation, next to the same **Apply to**, **For** and
+  **Destination** choices as the notice.
+- A new request also shows a notice in the bottom-right corner of the screen, even when the window is hidden in the
+  tray. It stays until you choose Allow or Block, and it does not take focus. Closing it keeps the application blocked
+  and pending.
 - The notice shows where the application tried to connect: the server name it looked up just before (when Windows
   resolved it), the address and port, and whether that is the **Internet**, your **Local network** or **Tailscale**.
   No name means the application connected straight to an address or resolved it on its own.
@@ -37,21 +42,20 @@ In **Live** mode, the Processes, Pending, Activity and Rules views read the engi
   stays above the taskbar, even when an explanation makes it taller.
 - The notice's **For** list makes the decision temporary: 1, 5, 10, 15 or 30 minutes, 1 hour, or until the engine
   restarts. When it expires the rule is removed and the application asks again.
-- **What is this? Ask AI** on the notice asks an AI model (Anthropic's Claude or NVIDIA's catalog, with your own API
+- **Ask AI** on the notice (or automatically, if you choose so in Settings) asks an AI model (Anthropic's Claude or NVIDIA's catalog, with your own API
   key) what the application is, why it connects and what you gain or lose by allowing it. The answer only helps you decide: it never allows or blocks
   anything and it can be wrong. See [AI explanations](docs/Explanations.md) for exactly what is sent.
-- **Activity** shows blocked attempts and rule changes recorded by the engine. Allowed connections are not recorded.
-- **Rules** lists saved Allow and Block rules, including rules for an app in any version, for a whole publisher or for
-  one destination, and
-  how long a temporary rule has left. You can change or remove a rule.
-- **Import** reads NetLimiter's settings file (`nl_settings.xml`) and turns its firewall rules for single applications
-  into GateBouncer rules. Rules limited to addresses, ports, zones or schedules, Ask rules and incoming-only rules are
-  listed with the reason and not imported.
+- **Apps** lists every application with a rule: for one file, for an app in any version, for a whole publisher, or
+  per server. Filters show Allow, Block, per-server and temporary rules, and the applications running in your session
+  without a rule. An app's page shows its rule, or each of its server rules, and lets you remove them.
+- **Activity** shows blocked attempts and decisions recorded by the engine since it started; repeated attempts by the
+  same application to the same address are counted on one line. Allowed connections are not recorded.
 - **Settings** switches between asking for unknown applications and letting them connect, sets whether the local
-  network asks, and holds the AI
-  explanation setup: the key, what is sent, the model, the language and whether notices ask automatically.
-
-A separate **Simulation** mode shows the views with synthetic data that stays in session memory.
+  network asks, and holds the AI explanation setup: the key, consent to send the details, the model, the language and
+  whether notices ask automatically.
+- **Import from NetLimiter** (in Settings) reads NetLimiter's settings file (`nl_settings.xml`) and turns its firewall
+  rules for single applications into GateBouncer rules. Rules limited to addresses, ports, zones or schedules, Ask
+  rules and incoming-only rules are listed with the reason and not imported.
 
 When a tray is available, closing hides the window in the notification area. Installing the engine registers the
 window to start at sign-in, minimized to the tray; opening it again brings the running window to the front.

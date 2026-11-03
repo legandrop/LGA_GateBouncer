@@ -1,22 +1,21 @@
-// Punto de entrada del GateBouncer.exe común (Qt). La misma interfaz que la etapa cargada por el lanzador
-// protegido, sin exigir esa instalación: el motor sin driver se instala aparte (GateBouncerEngine.exe).
+// Punto de entrada del GateBouncer.exe común (Qt): la ventana del firewall sin driver (FirewallWindow). La ventana
+// vieja (MainWindow) sigue en la etapa del lanzador protegido. El motor se instala aparte (GateBouncerEngine.exe).
 #include "bootstrap.h"
-#include "mainwindow.h"
+#include "firewallwindow.h"
 #include <QAbstractButton>
 #include <QApplication>
 #include <QLocalServer>
 #include <QLocalSocket>
-#include <QTableView>
 #include <QTimer>
 #include <cstdio>
 #include <windows.h>
 
 namespace {
 // Recorrido de QA sin abrir nada en el escritorio del usuario (se corre en un escritorio aparte):
-// GATEBOUNCER_QA_SHOT="<vista>;<pasos separados por coma>"; pasos: wait:<ms>, row:<fila>:<columna> (clic en la
-// tabla), click:<objectName> (botón), shot:<archivo.png>, toastshot:<archivo.png> (el aviso fijo) y
+// GATEBOUNCER_QA_SHOT="<vista>;<pasos separados por coma>"; pasos: wait:<ms>, view:<vista>, size:<ancho>x<alto>,
+// click:<objectName> (botón), shot:<archivo.png>, toastshot:<archivo.png> (el aviso fijo) y
 // toastclick:<objectName> (botón del aviso fijo). Al terminar los pasos sale.
-void runSteps(Gate::MainWindow *window, QStringList steps) {
+void runSteps(Gate::FirewallWindow *window, QStringList steps) {
     if (steps.isEmpty()) {
         QApplication::exit(0);
         return;
@@ -36,16 +35,11 @@ void runSteps(Gate::MainWindow *window, QStringList steps) {
         auto *target = toast ? toast->findChild<QAbstractButton *>(step.mid(11)) : nullptr;
         if (target && target->isEnabled()) target->click();
         else std::fprintf(stderr, "QA: botón del aviso ausente o deshabilitado: %s\n", qPrintable(step));
-    } else if (step.startsWith("row:")) {
-        const auto f = step.split(':');
-        auto *table = window->findChild<QTableView *>(window->view() + "-table");
-        if (table && f.size() == 3) {
-            const auto index = table->model()->index(f[1].toInt(), f[2].toInt());
-            table->setCurrentIndex(index);
-            emit table->clicked(index);
-        } else {
-            std::fprintf(stderr, "QA: tabla o fila no encontrada: %s\n", qPrintable(step));
-        }
+    } else if (step.startsWith("view:")) {
+        window->selectView(step.mid(5));
+    } else if (step.startsWith("size:")) {
+        const auto f = step.mid(5).split('x');
+        if (f.size() == 2) window->resize(f[0].toInt(), f[1].toInt());
     } else if (step.startsWith("click:")) {
         QAbstractButton *target = nullptr;
         for (auto *b : window->findChildren<QAbstractButton *>(step.mid(6)))
@@ -61,7 +55,7 @@ void qaSteps() {
     if (parts.size() < 2) return;
     QTimer::singleShot(2500, qApp, [view = parts[0], steps = parts[1].split(',')] {
         for (auto *w : QApplication::topLevelWidgets())
-            if (auto *window = qobject_cast<Gate::MainWindow *>(w)) {
+            if (auto *window = qobject_cast<Gate::FirewallWindow *>(w)) {
                 window->selectView(view);
                 QTimer::singleShot(800, qApp, [window, steps] { runSteps(window, steps); });
                 return;
@@ -102,18 +96,13 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "No se pudo cargar la fuente del producto.\n");
         return 2;
     }
-    Gate::MainWindow window;
+    Gate::FirewallWindow window;
     QObject::connect(&instance, &QLocalServer::newConnection, &window, [&instance, &window] {
         while (auto *client = instance.nextPendingConnection()) {
             QObject::connect(client, &QLocalSocket::disconnected, client, &QObject::deleteLater);
             window.bringToFront();
         }
     });
-    window.enableNativeAssistance();
-    auto startup = std::make_unique<Gate::Lifecycle::StartupPreference>(
-        QCoreApplication::applicationFilePath(), Gate::Lifecycle::makeNativeRunBackend(),
-        Gate::Lifecycle::makeOrdinaryGuiDeploymentValidator());
-    window.startLifecycle(Gate::Lifecycle::makeNativeTraySurface(),
-                          minimized, std::move(startup));
+    window.startLifecycle(Gate::Lifecycle::makeNativeTraySurface(), minimized);
     return app.exec();
 }

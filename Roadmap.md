@@ -41,6 +41,9 @@ Checkboxes mean **verified on Windows**, not only implemented.
   Windows 11 (Windows Sandbox): install, update over an open window with rules kept, uninstall cancelled at the
   confirmation (the firewall stays on), silent and interactive uninstall with no filters left behind, and reinstall
   recovering the saved rules.
+- [ ] **Window with five sections.** Implemented: Protection, Requests, Apps, Activity and Settings, with the state of
+  each section in the sidebar and requests decided from the window with the same choices as the notice. Done when it
+  is checked with the installed service.
 - [ ] **Known applications.** The notice can show a reviewed decision for a known application right away, without
   asking an AI model. Done when the first reviewed catalog ships.
 - [ ] **Coexistence.** Done when tests with Windows Defender Firewall and NetLimiter show the expected result.

@@ -153,7 +153,7 @@ set_target_properties(GateBouncerGuiStage PROPERTIES PREFIX "" AUTOMOC ON)
 # GateBouncer.exe común: la misma interfaz sin el lanzador de la instalación protegida.
 get_target_property(gatebouncer_app_sources GateBouncerGuiStage SOURCES)
 list(FILTER gatebouncer_app_sources EXCLUDE REGEX "deployment_ordinary_stage.cpp|src/main.cpp")
-qt_add_executable(GateBouncer WIN32 ${gatebouncer_app_sources} src/app_main.cpp)
+qt_add_executable(GateBouncer WIN32 ${gatebouncer_app_sources} src/app_main.cpp src/firewallwindow.cpp src/firewallwindow.h)
 target_include_directories(GateBouncer PRIVATE src common)
 target_link_libraries(GateBouncer PRIVATE Qt6::Widgets Qt6::Network gatebouncer_explain gatebouncer_data gatebouncer_assistance
     gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire

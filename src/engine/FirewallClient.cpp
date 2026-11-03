@@ -177,7 +177,13 @@ void FirewallClient::poll() {
 void FirewallClient::sendNext() {
     if (waiting_ || queue_.empty()) return;
     if (socket_->state() == QLocalSocket::UnconnectedState) {
-        socket_->connectToServer(ServerName);
+        // QA: un motor falso en otro canal (GATEBOUNCER_QA_PIPE), para recorrer pedidos sin tocar el firewall. Sólo
+        // dentro de un recorrido de QA (GATEBOUNCER_QA_SHOT), como el catálogo de prueba.
+        static const QString name = qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") ||
+                                            qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_PIPE")
+                                        ? QString(ServerName)
+                                        : qEnvironmentVariable("GATEBOUNCER_QA_PIPE");
+        socket_->connectToServer(name);
         return;
     }
     if (socket_->state() != QLocalSocket::ConnectedState) return;
