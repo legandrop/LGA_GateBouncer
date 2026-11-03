@@ -93,6 +93,8 @@ QPushButton[k="allow"] { background: #25301c; color: #c9e6a4; border: 1px solid 
 QPushButton[k="allow"]:hover { background: #2c3a21; }
 QPushButton[k="block"] { background: #3a2220; color: #f2b2a8; border: 1px solid #5e3530; }
 QPushButton[k="block"]:hover { background: #452826; }
+QPushButton[k="allow"][rec="1"] { border: 1px solid #7ea653; color: #e3f6c8; }
+QPushButton[k="block"][rec="1"] { border: 1px solid #a8564b; color: #ffd0c8; }
 QPushButton[k="allow"]:disabled, QPushButton[k="block"]:disabled { background: #212121; color: #656565; border: 1px solid #2a2a2a; }
 QPushButton[k="link"] { background: transparent; color: #aa95ed; padding: 0; min-height: 0; font-size: 13px; }
 QPushButton[k="link"]:hover { color: #c3b4f5; }
@@ -166,6 +168,12 @@ QPushButton *button(const QString &label, const char *kind = nullptr, bool small
     b->setCursor(Qt::PointingHandCursor);
     b->setFocusPolicy(Qt::TabFocus);
     return b;
+}
+// Resalta el botón que recomienda el catálogo de apps conocidas (o una app LGA); nunca decide nada.
+void recommend(QPushButton *block, QPushButton *allow, const QString &known) {
+    const QString suggested = KnownApps::suggestion(known);
+    allow->setProperty("rec", suggested == "allow" ? "1" : "");
+    block->setProperty("rec", suggested == "block" ? "1" : "");
 }
 QFrame *card(const char *role = "card") {
     auto *f = new QFrame;
@@ -1059,7 +1067,11 @@ QWidget *FirewallWindow::overviewPage() {
             info->addWidget(new ElideLabel("Wants " + target + " · first try " + clock(p.first), "small"));
             h->addLayout(info, 1);
             const auto e = explanationFor(p.id);
-            if (e.state == AccessToast::Explanation::Ready)
+            // Lo revisado (catálogo o app LGA) va antes que la explicación con IA.
+            const QString known = KnownApps::hint(p.signer, p.path, p.host);
+            if (!known.isEmpty())
+                h->addWidget(hint(known.section(" · ", 0, 1), "known"));
+            else if (e.state == AccessToast::Explanation::Ready)
                 h->addWidget(e.suggestion == "block"   ? hint("AI suggests Block", "block")
                              : e.suggestion == "allow" ? hint("AI suggests Allow", "allow")
                                                        : hint("AI: your call", "either"));
@@ -1070,6 +1082,7 @@ QWidget *FirewallWindow::overviewPage() {
             auto *allow = button("Allow", "allow", true);
             block->setObjectName("overview-block");
             allow->setObjectName("overview-allow");
+            recommend(block, allow, known);
             block->setEnabled(canDecide());
             allow->setEnabled(canDecide());
             connect(block, &QPushButton::clicked, this, [this, p] { decideDefault(p, false); });
@@ -1299,8 +1312,10 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
     meta->setMinimumWidth(10);
     info->addWidget(meta);
     th->addLayout(info, 1);
+    const QString known = KnownApps::hint(p.signer, p.path, p.host);
     if (!expanded) {
         const auto e = explanationFor(p.id);
+        if (!known.isEmpty()) th->addWidget(hint(known.section(" · ", 0, 1), "known"));
         if (e.state == AccessToast::Explanation::Ready)
             th->addWidget(e.suggestion == "block"   ? hint("AI suggests Block", "block")
                           : e.suggestion == "allow" ? hint("AI suggests Allow", "allow")
@@ -1314,6 +1329,7 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
         th->addWidget(open);
         auto *block = button("Block", "block", true);
         auto *allow = button("Allow", "allow", true);
+        recommend(block, allow, known);
         block->setEnabled(canDecide());
         allow->setEnabled(canDecide());
         connect(block, &QPushButton::clicked, this, [this, p] { decideDefault(p, false); });
@@ -1405,6 +1421,7 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
     auto *allow = button("Allow", "allow");
     block->setObjectName("request-block");
     allow->setObjectName("request-allow");
+    recommend(block, allow, known);
     for (auto *b : {block, allow}) {
         b->setMinimumHeight(34);
         b->setEnabled(canDecide());

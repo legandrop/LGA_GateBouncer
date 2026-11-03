@@ -1,6 +1,7 @@
 #include "accesstoast.h"
 #include "engine/FirewallClient.h"
 #include "explain/Explainer.h"
+#include "explain/KnownApps.h"
 #include <QAbstractItemView>
 #include <QComboBox>
 #include <QDateTime>
@@ -269,6 +270,8 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
         #accessToast QPushButton#toastBlock:hover { background:#452824; }
         #accessToast QPushButton#toastAllow { background:#25301c; color:#c9e6a4; border:1px solid #45592f; }
         #accessToast QPushButton#toastAllow:hover { background:#2d3a22; }
+        #accessToast QPushButton#toastAllow[rec="1"] { border-color:#7ea653; color:#e3f6c8; }
+        #accessToast QPushButton#toastBlock[rec="1"] { border-color:#a8564b; color:#ffd0c8; }
         #accessToast QPushButton#toastBlock:disabled, #accessToast QPushButton#toastAllow:disabled {
             background:#212121; color:#5c5c5c; border-color:#2e2e2e; }
         #accessToast QLabel#toastFooter { font-size:8.625pt; color:#707070; }
@@ -609,6 +612,10 @@ void AccessToast::setRequest(const Request &request) {
                        : QString("Blocked: a new server for %1.").arg(exe));
     infoBox_->setVisible(request.perDestination);
     renderKnown();
+    // Se resalta el botón que recomienda el catálogo (o una app LGA): los dos quedan iguales y nada se decide solo.
+    const QString recommended = KnownApps::suggestion(request.known);
+    restyle(allow_, "rec", recommended == "allow" ? "1" : "");
+    restyle(block_, "rec", recommended == "block" ? "1" : "");
     updateCounters();
     // Fuera del bloque anterior: un intento nuevo de la misma app puede ir a otro destino (relayout lo dibuja).
     relayout();

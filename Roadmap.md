@@ -45,7 +45,8 @@ Checkboxes mean **verified on Windows**, not only implemented.
   each section in the sidebar and requests decided from the window with the same choices as the notice. Done when it
   is checked with the installed service.
 - [ ] **Known applications.** The notice can show a reviewed decision for a known application right away, without
-  asking an AI model. Done when the first reviewed catalog ships.
+  asking an AI model. Applications from LGA folders already show **LGA app · usually Allow**. Done when the first
+  reviewed catalog ships.
 - [ ] **Coexistence.** Done when tests with Windows Defender Firewall and NetLimiter show the expected result.
 - [ ] **NetLimiter import.** Implemented: NetLimiter firewall rules for single applications become GateBouncer rules;
   rules with destination, port, zone or schedule conditions are listed and not imported. Done when it is checked

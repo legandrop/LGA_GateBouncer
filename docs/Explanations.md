@@ -39,7 +39,8 @@ Only when you ask (or when automatic explanations are on), for the application o
 - the product name, description, company and version stored in the file;
 - the public address and port it tried to reach, and the server name the application looked up for that address
   when the engine saw it. Addresses on your local network, and their names, are not sent;
-- the file name of the program that started it, when it is still running (for example `Code.exe` for a `node.exe`).
+- the file name of the program that started it, when it is still running (for example `Code.exe` for a `node.exe`);
+- for an LGA application (see below), a fixed sentence saying so.
 
 Never the file itself, its command line, your account name or anything else on your computer.
 
@@ -50,6 +51,12 @@ Before any model is asked, the notice checks a small catalog that ships with Gat
 decision and one sentence about the application; every entry was reviewed by hand before it was published. A match
 shows **Known app · usually Allow** (or Block) on the notice right away. Unsigned applications never match, because
 anyone can use a file name. Like the explanations, the catalog never allows or blocks anything by itself.
+
+LGA applications are unsigned, so they are recognized by their folder instead: installed in `C:\Portable\LGA\<App>\`
+or `C:\Program Files\LGA <App>\`, or built in a `build*` folder of a `C:\Portable\LGA_<Repo>\` source tree. They show
+**LGA app · usually Allow**: they connect to update themselves or for a feature that needs the internet. On the notice,
+in Requests and in Protection the recommended button is outlined. It is only a recommendation: you still click, and an
+unsigned rule covers that exact file. Any program saved in those folders gets it, so it is no proof of origin.
 
 ## How the keys are kept
 

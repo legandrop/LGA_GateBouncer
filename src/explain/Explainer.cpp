@@ -1,5 +1,6 @@
 #include "Explainer.h"
 #include "KeyStore.h"
+#include "KnownApps.h"
 #include <QCoreApplication>
 #include <QDate>
 #include <QDir>
@@ -271,6 +272,11 @@ QByteArray buildRequest(const Facts &f, const QString &model, const QString &lan
     if (!f.serverName.isEmpty()) facts["server_name"] = f.serverName;
     if (!f.launchedBy.isEmpty()) facts["launched_by"] = f.launchedBy;
     if (f.attempts > 0) facts["blocked_attempts"] = f.attempts;
+    // Dato de GateBouncer, no del autor del programa: sin él, el modelo ve un exe sin firma y lo trata de sospechoso.
+    if (KnownApps::isLgaApp(f.path))
+        facts["lga_app"] = QStringLiteral("the folder holds LGA applications, written by the owner of this computer; "
+                                          "they are unsigned and connect to update themselves or for features that "
+                                          "need the internet");
     const QString user = QString::fromUtf8(QJsonDocument(facts).toJson(QJsonDocument::Compact));
     if (providerOf(model) == Provider::Anthropic) {
         // Salida con esquema: la respuesta es siempre el objeto pedido. Esfuerzo bajo: alcanza para reconocer un

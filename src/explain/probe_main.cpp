@@ -7,6 +7,7 @@
 // lista.txt: una ruta de ejecutable por línea; opcionalmente «ruta|dirección|puerto|firma|servidor».
 #include "Explainer.h"
 #include "KeyStore.h"
+#include "KnownApps.h"
 #include <QCoreApplication>
 #include <QFile>
 #include <QFileInfo>
@@ -59,7 +60,8 @@ int main(int argc, char **argv) {
     // Sólo los datos locales que se mandarían, sin pedir nada a ningún proveedor.
     if (!value("--facts").isEmpty()) {
         const auto f = collectFacts(value("--facts"), {}, {}, 0, 0, 0);
-        out << "file_name: " << f.fileName << "\nfolder: " << f.folder << "\nlaunched_by: " << f.launchedBy << "\n";
+        out << "file_name: " << f.fileName << "\nfolder: " << f.folder << "\nlaunched_by: " << f.launchedBy
+            << "\nlga_app: " << (Gate::KnownApps::isLgaApp(f.path) ? "yes" : "no") << "\n";
         return 0;
     }
     QStringList models = value("--models").isEmpty() ? Settings::models() : value("--models").split(',');

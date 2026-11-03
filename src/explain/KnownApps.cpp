@@ -1,9 +1,11 @@
 #include "KnownApps.h"
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QRegularExpression>
 #include <vector>
 
 namespace Gate::KnownApps {
@@ -44,7 +46,7 @@ const std::vector<Entry> &entries() {
 
 } // namespace
 
-QString hint(const QString &signer, const QString &path, const QString &host) {
+static QString catalogHint(const QString &signer, const QString &path, const QString &host) {
     if (signer.isEmpty()) return {};
     const QString file = QFileInfo(path).fileName().toLower();
     const QString name = host.toLower();
@@ -60,6 +62,29 @@ QString hint(const QString &signer, const QString &path, const QString &host) {
     const QString verdict = e->decision == "allow" ? QStringLiteral("Allow") : QStringLiteral("Block");
     const QString scope = destination ? " for " + e->destination : QString();
     return "Known app · usually " + verdict + scope + (e->what.isEmpty() ? QString() : " · " + e->what);
+}
+
+QString hint(const QString &signer, const QString &path, const QString &host) {
+    const QString known = catalogHint(signer, path, host);
+    if (!known.isEmpty() || !isLgaApp(path)) return known;
+    return QStringLiteral("LGA app · usually Allow · From an LGA app folder. LGA apps connect to update themselves or "
+                          "for a feature that needs the internet.");
+}
+
+QString suggestion(const QString &hint) {
+    const QString verdict = hint.section(" · ", 1, 1);
+    return verdict.startsWith("usually Allow") ? QStringLiteral("allow")
+           : verdict.startsWith("usually Block") ? QStringLiteral("block")
+                                                 : QString();
+}
+
+// shortcut: sólo la carpeta, y C:\Portable lo puede escribir el usuario: cualquier exe que caiga ahí recibe la
+// recomendación. Alcanza porque es sólo una recomendación (el clic sigue siendo del usuario y, sin firma, la regla
+// cubre ese archivo exacto); pasar a la firma cuando las apps LGA se firmen.
+bool isLgaApp(const QString &path) {
+    static const QRegularExpression folder(
+        QStringLiteral("^c:/(portable/lga/[^/]+/|program files/lga [^/]+/|portable/lga_[^/]+/build[^/]*/)"));
+    return folder.match(QDir::fromNativeSeparators(path).toLower()).hasMatch();
 }
 
 } // namespace Gate::KnownApps
