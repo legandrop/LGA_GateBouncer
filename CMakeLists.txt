@@ -53,6 +53,8 @@ qt_add_library(GateBouncerGuiStage SHARED
     src/mainwindow.h
     src/accesstoast.cpp
     src/accesstoast.h
+    src/appicon.cpp
+    src/appicon.h
     src/toggleswitch.cpp
     src/toggleswitch.h
     src/productcontroller.cpp
@@ -143,7 +145,7 @@ endif()
 if(GATEBOUNCER_TOAST_TEST_SOURCE)
     find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
     qt_add_executable(GateBouncerToastTests "${GATEBOUNCER_TOAST_TEST_SOURCE}" src/accesstoast.cpp src/accesstoast.h
-        src/engine/FirewallClient.cpp src/engine/FirewallClient.h)
+        src/appicon.cpp src/appicon.h src/engine/FirewallClient.cpp src/engine/FirewallClient.h)
     target_include_directories(GateBouncerToastTests PRIVATE src)
     target_link_libraries(GateBouncerToastTests PRIVATE Qt6::Widgets Qt6::Network Qt6::Test gatebouncer_explain)
 endif()

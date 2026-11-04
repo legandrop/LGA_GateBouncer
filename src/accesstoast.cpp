@@ -1,4 +1,5 @@
 #include "accesstoast.h"
+#include "appicon.h"
 #include "engine/FirewallClient.h"
 #include "explain/Explainer.h"
 #include "explain/KnownApps.h"
@@ -8,7 +9,7 @@
 #include <QDir>
 #include <QEvent>
 #include <QFile>
-#include <QFileIconProvider>
+#include <QApplication>
 #include <QFileInfo>
 #include <QGridLayout>
 #include <QGuiApplication>
@@ -42,7 +43,8 @@ constexpr int Edge = 6;          // franja de los bordes izquierdo y derecho que
 constexpr int Pad = 14;          // margen lateral de las secciones
 constexpr int CardPad = 10;      // margen lateral de la tarjeta de la explicación
 constexpr int CardInset = 11;    // relleno interior de la tarjeta
-constexpr int IconSize = 38;     // ícono del programa
+constexpr int IconSize = 38;     // caja del ícono del programa
+constexpr int IconGlyph = 32;    // tamaño propio de Windows: no se reescala ni queda blando
 constexpr int IconGap = 11;
 constexpr int KeyColumn = 70;    // columna de rótulos de la grilla de datos
 constexpr int ColumnGap = 8;
@@ -217,6 +219,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
             color:#b2b2b2; font-family:'Inter'; font-size:13px; font-weight:400; padding:0; }
         #accessToast QPushButton { min-height:0; }
         #accessToast QLabel#toastHeader { font-size:12px; color:#8d8d8d; }
+        #accessToast QLabel#toastAppIcon { background:#242424; border-radius:9px; }
         #accessToast QPushButton#toastMenu, #accessToast QPushButton#toastClose { border-radius:4px; }
         #accessToast QPushButton#toastMenu:hover, #accessToast QPushButton#toastClose:hover { background:#2a2a2a; }
         #accessToast QLabel#toastTitle { font-size:10.875pt; font-weight:600; color:#ececec; }
@@ -324,6 +327,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     head->setContentsMargins(Pad, 2, Pad, 10);
     head->setSpacing(IconGap);
     icon_ = new QLabel(this);
+    icon_->setObjectName("toastAppIcon"); // la misma caja que en la ventana: un ícono oscuro se sigue leyendo
     icon_->setFixedSize(IconSize, IconSize);
     icon_->setAlignment(Qt::AlignCenter);
     head->addWidget(icon_, 0, Qt::AlignTop);
@@ -582,10 +586,7 @@ void AccessToast::setRequest(const Request &request) {
     request_ = request;
     if (!samePath) trace("pedido nuevo: " + request.id + " firma=" + request.signer);
     if (!samePath) {
-        const QFileInfo file(request.path);
-        QIcon appIcon = QFileIconProvider().icon(file);
-        if (appIcon.isNull()) appIcon = QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png");
-        icon_->setPixmap(appIcon.pixmap(IconSize, IconSize));
+        icon_->setPixmap(appIconPixmap(request.path, IconGlyph, qApp->devicePixelRatio()));
         rebuildScopes();
         targetChosen_ = false;
         rebuildTargets();

@@ -1,4 +1,5 @@
 #include "firewallwindow.h"
+#include "appicon.h"
 #include "explain/KnownApps.h"
 #include "platform/WindowFrame.h"
 #include "toggleswitch.h"
@@ -10,7 +11,6 @@
 #include <QDir>
 #include <QFile>
 #include <QFileDialog>
-#include <QFileIconProvider>
 #include <QFileInfo>
 #include <QFrame>
 #include <QGridLayout>
@@ -426,9 +426,7 @@ void drawIcon(QPainter &p, const QString &name, const QRectF &r, const QColor &c
             path.lineTo(s.p2());
         }
     } else { // ventana genérica: una app sin ícono propio
-        path.addRoundedRect(QRectF(3, 4, 14, 12), 2, 2);
-        path.moveTo(3, 7.5);
-        path.lineTo(17, 7.5);
+        path = genericAppGlyph();
     }
     p.drawPath(path);
     p.restore();
@@ -456,23 +454,11 @@ QLabel *headIcon(const QString &name) {
 
 // Ícono real del programa (el de Windows), en una caja chica; si no hay archivo, uno genérico.
 QLabel *appIcon(const QString &path, int box = 30) {
-    static QHash<QString, QPixmap> cache;
-    const int glyph = box >= 36 ? 24 : 20;
-    const QString key = path.toLower() + "|" + QString::number(glyph);
     auto *l = new QLabel;
     l->setFixedSize(box, box);
     l->setAlignment(Qt::AlignCenter);
     l->setStyleSheet(QString("background: #242424; border-radius: %1px;").arg(box >= 36 ? 9 : 7));
-    if (!cache.contains(key)) {
-        QPixmap pm;
-        if (!path.isEmpty() && QFileInfo::exists(path)) {
-            static QFileIconProvider provider;
-            pm = provider.icon(QFileInfo(path)).pixmap(QSize(glyph, glyph), qApp->devicePixelRatio());
-        }
-        if (pm.isNull()) pm = iconPixmap("window", glyph - 2, QColor("#a8a8a8"), qApp->devicePixelRatio());
-        cache.insert(key, pm);
-    }
-    l->setPixmap(cache.value(key));
+    l->setPixmap(appIconPixmap(path, box >= 36 ? 24 : 20, qApp->devicePixelRatio()));
     return l;
 }
 
