@@ -1,4 +1,5 @@
 #include "firewall_core.h"
+#include "destination_match.h"
 #include "signature.h"
 #include <algorithm>
 #include <chrono>
@@ -108,21 +109,6 @@ std::wstring describe(const Rule &rule) {
                              : rule.scope == Scope::Publisher ? L"all apps from " + rule.signer
                                                               : FirewallCore::fileName(rule.path);
     return rule.destination.empty() ? who : who + L" to " + rule.destination;
-}
-
-// Cuánto se parece un destino de regla a una conexión: 0 no coincide; más alto, más específico (IP, host exacto,
-// dominio más largo).
-std::size_t destinationMatch(const std::wstring &pattern, const std::wstring &host, const std::wstring &address) {
-    if (pattern.empty()) return 0;
-    if (DnsNames::normalize(pattern) == pattern) return pattern == address ? 10000 : 0;
-    if (host.empty()) return 0;
-    if (pattern.rfind(L"*.", 0) == 0) {
-        const std::wstring suffix = pattern.substr(2);
-        const bool under = host.size() > suffix.size() && host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0 &&
-                           host[host.size() - suffix.size() - 1] == L'.';
-        return host == suffix || under ? 100 + suffix.size() : 0;
-    }
-    return host == pattern ? 1000 + pattern.size() : 0;
 }
 
 // Texto del historial para la duración de una decisión: vacío si es permanente.
@@ -537,7 +523,14 @@ void FirewallCore::applyHint(const DnsHint &hint) {
             continue;
         }
         changed = changed || added;
-        pending_.erase(k + DestinationSeparator + a);
+        const auto asked = pending_.find(k + DestinationSeparator + a);
+        if (asked != pending_.end()) {
+            // El pedido se anotó antes de que llegara el nombre (la espera de nameWait_ venció): la regla lo resuelve y
+            // el historial lo dice, para que no quede sólo «waiting for decision» de algo que ya no se pregunta.
+            addGrantActivity(now(), asked->second.path, a, *r, asked->second.remoteAddress, asked->second.remotePort,
+                             asked->second.protocol);
+            pending_.erase(asked);
+        }
     }
     std::wstring error;
     if (changed) save(error);
@@ -955,7 +948,9 @@ void FirewallCore::verifyLoop() {
         bool hasDrop = false, hasHint = false;
         {
             std::unique_lock<std::mutex> lock(verifyMutex_);
-            const auto wake = std::min(nextRecheck, std::chrono::steady_clock::now() + ExpiryCheck);
+            auto wake = std::min(nextRecheck, std::chrono::steady_clock::now() + ExpiryCheck);
+            // Un bloqueo que espera su nombre se decide al vencer la espera aunque no llegue nada más.
+            if (const auto held = nameWait_.nextDeadline()) wake = std::min(wake, *held);
             verifyWake_.wait_until(lock, wake,
                                    [this] { return verifyStop_ || !verifyQueue_.empty() || !hintQueue_.empty(); });
             if (verifyStop_) return;
@@ -972,6 +967,11 @@ void FirewallCore::verifyLoop() {
         }
         if (hasHint) applyHint(hint);
         if (hasDrop) classify(drop, cachedSigner(drop.appPath));
+        // Los que esperaban un nombre: ya llegó (la consulta DNS se procesó arriba) o venció la espera.
+        for (const auto &held : nameWait_.release(std::chrono::steady_clock::now(), [this](const DropEvent &d) {
+                 return !dns_.nameFor(DnsNames::normalize(d.remoteAddress), key(d.appPath)).empty();
+             }))
+            classify(held, cachedSigner(held.appPath), true);
         expireRules();
         if (std::chrono::steady_clock::now() >= nextRecheck) {
             recheckCoverage(++recheckRound_ % FullRecheckEvery == 0);
@@ -1073,7 +1073,7 @@ std::wstring FirewallCore::cachedSigner(const std::wstring &path) {
     return signer;
 }
 
-void FirewallCore::classify(const DropEvent &drop, const std::wstring &cached) {
+void FirewallCore::classify(const DropEvent &drop, const std::wstring &cached, bool waited) {
     const auto k = key(drop.appPath);
     const auto t = fileTimeToUnix(drop.time);
     std::wstring signer = cached;
@@ -1090,7 +1090,7 @@ void FirewallCore::classify(const DropEvent &drop, const std::wstring &cached) {
         if (!perDestination && (rule != rules_.end() || !signerRuleFor(drop.appPath, signer))) signer.clear();
     }
     if (perDestination) {
-        classifyDestination(drop, cached);
+        classifyDestination(drop, cached, waited);
         return;
     }
     // Antes de dar un filtro por firma, la firma se verifica de nuevo sobre el archivo actual, sin caché.
@@ -1149,7 +1149,7 @@ void FirewallCore::classify(const DropEvent &drop, const std::wstring &cached) {
     addActivity({t, p.path, L"Blocked · waiting for decision", drop.remoteAddress, drop.remotePort, drop.protocol});
 }
 
-void FirewallCore::classifyDestination(const DropEvent &drop, const std::wstring &cached) {
+void FirewallCore::classifyDestination(const DropEvent &drop, const std::wstring &cached, bool waited) {
     const auto k = key(drop.appPath);
     const auto t = fileTimeToUnix(drop.time);
     const std::wstring address = DnsNames::normalize(drop.remoteAddress);
@@ -1169,6 +1169,12 @@ void FirewallCore::classifyDestination(const DropEvent &drop, const std::wstring
     const auto rule = rules_.find(k);
     if (rule != rules_.end() && !rule->second.filters.empty()) return;
     const Rule *r = destinationRuleFor(drop.appPath, signer, host, address, any);
+    // Sin nombre todavía: Windows avisa la consulta DNS hasta un segundo después del intento. Preguntar ya crearía un
+    // pedido que una regla por nombre resuelve un instante después (el aviso aparece y se cierra solo). Se espera el
+    // nombre y recién ahí se decide; una regla por IP no lo necesita y se aplica ya.
+    if (!r && any && host.empty() && !waited &&
+        nameWait_.hold(drop, std::chrono::steady_clock::now()))
+        return;
     // Una regla Allow por firma que apareció entre las dos miradas: el próximo intento la verifica.
     if (r && r->action == Action::Allow && r->scope != Scope::Path && !needFresh) return;
     if (r) {
@@ -1176,15 +1182,7 @@ void FirewallCore::classifyDestination(const DropEvent &drop, const std::wstring
         bool added = false;
         if (grant(drop.appPath, address, *r, stamp, error, &added)) {
             pending_.erase(k + DestinationSeparator + address);
-            // Lo que quedó de verdad: una IP compartida con un destino bloqueado sigue bloqueada.
-            const auto g = grants_.find(k + DestinationSeparator + address);
-            const bool allowed = g != grants_.end() && g->second.action == Action::Allow;
-            const auto owner = g != grants_.end() ? rules_.find(g->second.ruleKey) : rules_.end();
-            addActivity({t, drop.appPath,
-                         (allowed ? L"Allowed by rule: " : L"Blocked by rule: ") +
-                             describe(owner != rules_.end() ? owner->second : *r) +
-                             (allowed ? L" · next attempt connects" : L""),
-                         drop.remoteAddress, drop.remotePort, drop.protocol});
+            addGrantActivity(t, drop.appPath, address, *r, drop.remoteAddress, drop.remotePort, drop.protocol);
             if (added) save(error);
             return;
         }
@@ -1213,6 +1211,20 @@ void FirewallCore::classifyDestination(const DropEvent &drop, const std::wstring
     p.host = host;
     p.perDestination = any;
     addActivity({t, p.path, L"Blocked · waiting for decision", drop.remoteAddress, drop.remotePort, drop.protocol});
+}
+
+void FirewallCore::addGrantActivity(std::int64_t t, const std::wstring &path, const std::wstring &address,
+                                    const Rule &rule, const std::wstring &remote, std::uint16_t port,
+                                    std::uint8_t protocol) {
+    // Lo que quedó de verdad: una IP compartida con un destino bloqueado sigue bloqueada.
+    const auto g = grants_.find(key(path) + DestinationSeparator + address);
+    const bool allowed = g != grants_.end() && g->second.action == Action::Allow;
+    const auto owner = g != grants_.end() ? rules_.find(g->second.ruleKey) : rules_.end();
+    addActivity({t, path,
+                 (allowed ? L"Allowed by rule: " : L"Blocked by rule: ") +
+                     describe(owner != rules_.end() ? owner->second : rule) +
+                     (allowed ? L" · next attempt connects" : L""),
+                 remote, port, protocol});
 }
 
 void FirewallCore::addActivity(Activity a) {

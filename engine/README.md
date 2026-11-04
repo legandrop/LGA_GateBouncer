@@ -41,6 +41,14 @@ other driverless Windows firewalls.
   address serves an allowed and a blocked name, the Block stays. Permits unused for a week are removed. Deciding the
   whole application replaces its destination rules, and the other way round. Saved as `dest` and `grant` lines in
   `rules.tsv`.
+- **Waiting for the name before asking.** The blocked attempt usually reaches the engine before the name lookup that
+  preceded it (Windows delivers DNS events up to a second late). Without the name, a name rule such as
+  `*.example.com` cannot match, and asking right away would create a request that the name resolves a moment later: the
+  notice would open and close by itself and Requests would stay empty. So when an application in destination mode is
+  blocked at an address with no known name and no IP rule, the engine holds that attempt for up to two seconds and
+  decides when the name arrives: a matching rule grants the permit ("Allowed by rule … · next attempt connects" in the
+  history), otherwise it asks, already with the server name. Without a name after two seconds (direct address,
+  DNS over HTTPS) it asks as before. A request that a late name resolves anyway is also recorded as allowed by rule.
 - **Temporary rules.** A decision can last from one minute to a week, or until the engine restarts. The engine checks
   expiry every ten seconds; an expired rule is removed (with the paths it covered) and the application asks again.
   Until-restart rules are never written to the rules file.
@@ -106,13 +114,16 @@ running under your account, which could start the window and inject code into it
 With the service installed and running, a console engine shares its filters, so test it on a machine without the
 service; `--pipe <name>` gives the console engine its own channel name.
 `GateBouncerEngineSelfTest.exe` checks the full cycle on a copy of an HTTP client, also in a dynamic session.
+`GateBouncerEngineUnitTest.exe` checks engine logic that needs neither WFP nor the network (destination matching and
+the wait for a destination name); it needs no administrator rights and is safe with the service running.
 `--signer <exe>` prints the signer that signature rules use for that file; it needs no administrator rights.
 
 ## Limits
 
 - The first attempt of an unknown application fails; there is no waiting connection. With destination rules, the
   first attempt to a new address of an allowed name can also fail when Windows reports the name lookup after the
-  connection (up to a second).
+  connection (up to a second); the engine then grants that address without asking and the next attempt connects. An
+  application that gives up after one failed attempt per address has to be run again.
 - Destination rules match names the application resolved through Windows. An application that resolves names itself
   (DNS over HTTPS) or connects straight to an address only matches IP destinations. Services that share an address
   (content delivery networks) share the decision for that address.

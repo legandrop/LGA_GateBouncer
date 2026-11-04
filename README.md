@@ -36,7 +36,8 @@ The window reads the engine and has five sections; the sidebar shows the state o
 - The notice's **Destination** list limits a rule to where the application tried to go: **Only** that server, **Only
   \*.domain** (the server's domain and its subdomains) or, without a name, **Only** that address. An application with
   destination rules asks again for every new destination, so you can allow a tool to reach your own services and
-  block everything else it tries. **Any destination** decides for the whole application and replaces its destination
+  block everything else it tries. A new address of a server you already allowed does not ask: its first attempt may
+  fail, and the next one connects. **Any destination** decides for the whole application and replaces its destination
   rules.
 - The notice can be dragged anywhere and widened from its left or right edge; it remembers where you left it. It always
   stays above the taskbar, even when an explanation makes it taller.

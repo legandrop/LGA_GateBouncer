@@ -17,6 +17,7 @@
 // esas IPs para esa app (un «permiso de destino»). Una regla de la app entera y las reglas por destino de esa misma
 // identidad se excluyen: decidir una reemplaza a las otras.
 #include "dns_names.h"
+#include "name_wait.h"
 #include "wfp_engine.h"
 #include <atomic>
 #include <condition_variable>
@@ -160,8 +161,12 @@ class FirewallCore {
   private:
     void onDrop(const DropEvent &drop);
     void verifyLoop();
-    void classify(const DropEvent &drop, const std::wstring &signer);
-    void classifyDestination(const DropEvent &drop, const std::wstring &cached);
+    // waited: el bloqueo ya esperó el nombre de su destino (nameWait_); no se vuelve a retener.
+    void classify(const DropEvent &drop, const std::wstring &signer, bool waited = false);
+    void classifyDestination(const DropEvent &drop, const std::wstring &cached, bool waited);
+    // Historial de un permiso de destino recién puesto o refrescado: lo que quedó de verdad para esa IP. Con mutex_.
+    void addGrantActivity(std::int64_t t, const std::wstring &path, const std::wstring &address, const Rule &rule,
+                          const std::wstring &remote, std::uint16_t port, std::uint8_t protocol);
     void recheckCoverage(bool full);
     void expireRules();
     // Retira los filtros de la regla (o de sus coberturas) y la borra. Con mutex_ tomado.
@@ -226,6 +231,9 @@ class FirewallCore {
     bool verifyStop_ = false;
     std::thread verifyThread_;
     int recheckRound_ = 0; // sólo lo usa el hilo de verificación
+    // Bloqueos en modo por destino que llegaron antes que su consulta DNS: esperan el nombre antes de preguntar.
+    // Sólo lo usa el hilo de verificación.
+    NameWait<DropEvent> nameWait_{std::chrono::seconds(2), 1000};
     std::map<std::wstring, SignerCache> signers_; // clave: ruta en minúsculas; protegido por verifyMutex_
 };
 
