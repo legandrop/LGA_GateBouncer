@@ -14,7 +14,9 @@
 #include <QFileInfo>
 #include <QFrame>
 #include <QGridLayout>
+#include <QHash>
 #include <QHeaderView>
+#include <QHostAddress>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -30,6 +32,7 @@
 #include <QTableWidget>
 #include <QWindow>
 #include <QVBoxLayout>
+#include <algorithm>
 #include <thread>
 #include <windows.h>
 #include <tlhelp32.h>
@@ -83,6 +86,9 @@ QLabel[hint="either"] { border: 1px solid #444444; color: #aaaaaa; border-radius
 QLabel[hint="known"] { border: 1px solid #33475f; color: #9cc0ee; border-radius: 9px; padding: 1px 8px; font-size: 11px; }
 QLabel[hint="none"] { border: 1px dashed #444444; color: #777777; border-radius: 9px; padding: 1px 8px; font-size: 11px; }
 QLabel[chip="1"] { background: #262626; border: 1px solid #333333; color: #aaaaaa; border-radius: 4px; padding: 1px 6px; font-size: 11px; }
+QLabel[chip="wait"] { background: #4a3a14; border: 1px solid #5e4a1a; color: #f0c75e; border-radius: 4px; padding: 1px 6px; font-size: 11px; }
+QLabel[chip="allow"] { background: #25301c; border: 1px solid #36462a; color: #bfe08f; border-radius: 4px; padding: 1px 6px; font-size: 11px; }
+QLabel[chip="block"] { background: #3a2220; border: 1px solid #4f2e2a; color: #f0a497; border-radius: 4px; padding: 1px 6px; font-size: 11px; }
 QLabel#fwBadge { background: #4a3a14; color: #f0c75e; border-radius: 9px; font-size: 11px; font-weight: 600; }
 QPushButton { border: 0; border-radius: 5px; background: #2b2b2b; color: #c4c4c4; padding: 0 12px; min-height: 29px; font-size: 13px; }
 QPushButton:hover { background: #333333; }
@@ -153,9 +159,9 @@ QLabel *hint(const QString &value, const char *kind) {
     l->setFixedHeight(19);
     return l;
 }
-QLabel *chip(const QString &value) {
+QLabel *chip(const QString &value, const char *tone = "1") {
     auto *l = new QLabel(value);
-    l->setProperty("chip", "1");
+    l->setProperty("chip", tone);
     l->setTextFormat(Qt::PlainText);
     l->setSizePolicy(QSizePolicy::Maximum, QSizePolicy::Fixed);
     l->setFixedHeight(19);
@@ -546,10 +552,96 @@ QString destinationLine(const FirewallClient::PendingItem &p) {
     if (p.port) parts << FirewallClient::protocolName(p.protocol) + " " + QString::number(p.port);
     return parts.join(" · ");
 }
-QString activityChip(const QString &kind) {
-    if (kind.startsWith("Blocked by rule")) return "Your Block rule";
-    if (kind.contains("waiting", Qt::CaseInsensitive)) return "Waiting for you";
-    return kind;
+// La dirección como la escribe el motor en sus pedidos (IPv4 mapeada a IPv6 pasa a IPv4, sin zona), para comparar
+// la del historial, que viene tal cual la vio WFP, con la de un pedido abierto.
+QString plainAddress(const QString &address) {
+    const QHostAddress a(address.section('%', 0, 0).trimmed());
+    if (a.isNull()) return address.trimmed().toLower();
+    bool v4 = false;
+    const quint32 ip = a.toIPv4Address(&v4);
+    return v4 ? QHostAddress(ip).toString() : a.toString().toLower();
+}
+
+// Motivo de un bloqueo en el historial, con el tono de su etiqueta.
+struct BlockReason {
+    QString text;
+    const char *tone = "1"; // "1" neutro, "wait", "allow", "block"
+};
+
+// El motor anota «waiting for decision» en el momento del intento y no reescribe el historial: la ventana averigua si
+// ese pedido sigue abierto o cómo terminó. Una sola pasada de lo más nuevo a lo más viejo; para cada intento cuenta la
+// primera decisión posterior de la misma app (o el primer permiso por regla al mismo destino), siempre que llegue antes
+// de que el motor dé el pedido por vencido. Devuelve un motivo por evento; vacío en los que no son bloqueos.
+QVector<BlockReason> blockReasons(const QVector<FirewallClient::ActivityItem> &events,
+                                  const QVector<FirewallClient::PendingItem> &pending) {
+    // El motor descarta un pedido sin respuesta a las 24 h: una decisión posterior es sobre otra pregunta.
+    constexpr qint64 PendingLife = 24 * 3600;
+    // La ventana lee pedidos e historial en dos respuestas seguidas: un intento recién anotado puede llegar antes que
+    // su pedido. Sin decisión a la vista, uno de hace segundos se da por abierto en vez de mostrarlo cerrado un instante.
+    constexpr qint64 FreshGrace = 10;
+    // Pedidos abiertos: clave (ruta, o ruta|dirección en modo por destino) -> el comienzo más viejo.
+    QHash<QString, qint64> open;
+    for (const auto &p : pending) {
+        const QString k = p.path.toLower() + (p.perDestination ? '|' + plainAddress(p.remote) : QString());
+        const auto at = open.find(k);
+        if (at == open.end() || p.first < at.value()) open[k] = p.first;
+    }
+    QVector<BlockReason> out(events.size());
+    struct Seen {
+        int index = -1;
+        qint64 time = 0;
+        BlockReason reason;
+    };
+    QHash<QString, Seen> saved;   // ruta -> primera «Rule saved» posterior
+    QHash<QString, Seen> granted; // ruta|dirección -> primer «Allowed/Blocked by rule» posterior
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    for (int i = events.size() - 1; i >= 0; --i) {
+        const auto &e = events[i];
+        const QString app = e.path.toLower();
+        if (e.kind.startsWith("Rule saved: Allow")) {
+            saved[app] = {i, e.time, {"You allowed · " + clock(e.time), "allow"}};
+            continue;
+        }
+        if (e.kind.startsWith("Rule saved: Block")) {
+            saved[app] = {i, e.time, {"You blocked · " + clock(e.time), "block"}};
+            continue;
+        }
+        if (e.kind.startsWith("Allowed by rule")) {
+            granted[app + '|' + plainAddress(e.remote)] = {i, e.time, {"Allowed by your rule", "allow"}};
+            continue;
+        }
+        if (!e.kind.startsWith("Blocked")) continue;
+        if (e.kind.startsWith("Blocked by rule")) {
+            out[i] = {"Your Block rule"};
+            granted[app + '|' + plainAddress(e.remote)] = {i, e.time, {"Your Block rule"}};
+            continue;
+        }
+        if (!e.kind.contains("waiting", Qt::CaseInsensitive)) {
+            out[i] = {e.kind};
+            continue;
+        }
+        // Sigue abierto si hay un pedido de esa app (o de ese destino, en modo por destino) que empezó en este intento
+        // o antes. Uno que empezó después es otra pregunta: ésta ya se cerró.
+        const QString destination = app + '|' + plainAddress(e.remote);
+        const auto whole = open.constFind(app);
+        const auto one = open.constFind(destination);
+        if ((whole != open.constEnd() && whole.value() <= e.time) || (one != open.constEnd() && one.value() <= e.time)) {
+            out[i] = {"Waiting for you", "wait"};
+            continue;
+        }
+        const Seen *first = nullptr;
+        const auto s = saved.constFind(app);
+        if (s != saved.constEnd() && s->time - e.time <= PendingLife) first = &s.value();
+        const auto g = granted.constFind(destination);
+        if (g != granted.constEnd() && g->time - e.time <= PendingLife && (!first || g->index < first->index))
+            first = &g.value();
+        if (first) out[i] = first->reason;
+        else if (now - e.time <= FreshGrace) out[i] = {"Waiting for you", "wait"};
+        // Sin decisión a la vista: se cerró por otro camino (regla de la misma firma en otra copia, vencido a las 24 h,
+        // el programa ya no existe).
+        else out[i] = {"Request closed"};
+    }
+    return out;
 }
 const QString kHelp =
     "GateBouncer asks before an application connects to the internet for the first time. Its first attempt is "
@@ -1153,6 +1245,7 @@ QWidget *FirewallWindow::overviewPage() {
         int shown = 0;
         QSet<QString> listed; // una fila por app: los reintentos de la misma no tapan a las demás
         const auto &events = firewall_.activity();
+        const auto reasons = blockReasons(events, firewall_.pending());
         for (int i = events.size() - 1; i >= 0 && shown < 3; --i) {
             const auto &e = events[i];
             if (!e.kind.startsWith("Blocked") || e.path.isEmpty() || listed.contains(e.path.toLower())) continue;
@@ -1166,7 +1259,7 @@ QWidget *FirewallWindow::overviewPage() {
             t->setFixedWidth(44);
             hl->addWidget(t);
             auto *what = new QLabel(FirewallClient::fileName(e.path).toHtmlEscaped() + " <span style='color:#8a8a8a'>· " +
-                                    activityChip(e.kind).toLower().toHtmlEscaped() + "</span>");
+                                    reasons[i].text.toLower().toHtmlEscaped() + "</span>");
             what->setProperty("r", "body");
             hl->addWidget(what, 1);
             al->addWidget(h);
@@ -1941,20 +2034,52 @@ QWidget *FirewallWindow::activityPage() {
         setColumns(t, "decisions", {{"TIME", 80}, {"APPLICATION", 260}, {"DECISION", 300}});
     cl->addWidget(t);
     const auto &events = firewall_.activity();
-    const auto same = [](const FirewallClient::ActivityItem &a, const FirewallClient::ActivityItem &b) {
-        return a.path.compare(b.path, Qt::CaseInsensitive) == 0 && a.remote == b.remote && a.port == b.port &&
-               a.kind == b.kind;
+    const auto reasons = blockedView ? blockReasons(events, firewall_.pending()) : QVector<BlockReason>();
+    // Una fila por ráfaga: los intentos de una misma app con el mismo motivo van juntos aunque alternen entre varias
+    // direcciones o se intercalen con otras apps. Un intento se suma a la fila de su clave si es la última fila o si
+    // llegó a menos de un minuto del más viejo de ella, y siempre que la fila no pase de diez minutos: una regla Block
+    // que corta a una app cada minuto no se vuelve una sola fila de toda la mañana.
+    constexpr qint64 BurstGap = 60;
+    constexpr qint64 RowSpan = 600;
+    constexpr int RowLimit = 500;
+    struct Row {
+        const FirewallClient::ActivityItem *newest = nullptr;
+        BlockReason reason;
+        qint64 oldest = 0;
+        QStringList destinations; // de la más nueva a la más vieja
+        QHash<QString, int> hits; // destino -> intentos
     };
-    for (int i = events.size() - 1; i >= 0 && t->rowCount() < 500; --i) {
+    QVector<Row> rows;
+    QHash<QString, int> rowOf; // clave -> fila más nueva de esa clave
+    for (int i = events.size() - 1; i >= 0; --i) {
         const auto &e = events[i];
-        const bool blocked = e.kind.startsWith("Blocked");
-        if (blockedView != blocked) continue;
-        // Los reintentos seguidos de una misma app al mismo destino van en una sola fila, con la cuenta.
-        int repeats = 1;
-        while (i > 0 && same(events[i - 1], e)) {
-            --i;
-            ++repeats;
+        if (blockedView != e.kind.startsWith("Blocked")) continue;
+        const BlockReason reason = blockedView ? reasons[i] : BlockReason{e.kind};
+        const QString key = e.path.toLower() + '\n' + reason.text + '\n' + reason.tone;
+        const auto at = rowOf.constFind(key);
+        int r = -1;
+        if (at != rowOf.constEnd() && rows[at.value()].newest->time - e.time <= RowSpan &&
+            (at.value() == rows.size() - 1 || rows[at.value()].oldest - e.time <= BurstGap))
+            r = at.value();
+        if (r < 0) {
+            if (rows.size() >= RowLimit) break;
+            rows.push_back({&e, reason, e.time, {}, {}});
+            r = rows.size() - 1;
+            rowOf[key] = r;
         }
+        auto &row = rows[r];
+        row.oldest = e.time;
+        // Normalizada: la misma dirección escrita como IPv4 o como IPv4 mapeada a IPv6 es un solo destino.
+        const QString dest = e.remote.isEmpty() ? QString("—")
+                                                : plainAddress(e.remote) + (e.port ? ":" + QString::number(e.port) : QString());
+        if (!row.hits.contains(dest)) row.destinations << dest;
+        ++row.hits[dest];
+    }
+    for (const auto &row : rows) {
+        const auto &e = *row.newest;
+        // Los intentos se cuentan por destino: una app que prueba 8 direcciones 4 veces muestra «4 times».
+        int repeats = 0;
+        for (const int n : row.hits) repeats = std::max(repeats, n);
         const int r = t->rowCount();
         t->insertRow(r);
         auto *when = new ElideLabel(clock(e.time), "time");
@@ -1966,13 +2091,13 @@ QWidget *FirewallWindow::activityPage() {
         ah->addWidget(new ElideLabel(e.path.isEmpty() ? QString("GateBouncer") : FirewallClient::fileName(e.path), "body"), 1);
         if (repeats > 1) ah->addWidget(text(QString("%1 times").arg(repeats), "time"));
         if (blockedView) {
-            auto *dest = new ElideLabel(e.remote.isEmpty() ? QString("—")
-                                                           : e.remote + (e.port ? ":" + QString::number(e.port) : QString()),
-                                        "sub");
+            QString where = row.destinations.first();
+            if (row.destinations.size() > 1) where += QString(" +%1 more").arg(row.destinations.size() - 1);
+            auto *dest = new ElideLabel(where, "sub");
             auto *reason = new QWidget;
             auto *rh = new QHBoxLayout(reason);
             rh->setContentsMargins(0, 0, 0, 0);
-            rh->addWidget(chip(activityChip(e.kind)));
+            rh->addWidget(chip(row.reason.text, row.reason.tone));
             rh->addStretch();
             fillRow(t, r, {cell(when), cell(app), cell(dest), cell(reason)});
         } else {
