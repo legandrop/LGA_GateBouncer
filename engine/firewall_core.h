@@ -21,12 +21,15 @@
 // identidad se excluyen: decidir una reemplaza a las otras.
 #include "dns_names.h"
 #include "folder_rule.h"
+#include "folder_watch.h"
 #include "name_wait.h"
 #include "wfp_engine.h"
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -177,13 +180,27 @@ class FirewallCore {
     void addGrantActivity(std::int64_t t, const std::wstring &path, const std::wstring &address, const Rule &rule,
                           const std::wstring &remote, std::uint16_t port, std::uint8_t protocol);
     void recheckCoverage(bool full);
-    // Vuelve a decidir cada archivo cubierto por una carpeta con la precedencia entera: una regla de firma que coincide
-    // (con la firma verificada de nuevo) u otra carpeta que gana (más profunda, la misma con el nombre del exe) pasa a
-    // cubrirlo, con su acción; el modo por destino de su identidad le saca la cobertura (el próximo intento se decide
-    // por destino). Hace E/S: sin mutex_, en el hilo de verificación.
-    void reviewFolderCoverage();
-    // Pide esa revisión al hilo de verificación (después de guardar una regla). Con o sin mutex_.
-    void requestFolderReview();
+    // Vuelve a decidir cada archivo cubierto por una regla de firma o de carpeta con la precedencia entera (destino →
+    // app → editor → carpeta): otra regla que gana (la de la app sobre la del editor, una de firma sobre una carpeta,
+    // con la firma verificada de nuevo; una carpeta más profunda, o la misma con el nombre del exe) pasa a cubrirlo con
+    // su acción, sin esperar un intento; el modo por destino de su identidad le saca la cobertura (el próximo intento
+    // se decide por destino). Hace E/S: sin mutex_, en el hilo de verificación.
+    void reviewCoverage();
+    // Pide esa revisión al hilo de verificación (después de guardar una regla y al arrancar). Con o sin mutex_.
+    void requestCoverageReview();
+    // Un .exe apareció o cambió en una carpeta con regla (hilo del vigía): se anota para cubrirlo antes de su primer
+    // intento, cuando deje de cambiar (el linker escribe en tandas).
+    void onFolderChange(const std::wstring &path);
+    // Lo mismo para las rutas que soltó una regla quitada o vencida: pasan a la regla que les toque sin esperar un
+    // intento (con «Ask» apagado ese intento no se bloquea). Con mutex_ tomado.
+    void queueReleased(const std::vector<std::wstring> &paths);
+    // Cubre ese archivo si no tiene regla ni cobertura propia y lo tiene una regla por carpeta (o, si lo soltó otra
+    // regla, también una de firma), con la misma precedencia y verificación que un bloqueo. Mira los enlaces sin abrir
+    // nada antes de tocar el archivo. Verdadero si agregó una cobertura (hay que guardar). Hace E/S: sin mutex_, en el
+    // hilo de verificación.
+    bool preCover(const std::wstring &path, bool released);
+    // Le pasa al vigía las carpetas de las reglas por carpeta. Con mutex_ tomado.
+    void updateWatches();
     void expireRules();
     // Retira los filtros de la regla (o de sus coberturas) y la borra. Con mutex_ tomado.
     bool dropRule(std::map<std::wstring, Rule>::iterator it, const std::wstring &reason, std::wstring &error);
@@ -251,7 +268,7 @@ class FirewallCore {
     std::deque<DropEvent> verifyQueue_;
     std::deque<DnsHint> hintQueue_;
     bool verifyStop_ = false;
-    bool reviewFolders_ = false; // protegido por verifyMutex_
+    bool reviewRequested_ = false; // protegido por verifyMutex_
     std::thread verifyThread_;
     int recheckRound_ = 0; // sólo lo usa el hilo de verificación
     bool reviewAgain_ = false; // ídem: la última revisión de carpetas no pudo ubicar algún archivo
@@ -259,6 +276,16 @@ class FirewallCore {
     // Sólo lo usa el hilo de verificación.
     NameWait<DropEvent> nameWait_{std::chrono::seconds(2), 1000};
     std::map<std::wstring, SignerCache> signers_; // clave: ruta en minúsculas; protegido por verifyMutex_
+    // Los .exe que avisó el vigía, por ruta en minúsculas, con el momento en que se cubren si dejaron de cambiar.
+    // Protegido por verifyMutex_.
+    struct Ahead {
+        std::wstring path;
+        std::chrono::steady_clock::time_point due;
+        bool released = false; // la soltó una regla quitada o vencida (no la avisó el vigía)
+    };
+    std::map<std::wstring, Ahead> ahead_;
+    bool aheadNew_ = false;
+    std::unique_ptr<FolderWatch> watch_;
 };
 
 } // namespace gbe

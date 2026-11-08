@@ -45,7 +45,9 @@ The window reads the engine and has five sections; the sidebar shows the state o
   Files, ProgramData, Users, each profile, AppData, Desktop, Documents, Downloads, Temp and the Recycle Bin) cannot be
   trusted, nor a folder inside Windows, Downloads or Temp, nor a folder that holds any of them. A rule for a file, an
   app or a publisher comes first; between two folder rules the deeper folder wins, and a rule saved later that comes
-  first takes over the programs a folder had already covered. Anything that can write to a trusted folder gets the
+  first takes over the programs another rule had already covered. A new build in a trusted folder gets its rule a
+  moment after it is written (about 1.5 seconds), so it usually connects on its first attempt; one started sooner
+  loses that attempt and connects on the next. Anything that can write to a trusted folder gets the
   same access, so trust only folders where you build or install programs yourself.
 - The notice's **Destination** list limits a rule to where the application tried to go: **Only** that server, **Only
   \*.domain** (the server's domain and its subdomains) or, without a name, **Only** that address. An application with

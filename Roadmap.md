@@ -22,6 +22,7 @@ Checkboxes mean **verified on Windows**, not only implemented.
 - [ ] **Trusted folders.** Implemented: a folder rule covers one file name, or every program, in a folder and its
   subfolders, so unsigned programs rebuilt in new folders (a worktree per branch) don't ask again. The notice offers
   the program by name in its Git repository, preselected when it is unsigned; Apps → Folders adds any folder by hand.
+  The engine watches trusted folders and allows a new build as soon as it is written, before its first attempt.
   Verified without the service: folder checks with real
   folders and junctions (a junction that leads outside, a drive root, Downloads, Temp and system folders are refused),
   and the window and notice against a simulated engine. Done when it is checked with the installed service.

@@ -227,6 +227,21 @@ bool finalPathOf(const std::wstring &path, bool directory, FinalPath &out) {
     return true;
 }
 
+bool linkFreePath(const std::wstring &path) {
+    if (path.size() < 4 || !hasDriveLetter(path) || path[2] != L'\\') return false;
+    const wchar_t root[] = {path[0], L':', L'\\', L'\0'};
+    if (GetDriveTypeW(root) != DRIVE_FIXED) return false;
+    // Tramo por tramo: si uno de arriba fuera un enlace, ya se rechazó antes de mirar los de abajo.
+    for (std::size_t end = path.find(L'\\', 3);; end = path.find(L'\\', end + 1)) {
+        const std::wstring part = path.substr(0, end);
+        if (part.size() > 3) {
+            const DWORD a = GetFileAttributesW(part.c_str());
+            if (a == INVALID_FILE_ATTRIBUTES || (a & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+        }
+        if (end == std::wstring::npos) return true;
+    }
+}
+
 bool placeOf(const std::wstring &reportedPath, FinalPath &out) {
     FinalPath f;
     if (!finalPathOf(reportedPath, false, f)) return false;

@@ -21,7 +21,11 @@ other driverless Windows firewalls.
   every app from a signer. WFP only matches paths, so these rules live in the engine: when an executable without a
   path rule is blocked, the engine checks its signature (offline, no revocation lookup; see Limits) and, if
   a signature rule matches, adds the filter for that path. The first attempt is still lost; the next one uses the rule.
-  These paths are saved with the rule and verified again at every engine start.
+  These paths are saved with the rule and verified again at every engine start. A signature rule saved later that
+  comes first (the app over its publisher) takes over the paths another one had covered right away, with its own
+  action, after verifying the signature on the file again; with **Ask** turned off too. When a rule is removed or
+  expires, the paths it covered go to the next rule that holds them (a signature or folder rule) right away, if they
+  are on a local fixed disk and their path has no links; otherwise they wait for their next blocked attempt.
 - **Folder rules.** A rule can also cover every executable inside a folder and its subfolders, or only the ones with one
   file name, for unsigned programs that are rebuilt in new folders (a worktree per branch). They work like signature
   rules: an executable with no rule of its own is checked when it is blocked and, if a folder rule holds it, gets the
@@ -35,13 +39,22 @@ other driverless Windows firewalls.
   profile of local, domain and Entra ID accounts, AppData, Desktop, Documents, Downloads, Temp and each drive's Recycle
   Bin, also when moved), any folder inside Windows, Downloads or Temp, and any folder that contains one of them; a
   Downloads or Temp that is a whole drive makes the whole drive refused. The service only opens drive-letter paths on
-  local fixed disks while checking: never a network path or a pipe, even if a user's folder settings point there.
+  local fixed disks while checking, so a user's folder settings that point to a network path or a pipe are never
+  opened; before opening a file reported by the folder watch (below) it also checks each part of its path for links
+  without opening anything, so a symlink there that leads to a network path is not followed (a link swapped in during
+  the instant between that check and the opening still is).
   Covered paths are rechecked like signature ones: a file that left the folder loses its filter, while a rebuilt file
   in the same place keeps it. When a rule that comes first is saved later (a signature rule that matches, a deeper
   folder rule, or the same folder naming the executable), it takes over the files a folder rule had covered right away,
   with its own action; for a signature rule the signature is verified again on the file first. Destination rules for
-  the same app release the file, so that its next attempt is decided per destination. A folder on a volume mounted in
-  another folder is refused, because WFP reports its programs without a drive letter. Saved as `folder` lines in
+  the same app release the file, so that its next attempt is decided per destination; with **Ask** turned off a
+  covered Block is kept instead (nothing would block that attempt) until Ask is on again. A folder on a volume mounted in
+  another folder is refused, because WFP reports its programs without a drive letter. The engine also watches each
+  folder with a folder rule (`ReadDirectoryChangesW`, up to 60 folders): when an executable is created, rewritten or
+  renamed into it, it is covered 1.5 seconds after it stops changing, with the same checks and precedence as a blocked
+  attempt, so a new build usually connects on its first attempt. A trusted folder inside another one shares its watch. A
+  missed notice (too many changes at once, a folder of programs moved in as a whole, a folder beyond the first 60)
+  only means that file is covered at its first blocked attempt instead. Saved as `folder` lines in
   `rules.tsv` (version 3; an older engine skips them and keeps a `.bad` copy); a line for a whole volume is refused
   when loading.
 - **Local network without asking** (on by default): an outbound permit filter for private ranges (10/8, 172.16/12,
@@ -164,9 +177,13 @@ a folder can be trusted and whether that executable is inside it; neither needs 
   under your account gets the same access. Folders under `C:\` that users create can usually be written by every user
   of the computer. Renaming the trusted folder, even only its capitals, stops the rule from covering anything (it asks
   again) until it is created for the new name.
-- Signature and folder rules reach a new path when its first attempt is blocked. With **Ask** turned off nothing is
-  blocked by default, so they keep the paths they already cover, but a new copy or build is not covered until Ask is
-  on again, and a path left by a removed rule has no filter of its own.
+- Signature rules reach a new path when its first attempt is blocked; folder rules reach it when the file appears,
+  and at its first blocked attempt if that notice was missed (a program that starts within 1.5 seconds of being
+  written still loses its first attempt). With **Ask** turned off nothing is blocked by default: folder rules still
+  cover new programs in their folders, but a new copy of a signed app elsewhere is not covered until Ask is on again.
+- While the engine watches a trusted folder it keeps that folder open (sharing read, write and delete). Windows may
+  refuse to rename or move a folder above it, and deleting the trusted folder itself finishes only when the engine
+  lets it go (at once, when the folder is gone); removing the rule, or stopping the service, releases it.
 - Three kinds of signature count, all checked offline: the signature embedded in the file; a Windows catalog that
   lists the file (most Windows tools, such as `powershell.exe`, are signed this way); and, for Microsoft Store and
   other packaged apps under `C:\Program Files\WindowsApps`, the package publisher from the package's

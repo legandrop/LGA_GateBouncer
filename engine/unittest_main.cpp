@@ -8,6 +8,7 @@
 // de Temp, Downloads y las demás carpetas en las que no se puede confiar.
 #include "destination_match.h"
 #include "folder_rule.h"
+#include "folder_watch.h"
 #include "name_wait.h"
 #include <windows.h>
 #include <sddl.h>
@@ -391,6 +392,90 @@ void folderRulesWithoutDisk() {
                                                  name == gbe::folderNameKey(L"D:\\Árbol\\Éxito.exe"));
 }
 
+// El vigía de carpetas con carpetas y archivos reales: avisa los .exe nuevos de adentro y nada más.
+void folderWatchOnDisk(const std::wstring &base) {
+    check(L"vigía: «.exe» en cualquier mayúscula", gbe::isExeName(L"DayTrace.exe") && gbe::isExeName(L"APP.EXE"));
+    check(L"vigía: otras extensiones no", !gbe::isExeName(L"notes.txt") && !gbe::isExeName(L"a.exe.txt") &&
+                                             !gbe::isExeName(L".exe") && !gbe::isExeName(L"aexe"));
+    Scratch s;
+    const std::wstring run = base + L"\\watch-" + std::to_wstring(GetCurrentProcessId()) + L"-" +
+                             std::to_wstring(GetTickCount64());
+    const std::wstring trusted = run + L"\\LGA_Repo", build = trusted + L"\\build", outside = run + L"\\Outside";
+    if (!(s.dir(run) && s.dir(trusted) && s.dir(build) && s.dir(outside))) {
+        check(L"vigía: arma el árbol de prueba", false);
+        return;
+    }
+    gbe::FinalPath folder;
+    if (!gbe::resolveTrustedFolder(trusted, folder).empty()) {
+        check(L"vigía: la carpeta de prueba se puede confiar", false);
+        return;
+    }
+    std::mutex m;
+    std::vector<std::wstring> seen;
+    const auto saw = [&](const std::wstring &tail) {
+        std::lock_guard<std::mutex> lock(m);
+        for (const auto &p : seen)
+            if (p.size() >= tail.size() && _wcsicmp(p.c_str() + p.size() - tail.size(), tail.c_str()) == 0) return true;
+        return false;
+    };
+    const auto waitFor = [&](const std::wstring &tail, int ms) {
+        for (int i = 0; i < ms / 50 && !saw(tail); ++i) Sleep(50);
+        return saw(tail);
+    };
+    gbe::FolderWatch watch([&](const std::wstring &path) {
+        std::lock_guard<std::mutex> lock(m);
+        seen.push_back(path);
+    });
+    watch.setFolders({folder.dos});
+    for (int i = 0; i < 40 && watch.watching() != 1; ++i) Sleep(50);
+    check(L"vigía: vigila la carpeta", watch.watching() == 1);
+    const bool escape = s.junction(trusted + L"\\escape", outside);
+    s.file(build + L"\\DayTrace.exe");
+    s.file(build + L"\\notes.txt");
+    s.file(outside + L"\\Evil.exe");
+    // Escrito a través del junction que sale de la carpeta: el archivo real queda afuera.
+    const bool via = escape && s.file(trusted + L"\\escape\\Via.exe");
+    // Como lld: se escribe con otro nombre y se renombra al final.
+    bool renamed = s.file(build + L"\\Linked.tmp") &&
+                   MoveFileW((build + L"\\Linked.tmp").c_str(), (build + L"\\Linked.exe").c_str());
+    if (renamed) s.made.back().path = build + L"\\Linked.exe";
+    check(L"vigía: avisa un .exe nuevo en una subcarpeta", waitFor(L"\\build\\DayTrace.exe", 3000));
+    check(L"vigía: avisa un .exe que llega por un cambio de nombre", renamed && waitFor(L"\\build\\Linked.exe", 3000));
+    Sleep(500);
+    check(L"vigía: un archivo que no es .exe no se avisa", !saw(L"notes.txt") && !saw(L"Linked.tmp"));
+    check(L"vigía: un .exe en otra carpeta no se avisa", !saw(L"\\Outside\\Evil.exe"));
+    if (via) {
+        check(L"vigía: un .exe escrito por un junction que sale no se avisa", !saw(L"Via.exe"));
+        check(L"enlaces: la ruta por el junction tiene un enlace", !gbe::linkFreePath(trusted + L"\\escape\\Via.exe"));
+    } else {
+        std::wprintf(L"SKIP  vigía por un junction (no se pudo crear)\n");
+    }
+    check(L"enlaces: una ruta sin enlaces pasa", gbe::linkFreePath(build + L"\\DayTrace.exe"));
+    check(L"enlaces: una ruta de red o sin letra no pasa",
+          !gbe::linkFreePath(L"\\\\server\\share\\x.exe") && !gbe::linkFreePath(L"\\\\.\\pipe\\x") &&
+              !gbe::linkFreePath(L"x.exe"));
+    // Lo que avise tiene que estar adentro de verdad: si llegara algo por el junction, el motor lo descarta igual.
+    bool allInside = true;
+    {
+        std::lock_guard<std::mutex> lock(m);
+        for (const auto &p : seen) allInside = allInside && inside(p, folder);
+    }
+    check(L"vigía: todo lo avisado está dentro de la carpeta por su ruta final", allInside);
+    watch.setFolders({});
+    for (int i = 0; i < 40 && watch.watching() != 0; ++i) Sleep(50);
+    check(L"vigía: deja de vigilar una carpeta sin regla", watch.watching() == 0);
+    s.file(build + L"\\Late.exe");
+    Sleep(800);
+    check(L"vigía: sin regla ya no avisa", !saw(L"Late.exe"));
+    if (escape) {
+        // Una carpeta de regla que pasó a ser un enlace (acá, el junction que sale) no se vigila.
+        watch.setFolders({trusted + L"\\escape"});
+        Sleep(500);
+        check(L"vigía: una carpeta que es un enlace no se vigila", watch.watching() == 0);
+    }
+    watch.stop();
+}
+
 std::wstring currentUserSid() {
     HANDLE token = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return {};
@@ -454,6 +539,7 @@ int wmain(int argc, wchar_t **argv) {
     }
     while (base.size() > 3 && base.back() == L'\\') base.pop_back();
     folderRulesOnDisk(base);
+    folderWatchOnDisk(base);
     std::wprintf(failures ? L"\n%d FAILED\n" : L"\nALL PASSED\n", failures);
     return failures ? 1 : 0;
 }

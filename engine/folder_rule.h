@@ -25,6 +25,12 @@ struct FinalPath {
 // Sólo abre rutas con letra de unidad de un disco local fijo: nunca una ruta de red ni una pipe.
 bool finalPathOf(const std::wstring &path, bool directory, FinalPath &out);
 
+// Ningún tramo de la ruta, desde la raíz de la unidad hasta el último, es un enlace (junction, symlink, punto de
+// montaje): se mira cada tramo con GetFileAttributesW, que no sigue el último componente, sin abrir nada. Para mirarlo
+// antes de abrir un archivo que avisó el vigía: un symlink a una ruta de red haría que SYSTEM se conecte a otro
+// equipo. Sólo con letra de unidad de un disco local fijo.
+bool linkFreePath(const std::wstring &path);
+
 // La ruta con los nombres cortos 8.3 expandidos (sin seguir enlaces); la misma si no se puede.
 std::wstring longPathOf(const std::wstring &path);
 // El nombre de archivo de una ruta como lo comparan las reglas por carpeta: en minúsculas con la tabla invariante
