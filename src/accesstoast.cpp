@@ -5,6 +5,7 @@
 #include "foldertrust.h"
 #include "explain/Explainer.h"
 #include "explain/KnownApps.h"
+#include "i18n.h"
 #include "theme.h"
 #include <QAbstractItemView>
 #include <QComboBox>
@@ -370,7 +371,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     }
     setAttribute(Qt::WA_TranslucentBackground);
     setObjectName("accessToast");
-    setAccessibleName("Access request");
+    setAccessibleName(I18n::tr("Access request"));
     setMouseTracking(true);
     width_ = Width;
     setFixedWidth(Width);
@@ -398,7 +399,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     more->setFixedSize(26, 26);
     more->setIcon(headerIcon(false));
     more->setIconSize(QSize(16, 16));
-    more->setAccessibleName("More actions");
+    more->setAccessibleName(I18n::tr("More actions"));
     more->setCursor(Qt::PointingHandCursor);
     barRow->addWidget(more);
     auto *close = new QPushButton(bar);
@@ -406,15 +407,15 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     close->setFixedSize(26, 26);
     close->setIcon(headerIcon(true));
     close->setIconSize(QSize(16, 16));
-    CustomTooltip::instance()->setToolTip(close, "Close and keep it waiting");
-    close->setAccessibleName("Close and keep it waiting");
+    CustomTooltip::instance()->setToolTip(close, I18n::tr("Close and keep it waiting"));
+    close->setAccessibleName(I18n::tr("Close and keep it waiting"));
     close->setCursor(Qt::PointingHandCursor);
     barRow->addWidget(close);
     layout->addWidget(bar);
 
     auto *menu = new QMenu(this);
-    menu->addAction("Open GateBouncer", this, [this] { emit openRequested(); });
-    menu->addAction("Pending list", this, [this] { emit pendingListRequested(); });
+    menu->addAction(I18n::tr("Open GateBouncer"), this, [this] { emit openRequested(); });
+    menu->addAction(I18n::tr("Pending list"), this, [this] { emit pendingListRequested(); });
     connect(more, &QPushButton::clicked, this, [more, menu] { menu->popup(more->mapToGlobal(QPoint(0, more->height()))); });
     connect(close, &QPushButton::clicked, this, [this] { emit dismissed(request_.id); });
 
@@ -459,8 +460,8 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     };
     warnBox_ = noteBox("toastWarn", warn_, Qt::PlainText); // el texto depende de si hay carpeta que ofrecer
     infoBox_ = noteBox("toastInfo", info_, Qt::RichText);
-    info_->setText(QString("Allow or Block applies to this server only. Choose <b style=\"color:%1\">Any destination "
-                           "(whole app)</b> in the menu to replace its server rules.")
+    info_->setText(I18n::tr("Allow or Block applies to this server only. Choose <b style=\"color:%1\">Any destination "
+                            "(whole app)</b> in the menu to replace its server rules.")
                        .arg(Theme::kTextStrong));
 
     // Datos en grilla bajo una línea: firma, a dónde quería ir y quién la lanzó.
@@ -483,7 +484,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
         k->setFixedWidth(KeyColumn);
         return k;
     };
-    facts->addWidget(key("Signature"), 0, 0, Qt::AlignTop);
+    facts->addWidget(key(I18n::tr("Signature")), 0, 0, Qt::AlignTop);
     auto *signature = new QVBoxLayout;
     signature->setSpacing(1);
     signature_ = new QLabel(this);
@@ -494,7 +495,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     signatureDetail_ = label(this, "toastValueDetail");
     signature->addWidget(signatureDetail_);
     facts->addLayout(signature, 0, 1, Qt::AlignTop);
-    wantsKey_ = key("Wants");
+    wantsKey_ = key(I18n::tr("Wants"));
     facts->addWidget(wantsKey_, 1, 0, Qt::AlignTop);
     auto *wants = new QVBoxLayout;
     wants->setSpacing(1);
@@ -503,7 +504,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     destinationDetail_ = label(this, "toastValueDetail");
     wants->addWidget(destinationDetail_);
     facts->addLayout(wants, 1, 1, Qt::AlignTop);
-    launchedKey_ = key("Started by");
+    launchedKey_ = key(I18n::tr("Started by"));
     facts->addWidget(launchedKey_, 2, 0, Qt::AlignTop);
     launched_ = label(this, "toastValue");
     facts->addWidget(launched_, 2, 1, Qt::AlignTop);
@@ -541,9 +542,9 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     suggestion_->setFixedHeight(22);
     cardRow->addWidget(suggestion_);
     cardRow->addStretch(1);
-    details_ = link(explainBox_, "toastDetails", "Details");
+    details_ = link(explainBox_, "toastDetails", I18n::tr("Details"));
     cardRow->addWidget(details_);
-    settingsLink_ = link(explainBox_, "toastSettings", "Set up in Settings");
+    settingsLink_ = link(explainBox_, "toastSettings", I18n::tr("Set up in Settings"));
     cardRow->addWidget(settingsLink_);
     explainAction_ = new QPushButton(explainBox_);
     explainAction_->setObjectName("toastExplain");
@@ -574,9 +575,9 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
         moreLayout->addWidget(body);
         if (!last) moreLayout->addSpacing(9);
     };
-    section("WHY IT CONNECTS", whyHead_, why_, false);
-    section("WHY THIS SUGGESTION", reasonHead_, reason_, false);
-    section("IS IT GENUINE", riskHead_, risk_, true);
+    section(I18n::tr("WHY IT CONNECTS"), whyHead_, why_, false);
+    section(I18n::tr("WHY THIS SUGGESTION"), reasonHead_, reason_, false);
+    section(I18n::tr("IS IT GENUINE"), riskHead_, risk_, true);
     for (auto *h : {whyHead_, reasonHead_, riskHead_}) smallCaps(h);
     card->addWidget(more_);
     explainFoot_ = label(explainBox_, "toastExplainFoot", true);
@@ -609,7 +610,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     rule->setContentsMargins(Pad, Gap, Pad, 0);
     rule->setSpacing(6);
     auto *ruleLabel = label(this, "toastRuleLabel");
-    ruleLabel->setText("Rule");
+    ruleLabel->setText(I18n::tr("Rule"));
     smallCaps(ruleLabel);
     rule->addWidget(ruleLabel);
     choices_ = new QWidget(this);
@@ -620,19 +621,19 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     layout->addLayout(rule);
     scope_ = new ScopeCombo(choices_);
     scope_->setObjectName("toastScope");
-    scope_->setAccessibleName("Apply to");
+    scope_->setAccessibleName(I18n::tr("Apply to"));
     duration_ = new ScopeCombo(choices_);
     duration_->setObjectName("toastDuration");
-    duration_->setAccessibleName("For");
-    duration_->addItem("Always", "always");
+    duration_->setAccessibleName(I18n::tr("For"));
+    duration_->addItem(I18n::tr("Always"), "always");
     for (const int minutes : {1, 5, 10, 15, 30})
-        duration_->addItem(minutes == 1 ? QStringLiteral("1 minute") : QString("%1 minutes").arg(minutes),
+        duration_->addItem(minutes == 1 ? I18n::tr("1 minute") : I18n::tr("%1 minutes").arg(minutes),
                            QString::number(minutes * 60));
-    duration_->addItem("1 hour", "3600");
-    duration_->addItem("Until restart", "restart");
+    duration_->addItem(I18n::tr("1 hour"), "3600");
+    duration_->addItem(I18n::tr("Until restart"), "restart");
     target_ = new ScopeCombo(choices_);
     target_->setObjectName("toastTarget");
-    target_->setAccessibleName("Destination");
+    target_->setAccessibleName(I18n::tr("Destination"));
     static_cast<ScopeCombo *>(target_)->elideMode = Qt::ElideMiddle; // un nombre largo conserva su dominio
     for (auto *combo : {scope_, duration_, target_}) {
         // Con el delegado común la lista toma el estilo de cada fila de la hoja de estilo.
@@ -665,9 +666,9 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     buttons->setContentsMargins(Pad, Gap, Pad, 0);
     buttons->setSpacing(8);
     buttons->addStretch(1);
-    block_ = new QPushButton("Block", this);
+    block_ = new QPushButton(I18n::tr("Block"), this);
     block_->setObjectName("toastBlock");
-    allow_ = new QPushButton("Allow", this);
+    allow_ = new QPushButton(I18n::tr("Allow"), this);
     allow_->setObjectName("toastAllow");
     // 72 x 26: la hoja de estilo fija 70 x 24 de contenido más el borde (un tamaño fijo en código lo pisa la hoja
     // global de la app al volver a aplicar el estilo).
@@ -687,7 +688,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     foot->setSpacing(6);
     footer_ = label(this, "toastFooter");
     foot->addWidget(footer_, 1);
-    auto *open = link(this, "toastOpen", "Open GateBouncer");
+    auto *open = link(this, "toastOpen", I18n::tr("Open GateBouncer"));
     foot->addWidget(open);
     connect(open, &QPushButton::clicked, this, [this] { emit openRequested(); });
     layout->addLayout(foot);
@@ -721,13 +722,14 @@ void AccessToast::setRequest(const Request &request) {
         rebuildTargets();
     }
     const QString exe = QFileInfo(request.path).fileName();
-    body_->setText(!request.perDestination ? QStringLiteral("Blocked. Allow lets its next attempt connect.")
-                   : request.serverRules > 0
-                       ? QString("Blocked: a new server. %1 already has rules for %2 %3.")
+    body_->setText(!request.perDestination ? I18n::tr("Blocked. Allow lets its next attempt connect.")
+                   : request.serverRules == 1
+                       ? I18n::tr("Blocked: a new server. %1 already has rules for 1 server.").arg(exe)
+                   : request.serverRules > 1
+                       ? I18n::tr("Blocked: a new server. %1 already has rules for %2 servers.")
                              .arg(exe)
                              .arg(request.serverRules)
-                             .arg(request.serverRules == 1 ? "server" : "servers")
-                       : QString("Blocked: a new server for %1.").arg(exe));
+                       : I18n::tr("Blocked: a new server for %1.").arg(exe));
     infoBox_->setVisible(request.perDestination);
     renderKnown();
     // Se resalta el botón que recomienda el catálogo (o una app LGA): los dos quedan iguales y nada se decide solo.
@@ -757,15 +759,15 @@ void AccessToast::rebuildTargets() {
         targets << request_.remote;
     }
     // En modo por destino la decisión es sobre este destino; la app entera queda como última opción.
-    if (!request_.perDestination) target_->addItem("Any destination", QString());
+    if (!request_.perDestination) target_->addItem(I18n::tr("Any destination"), QString());
     // A media fila «Only www.github.com» no suele entrar: el desplegable muestra el nombre solo antes que recortarlo.
     for (const auto &t : targets) {
-        target_->addItem("Only " + t, t);
+        target_->addItem(I18n::tr("Only %1").arg(t), t);
         target_->setItemData(target_->count() - 1, t, ShortTextRole);
     }
     if (request_.perDestination) {
-        target_->addItem("Any destination (whole app)", QString());
-        target_->setItemData(target_->count() - 1, QStringLiteral("Any destination"), ShortTextRole);
+        target_->addItem(I18n::tr("Any destination (whole app)"), QString());
+        target_->setItemData(target_->count() - 1, I18n::tr("Any destination"), ShortTextRole);
     }
     const int keep = targetChosen_ ? target_->findData(chosen) : -1;
     const int narrowest = targets.isEmpty() ? 0 : target_->findData(targets.first());
@@ -802,8 +804,9 @@ void AccessToast::renderDestination() {
     // La firma en color (cian válida, amarillo sin firma) y debajo la carpeta del programa, recortada al medio si no
     // entra; la ruta entera va en el tooltip de las dos.
     signature_->setText(request_.signer.isEmpty()
-                            ? QString("<span style=\"color:%1; font-weight:500\">Not signed</span>").arg(Theme::kWarn)
-                            : QString("<span style=\"color:%1; font-weight:500\">%2</span> · valid")
+                            ? QString("<span style=\"color:%1; font-weight:500\">%2</span>")
+                                  .arg(Theme::kWarn, I18n::tr("Not signed").toHtmlEscaped())
+                            : I18n::tr("<span style=\"color:%1; font-weight:500\">%2</span> · valid")
                                   .arg(QLatin1String(Theme::kOk), request_.signer.toHtmlEscaped()));
     CustomTooltip::instance()->setToolTip(signature_, full.toHtmlEscaped());
     fit(signature_, value);
@@ -829,9 +832,10 @@ void AccessToast::renderDestination() {
                                                  QString::number(request_.port)
                                            : FirewallClient::protocolName(request_.protocol);
         // Sin nombre: la app se conectó directo a la IP o resolvió por su cuenta, y eso también es un dato.
+        const QString where = FirewallClient::destinationKindLabel(kind);
         elide(destinationDetail_,
-              kind + (request_.host.isEmpty() ? QStringLiteral(" · no server name seen") : QString()) + " · " + port,
-              value, Qt::ElideRight);
+              (request_.host.isEmpty() ? I18n::tr("%1 · no server name seen").arg(where) : where) + " · " + port, value,
+              Qt::ElideRight);
     }
     const bool launched = !request_.launchedBy.isEmpty();
     launchedKey_->setVisible(launched);
@@ -866,10 +870,10 @@ void AccessToast::rebuildScopes() {
     }
     scope_->setCurrentIndex(0);
     scope_->setEnabled(scope_->count() > 1);
-    warn_->setText(repository ? QStringLiteral("No signature: the rule can't follow a publisher, only this file or this "
-                                               "app's name inside its repository.")
-                              : QStringLiteral("No signature: a rule can only cover this exact file. If the file "
-                                               "changes, it asks again."));
+    warn_->setText(repository ? I18n::tr("No signature: the rule can't follow a publisher, only this file or this "
+                                         "app's name inside its repository.")
+                              : I18n::tr("No signature: a rule can only cover this exact file. If the file changes, "
+                                         "it asks again."));
     warnBox_->setVisible(request_.signer.isEmpty());
     syncFolderScope();
 }
@@ -882,9 +886,11 @@ void AccessToast::updateCounters() {
     target_->setEnabled(request_.canDecide && armed_ && target_->count() > 1 && !folderScope());
     QStringList parts;
     if (request_.attempts > 0)
-        parts << (request_.attempts == 1 ? QStringLiteral("1 attempt") : QString("%1 attempts").arg(request_.attempts));
-    if (request_.othersWaiting > 0) parts << QString("%1 more waiting").arg(request_.othersWaiting);
-    if (!request_.canDecide) parts << "read only";
+        parts << (request_.attempts == 1 ? I18n::tr("1 attempt") : I18n::tr("%1 attempts").arg(request_.attempts));
+    if (request_.othersWaiting > 0)
+        parts << (request_.othersWaiting == 1 ? I18n::tr("1 more waiting")
+                                              : I18n::tr("%1 more waiting").arg(request_.othersWaiting));
+    if (!request_.canDecide) parts << I18n::tr("read only");
     footer_->setText(parts.join(" · "));
 }
 
@@ -913,23 +919,23 @@ void AccessToast::renderExplanation() {
     restyle(explainStatus_, "tone",
             working ? QStringLiteral("working") : e.state == Explanation::Failed ? QStringLiteral("err") : QString());
     const QString model = modelName(e.model.isEmpty() ? Explain::Settings::load().model : e.model);
-    explainStatus_->setText(working ? "Asking " + (model.isEmpty() ? QStringLiteral("the AI") : model) +
-                                          " what this is" + QChar(0x2026)
-                            : e.state == Explanation::NoKey  ? QStringLiteral("Explanations are off.")
-                            : e.state == Explanation::Failed ? QStringLiteral("The explanation did not arrive.")
-                                                             : QStringLiteral("What is this program?"));
+    explainStatus_->setText(working ? (model.isEmpty() ? I18n::tr("Asking the AI what this is…")
+                                                       : I18n::tr("Asking %1 what this is…").arg(model))
+                            : e.state == Explanation::NoKey  ? I18n::tr("Explanations are off.")
+                            : e.state == Explanation::Failed ? I18n::tr("The explanation did not arrive.")
+                                                             : I18n::tr("What is this program?"));
     settingsLink_->setVisible(e.state == Explanation::NoKey);
     explainAction_->setVisible(e.state == Explanation::Offer || e.state == Explanation::Failed);
-    explainAction_->setText(e.state == Explanation::Failed ? "Try again" : "Ask AI");
+    explainAction_->setText(e.state == Explanation::Failed ? I18n::tr("Try again") : I18n::tr("Ask AI"));
 
     suggestion_->setVisible(ready);
     restyle(suggestion_, "kind", e.suggestion == "block" || e.suggestion == "allow" ? e.suggestion : QString());
-    suggestion_->setText(e.suggestion == "block"   ? QStringLiteral("AI suggests Block")
-                         : e.suggestion == "allow" ? QStringLiteral("AI suggests Allow")
-                                                   : QStringLiteral("AI: your call"));
+    suggestion_->setText(e.suggestion == "block"   ? I18n::tr("AI suggests Block")
+                         : e.suggestion == "allow" ? I18n::tr("AI suggests Allow")
+                                                   : I18n::tr("AI: your call"));
     const bool hasMore = ready && !(e.why.isEmpty() && e.reason.isEmpty() && e.risk.isEmpty());
     details_->setVisible(hasMore);
-    details_->setText(detailsOpen_ ? "Less" : "Details");
+    details_->setText(detailsOpen_ ? I18n::tr("Less") : I18n::tr("Details"));
     what_->setText(ready ? e.what : QString());
     what_->setVisible(ready && !e.what.isEmpty());
     more_->setVisible(hasMore && detailsOpen_);
@@ -940,12 +946,12 @@ void AccessToast::renderExplanation() {
         head->setVisible(!body->text().isEmpty());
         body->setVisible(!body->text().isEmpty());
     }
-    // Los rótulos van en inglés como el resto de la interfaz; el contenido llega en el idioma elegido en Settings.
-    const QString foot = ready     ? "AI explanation · " + modelName(e.model) + " · may be wrong"
-                         : working ? QStringLiteral("You can decide now; the answer never holds the notice.")
+    // Los rótulos van en el idioma de la interfaz; el contenido llega en el idioma elegido para las explicaciones.
+    const QString foot = ready     ? I18n::tr("AI explanation · %1 · may be wrong").arg(modelName(e.model))
+                         : working ? I18n::tr("You can decide now; the answer never holds the notice.")
                          : e.state == Explanation::Failed ? e.error
                          : e.state == Explanation::Offer && !Explain::Settings::load().automatic
-                             ? QStringLiteral("Automatic explanations are off.")
+                             ? I18n::tr("Automatic explanations are off.")
                              : QString();
     explainFoot_->setText(foot);
     explainFoot_->setVisible(!foot.isEmpty());

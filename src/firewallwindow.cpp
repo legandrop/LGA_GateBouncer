@@ -604,7 +604,15 @@ QWidget *header(const QString &title, const QString &description, QWidget *right
         auto *d = text(description, "desc", true);
         d->setObjectName("page-description");
         d->setMaximumWidth(560);
-        t->addWidget(d);
+        // En una fila con un estiramiento: la altura de un texto partido en renglones se calcula con el ancho que el
+        // layout le da a cada pieza. Suelto en la columna, Qt la calcula con el ancho entero (sin el máximo de 560) y
+        // un texto que a ese ancho entra en un renglón y a 560 en dos quedaba encimado al título.
+        auto *dl = new QHBoxLayout;
+        dl->setContentsMargins(0, 0, 0, 0);
+        dl->setSpacing(0);
+        dl->addWidget(d, 1);
+        dl->addStretch(0);
+        t->addLayout(dl);
     }
     h->addLayout(t, 1);
     if (right) {
@@ -617,15 +625,26 @@ QWidget *header(const QString &title, const QString &description, QWidget *right
     return w;
 }
 
+// Las fechas en el idioma de la interfaz: «Nov 8» / «8 nov».
+bool spanish() { return I18n::language() == I18n::Language::Spanish; }
 QString clock(qint64 seconds) {
     if (seconds <= 0) return {};
     const QDateTime t = QDateTime::fromSecsSinceEpoch(seconds);
     if (t.date() == QDate::currentDate()) return t.toString("HH:mm");
-    return QLocale(QLocale::English).toString(t.date(), "MMM d");
+    return spanish() ? QLocale(QLocale::Spanish).toString(t.date(), "d MMM")
+                     : QLocale(QLocale::English).toString(t.date(), "MMM d");
 }
 QString clockFull(qint64 seconds) {
     if (seconds <= 0) return QStringLiteral("—");
-    return QLocale(QLocale::English).toString(QDateTime::fromSecsSinceEpoch(seconds), "MMM d, HH:mm");
+    const QDateTime t = QDateTime::fromSecsSinceEpoch(seconds);
+    return spanish() ? QLocale(QLocale::Spanish).toString(t, "d MMM, HH:mm")
+                     : QLocale(QLocale::English).toString(t, "MMM d, HH:mm");
+}
+// La etiqueta de una regla temporal: «Allow · until 14:30».
+QString temporaryRule(bool allow, qint64 expires) {
+    if (expires < 0) return allow ? I18n::tr("Allow · until restart") : I18n::tr("Block · until restart");
+    const QString until = clock(expires);
+    return allow ? I18n::tr("Allow · until %1").arg(until) : I18n::tr("Block · until %1").arg(until);
 }
 // Carpeta corta para mostrar: las dos últimas partes.
 QString shortFolder(const QString &path) {
@@ -649,12 +668,12 @@ QVector<QPair<QString, QString>> scopeOptions(const FirewallClient::PendingItem 
     return FolderTrust::scopeChoices(p.path, p.signer, p.perDestination);
 }
 QVector<QPair<QString, QString>> durationOptions() {
-    QVector<QPair<QString, QString>> d{{"Always", "always"}};
+    QVector<QPair<QString, QString>> d{{I18n::tr("Always"), "always"}};
     for (const int minutes : {1, 5, 10, 15, 30})
-        d.push_back({minutes == 1 ? QStringLiteral("1 minute") : QString("%1 minutes").arg(minutes),
+        d.push_back({minutes == 1 ? I18n::tr("1 minute") : I18n::tr("%1 minutes").arg(minutes),
                      QString::number(minutes * 60)});
-    d.push_back({"1 hour", "3600"});
-    d.push_back({"Until restart", "restart"});
+    d.push_back({I18n::tr("1 hour"), "3600"});
+    d.push_back({I18n::tr("Until restart"), "restart"});
     return d;
 }
 QVector<QPair<QString, QString>> targetOptions(const FirewallClient::PendingItem &p) {
@@ -668,16 +687,16 @@ QVector<QPair<QString, QString>> targetOptions(const FirewallClient::PendingItem
         targets << p.remote;
     }
     QVector<QPair<QString, QString>> t;
-    if (!p.perDestination) t.push_back({"Any destination", QString()});
-    for (const auto &x : targets) t.push_back({"Only " + x, x});
-    if (p.perDestination) t.push_back({"Any destination (whole app)", QString()});
+    if (!p.perDestination) t.push_back({I18n::tr("Any destination"), QString()});
+    for (const auto &x : targets) t.push_back({I18n::tr("Only %1").arg(x), x});
+    if (p.perDestination) t.push_back({I18n::tr("Any destination (whole app)"), QString()});
     return t;
 }
 QString destinationLine(const FirewallClient::PendingItem &p) {
     const QString kind = FirewallClient::destinationKind(p.remote);
     QStringList parts;
-    if (!kind.isEmpty()) parts << kind;
-    if (p.host.isEmpty() && kind == "Internet") parts << "no server name seen";
+    if (!kind.isEmpty()) parts << FirewallClient::destinationKindLabel(kind);
+    if (p.host.isEmpty() && kind == "Internet") parts << I18n::tr("no server name seen");
     if (p.port) parts << FirewallClient::protocolName(p.protocol) + " " + QString::number(p.port);
     return parts.join(" · ");
 }
@@ -728,21 +747,21 @@ QVector<BlockReason> blockReasons(const QVector<FirewallClient::ActivityItem> &e
         const auto &e = events[i];
         const QString app = e.path.toLower();
         if (e.kind.startsWith("Rule saved: Allow")) {
-            saved[app] = {i, e.time, {"You allowed · " + clock(e.time), "allow"}};
+            saved[app] = {i, e.time, {I18n::tr("You allowed · %1").arg(clock(e.time)), "allow"}};
             continue;
         }
         if (e.kind.startsWith("Rule saved: Block")) {
-            saved[app] = {i, e.time, {"You blocked · " + clock(e.time), "block"}};
+            saved[app] = {i, e.time, {I18n::tr("You blocked · %1").arg(clock(e.time)), "block"}};
             continue;
         }
         if (e.kind.startsWith("Allowed by rule")) {
-            granted[app + '|' + plainAddress(e.remote)] = {i, e.time, {"Allowed by your rule", "allow"}};
+            granted[app + '|' + plainAddress(e.remote)] = {i, e.time, {I18n::tr("Allowed by your rule"), "allow"}};
             continue;
         }
         if (!e.kind.startsWith("Blocked")) continue;
         if (e.kind.startsWith("Blocked by rule")) {
-            out[i] = {"Your Block rule"};
-            granted[app + '|' + plainAddress(e.remote)] = {i, e.time, {"Your Block rule"}};
+            out[i] = {I18n::tr("Your Block rule")};
+            granted[app + '|' + plainAddress(e.remote)] = {i, e.time, {I18n::tr("Your Block rule")}};
             continue;
         }
         if (!e.kind.contains("waiting", Qt::CaseInsensitive)) {
@@ -755,7 +774,7 @@ QVector<BlockReason> blockReasons(const QVector<FirewallClient::ActivityItem> &e
         const auto whole = open.constFind(app);
         const auto one = open.constFind(destination);
         if ((whole != open.constEnd() && whole.value() <= e.time) || (one != open.constEnd() && one.value() <= e.time)) {
-            out[i] = {"Waiting for you", "wait"};
+            out[i] = {I18n::tr("Waiting for you"), "wait"};
             continue;
         }
         const Seen *first = nullptr;
@@ -765,10 +784,10 @@ QVector<BlockReason> blockReasons(const QVector<FirewallClient::ActivityItem> &e
         if (g != granted.constEnd() && g->time - e.time <= PendingLife && (!first || g->index < first->index))
             first = &g.value();
         if (first) out[i] = first->reason;
-        else if (now - e.time <= FreshGrace) out[i] = {"Waiting for you", "wait"};
+        else if (now - e.time <= FreshGrace) out[i] = {I18n::tr("Waiting for you"), "wait"};
         // Sin decisión a la vista: se cerró por otro camino (regla de la misma firma en otra copia, vencido a las 24 h,
         // el programa ya no existe).
-        else out[i] = {"Request closed"};
+        else out[i] = {I18n::tr("Request closed")};
     }
     return out;
 }
@@ -1142,8 +1161,8 @@ void FirewallWindow::buildShell() {
     bl->addStretch();
     auto *help = new ChromeButton("help");
     help->setObjectName("help-window");
-    help->setAccessibleName("How it works");
-    CustomTooltip::instance()->setToolTip(help, "Opens and closes How it works on every page.");
+    help->setAccessibleName(I18n::tr("How it works"));
+    CustomTooltip::instance()->setToolTip(help, I18n::tr("Opens and closes How it works on every page."));
     helpButton_ = help;
     connect(help, &QAbstractButton::clicked, this, [this] { setHowOpen(!howOpen_); });
     bl->addWidget(help);
@@ -1153,9 +1172,9 @@ void FirewallWindow::buildShell() {
     sep->setStyleSheet(QString("background: %1;").arg(Theme::kDivider));
     bl->addWidget(sep);
     bl->addSpacing(4);
-    const struct { const char *kind, *name, *access; } chrome[] = {
-        {"min", "minimize-window", "Minimize"}, {"max", "maximize-window", "Maximize or restore"},
-        {"close", "close-window", "Close to the tray"}};
+    const struct { const char *kind, *name; QString access; } chrome[] = {
+        {"min", "minimize-window", I18n::tr("Minimize")}, {"max", "maximize-window", I18n::tr("Maximize or restore")},
+        {"close", "close-window", I18n::tr("Close to the tray")}};
     for (const auto &c : chrome) {
         auto *b = new ChromeButton(c.kind);
         b->setObjectName(c.name);
@@ -1196,17 +1215,17 @@ void FirewallWindow::buildShell() {
         l->setAlignment(Qt::AlignLeft | Qt::AlignTop);
         sv->addWidget(l);
     };
-    auto *protection = add("overview", "shield", "Protection", true);
+    auto *protection = add("overview", "shield", I18n::tr("Protection"), true);
     protection->toggle()->setObjectName("nav-ask-switch");
-    protection->toggle()->setAccessibleName("Ask before unknown applications connect");
+    protection->toggle()->setAccessibleName(I18n::tr("Ask before unknown applications connect"));
     // clicked y no toggled: reflejar el estado con setChecked no es un pedido del usuario.
     connect(protection->toggle(), &QAbstractButton::clicked, this, [this](bool on) { firewall_.setAsk(on); });
-    label("Firewall");
-    add("requests", "bell", "Requests");
-    add("apps", "apps", "Apps");
-    add("activity", "pulse", "Activity");
-    label("App");
-    add("settings", "gear", "Settings");
+    label(I18n::tr("Firewall"));
+    add("requests", "bell", I18n::tr("Requests"));
+    add("apps", "apps", I18n::tr("Apps"));
+    add("activity", "pulse", I18n::tr("Activity"));
+    label(I18n::tr("App"));
+    add("settings", "gear", I18n::tr("Settings"));
     sv->addStretch();
     sl->addWidget(side);
 
@@ -1250,18 +1269,18 @@ QWidget *FirewallWindow::how(const QStringList &steps, const QString &note) {
     col->setSpacing(0);
     auto *head = new StripHeader;
     head->setObjectName("how-it-works-toggle");
-    head->setAccessibleName("How it works");
+    head->setAccessibleName(I18n::tr("How it works"));
     auto *hl = new QHBoxLayout(head);
     hl->setContentsMargins(13, 0, 13, 0);
     hl->setSpacing(9);
     hl->addWidget(new Glyph("help", 16, Theme::color(howOpen_ ? Theme::kAccent : Theme::kTextCaption)), 0,
                   Qt::AlignVCenter);
-    auto *title = text("How it works", "howtitle");
+    auto *title = text(I18n::tr("How it works"), "howtitle");
     title->setAttribute(Qt::WA_TransparentForMouseEvents);
     hl->addWidget(title, 0, Qt::AlignVCenter);
     hl->addStretch();
     if (!howOpen_) {
-        auto *count = text(steps.size() == 1 ? QString("1 step") : QString("%1 steps").arg(steps.size()), "faint");
+        auto *count = text(steps.size() == 1 ? I18n::tr("1 step") : I18n::tr("%1 steps").arg(steps.size()), "faint");
         count->setAttribute(Qt::WA_TransparentForMouseEvents);
         hl->addWidget(count, 0, Qt::AlignVCenter);
     }
@@ -1432,14 +1451,14 @@ void FirewallWindow::updateSidebar() {
         if (ask->isChecked() != (s.connected && s.ask)) ask->setChecked(s.connected && s.ask);
         ask->setEnabled(canDecide());
     }
-    if (!s.connected) side_["overview"]->setState("Engine not running", "bad");
-    else if (!s.ask) side_["overview"]->setState("On · not asking", "warn");
-    else if (!s.allApps) side_["overview"]->setState("Test session", "warn");
-    else side_["overview"]->setState("On · asking first", "ok");
+    if (!s.connected) side_["overview"]->setState(I18n::tr("Engine not running"), "bad");
+    else if (!s.ask) side_["overview"]->setState(I18n::tr("On · not asking"), "warn");
+    else if (!s.allApps) side_["overview"]->setState(I18n::tr("Test session"), "warn");
+    else side_["overview"]->setState(I18n::tr("On · asking first"), "ok");
     const auto &pending = firewall_.pending();
     qint64 oldest = 0;
     for (const auto &p : pending) if (!oldest || p.first < oldest) oldest = p.first;
-    side_["requests"]->setState(pending.isEmpty() ? QString("Nothing waiting") : "Oldest " + clock(oldest),
+    side_["requests"]->setState(pending.isEmpty() ? I18n::tr("Nothing waiting") : I18n::tr("Oldest %1").arg(clock(oldest)),
                                 pending.isEmpty() ? QString() : QString("warn"), int(pending.size()));
     // Igual que la lista de Apps: una fila por app, aunque tenga varias reglas por servidor.
     const auto entries = appEntries();
@@ -1450,16 +1469,21 @@ void FirewallWindow::updateSidebar() {
                 ++temporary;
                 break;
             }
-    const QString apps = entries.size() == 1 ? QString("1 app") : QString("%1 apps").arg(entries.size());
-    side_["apps"]->setState(temporary ? QString("%1 · %2 temporary").arg(apps).arg(temporary) : apps, {});
+    const QString apps = entries.size() == 1 ? I18n::tr("1 app") : I18n::tr("%1 apps").arg(entries.size());
+    side_["apps"]->setState(temporary == 1 ? I18n::tr("%1 · 1 temporary").arg(apps)
+                            : temporary    ? I18n::tr("%1 · %2 temporary").arg(apps).arg(temporary)
+                                           : apps,
+                            {});
     int blocked = 0;
     for (const auto &a : firewall_.activity()) blocked += a.kind.startsWith("Blocked");
-    side_["activity"]->setState(s.started ? QString("%1 blocked since %2").arg(blocked).arg(clock(s.started))
-                                          : QString("%1 blocked").arg(blocked),
+    const QString since = clock(s.started);
+    side_["activity"]->setState(s.started ? (blocked == 1 ? I18n::tr("1 blocked since %1").arg(since)
+                                                          : I18n::tr("%1 blocked since %2").arg(blocked).arg(since))
+                                          : (blocked == 1 ? I18n::tr("1 blocked") : I18n::tr("%1 blocked").arg(blocked)),
                                 {});
     const auto settings = Explain::Settings::load();
     const bool ai = Explain::KeyStore::has(Explain::providerOf(settings.model)) && settings.consent;
-    side_["settings"]->setState(ai ? "AI: " + settings.model : QString("AI explanations off"), {});
+    side_["settings"]->setState(ai ? I18n::tr("AI: %1").arg(settings.model) : I18n::tr("AI explanations off"), {});
 }
 
 void FirewallWindow::message(const QString &value) {
@@ -1476,22 +1500,22 @@ void FirewallWindow::trustFolderDialog(const QString &folder, const QString &nam
     d->setStyleSheet("QDialog { background: #17171B; border: 1px solid #2E2E36; }");
     constexpr int Wide = 470;
     auto *l = column(d, 18, 8);
-    l->addWidget(text("Trust a folder", "cardtitle"));
-    auto *intro = text("The rule covers one program name, or every program, inside the folder and its subfolders, also "
-                       "builds made or copied there later. A rule for a file, an app or a publisher comes first. Trust "
-                       "only folders where you build or install programs yourself: whatever is saved there with that "
-                       "name gets the same access.",
+    l->addWidget(text(I18n::tr("Trust a folder"), "cardtitle"));
+    auto *intro = text(I18n::tr("The rule covers one program name, or every program, inside the folder and its "
+                                "subfolders, also builds made or copied there later. A rule for a file, an app or a "
+                                "publisher comes first. Trust only folders where you build or install programs yourself: "
+                                "whatever is saved there with that name gets the same access."),
                        "sub", true);
     intro->setFixedWidth(Wide);
     l->addWidget(intro);
     l->addSpacing(6);
-    l->addWidget(text("Folder", "colhead"));
+    l->addWidget(text(I18n::tr("Folder"), "colhead"));
     auto *fr = row(8);
     auto *path = new QLineEdit(QDir::toNativeSeparators(folder));
     path->setObjectName("trust-folder-path");
     path->setPlaceholderText("C:\\Projects\\MyApp");
     fr->addWidget(path, 1);
-    auto *browse = button("Browse…");
+    auto *browse = button(I18n::tr("Browse…"));
     browse->setObjectName("trust-folder-browse");
     fr->addWidget(browse);
     l->addLayout(fr);
@@ -1500,19 +1524,19 @@ void FirewallWindow::trustFolderDialog(const QString &folder, const QString &nam
     status->setFixedWidth(Wide);
     l->addWidget(status);
     l->addSpacing(6);
-    l->addWidget(text("Program name (optional)", "colhead"));
+    l->addWidget(text(I18n::tr("Program name (optional)"), "colhead"));
     auto *program = new QLineEdit(name);
     program->setObjectName("trust-folder-name");
-    program->setPlaceholderText("Every program, or one name such as MyApp.exe");
+    program->setPlaceholderText(I18n::tr("Every program, or one name such as MyApp.exe"));
     l->addWidget(program);
     l->addSpacing(10);
     auto *buttons = row(8);
     buttons->addStretch();
-    auto *cancel = button("Cancel");
+    auto *cancel = button(I18n::tr("Cancel"));
     cancel->setObjectName("trust-folder-cancel");
-    auto *block = button("Block", "block");
+    auto *block = button(I18n::tr("Block"), "block");
     block->setObjectName("trust-folder-block");
-    auto *allow = button("Allow", "allow");
+    auto *allow = button(I18n::tr("Allow"), "allow");
     allow->setObjectName("trust-folder-allow");
     for (auto *b : {cancel, block, allow}) {
         b->setMinimumWidth(84);
@@ -1531,17 +1555,17 @@ void FirewallWindow::trustFolderDialog(const QString &folder, const QString &nam
         const bool nameOk = gbe::normalizeFolderRuleName(program->text().toStdWString(), exe);
         QString message, tone = "sub";
         if (typed.isEmpty()) {
-            message = "Choose the folder of a project or an app.";
+            message = I18n::tr("Choose the folder of a project or an app.");
         } else if (!problem.isEmpty()) {
-            message = problem;
+            message = FolderTrust::problemText(problem);
             tone = "bad";
         } else if (!nameOk) {
-            message = "Use a file name such as MyApp.exe, or leave it empty for every program.";
+            message = I18n::tr("Use a file name such as MyApp.exe, or leave it empty for every program.");
             tone = "bad";
         } else {
             const QString where = QString::fromStdWString(place.dos);
-            message = (exe.empty() ? QStringLiteral("✓ Every program in ") : "✓ " + program->text().trimmed() + " in ") +
-                      where + " and its subfolders.";
+            message = exe.empty() ? I18n::tr("✓ Every program in %1 and its subfolders.").arg(where)
+                                  : I18n::tr("✓ %1 in %2 and its subfolders.").arg(program->text().trimmed(), where);
             tone = "ok";
             // El nombre como se escribió, para el mensaje («DayTrace.exe»): el motor lo pasa a minúsculas.
             *resolved = {where, exe.empty() ? QString() : program->text().trimmed()};
@@ -1563,7 +1587,7 @@ void FirewallWindow::trustFolderDialog(const QString &folder, const QString &nam
     connect(program, &QLineEdit::textChanged, later, qOverload<>(&QTimer::start));
     check();
     connect(browse, &QPushButton::clicked, d, [d, path] {
-        auto *dialog = new QFileDialog(d, "Choose the folder to trust", path->text().trimmed());
+        auto *dialog = new QFileDialog(d, I18n::tr("Choose the folder to trust"), path->text().trimmed());
         dialog->setObjectName("trust-folder-picker");
         dialog->setOption(QFileDialog::DontUseNativeDialog);
         dialog->setOption(QFileDialog::ShowDirsOnly);
@@ -1600,14 +1624,14 @@ QWidget *FirewallWindow::overviewPage() {
     auto *askSwitch = new ToggleSwitch;
     askSwitch->setLarge(true);
     askSwitch->setObjectName("protection-ask");
-    askSwitch->setAccessibleName("Ask before unknown applications connect");
+    askSwitch->setAccessibleName(I18n::tr("Ask before unknown applications connect"));
     askSwitch->setChecked(s.connected && s.ask);
     askSwitch->setEnabled(canDecide());
     connect(askSwitch, &QAbstractButton::clicked, this, [this](bool on) { firewall_.setAsk(on); });
-    l->addWidget(header("Protection",
-                        !s.connected ? "Without the engine, new applications cannot ask for access."
-                        : s.ask      ? "Unknown applications are blocked until you decide."
-                                     : "Unknown applications connect. Saved rules still apply.",
+    l->addWidget(header(I18n::tr("Protection"),
+                        !s.connected ? I18n::tr("Without the engine, new applications cannot ask for access.")
+                        : s.ask      ? I18n::tr("Unknown applications are blocked until you decide.")
+                                     : I18n::tr("Unknown applications connect. Saved rules still apply."),
                         askSwitch));
 
     // Estado en vivo (`.live`): el punto de color, qué pasa y una acción.
@@ -1626,21 +1650,22 @@ QWidget *FirewallWindow::overviewPage() {
     st->setSpacing(1);
     QString title, sub;
     if (!s.connected) {
-        title = "The GateBouncer engine is not running";
-        sub = "Saved rules and the block on unknown applications still apply, but nothing can ask you. Restart Windows "
-              "or run the installer again.";
+        title = I18n::tr("The GateBouncer engine is not running");
+        sub = I18n::tr("Saved rules and the block on unknown applications still apply, but nothing can ask you. "
+                       "Restart Windows or run the installer again.");
     } else if (!s.ask) {
-        title = "Unknown applications can connect";
-        sub = "Asking is off. Saved Allow and Block rules still apply.";
+        title = I18n::tr("Unknown applications can connect");
+        sub = I18n::tr("Asking is off. Saved Allow and Block rules still apply.");
     } else if (!s.allApps) {
-        title = "Test session";
-        sub = "Only the selected test applications ask before connecting. Rules disappear when the engine stops.";
+        title = I18n::tr("Test session");
+        sub = I18n::tr("Only the selected test applications ask before connecting. Rules disappear when the engine "
+                       "stops.");
     } else {
-        title = "GateBouncer is protecting this PC";
+        title = I18n::tr("GateBouncer is protecting this PC");
         QStringList parts;
-        if (s.started) parts << "Engine running since " + clock(s.started);
-        parts << (s.localNetwork ? "local network connects without asking" : "local network asks first");
-        if (!s.control) parts << "view only";
+        if (s.started) parts << I18n::tr("Engine running since %1").arg(clock(s.started));
+        parts << (s.localNetwork ? I18n::tr("local network connects without asking") : I18n::tr("local network asks first"));
+        if (!s.control) parts << I18n::tr("view only");
         sub = parts.join(" · ");
     }
     auto *stt = text(title, "strong");
@@ -1649,24 +1674,24 @@ QWidget *FirewallWindow::overviewPage() {
     st->addWidget(text(sub, "sub", true));
     sh->addLayout(st, 1);
     if (s.connected && !s.ask) {
-        auto *on = button("Turn asking on", "primary");
+        auto *on = button(I18n::tr("Turn asking on"), "primary");
         on->setEnabled(canDecide());
         connect(on, &QPushButton::clicked, this, [this] { firewall_.setAsk(true); });
         sh->addWidget(on, 0, Qt::AlignVCenter);
     } else if (s.connected) {
-        auto *go = button("Firewall settings");
+        auto *go = button(I18n::tr("Firewall settings"));
         go->setObjectName("open-settings");
         connect(go, &QPushButton::clicked, this, [this] { selectView("settings"); });
         sh->addWidget(go, 0, Qt::AlignVCenter);
     }
     l->addWidget(status);
     l->addSpacing(2);
-    l->addWidget(how({"GateBouncer blocks any program that has no rule and asks you in a notice.",
-                      "Choose <b>Allow</b> or <b>Block</b> there, or later in <b>Requests</b>.",
-                      "The first attempt of a program fails; <b>Allow</b> lets its next attempt connect."},
-                     "A program with a rule never asks again. The engine is a Windows service: closing this window "
-                     "keeps the firewall working. Turn the switch off to let everything without a rule connect; Block "
-                     "rules still apply."));
+    l->addWidget(how({I18n::tr("GateBouncer blocks any program that has no rule and asks you in a notice."),
+                      I18n::tr("Choose <b>Allow</b> or <b>Block</b> there, or later in <b>Requests</b>."),
+                      I18n::tr("The first attempt of a program fails; <b>Allow</b> lets its next attempt connect.")},
+                     I18n::tr("A program with a rule never asks again. The engine is a Windows service: closing this "
+                              "window keeps the firewall working. Turn the switch off to let everything without a rule "
+                              "connect; Block rules still apply.")));
 
     if (s.connected) {
         auto pending = firewall_.pending();
@@ -1674,11 +1699,11 @@ QWidget *FirewallWindow::overviewPage() {
         auto *wait = card(pending.isEmpty() ? "card" : "alert");
         auto *wl = cardColumn(wait, 0);
         auto *wh = row(10);
-        wh->addWidget(text("Waiting for you", "cardtitle"));
-        if (!pending.isEmpty()) wh->addWidget(chip(QString("%1 waiting").arg(pending.size()), "warn"));
+        wh->addWidget(text(I18n::tr("Waiting for you"), "cardtitle"));
+        if (!pending.isEmpty()) wh->addWidget(chip(I18n::tr("%1 waiting").arg(pending.size()), "warn"));
         wh->addStretch();
         if (!pending.isEmpty()) {
-            auto *all = button("Open Requests", "link");
+            auto *all = button(I18n::tr("Open Requests"), "link");
             all->setObjectName("review-all");
             connect(all, &QPushButton::clicked, this, [this] { selectView("requests"); });
             wh->addWidget(all);
@@ -1686,8 +1711,8 @@ QWidget *FirewallWindow::overviewPage() {
         wl->addLayout(wh);
         if (pending.isEmpty()) {
             wl->addSpacing(6);
-            wl->addWidget(text("Nothing is waiting. A new application that tries to connect appears here and in a "
-                               "notice.",
+            wl->addWidget(text(I18n::tr("Nothing is waiting. A new application that tries to connect appears here and "
+                                        "in a notice."),
                                "sub", true));
         } else {
             wl->addSpacing(8);
@@ -1706,7 +1731,7 @@ QWidget *FirewallWindow::overviewPage() {
             info->setSpacing(2);
             info->addWidget(new ElideLabel(FirewallClient::fileName(p.path), "strong"));
             const QString target = p.host.isEmpty() ? p.remote : p.host;
-            info->addWidget(new ElideLabel("Wants " + target + " · first try " + clock(p.first), "small"));
+            info->addWidget(new ElideLabel(I18n::tr("Wants %1 · first try %2").arg(target, clock(p.first)), "small"));
             h->addLayout(info, 1);
             const auto e = explanationFor(p.id);
             // Lo revisado (catálogo o app LGA) va antes que la explicación con IA.
@@ -1714,14 +1739,15 @@ QWidget *FirewallWindow::overviewPage() {
             if (!known.isEmpty())
                 h->addWidget(hint(known.section(" · ", 0, 1), "known"));
             else if (e.state == AccessToast::Explanation::Ready)
-                h->addWidget(e.suggestion == "block"   ? hint("AI suggests Block", "block")
-                             : e.suggestion == "allow" ? hint("AI suggests Allow", "allow")
-                                                       : hint("AI: your call", "either"));
+                h->addWidget(e.suggestion == "block"   ? hint(I18n::tr("AI suggests Block"), "block")
+                             : e.suggestion == "allow" ? hint(I18n::tr("AI suggests Allow"), "allow")
+                                                       : hint(I18n::tr("AI: your call"), "either"));
             else
-                h->addWidget(hint(e.state == AccessToast::Explanation::Working ? "Asking AI…" : "Not explained yet",
+                h->addWidget(hint(e.state == AccessToast::Explanation::Working ? I18n::tr("Asking AI…")
+                                                                               : I18n::tr("Not explained yet"),
                                   "none"));
-            auto *block = decision("Block", "block");
-            auto *allow = decision("Allow", "allow");
+            auto *block = decision(I18n::tr("Block"), "block");
+            auto *allow = decision(I18n::tr("Allow"), "allow");
             block->setObjectName("overview-block");
             allow->setObjectName("overview-allow");
             recommend(block, allow, known);
@@ -1737,12 +1763,12 @@ QWidget *FirewallWindow::overviewPage() {
             wl->addWidget(divider());
             wl->addSpacing(10);
             const QString em = QString("<span style='color:%1;font-weight:500'>").arg(Theme::kTextStrong);
-            auto *tip = new QLabel("Block and Allow here use the choices the notice would preselect: " + em +
-                                   "this app, any version</span> when it is signed, " + em +
-                                   "this app in its repository</span> for an unsigned build inside a Git repository, " +
-                                   em + "this file</span> otherwise, and " + em +
-                                   "only that server</span> for an app that already has server rules. Open the "
-                                   "request to choose another.");
+            auto *tip = new QLabel(I18n::tr("Block and Allow here use the choices the notice would preselect: "
+                                            "%1this app, any version</span> when it is signed, %1this app in its "
+                                            "repository</span> for an unsigned build inside a Git repository, %1this "
+                                            "file</span> otherwise, and %1only that server</span> for an app that "
+                                            "already has server rules. Open the request to choose another.")
+                                       .arg(em));
             tip->setProperty("r", "faint");
             tip->setWordWrap(true);
             wl->addWidget(tip);
@@ -1756,9 +1782,9 @@ QWidget *FirewallWindow::overviewPage() {
         auto *rc = card();
         auto *rl = cardColumn(rc, 0);
         auto *rh = row();
-        rh->addWidget(text("Rules", "cardtitle"));
+        rh->addWidget(text(I18n::tr("Rules"), "cardtitle"));
         rh->addStretch();
-        auto *open = button("Open Apps", "link");
+        auto *open = button(I18n::tr("Open Apps"), "link");
         connect(open, &QPushButton::clicked, this, [this] { selectView("apps"); });
         rh->addWidget(open);
         rl->addLayout(rh);
@@ -1777,7 +1803,8 @@ QWidget *FirewallWindow::overviewPage() {
         }
         rl->addSpacing(10);
         auto *stats = row(26);
-        for (const auto &[n, name] : {std::pair{allow, "allow"}, {block, "block"}, {temporary, "temporary"}}) {
+        for (const auto &[n, name] : {std::pair{allow, I18n::trc("count", "allow")}, {block, I18n::trc("count", "block")},
+                                      {temporary, I18n::trc("count", "temporary")}}) {
             auto *sv = new QVBoxLayout;
             sv->setSpacing(0);
             auto *num = text(QString::number(n), "stat");
@@ -1790,20 +1817,23 @@ QWidget *FirewallWindow::overviewPage() {
         rl->addLayout(stats);
         rl->addSpacing(12);
         if (soonest) {
+            const QString folder = FolderTrust::label(soonest->path);
             const QString who = soonest->scope == "app"         ? soonest->name
-                                : soonest->scope == "publisher" ? "Apps from " + soonest->signer
+                                : soonest->scope == "publisher" ? I18n::tr("Apps from %1").arg(soonest->signer)
                                 : soonest->scope == "folder"
-                                    ? (soonest->name.isEmpty() ? QStringLiteral("Apps") : soonest->name) + " in " +
-                                          FolderTrust::label(soonest->path)
+                                    ? (soonest->name.isEmpty() ? I18n::tr("Apps in %1").arg(folder)
+                                                               : I18n::tr("%1 in %2").arg(soonest->name, folder))
                                     : FirewallClient::fileName(soonest->path);
-            rl->addWidget(text(QString("%1 can %2 %3.")
-                                   .arg(who, soonest->allow ? "connect" : "stay blocked",
-                                        soonest->expires < 0 ? QString("until restart")
-                                                             : "until " + clock(soonest->expires)),
+            const bool restart = soonest->expires < 0;
+            const QString until = clock(soonest->expires);
+            rl->addWidget(text(soonest->allow ? (restart ? I18n::tr("%1 can connect until restart.").arg(who)
+                                                         : I18n::tr("%1 can connect until %2.").arg(who, until))
+                                              : (restart ? I18n::tr("%1 can stay blocked until restart.").arg(who)
+                                                         : I18n::tr("%1 can stay blocked until %2.").arg(who, until)),
                                "sub", true));
         } else if (perServer) {
-            rl->addWidget(text(perServer == 1 ? QString("1 of them only for one server.")
-                                              : QString("%1 of them only for one server.").arg(perServer),
+            rl->addWidget(text(perServer == 1 ? I18n::tr("1 of them only for one server.")
+                                              : I18n::tr("%1 of them only for one server.").arg(perServer),
                                "sub", true));
         }
         rl->addStretch();
@@ -1813,9 +1843,9 @@ QWidget *FirewallWindow::overviewPage() {
         auto *ac = card();
         auto *al = cardColumn(ac, 0);
         auto *ah = row();
-        ah->addWidget(text("Blocked recently", "cardtitle"));
+        ah->addWidget(text(I18n::tr("Blocked recently"), "cardtitle"));
         ah->addStretch();
-        auto *open = button("Activity", "link");
+        auto *open = button(I18n::tr("Activity"), "link");
         connect(open, &QPushButton::clicked, this, [this] { selectView("activity"); });
         ah->addWidget(open);
         al->addLayout(ah);
@@ -1843,7 +1873,7 @@ QWidget *FirewallWindow::overviewPage() {
             al->addWidget(h);
             ++shown;
         }
-        if (!shown) al->addWidget(text("Nothing blocked since the engine started.", "sub", true));
+        if (!shown) al->addWidget(text(I18n::tr("Nothing blocked since the engine started."), "sub", true));
         al->addStretch();
         grid->addWidget(ac, 5);
     }
@@ -1899,44 +1929,45 @@ QWidget *FirewallWindow::aiCard(const FirewallClient::PendingItem &p) {
     const QString model = Explain::Settings::load().model;
     if (ready) {
         auto *h = row(8);
-        h->addWidget(e.suggestion == "block"   ? hint("AI suggests Block", "block")
-                     : e.suggestion == "allow" ? hint("AI suggests Allow", "allow")
-                                               : hint("AI: your call", "either"));
+        h->addWidget(e.suggestion == "block"   ? hint(I18n::tr("AI suggests Block"), "block")
+                     : e.suggestion == "allow" ? hint(I18n::tr("AI suggests Allow"), "allow")
+                                               : hint(I18n::tr("AI: your call"), "either"));
         h->addStretch();
         l->addLayout(h);
         auto *what = text(e.what, "value", true);
         l->addWidget(what);
         l->addWidget(divider());
-        for (const auto &[title, value] : {std::pair{QString("WHY IT CONNECTS"), e.why},
-                                           {QString("WHY THIS SUGGESTION"), e.reason},
-                                           {QString("IS IT GENUINE"), e.risk}}) {
+        for (const auto &[title, value] : {std::pair{I18n::tr("WHY IT CONNECTS"), e.why},
+                                           {I18n::tr("WHY THIS SUGGESTION"), e.reason},
+                                           {I18n::tr("IS IT GENUINE"), e.risk}}) {
             if (value.isEmpty()) continue;
             auto *t = caps(title);
             l->addWidget(t);
             auto *v = text(value, "body", true);
             l->addWidget(v);
         }
-        l->addWidget(text("AI explanation · " + (e.model.isEmpty() ? model : e.model) +
-                              " · may be wrong and never decides for you",
+        l->addWidget(text(I18n::tr("AI explanation · %1 · may be wrong and never decides for you")
+                              .arg(e.model.isEmpty() ? model : e.model),
                           "faint", true));
     } else if (e.state == AccessToast::Explanation::Working) {
-        l->addWidget(text("Asking " + model + " what this is…", "body"));
-        l->addWidget(text("You can decide now; the answer never holds the request.", "colhead"));
+        // Con wrap: un nombre de modelo largo (o el texto en castellano) parte el renglón en vez de ensanchar la página.
+        l->addWidget(text(I18n::tr("Asking %1 what this is…").arg(model), "body", true));
+        l->addWidget(text(I18n::tr("You can decide now; the answer never holds the request."), "colhead", true));
     } else if (e.state == AccessToast::Explanation::NoKey) {
         auto *h = row();
-        h->addWidget(text("Explanations are off.", "sub"));
-        h->addStretch();
-        auto *go = button("Set up in Settings", "link");
+        h->addWidget(text(I18n::tr("Explanations are off."), "sub", true), 1);
+        auto *go = button(I18n::tr("Set up in Settings"), "link");
         connect(go, &QPushButton::clicked, this, [this] { selectView("settings"); });
         h->addWidget(go);
         l->addLayout(h);
     } else {
         auto *h = row();
-        h->addWidget(text(e.state == AccessToast::Explanation::Failed ? "The explanation did not arrive."
-                                                                      : "What is this program?",
-                          e.state == AccessToast::Explanation::Failed ? "bad" : "sub"));
-        h->addStretch();
-        auto *ask = button(e.state == AccessToast::Explanation::Failed ? "Try again" : "Ask AI", nullptr, true);
+        h->addWidget(text(e.state == AccessToast::Explanation::Failed ? I18n::tr("The explanation did not arrive.")
+                                                                      : I18n::tr("What is this program?"),
+                          e.state == AccessToast::Explanation::Failed ? "bad" : "sub", true),
+                     1);
+        auto *ask = button(e.state == AccessToast::Explanation::Failed ? I18n::tr("Try again") : I18n::tr("Ask AI"),
+                           nullptr, true);
         ask->setObjectName("request-ask-ai");
         connect(ask, &QPushButton::clicked, this, [this, id = p.id] { explain(id, false); });
         h->addWidget(ask);
@@ -1964,16 +1995,17 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
     info->addWidget(name);
     const QString signature =
         p.signer.isEmpty()
-            ? QString("<span style='color:%1;font-weight:500'>Not signed</span>").arg(Theme::kWarn)
+            ? QString("<span style='color:%1;font-weight:500'>%2</span>").arg(Theme::kWarn, I18n::tr("Not signed").toHtmlEscaped())
             : QString("<span style='color:%1;font-weight:500'>%2</span>").arg(Theme::kOk, p.signer.toHtmlEscaped());
     // La firma en color y, recortados al medio si no entran, la carpeta y los intentos (una sola línea).
     auto *metaRow = row(0);
     auto *signed_ = new QLabel(signature + " · ");
     signed_->setProperty("r", "small");
     metaRow->addWidget(signed_);
+    const QString since = clock(p.first);
     metaRow->addWidget(new ElideLabel(QDir::toNativeSeparators(QFileInfo(p.path).path()) + " · " +
-                                          (p.attempts == 1 ? QString("1 attempt") : QString("%1 attempts").arg(p.attempts)) +
-                                          " since " + clock(p.first),
+                                          (p.attempts == 1 ? I18n::tr("1 attempt since %1").arg(since)
+                                                           : I18n::tr("%1 attempts since %2").arg(p.attempts).arg(since)),
                                       "small", Qt::ElideMiddle),
                        1);
     info->addLayout(metaRow);
@@ -1983,18 +2015,18 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
         const auto e = explanationFor(p.id);
         if (!known.isEmpty()) th->addWidget(hint(known.section(" · ", 0, 1), "known"));
         if (e.state == AccessToast::Explanation::Ready)
-            th->addWidget(e.suggestion == "block"   ? hint("AI suggests Block", "block")
-                          : e.suggestion == "allow" ? hint("AI suggests Allow", "allow")
-                                                    : hint("AI: your call", "either"));
-        auto *open = decision("Review", nullptr);
+            th->addWidget(e.suggestion == "block"   ? hint(I18n::tr("AI suggests Block"), "block")
+                          : e.suggestion == "allow" ? hint(I18n::tr("AI suggests Allow"), "allow")
+                                                    : hint(I18n::tr("AI: your call"), "either"));
+        auto *open = decision(I18n::tr("Review"), nullptr);
         open->setObjectName("request-open");
         connect(open, &QPushButton::clicked, this, [this, id = p.id] {
             expanded_ = id;
             render(true);
         });
         th->addWidget(open);
-        auto *block = decision("Block", "block");
-        auto *allow = decision("Allow", "allow");
+        auto *block = decision(I18n::tr("Block"), "block");
+        auto *allow = decision(I18n::tr("Allow"), "allow");
         recommend(block, allow, known);
         block->setEnabled(canDecide());
         allow->setEnabled(canDecide());
@@ -2014,17 +2046,17 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
     auto *leftCol = new QVBoxLayout;
     leftCol->setSpacing(12);
     if (p.perDestination) {
-        auto *n = text("This app already has rules for other servers: Allow or Block applies to this server only. "
-                       "Choose Any destination (whole app) to replace its server rules.",
+        auto *n = text(I18n::tr("This app already has rules for other servers: Allow or Block applies to this server "
+                                "only. Choose Any destination (whole app) to replace its server rules."),
                        "info", true);
         leftCol->addWidget(n);
     }
     if (p.signer.isEmpty()) {
         const bool repository = FolderTrust::isFolderScope(scopeOptions(p).first().second);
-        auto *n = text(repository ? "No signature: the rule can't follow a publisher, only this file or this app's name "
-                                    "inside its repository."
-                                  : "No signature: a rule can only cover this exact file. If the file changes, it asks "
-                                    "again.",
+        auto *n = text(repository ? I18n::tr("No signature: the rule can't follow a publisher, only this file or this "
+                                             "app's name inside its repository.")
+                                  : I18n::tr("No signature: a rule can only cover this exact file. If the file changes, "
+                                             "it asks again."),
                        "note", true);
         leftCol->addWidget(n);
     }
@@ -2048,9 +2080,9 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
     target->setTextInteractionFlags(Qt::TextSelectableByMouse);
     wv->addWidget(target);
     wv->addWidget(text(destinationLine(p), "faint"));
-    fact("Wants", wants);
+    fact(I18n::tr("Wants"), wants);
     const QString parent = launchedBy(p);
-    if (!parent.isEmpty()) fact("Started by", text(parent, "value", true));
+    if (!parent.isEmpty()) fact(I18n::tr("Started by"), text(parent, "value", true));
     leftCol->addLayout(facts);
     leftCol->addWidget(aiCard(p));
     leftCol->addStretch();
@@ -2089,10 +2121,10 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
         grid->addWidget(combo, gridRow + 1, gridCol, 1, span);
         return combo;
     };
-    auto *scopeBox = addCombo("Apply to", scopeOptions(p), choice.scope, "request-scope", 0, 0, 2);
+    auto *scopeBox = addCombo(I18n::tr("Apply to"), scopeOptions(p), choice.scope, "request-scope", 0, 0, 2);
     grid->setRowMinimumHeight(2, 8);
-    addCombo("For", durationOptions(), choice.duration, "request-duration", 3, 0, 1);
-    auto *targetBox = addCombo("Destination", targetOptions(p), choice.target, "request-target", 3, 1, 1);
+    addCombo(I18n::tr("For"), durationOptions(), choice.duration, "request-duration", 3, 0, 1);
+    auto *targetBox = addCombo(I18n::tr("Destination"), targetOptions(p), choice.target, "request-target", 3, 1, 1);
     choice.set = true;
     rightCol->addLayout(grid);
     // Una regla por carpeta es para la app entera: el destino queda en «Any destination» y se dice qué carpeta abre.
@@ -2119,8 +2151,8 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
     rightCol->addSpacing(12);
     auto *buttons = row(8);
     buttons->addStretch();
-    auto *block = decision("Block", "block");
-    auto *allow = decision("Allow", "allow");
+    auto *block = decision(I18n::tr("Block"), "block");
+    auto *allow = decision(I18n::tr("Allow"), "allow");
     block->setObjectName("request-block");
     allow->setObjectName("request-allow");
     recommend(block, allow, known);
@@ -2136,10 +2168,13 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
         });
     }
     rightCol->addLayout(buttons);
+    // Entre 290 y 330: con lugar, los desplegables de abajo muestran entero «Cualquier destino»; en la ventana más
+    // angosta ceden y recortan con «…» (el texto entero queda en el tooltip).
     auto *rw = new QWidget;
-    rw->setFixedWidth(290);
+    rw->setMinimumWidth(290);
+    rw->setMaximumWidth(330);
     rw->setLayout(rightCol);
-    bh->addWidget(rw);
+    bh->addWidget(rw, 1);
     cl->addWidget(body);
     return c;
 }
@@ -2148,25 +2183,26 @@ QWidget *FirewallWindow::requestsPage() {
     auto *page = new QWidget;
     auto *l = column(page, 28, 12);
     l->setContentsMargins(28, 24, 28, 28);
-    l->addWidget(header("Requests",
-                        "Each application here was blocked and is waiting. Allow lets its next attempt connect."));
+    l->addWidget(header(I18n::tr("Requests"),
+                        I18n::tr("Each application here was blocked and is waiting. Allow lets its next attempt "
+                                 "connect.")));
     l->addSpacing(2);
-    l->addWidget(how({"Each program here was blocked and is waiting for you.",
-                      "Choose what the rule covers: <b>this file</b>, <b>any version</b> of a signed app or the app "
-                      "inside its <b>repository</b>, and for how long and to which server.",
-                      "Press <b>Allow</b> or <b>Block</b>. Allow lets the next attempt connect."},
-                     "Closing a notice keeps the request waiting here. Block and Allow on a closed card use what the "
-                     "notice would preselect."));
+    l->addWidget(how({I18n::tr("Each program here was blocked and is waiting for you."),
+                      I18n::tr("Choose what the rule covers: <b>this file</b>, <b>any version</b> of a signed app or "
+                               "the app inside its <b>repository</b>, and for how long and to which server."),
+                      I18n::tr("Press <b>Allow</b> or <b>Block</b>. Allow lets the next attempt connect.")},
+                     I18n::tr("Closing a notice keeps the request waiting here. Block and Allow on a closed card use "
+                              "what the notice would preselect.")));
     auto pending = firewall_.pending();
     std::sort(pending.begin(), pending.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
     if (!firewall_.status().connected) {
         auto *c = card();
-        cardColumn(c)->addWidget(text("The engine is not running, so no requests can arrive.", "sub", true));
+        cardColumn(c)->addWidget(text(I18n::tr("The engine is not running, so no requests can arrive."), "sub", true));
         l->addWidget(c);
     } else if (pending.isEmpty()) {
         auto *c = card();
-        cardColumn(c)->addWidget(text("Nothing is waiting. A new application that tries to connect appears here and in a "
-                                  "notice in the corner of the screen.",
+        cardColumn(c)->addWidget(text(I18n::tr("Nothing is waiting. A new application that tries to connect appears "
+                                               "here and in a notice in the corner of the screen."),
                                   "sub", true));
         l->addWidget(c);
     }
@@ -2215,19 +2251,20 @@ QVector<FirewallWindow::AppEntry> FirewallWindow::appEntries() const {
             e.path = r.path;
             if (r.scope == "path") {
                 e.title = FirewallClient::fileName(r.path);
-                e.subtitle = "This file · " + shortFolder(r.path);
+                e.subtitle = I18n::tr("This file · %1").arg(shortFolder(r.path));
                 e.iconPath = r.path;
             } else if (r.scope == "app") {
                 e.title = r.name;
-                e.subtitle = "Any version · " + r.signer;
+                e.subtitle = I18n::tr("Any version · %1").arg(r.signer);
             } else if (r.scope == "folder") {
                 // Con nombre: como una regla de app («node.exe · Any version»), pero por carpeta.
-                e.title = r.name.isEmpty() ? "All apps in " + FolderTrust::label(r.path) : r.name;
-                e.subtitle = (r.name.isEmpty() ? "Folder rule · " : "Anywhere in ") + QDir::toNativeSeparators(r.path);
+                const QString folder = QDir::toNativeSeparators(r.path);
+                e.title = r.name.isEmpty() ? I18n::tr("All apps in %1").arg(FolderTrust::label(r.path)) : r.name;
+                e.subtitle = r.name.isEmpty() ? I18n::tr("Folder rule · %1").arg(folder) : I18n::tr("Anywhere in %1").arg(folder);
                 if (r.name.isEmpty()) e.iconPath = r.path; // el ícono de carpeta de Windows
             } else {
-                e.title = "All apps from " + r.signer;
-                e.subtitle = "Publisher rule";
+                e.title = I18n::tr("All apps from %1").arg(r.signer);
+                e.subtitle = I18n::tr("Publisher rule");
             }
             at = entries.size();
             index.insert(key, at);
@@ -2307,26 +2344,27 @@ QWidget *FirewallWindow::appsPage() {
     auto *page = new QWidget;
     auto *l = column(page, 28, 12);
     l->setContentsMargins(28, 24, 28, 24);
-    l->addWidget(header("Apps",
-                        "Every application with a rule. A signed app keeps its rule across updates; a rule in a folder "
-                        "also covers builds made there later."));
+    l->addWidget(header(I18n::tr("Apps"),
+                        I18n::tr("Every application with a rule. A signed app keeps its rule across updates; a rule in "
+                                 "a folder also covers builds made there later.")));
     l->addSpacing(2);
-    l->addWidget(how({"Every program with a rule is listed here, with what it covers and where it may connect.",
-                      "A <b>signed</b> program keeps its rule across updates; a <b>folder rule</b> covers every build made "
-                      "inside that folder.",
-                      "Click a row to change or remove its rule. <b>Running, no rule</b> lets you decide before a "
-                      "program asks."}));
+    l->addWidget(how({I18n::tr("Every program with a rule is listed here, with what it covers and where it may "
+                               "connect."),
+                      I18n::tr("A <b>signed</b> program keeps its rule across updates; a <b>folder rule</b> covers "
+                               "every build made inside that folder."),
+                      I18n::tr("Click a row to change or remove its rule. <b>Running, no rule</b> lets you decide "
+                               "before a program asks.")}));
     auto *bar = row(10);
     auto *search = new QLineEdit(appsQuery_);
     search->setObjectName("apps-search");
-    search->setPlaceholderText("Search apps or publishers");
+    search->setPlaceholderText(I18n::tr("Search apps or publishers"));
     search->setClearButtonEnabled(true);
     search->setMinimumWidth(140);
     search->setMinimumHeight(30);
     search->addAction(QIcon(iconPixmap("search", 16, Theme::color(Theme::kTextCaption), devicePixelRatioF())),
                       QLineEdit::LeadingPosition);
     bar->addWidget(search, 1);
-    auto *trust = button("Trust a folder…");
+    auto *trust = button(I18n::tr("Trust a folder…"));
     trust->setObjectName("apps-trust-folder");
     trust->setEnabled(canDecide());
     connect(trust, &QPushButton::clicked, this, [this] { trustFolderDialog({}, {}); });
@@ -2392,13 +2430,13 @@ void FirewallWindow::fillApps() {
         }
         delete item;
     }
-    const QVector<std::tuple<QString, QString, int>> filters{{"all", "All", int(entries.size())},
-                                                            {"allow", "Allow", allow},
-                                                            {"block", "Block", block},
-                                                            {"server", "Per server", perServer},
-                                                            {"temp", "Temporary", temporary},
-                                                            {"folder", "Folders", folders},
-                                                            {"running", "Running, no rule", int(loose.size())}};
+    const QVector<std::tuple<QString, QString, int>> filters{{"all", I18n::tr("All"), int(entries.size())},
+                                                            {"allow", I18n::trc("filter", "Allow"), allow},
+                                                            {"block", I18n::trc("filter", "Block"), block},
+                                                            {"server", I18n::tr("Per server"), perServer},
+                                                            {"temp", I18n::tr("Temporary"), temporary},
+                                                            {"folder", I18n::tr("Folders"), folders},
+                                                            {"running", I18n::tr("Running, no rule"), int(loose.size())}};
     for (const auto &[id, name, n] : filters) {
         // El número va más apagado que el nombre (`.seg em`): dos textos dentro del botón, que no toman el mouse.
         const bool on = appsFilter_ == id;
@@ -2452,7 +2490,8 @@ void FirewallWindow::fillApps() {
         return w;
     };
     if (runningView) {
-        setColumns(t, "running", {{"APPLICATION", 260}, {"FOLDER", 340}, {"RULE FOR THIS FILE", 170}});
+        setColumns(t, "running",
+                   {{I18n::tr("APPLICATION"), 260}, {I18n::tr("FOLDER"), 340}, {I18n::tr("RULE FOR THIS FILE"), 190}});
         t->viewport()->setCursor(Qt::ArrowCursor);
         for (const auto &path : loose) {
             if (!matches(path)) continue;
@@ -2465,7 +2504,7 @@ void FirewallWindow::fillApps() {
             dh->setContentsMargins(0, 0, 0, 0);
             dh->setSpacing(8);
             for (const bool allowed : {false, true}) {
-                auto *b = decision(allowed ? "Allow" : "Block", allowed ? "allow" : "block");
+                auto *b = decision(allowed ? I18n::tr("Allow") : I18n::tr("Block"), allowed ? "allow" : "block");
                 b->setObjectName(allowed ? "running-allow" : "running-block");
                 b->setEnabled(canDecide());
                 connect(b, &QPushButton::clicked, this, [this, path, allowed] {
@@ -2476,11 +2515,12 @@ void FirewallWindow::fillApps() {
             dh->addStretch();
             fillRow(t, r, {cell(nameCell(path, FirewallClient::fileName(path), {})), cell(folder), cell(decide, Qt::AlignLeft, true)});
         }
-        appsTip_->setText("Applications running in your Windows session without a rule. They ask the first time they "
-                          "connect, or Allow and Block here save a rule for that file now.");
+        appsTip_->setText(I18n::tr("Applications running in your Windows session without a rule. They ask the first "
+                                   "time they connect, or Allow and Block here save a rule for that file now."));
     } else {
         setColumns(t, "rules",
-                   {{"APPLICATION", 330}, {"DESTINATION", 120}, {"RULE", 170}, {"WHEN", 130, Qt::AlignRight}});
+                   {{I18n::tr("APPLICATION"), 330}, {I18n::tr("DESTINATION"), 120}, {I18n::tr("RULE"), 170},
+                    {I18n::tr("WHEN"), 130, Qt::AlignRight}});
         t->viewport()->setCursor(Qt::PointingHandCursor);
         for (const auto &e : entries) {
             const QString c = classify(e);
@@ -2492,21 +2532,21 @@ void FirewallWindow::fillApps() {
             const int r = t->rowCount();
             t->insertRow(r);
             const auto &r0 = e.rules.first();
-            QWidget *dest = e.perServer ? static_cast<QWidget *>(chip(e.rules.size() == 1 ? QString("1 server")
-                                                                                          : QString("%1 servers").arg(e.rules.size())))
-                                        : new ElideLabel("Anywhere", "small");
-            QLabel *policy = c == "server" ? pill("Per server", "dest")
-                             : c == "temp" ? pill(QString(r0.allow ? "Allow" : "Block") + " · " +
-                                                      (r0.expires < 0 ? QString("until restart") : "until " + clock(r0.expires)),
-                                                  "temp")
-                             : c == "allow" ? pill("Allow", "allow")
-                                            : pill("Block", "block");
+            QWidget *dest = e.perServer ? static_cast<QWidget *>(chip(e.rules.size() == 1 ? I18n::tr("1 server")
+                                                                                          : I18n::tr("%1 servers").arg(e.rules.size())))
+                                        : new ElideLabel(I18n::tr("Anywhere"), "small");
+            QLabel *policy = c == "server" ? pill(I18n::tr("Per server"), "dest")
+                             : c == "temp" ? pill(temporaryRule(r0.allow, r0.expires), "temp")
+                             : c == "allow" ? pill(I18n::tr("Allow"), "allow")
+                                            : pill(I18n::tr("Block"), "block");
             qint64 lastBlock = 0, created = 0;
             for (const auto &x : e.rules) {
                 lastBlock = qMax(lastBlock, x.allow ? 0 : x.lastBlock);
                 if (!created || x.created < created) created = x.created;
             }
-            auto *when = new ElideLabel(lastBlock ? "blocked " + clock(lastBlock) : "added " + clock(created), "time");
+            auto *when = new ElideLabel(lastBlock ? I18n::tr("blocked %1").arg(clock(lastBlock))
+                                                  : I18n::tr("added %1").arg(clock(created)),
+                                        "time");
             when->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
             // Una ruta se recorta al medio (se ve el final); un editor, al final.
             fillRow(t, r, {cell(nameCell(e.iconPath, e.title, e.subtitle, e.scope == "path" ? Qt::ElideMiddle : Qt::ElideRight)),
@@ -2514,18 +2554,20 @@ void FirewallWindow::fillApps() {
             t->item(r, 0)->setData(Qt::UserRole, "rule:" + e.key);
         }
         if (appsFilter_ == "folder")
-            appsTip_->setText("A folder rule covers programs in that folder and its subfolders, also ones built or copied "
-                              "there later. A notice offers it for one app in its repository; Trust a folder… adds any "
-                              "folder by hand, for one program name or for all of them.");
+            appsTip_->setText(I18n::tr("A folder rule covers programs in that folder and its subfolders, also ones "
+                                       "built or copied there later. A notice offers it for one app in its repository; "
+                                       "Trust a folder… adds any folder by hand, for one program name or for all of "
+                                       "them."));
         else
             appsTip_->clear();
     }
     if (t->rowCount() == 0) {
         t->insertRow(0);
-        auto *empty = new ElideLabel(runningView ? "Every running application of this session has a rule or is waiting."
-                                     : !appsQuery_.isEmpty()   ? "No app matches the search."
-                                     : appsFilter_ == "folder" ? "No folder rules yet."
-                                                               : "No rules here yet.",
+        auto *empty = new ElideLabel(runningView ? I18n::tr("Every running application of this session has a rule or "
+                                                            "is waiting.")
+                                     : !appsQuery_.isEmpty()   ? I18n::tr("No app matches the search.")
+                                     : appsFilter_ == "folder" ? I18n::tr("No folder rules yet.")
+                                                               : I18n::tr("No rules here yet."),
                                      "sub");
         fillRow(t, 0, {cell(empty)});
         t->setSpan(0, 0, 1, t->columnCount());
@@ -2539,7 +2581,7 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
     auto *page = new QWidget;
     auto *l = column(page, 28, 12);
     l->setContentsMargins(28, 24, 28, 28);
-    auto *back = button("‹ Apps", "link");
+    auto *back = button(I18n::tr("‹ Apps"), "link");
     back->setObjectName("detail-back");
     connect(back, &QPushButton::clicked, this, [this] { selectView("apps"); });
     auto *bl = row();
@@ -2550,26 +2592,28 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
     const AppEntry *e = nullptr;
     for (const auto &x : entries) if (x.key == key) e = &x;
     if (!e) {
-        l->addWidget(text("This app has no rules any more.", "sub"));
+        l->addWidget(text(I18n::tr("This app has no rules any more."), "sub"));
         l->addStretch();
         return page;
     }
     const auto &r0 = e->rules.first();
     // e->title es el nombre con sus mayúsculas reales si ya cubrió un archivo (appEntries).
-    const QString folderText = (r0.name.isEmpty() ? QStringLiteral("Every program in ") : e->title + " anywhere in ") +
-                               FolderTrust::shown(e->path) + " and its subfolders";
+    const QString shownFolder = FolderTrust::shown(e->path);
+    const QString folderText = r0.name.isEmpty()
+                                   ? I18n::tr("Every program in %1 and its subfolders").arg(shownFolder)
+                                   : I18n::tr("%1 anywhere in %2 and its subfolders").arg(e->title, shownFolder);
     QString where = e->scope == "path"     ? QDir::toNativeSeparators(e->path)
-                    : e->scope == "app"    ? "Any version signed by " + e->signer
+                    : e->scope == "app"    ? I18n::tr("Any version signed by %1").arg(e->signer)
                     : e->scope == "folder" ? folderText
-                                           : "Any application signed by " + e->signer;
+                                           : I18n::tr("Any application signed by %1").arg(e->signer);
     if (e->scope == "app" && !e->iconPath.isEmpty())
-        where = QDir::toNativeSeparators(e->iconPath) + " · any version signed by " + e->signer;
+        where = I18n::tr("%1 · any version signed by %2").arg(QDir::toNativeSeparators(e->iconPath), e->signer);
     l->addWidget(header(e->title, where, nullptr, appIcon(e->iconPath, 36)));
-    l->addWidget(how({"The <b>Rule</b> card says what this rule covers and when it last blocked an attempt.",
-                      "A rule for a file or a folder can change between <b>Allow</b> and <b>Block</b> here; a rule for a "
-                      "signed app changes on its next notice.",
-                      "<b>Remove</b> drops the rule: the program asks again the next time it connects, unless a folder "
-                      "rule covers it."}));
+    l->addWidget(how({I18n::tr("The <b>Rule</b> card says what this rule covers and when it last blocked an attempt."),
+                      I18n::tr("A rule for a file or a folder can change between <b>Allow</b> and <b>Block</b> here; a "
+                               "rule for a signed app changes on its next notice."),
+                      I18n::tr("<b>Remove</b> drops the rule: the program asks again the next time it connects, unless "
+                               "a folder rule covers it.")}));
     const bool can = canDecide();
     int covered = 0;
     for (const auto &r : e->rules)
@@ -2579,7 +2623,7 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
         auto *c = card();
         auto *cl = cardColumn(c, 0);
         auto *ch = row(10);
-        ch->addWidget(text("Server rules", "cardtitle"));
+        ch->addWidget(text(I18n::tr("Server rules"), "cardtitle"));
         ch->addWidget(chip(QString::number(e->rules.size()), "mute"));
         ch->addStretch();
         cl->addLayout(ch);
@@ -2594,20 +2638,20 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
             h->setContentsMargins(0, 3, 0, 3);
             h->setSpacing(10);
             h->addWidget(new ElideLabel(r.destination, "value"), 1);
-            h->addWidget(text(r.expires == 0 ? QString("Always")
-                              : r.expires < 0 ? QString("Until restart")
-                                              : "Until " + clock(r.expires),
+            h->addWidget(text(r.expires == 0 ? I18n::tr("Always")
+                              : r.expires < 0 ? I18n::tr("Until restart")
+                                              : I18n::tr("Until %1").arg(clock(r.expires)),
                               "sub"));
             auto *pw = new QWidget;
-            pw->setFixedWidth(70);
+            pw->setFixedWidth(84);
             auto *pl = new QHBoxLayout(pw);
             pl->setContentsMargins(0, 0, 0, 0);
             pl->addStretch();
-            pl->addWidget(pill(r.allow ? "Allow" : "Block", r.allow ? "allow" : "block"));
+            pl->addWidget(pill(r.allow ? I18n::tr("Allow") : I18n::tr("Block"), r.allow ? "allow" : "block"));
             h->addWidget(pw);
             auto *x = button("×", "x");
             x->setObjectName("remove-server-rule");
-            CustomTooltip::instance()->setToolTip(x, "Remove only this server rule");
+            CustomTooltip::instance()->setToolTip(x, I18n::tr("Remove only this server rule"));
             x->setEnabled(can);
             connect(x, &QPushButton::clicked, this, [this, id = r.id] { firewall_.removeRule(id); });
             h->addWidget(x);
@@ -2616,15 +2660,15 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
         cl->addSpacing(4);
         cl->addWidget(divider());
         cl->addSpacing(10);
-        cl->addWidget(text("Any other server asks first, with its own notice. A name is matched through the address the "
-                           "app looked up, so on a shared network like Cloudflare an allowed address also reaches other "
-                           "sites there.",
+        cl->addWidget(text(I18n::tr("Any other server asks first, with its own notice. A name is matched through the "
+                                    "address the app looked up, so on a shared network like Cloudflare an allowed "
+                                    "address also reaches other sites there."),
                            "faint", true));
         l->addWidget(c);
     } else {
         auto *c = card();
         auto *cl = cardColumn(c, 10);
-        cl->addWidget(text("Rule", "cardtitle"));
+        cl->addWidget(text(I18n::tr("Rule"), "cardtitle"));
         auto *grid = new QGridLayout;
         grid->setHorizontalSpacing(12);
         grid->setVerticalSpacing(9);
@@ -2637,28 +2681,30 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
         auto *pw = new QWidget;
         auto *pl = new QHBoxLayout(pw);
         pl->setContentsMargins(0, 0, 0, 0);
-        pl->addWidget(r0.expires != 0 ? pill(QString(r0.allow ? "Allow" : "Block") + " · " +
-                                                 (r0.expires < 0 ? QString("until restart") : "until " + clock(r0.expires)),
-                                             "temp")
-                                      : pill(r0.allow ? "Allow" : "Block", r0.allow ? "allow" : "block"));
+        pl->addWidget(r0.expires != 0 ? pill(temporaryRule(r0.allow, r0.expires), "temp")
+                                      : pill(r0.allow ? I18n::tr("Allow") : I18n::tr("Block"), r0.allow ? "allow" : "block"));
         pl->addStretch();
-        kv("Decision", pw);
-        kv("Applies to", text(e->scope == "path"     ? QString("This file only")
-                              : e->scope == "app"    ? "Any version of " + r0.name + " signed by this publisher"
-                              : e->scope == "folder" ? folderText + ", also programs built or copied there later. A "
-                                                                    "rule for a file, an app or a publisher comes first."
-                                                     : "Any application signed by " + r0.signer,
-                              "value", true));
-        if (e->scope != "path") kv("Files seen", text(QString::number(covered), "value"));
-        kv("Created", text(clockFull(r0.created), "value"));
-        kv("Last blocked attempt", text(r0.allow ? QString("—") : clockFull(r0.lastBlock), "value"));
+        kv(I18n::tr("Decision"), pw);
+        kv(I18n::tr("Applies to"),
+           text(e->scope == "path"   ? I18n::tr("This file only")
+                : e->scope == "app"  ? I18n::tr("Any version of %1 signed by this publisher").arg(r0.name)
+                : e->scope == "folder"
+                    ? I18n::tr("%1, also programs built or copied there later. A rule for a file, an app or a publisher "
+                               "comes first.")
+                          .arg(folderText)
+                    : I18n::tr("Any application signed by %1").arg(r0.signer),
+                "value", true));
+        if (e->scope != "path") kv(I18n::tr("Files seen"), text(QString::number(covered), "value"));
+        kv(I18n::tr("Created"), text(clockFull(r0.created), "value"));
+        kv(I18n::tr("Last blocked attempt"), text(r0.allow ? QString("—") : clockFull(r0.lastBlock), "value"));
         cl->addLayout(grid);
         if ((e->scope == "path" || e->scope == "folder") && r0.expires == 0) {
             // Una regla por ruta o por carpeta se puede invertir aquí; las de firma se cambian en el próximo aviso que
             // coincida.
             auto *actions = row(8);
             actions->addStretch();
-            auto *flip = button(r0.allow ? "Change to Block" : "Change to Allow", r0.allow ? "block" : "allow");
+            auto *flip = button(r0.allow ? I18n::tr("Change to Block") : I18n::tr("Change to Allow"),
+                                r0.allow ? "block" : "allow");
             flip->setObjectName("rule-flip");
             flip->setEnabled(can);
             connect(flip, &QPushButton::clicked, this,
@@ -2686,27 +2732,27 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
             auto *ct = new QVBoxLayout;
             ct->setSpacing(2);
             if (inside && inside->allow) {
-                ct->addWidget(text("Inside a trusted folder", "strong"));
-                ct->addWidget(text(QString("%1 is a trusted folder. This file rule comes first; if you remove it, the "
-                                           "folder rule takes over after one blocked attempt.")
+                ct->addWidget(text(I18n::tr("Inside a trusted folder"), "strong"));
+                ct->addWidget(text(I18n::tr("%1 is a trusted folder. This file rule comes first; if you remove it, the "
+                                            "folder rule takes over after one blocked attempt.")
                                        .arg(FolderTrust::shown(inside->path)),
                                    "small", true));
             } else if (inside) {
-                ct->addWidget(text("Inside a blocked folder", "strong"));
-                ct->addWidget(text(QString("A folder rule blocks %1 in %2. This file rule comes first; if you remove it, "
-                                           "the folder rule blocks it without asking.")
+                ct->addWidget(text(I18n::tr("Inside a blocked folder"), "strong"));
+                ct->addWidget(text(I18n::tr("A folder rule blocks %1 in %2. This file rule comes first; if you remove "
+                                            "it, the folder rule blocks it without asking.")
                                        .arg(e->title, FolderTrust::shown(inside->path)),
                                    "small", true));
             } else {
-                ct->addWidget(text("Cover new builds too", "strong"));
-                ct->addWidget(text(QString("This rule covers only this file: a build of %1 in another folder asks "
-                                           "again. A rule for %1 anywhere in %2 covers every build there.")
+                ct->addWidget(text(I18n::tr("Cover new builds too"), "strong"));
+                ct->addWidget(text(I18n::tr("This rule covers only this file: a build of %1 in another folder asks "
+                                            "again. A rule for %1 anywhere in %2 covers every build there.")
                                        .arg(e->title, FolderTrust::shown(folder)),
                                    "small", true));
             }
             ch->addLayout(ct, 1);
             if (!inside) {
-                auto *b = button("Cover all builds…");
+                auto *b = button(I18n::tr("Cover all builds…"));
                 b->setObjectName("detail-trust-folder");
                 b->setEnabled(can);
                 connect(b, &QPushButton::clicked, this, [this, folder, name = e->title] { trustFolderDialog(folder, name); });
@@ -2721,18 +2767,23 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
     rh->setSpacing(12);
     auto *rt = new QVBoxLayout;
     rt->setSpacing(2);
-    rt->addWidget(text(e->rules.size() > 1 ? "Remove all rules for " + e->title : "Remove this rule", "strong"));
-    rt->addWidget(text(inside && inside->allow ? "The trusted folder decides for " + e->title + " after one blocked attempt."
-                       : inside            ? "The folder rule blocks " + e->title + " without asking."
-                       : e->scope == "path" ? e->title + " asks again the next time it connects."
+    rt->addWidget(text(e->rules.size() > 1 ? I18n::tr("Remove all rules for %1").arg(e->title)
+                                           : I18n::tr("Remove this rule"),
+                       "strong"));
+    rt->addWidget(text(inside && inside->allow
+                           ? I18n::tr("The trusted folder decides for %1 after one blocked attempt.").arg(e->title)
+                       : inside             ? I18n::tr("The folder rule blocks %1 without asking.").arg(e->title)
+                       : e->scope == "path" ? I18n::tr("%1 asks again the next time it connects.").arg(e->title)
                        : e->scope == "folder"
-                           ? "Programs in " + FolderTrust::shown(e->path) +
-                                 " ask again the next time they connect, unless another rule covers them."
-                           : e->title + " asks again the next time it connects. To change a rule like this one, decide "
-                                        "on its next notice.",
+                           ? I18n::tr("Programs in %1 ask again the next time they connect, unless another rule covers "
+                                      "them.")
+                                 .arg(FolderTrust::shown(e->path))
+                           : I18n::tr("%1 asks again the next time it connects. To change a rule like this one, decide "
+                                      "on its next notice.")
+                                 .arg(e->title),
                        "small", true));
     rh->addLayout(rt, 1);
-    auto *rb = button(e->rules.size() > 1 ? "Remove rules" : "Remove rule");
+    auto *rb = button(e->rules.size() > 1 ? I18n::tr("Remove rules") : I18n::tr("Remove rule"));
     rb->setObjectName("remove-rule");
     rb->setEnabled(can);
     connect(rb, &QPushButton::clicked, this, [this, rules = e->rules] {
@@ -2758,7 +2809,8 @@ QWidget *FirewallWindow::activityPage() {
     auto *sl = new QHBoxLayout(seg);
     sl->setContentsMargins(2, 2, 2, 2);
     sl->setSpacing(2);
-    for (const auto &[id, name] : {std::pair{QString("blocked"), QString("Blocked")}, {QString("decisions"), QString("Decisions")}}) {
+    for (const auto &[id, name] :
+         {std::pair{QString("blocked"), I18n::tr("Blocked")}, {QString("decisions"), I18n::tr("Decisions")}}) {
         auto *b = button(name, "seg");
         b->setFixedHeight(24);
         b->setObjectName("activity-filter-" + id);
@@ -2769,15 +2821,17 @@ QWidget *FirewallWindow::activityPage() {
         });
         sl->addWidget(b);
     }
-    l->addWidget(header("Activity",
-                        (s.started ? "Since the engine started at " + clock(s.started) + ". " : QString()) +
-                            "Allowed connections are not recorded.",
+    l->addWidget(header(I18n::tr("Activity"),
+                        s.started ? I18n::tr("Since the engine started at %1. Allowed connections are not recorded.")
+                                        .arg(clock(s.started))
+                                  : I18n::tr("Allowed connections are not recorded."),
                         seg));
     l->addSpacing(2);
-    l->addWidget(how({"<b>Blocked</b> lists every attempt the engine stopped and how each request ended.",
-                      "<b>Decisions</b> shows what you chose and when one of your rules let a program through.",
-                      "Repeated attempts of one program are grouped in one row."},
-                     "The list keeps the latest 2,000 events and starts again when the engine restarts."));
+    l->addWidget(how({I18n::tr("<b>Blocked</b> lists every attempt the engine stopped and how each request ended."),
+                      I18n::tr("<b>Decisions</b> shows what you chose and when one of your rules let a program "
+                               "through."),
+                      I18n::tr("Repeated attempts of one program are grouped in one row.")},
+                     I18n::tr("The list keeps the latest 2,000 events and starts again when the engine restarts.")));
     const bool blockedView = activityFilter_ == "blocked";
     auto *c = card();
     auto *cl = new QVBoxLayout(c);
@@ -2785,9 +2839,10 @@ QWidget *FirewallWindow::activityPage() {
     auto *t = makeTable("activity", 50);
     t->viewport()->setCursor(Qt::ArrowCursor);
     if (blockedView)
-        setColumns(t, "blocked", {{"TIME", 80}, {"APPLICATION", 260}, {"DESTINATION", 200}, {"REASON", 160}});
+        setColumns(t, "blocked", {{I18n::tr("TIME"), 80}, {I18n::tr("APPLICATION"), 260}, {I18n::tr("DESTINATION"), 200},
+                                  {I18n::tr("REASON"), 160}});
     else
-        setColumns(t, "decisions", {{"TIME", 80}, {"APPLICATION", 260}, {"DECISION", 300}});
+        setColumns(t, "decisions", {{I18n::tr("TIME"), 80}, {I18n::tr("APPLICATION"), 260}, {I18n::tr("DECISION"), 300}});
     cl->addWidget(t);
     const auto &events = firewall_.activity();
     const auto reasons = blockedView ? blockReasons(events, firewall_.pending()) : QVector<BlockReason>();
@@ -2847,10 +2902,11 @@ QWidget *FirewallWindow::activityPage() {
         auto *appName = new ElideLabel(e.path.isEmpty() ? QString("GateBouncer") : FirewallClient::fileName(e.path), "value");
         appName->setStyleSheet("font-weight: 500;");
         ah->addWidget(appName, 1);
-        if (repeats > 1) ah->addWidget(text(QString("%1 times").arg(repeats), "time"));
+        if (repeats > 1) ah->addWidget(text(I18n::tr("%1 times").arg(repeats), "time"));
         if (blockedView) {
             QString where = row.destinations.first();
-            if (row.destinations.size() > 1) where += QString(" +%1 more").arg(row.destinations.size() - 1);
+            if (row.destinations.size() > 1)
+                where = I18n::tr("%1 +%2 more").arg(where).arg(row.destinations.size() - 1);
             auto *dest = new ElideLabel(where, "sub");
             auto *reason = new QWidget;
             auto *rh = new QHBoxLayout(reason);
@@ -2878,8 +2934,8 @@ QWidget *FirewallWindow::activityPage() {
     }
     if (t->rowCount() == 0) {
         t->insertRow(0);
-        fillRow(t, 0, {cell(new ElideLabel(blockedView ? "Nothing blocked since the engine started."
-                                                       : "No decisions since the engine started.",
+        fillRow(t, 0, {cell(new ElideLabel(blockedView ? I18n::tr("Nothing blocked since the engine started.")
+                                                       : I18n::tr("No decisions since the engine started."),
                                            "sub"))});
         t->setSpan(0, 0, 1, t->columnCount());
     }
@@ -2896,15 +2952,16 @@ QWidget *FirewallWindow::settingsPage() {
     auto *page = new QWidget;
     auto *l = column(page, 28, 12);
     l->setContentsMargins(28, 24, 28, 28);
-    l->addWidget(header("Settings", "Firewall mode, AI explanations, import and startup."));
+    l->addWidget(header(I18n::tr("Settings"), I18n::tr("Firewall mode, AI explanations, import and startup.")));
     l->addSpacing(2);
-    l->addWidget(how({"<b>Ask before unknown applications connect</b> is the switch of Protection: off, everything "
-                      "without a rule connects.",
-                      "<b>AI explanations</b> need your own key and your consent; they only explain, they never allow "
-                      "or block.",
-                      "<b>Import from NetLimiter</b> turns its rules for single applications into GateBouncer rules."},
-                     "Closing the window keeps the firewall running: the engine is a Windows service. Quit in the tray "
-                     "menu closes only this window."));
+    l->addWidget(how({I18n::tr("<b>Ask before unknown applications connect</b> is the switch of Protection: off, "
+                               "everything without a rule connects."),
+                      I18n::tr("<b>AI explanations</b> need your own key and your consent; they only explain, they "
+                               "never allow or block."),
+                      I18n::tr("<b>Import from NetLimiter</b> turns its rules for single applications into GateBouncer "
+                               "rules.")},
+                     I18n::tr("Closing the window keeps the firewall running: the engine is a Windows service. Quit in "
+                              "the tray menu closes only this window.")));
 
     const auto setRow = [](QVBoxLayout *into, const QString &title, const QString &caption, QWidget *trailing,
                            bool first = false) {
@@ -2926,37 +2983,37 @@ QWidget *FirewallWindow::settingsPage() {
 
     auto *fw = card();
     auto *fl = cardColumn(fw, 0);
-    fl->addWidget(text("Firewall", "cardtitle"));
+    fl->addWidget(text(I18n::tr("Firewall"), "cardtitle"));
     fl->addSpacing(4);
     auto *ask = new ToggleSwitch;
     ask->setObjectName("firewall-ask");
     ask->setChecked(s.ask);
     ask->setEnabled(can);
     connect(ask, &ToggleSwitch::toggled, this, [this](bool on) { firewall_.setAsk(on); });
-    setRow(fl, "Ask before unknown applications connect",
-           "Off lets everything without a rule connect. Block rules still apply.", ask, true);
+    setRow(fl, I18n::tr("Ask before unknown applications connect"),
+           I18n::tr("Off lets everything without a rule connect. Block rules still apply."), ask, true);
     auto *lan = new ToggleSwitch;
     lan->setObjectName("firewall-lan");
     lan->setChecked(s.localNetwork);
     lan->setEnabled(can);
     connect(lan, &ToggleSwitch::toggled, this, [this](bool on) { firewall_.setLocalNetwork(on); });
-    setRow(fl, "Allow the local network without asking",
-           "Other computers, printers and storage at home or the office, and devices on Tailscale. A Block rule for an "
-           "application still applies there.",
+    setRow(fl, I18n::tr("Allow the local network without asking"),
+           I18n::tr("Other computers, printers and storage at home or the office, and devices on Tailscale. A Block "
+                    "rule for an application still applies there."),
            lan);
     fl->addSpacing(4);
     fl->addWidget(divider());
     fl->addSpacing(12);
-    auto *off = new QLabel(QString("Windows services, DNS and connections inside this PC always connect. To turn "
-                                   "GateBouncer off completely, run <span style=\"background:%1; color:%2; "
-                                   "font-weight:600;\">&nbsp;GateBouncerEngine.exe --remove-filters&nbsp;</span> as "
-                                   "administrator.")
-                               .arg(Theme::kTile, Theme::kTextStrong));
+    auto *off = new QLabel(I18n::tr("Windows services, DNS and connections inside this PC always connect. To turn "
+                                    "GateBouncer off completely, run %1 as administrator.")
+                               .arg(QString("<span style=\"background:%1; color:%2; font-weight:600;\">&nbsp;"
+                                            "GateBouncerEngine.exe --remove-filters&nbsp;</span>")
+                                        .arg(Theme::kTile, Theme::kTextStrong)));
     off->setProperty("r", "sub");
     off->setWordWrap(true);
     fl->addWidget(off);
     if (!s.connected)
-        fl->addWidget(text("The engine is not running: these options apply when it starts again.", "warn", true));
+        fl->addWidget(text(I18n::tr("The engine is not running: these options apply when it starts again."), "warn", true));
     l->addWidget(fw);
     l->addWidget(appCard());
 
@@ -2968,13 +3025,15 @@ QWidget *FirewallWindow::settingsPage() {
     auto *ai = card();
     auto *al = cardColumn(ai, 0);
     auto *aih = row(10);
-    aih->addWidget(text("AI explanations", "cardtitle"));
+    aih->addWidget(text(I18n::tr("AI explanations"), "cardtitle"));
     aih->addStretch();
-    aih->addWidget(hasKey && settings.consent ? chip("Ready", "ok") : hasKey ? chip("Key saved", "mute") : chip("Off", "mute"));
+    aih->addWidget(hasKey && settings.consent ? chip(I18n::tr("Ready"), "ok")
+                   : hasKey                   ? chip(I18n::tr("Key saved"), "mute")
+                                              : chip(I18n::tr("Off"), "mute"));
     al->addLayout(aih);
     al->addSpacing(6);
-    al->addWidget(text("When an application is blocked, an AI model can say what it is and why it connects. The answer "
-                       "only helps you decide: it never allows or blocks anything, and it can be wrong.",
+    al->addWidget(text(I18n::tr("When an application is blocked, an AI model can say what it is and why it connects. The "
+                                "answer only helps you decide: it never allows or blocks anything, and it can be wrong."),
                        "small", true));
     al->addSpacing(6);
     auto *keyBox = new QWidget;
@@ -2985,34 +3044,37 @@ QWidget *FirewallWindow::settingsPage() {
     key->setObjectName("explain-key");
     key->setEchoMode(QLineEdit::Password);
     key->setFixedWidth(200);
-    key->setPlaceholderText(hasKey ? "Paste a new key"
-                                   : QString("Paste your key (%1…)").arg(provider == Explain::Provider::Anthropic ? "sk-ant-" : "nvapi-"));
+    key->setPlaceholderText(hasKey ? I18n::tr("Paste a new key")
+                                   : I18n::tr("Paste your key (%1…)")
+                                         .arg(provider == Explain::Provider::Anthropic ? "sk-ant-" : "nvapi-"));
     kb->addWidget(key);
-    auto *saveKey = button("Save key", "primary");
+    auto *saveKey = button(I18n::tr("Save key"), "primary");
     saveKey->setObjectName("explain-save-key");
     saveKey->setEnabled(false);
     // Sin nada pegado no hay qué guardar: el botón principal no invita a una acción vacía.
     connect(key, &QLineEdit::textChanged, saveKey, [saveKey](const QString &v) { saveKey->setEnabled(!v.trimmed().isEmpty()); });
     kb->addWidget(saveKey);
-    auto *removeKey = button("Remove");
+    auto *removeKey = button(I18n::tr("Remove"));
     removeKey->setObjectName("explain-remove-key");
     removeKey->setEnabled(hasKey);
     kb->addWidget(removeKey);
-    setRow(al, providerName + " key",
-           hasKey ? "Saved for this Windows account, encrypted." : "No key saved: explanations are off.", keyBox, true);
+    setRow(al, I18n::tr("%1 key").arg(providerName),
+           hasKey ? I18n::tr("Saved for this Windows account, encrypted.") : I18n::tr("No key saved: explanations are off."),
+           keyBox, true);
     auto *consent = new ToggleSwitch;
     consent->setObjectName("explain-consent");
     consent->setChecked(settings.consent);
-    setRow(al, "Send app details to " + providerName + " when an explanation is requested",
-           "The file name, its folder without your account name, signature and version, the public server it wanted and "
-           "the program that started it. Never the file, its command line or your local network. Uses your " +
-               providerName + " account and its terms; up to 100 a day.",
+    setRow(al, I18n::tr("Send app details to %1 when an explanation is requested").arg(providerName),
+           I18n::tr("The file name, its folder without your account name, signature and version, the public server it "
+                    "wanted and the program that started it. Never the file, its command line or your local network. "
+                    "Uses your %1 account and its terms; up to 100 a day.")
+               .arg(providerName),
            consent);
     auto *automatic = new ToggleSwitch;
     automatic->setObjectName("explain-automatic");
     automatic->setChecked(settings.automatic);
-    setRow(al, "Explain automatically when a notice appears", "Off shows an Ask AI button on the notice instead.",
-           automatic);
+    setRow(al, I18n::tr("Explain automatically when a notice appears"),
+           I18n::tr("Off shows an Ask AI button on the notice instead."), automatic);
     auto *opts = new QWidget;
     auto *ol = new QHBoxLayout(opts);
     ol->setContentsMargins(0, 0, 0, 0);
@@ -3030,11 +3092,11 @@ QWidget *FirewallWindow::settingsPage() {
     language->setCurrentIndex(settings.language == "es" ? 1 : 0);
     language->setFixedWidth(110);
     ol->addWidget(language);
-    auto *test = button("Test with Notepad");
+    auto *test = button(I18n::tr("Test with Notepad"));
     test->setObjectName("explain-test");
     test->setEnabled(hasKey && settings.consent);
     ol->addWidget(test);
-    setRow(al, "Model and language", {}, opts);
+    setRow(al, I18n::tr("Model and language"), {}, opts);
     auto *testResult = text({}, "small", true);
     testResult->setObjectName("explain-test-result");
     testResult->hide();
@@ -3075,7 +3137,7 @@ QWidget *FirewallWindow::settingsPage() {
             return;
         }
         key->clear();
-        message(providerName + " key saved for this Windows account.");
+        message(I18n::tr("%1 key saved for this Windows account.").arg(providerName));
         render(true);
     });
     connect(removeKey, &QPushButton::clicked, this, [this, provider, providerName] {
@@ -3084,7 +3146,7 @@ QWidget *FirewallWindow::settingsPage() {
             message(error);
             return;
         }
-        message(providerName + " key removed.");
+        message(I18n::tr("%1 key removed.").arg(providerName));
         render(true);
     });
     connect(test, &QPushButton::clicked, this, [test, testResult, providerName] {
@@ -3097,7 +3159,7 @@ QWidget *FirewallWindow::settingsPage() {
         test->setEnabled(false);
         if (!allowed()) return;
         testResult->show();
-        testResult->setText("Asking " + providerName + " about notepad.exe…");
+        testResult->setText(I18n::tr("Asking %1 about notepad.exe…").arg(providerName));
         const QString notepad = QDir::fromNativeSeparators(qEnvironmentVariable("SystemRoot") + "\\System32\\notepad.exe");
         const auto facts = Explain::collectFacts(notepad, "Microsoft Windows", {}, 0, 6, 1);
         QPointer<QLabel> result(testResult);
@@ -3114,8 +3176,11 @@ QWidget *FirewallWindow::settingsPage() {
                 [ok, answer, error, ms, result, again, allowed] {
                     if (again) again->setEnabled(allowed());
                     if (!result) return;
-                    result->setText(ok ? QString("Working · %1 s · %2").arg(ms / 1000.0, 0, 'f', 1).arg(answer.what)
-                                       : "Not working: " + error);
+                    result->setText(ok ? I18n::tr("Working · %1 s · %2")
+                                             .arg(QLocale(spanish() ? QLocale::Spanish : QLocale::English)
+                                                      .toString(ms / 1000.0, 'f', 1),
+                                                  answer.what)
+                                       : I18n::tr("Not working: %1").arg(error));
                 },
                 Qt::QueuedConnection);
         }).detach();
@@ -3127,10 +3192,11 @@ QWidget *FirewallWindow::settingsPage() {
     ih->setSpacing(14);
     auto *it = new QVBoxLayout;
     it->setSpacing(2);
-    it->addWidget(text("Import from NetLimiter", "strong"));
-    it->addWidget(text("Turns NetLimiter firewall rules for single applications into GateBouncer rules.", "small", true));
+    it->addWidget(text(I18n::tr("Import from NetLimiter"), "strong"));
+    it->addWidget(text(I18n::tr("Turns NetLimiter firewall rules for single applications into GateBouncer rules."),
+                       "small", true));
     ih->addLayout(it, 1);
-    auto *openImport = button("Choose file…");
+    auto *openImport = button(I18n::tr("Choose file…"));
     openImport->setObjectName("open-import");
     connect(openImport, &QPushButton::clicked, this, [this] { selectView("import"); });
     ih->addWidget(openImport);
@@ -3154,15 +3220,15 @@ QWidget *FirewallWindow::settingsPage() {
     ct->addStretch();
     cv->addLayout(ct);
     auto *by = row(4);
-    by->addWidget(text("Developed by Lega Pugliese ·", "sub"));
+    by->addWidget(text(I18n::tr("Developed by Lega Pugliese ·"), "sub"));
     auto *site = button("lega.com.ar", "link");
     site->setObjectName("settings-site");
     connect(site, &QPushButton::clicked, this, [] { QDesktopServices::openUrl(QUrl("https://lega.com.ar")); });
     by->addWidget(site);
     by->addStretch();
     cv->addLayout(by);
-    cv->addWidget(text("Opens at sign-in, minimized to the tray. Closing the window hides it; the firewall keeps "
-                       "working either way.",
+    cv->addWidget(text(I18n::tr("Opens at sign-in, minimized to the tray. Closing the window hides it; the firewall "
+                                "keeps working either way."),
                        "sub", true));
     colophon->addLayout(cv, 1);
     l->addLayout(colophon);
@@ -3292,7 +3358,7 @@ QWidget *FirewallWindow::importPage() {
     auto *page = new QWidget;
     auto *l = column(page, 28, 12);
     l->setContentsMargins(28, 24, 28, 28);
-    auto *back = button("‹ Settings", "link");
+    auto *back = button(I18n::tr("‹ Settings"), "link");
     connect(back, &QPushButton::clicked, this, [this] { selectView("settings"); });
     auto *bl = row();
     bl->addWidget(back);
@@ -3300,29 +3366,29 @@ QWidget *FirewallWindow::importPage() {
     l->addLayout(bl);
     int importable = 0;
     for (const auto &r : netLimiterRules_) importable += r.importable && !firewall_.ruleFor(r.path);
-    l->addWidget(header("Import from NetLimiter",
-                        netLimiterFile_.isEmpty() ? QString("NetLimiter keeps its rules in nl_settings.xml.")
-                                                  : QString("%1 · %2 NetLimiter rules · %3 can be imported")
+    l->addWidget(header(I18n::tr("Import from NetLimiter"),
+                        netLimiterFile_.isEmpty() ? I18n::tr("NetLimiter keeps its rules in nl_settings.xml.")
+                                                  : I18n::tr("%1 · %2 NetLimiter rules · %3 can be imported")
                                                         .arg(QFileInfo(netLimiterFile_).fileName())
                                                         .arg(netLimiterRules_.size())
                                                         .arg(importable)));
-    l->addWidget(how({"Choose the <b>nl_settings.xml</b> file of NetLimiter.",
-                      "Rules for one application, outgoing, active, Allow or Deny, can be imported; the rest are listed "
-                      "with the reason.",
-                      "Press <b>Import</b> to add them as GateBouncer rules for those files."}));
+    l->addWidget(how({I18n::tr("Choose the <b>nl_settings.xml</b> file of NetLimiter."),
+                      I18n::tr("Rules for one application, outgoing, active, Allow or Deny, can be imported; the rest "
+                               "are listed with the reason."),
+                      I18n::tr("Press <b>Import</b> to add them as GateBouncer rules for those files.")}));
     auto *choose = card();
     auto *ch = new QHBoxLayout(choose);
     ch->setContentsMargins(18, 15, 18, 16);
-    auto *ct = text(netLimiterFile_.isEmpty() ? QString("No file chosen.") : QDir::toNativeSeparators(netLimiterFile_),
+    auto *ct = text(netLimiterFile_.isEmpty() ? I18n::tr("No file chosen.") : QDir::toNativeSeparators(netLimiterFile_),
                     "small", true);
     ch->addWidget(ct, 1);
-    auto *pick = button("Choose file…");
+    auto *pick = button(I18n::tr("Choose file…"));
     pick->setObjectName("netlimiter-choose");
     ch->addWidget(pick);
     l->addWidget(choose);
     connect(pick, &QPushButton::clicked, this, [this] {
-        auto *dialog = new QFileDialog(this, "Choose NetLimiter settings file", NetLimiterRules::defaultFolder(),
-                                       "NetLimiter settings (nl_settings.xml *.xml);;All files (*)");
+        auto *dialog = new QFileDialog(this, I18n::tr("Choose NetLimiter settings file"), NetLimiterRules::defaultFolder(),
+                                       I18n::tr("NetLimiter settings (nl_settings.xml *.xml);;All files (*)"));
         dialog->setObjectName("netlimiter-file-dialog");
         dialog->setOption(QFileDialog::DontUseNativeDialog);
         dialog->setAttribute(Qt::WA_DeleteOnClose);
@@ -3332,7 +3398,7 @@ QWidget *FirewallWindow::importPage() {
             QString error;
             netLimiterFile_ = path;
             netLimiterRules_.clear();
-            if (!input.open(QIODevice::ReadOnly)) error = "The file could not be opened.";
+            if (!input.open(QIODevice::ReadOnly)) error = I18n::tr("The file could not be opened.");
             else netLimiterRules_ = NetLimiterRules::read(input, error);
             if (!error.isEmpty()) message(error);
             render();
@@ -3349,7 +3415,7 @@ QWidget *FirewallWindow::importPage() {
         grid->setColumnStretch(1, 2);
         grid->setColumnStretch(2, 2);
         int gr = 0;
-        for (const auto &h : {QString("APPLICATION"), QString("NETLIMITER RULE"), QString("IN GATEBOUNCER")}) {
+        for (const auto &h : {I18n::tr("APPLICATION"), I18n::tr("NETLIMITER RULE"), I18n::tr("IN GATEBOUNCER")}) {
             auto *x = text(h, "colhead");
             x->setContentsMargins(0, 0, 0, 8);
             grid->addWidget(x, gr, grid->count() % 3);
@@ -3372,9 +3438,10 @@ QWidget *FirewallWindow::importPage() {
             }
             grid->addWidget(app, gr, 0);
             grid->addWidget(text(r.action + (r.ruleName.isEmpty() ? QString() : " · " + r.ruleName), "body", true), gr, 1);
-            const QString state = existing ? QString("Already has a rule (%1)").arg(existing->allow ? "Allow" : "Block")
-                                  : r.importable ? QString(r.allow ? "Will be allowed" : "Will be blocked")
-                                                 : "Not imported: " + r.reason;
+            const QString state = existing ? (existing->allow ? I18n::tr("Already has a rule (Allow)")
+                                                              : I18n::tr("Already has a rule (Block)"))
+                                  : r.importable ? (r.allow ? I18n::tr("Will be allowed") : I18n::tr("Will be blocked"))
+                                                 : I18n::tr("Not imported: %1").arg(r.reason);
             grid->addWidget(text(state, r.importable && !existing ? "body" : "sub", true), gr, 2);
             ++gr;
         }
@@ -3382,17 +3449,18 @@ QWidget *FirewallWindow::importPage() {
         cl->addSpacing(8);
         cl->addWidget(divider());
         cl->addSpacing(10);
-        cl->addWidget(text("Rules limited to addresses, ports, zones or schedules, Ask rules and incoming-only rules are "
-                           "listed and not imported. Nothing changes until you import.",
+        cl->addWidget(text(I18n::tr("Rules limited to addresses, ports, zones or schedules, Ask rules and incoming-only "
+                                    "rules are listed and not imported. Nothing changes until you import."),
                            "faint", true));
         l->addWidget(c);
     }
     auto *actions = row(8);
     actions->addStretch();
-    auto *cancel = button("Cancel");
+    auto *cancel = button(I18n::tr("Cancel"));
     connect(cancel, &QPushButton::clicked, this, [this] { selectView("settings"); });
     actions->addWidget(cancel);
-    auto *run = button(importable == 1 ? QString("Import 1 rule") : QString("Import %1 rules").arg(importable), "primary");
+    auto *run = button(importable == 1 ? I18n::tr("Import 1 rule") : I18n::tr("Import %1 rules").arg(importable),
+                       "primary");
     run->setObjectName("netlimiter-import");
     run->setEnabled(importable > 0 && canDecide());
     actions->addWidget(run);
@@ -3403,7 +3471,8 @@ QWidget *FirewallWindow::importPage() {
                 firewall_.decide(r.path, r.allow, "path", "always");
                 ++sent;
             }
-        message(QString("Importing %1 rules from NetLimiter…").arg(sent));
+        message(sent == 1 ? I18n::tr("Importing 1 rule from NetLimiter…")
+                          : I18n::tr("Importing %1 rules from NetLimiter…").arg(sent));
     });
     l->addLayout(actions);
     l->addStretch();

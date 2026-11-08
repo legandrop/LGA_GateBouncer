@@ -83,7 +83,8 @@ function Join-Literals([string]$run) {
 }
 
 # ---------------------------------------------------------------- lo que usa el codigo
-$used = @{}          # clave -> "archivo:linea" de la primera vez
+# Las tablas distinguen mayusculas como QHash: "FOLDER" (encabezado) y "Folder" (rotulo) son dos claves.
+$used = New-Object System.Collections.Hashtable ([System.StringComparer]::Ordinal) # clave -> "archivo:linea"
 $dynamic = New-Object System.Collections.ArrayList
 $files = Get-ChildItem -Path $src -Recurse -Include *.cpp, *.h, *.mm |
     Where-Object {
@@ -111,7 +112,7 @@ foreach ($file in $files) {
 }
 
 # ---------------------------------------------------------------- lo que tiene la tabla
-$table = @{}
+$table = New-Object System.Collections.Hashtable ([System.StringComparer]::Ordinal)
 $tableText = Remove-Comments ([System.IO.File]::ReadAllText($tablePath, $utf8))
 $duplicates = New-Object System.Collections.ArrayList
 foreach ($m in [regex]::Matches($tableText, "\bE\(\s*($lits)\s*,\s*($lits)\)")) {

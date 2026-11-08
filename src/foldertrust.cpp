@@ -1,6 +1,7 @@
 #include "foldertrust.h"
 #include "engine/FirewallClient.h"
 #include "folder_rule.h"
+#include "i18n.h"
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
@@ -88,16 +89,16 @@ QVector<QPair<QString, QString>> scopeChoices(const QString &exePath, const QStr
     const QString folder = perDestination ? QString() : suggestion(exePath, &inRepository);
     const bool repository = !folder.isEmpty() && inRepository;
     // Corta, como «This app, any version»: lo que cubre exacto (el nombre y la carpeta entera) va en note().
-    const QPair<QString, QString> named{"This app in " + label(folder), NamedPrefix + folder};
+    const QPair<QString, QString> named{I18n::tr("This app in %1").arg(label(folder)), NamedPrefix + folder};
     QVector<QPair<QString, QString>> s;
     if (signer.isEmpty()) {
         if (repository) s.push_back(named);
-        s.push_back({"This file only", "path"});
+        s.push_back({I18n::tr("This file only"), "path"});
         return s;
     }
-    s.push_back({"This app, any version", "app"});
-    s.push_back({"This file only", "path"});
-    if (FirewallClient::publisherRuleAllowed(signer)) s.push_back({"All apps from " + signer, "publisher"});
+    s.push_back({I18n::tr("This app, any version"), "app"});
+    s.push_back({I18n::tr("This file only"), "path"});
+    if (FirewallClient::publisherRuleAllowed(signer)) s.push_back({I18n::tr("All apps from %1").arg(signer), "publisher"});
     if (repository) s.push_back(named);
     return s;
 }
@@ -106,12 +107,51 @@ bool isFolderScope(const QString &scope) { return scope.startsWith(FolderPrefix)
 
 QString note(const QString &scope, const QString &exePath) {
     if (scope.startsWith(NamedPrefix))
-        return QString("Covers %1 in %2 and its subfolders, also new builds.")
+        return I18n::tr("Covers %1 in %2 and its subfolders, also new builds.")
             .arg(QFileInfo(exePath).fileName(), shown(scope.mid(NamedPrefix.size())));
     if (scope.startsWith(FolderPrefix))
-        return QString("Covers every program in %1 and its subfolders, also ones built there later.")
+        return I18n::tr("Covers every program in %1 and its subfolders, also ones built there later.")
             .arg(shown(scope.mid(FolderPrefix.size())));
     return {};
+}
+
+QString problemText(const QString &problem) {
+    // Los textos de engine/folder_rule.cpp (Win32, compartido con el motor, sin Qt), como se muestran. Uno que no esté
+    // acá queda como lo escribió el motor.
+    if (I18n::language() == I18n::Language::English) return problem;
+    if (problem == QLatin1String("Choose a folder.")) return I18n::tr("Choose a folder.");
+    if (problem == QLatin1String("This is not a valid folder path.")) return I18n::tr("This is not a valid folder path.");
+    if (problem == QLatin1String("Choose a folder on a local drive, such as C:\\Projects\\MyApp."))
+        return I18n::tr("Choose a folder on a local drive, such as C:\\Projects\\MyApp.");
+    if (problem == QLatin1String("A whole drive cannot be trusted. Choose a folder inside it."))
+        return I18n::tr("A whole drive cannot be trusted. Choose a folder inside it.");
+    if (problem == QLatin1String("Choose a folder on a local drive: not a network, removable or optical drive."))
+        return I18n::tr("Choose a folder on a local drive: not a network, removable or optical drive.");
+    if (problem == QLatin1String("This folder does not exist.")) return I18n::tr("This folder does not exist.");
+    if (problem == QLatin1String("This is a file, not a folder.")) return I18n::tr("This is a file, not a folder.");
+    if (problem == QLatin1String("This folder is on a drive mounted inside another folder. Use a drive letter for that "
+                                 "drive instead."))
+        return I18n::tr("This folder is on a drive mounted inside another folder. Use a drive letter for that drive "
+                        "instead.");
+    // Los que nombran una carpeta: se separa el dato del texto fijo.
+    const auto between = [&problem](const QString &head, const QString &tail, QString &middle) {
+        if (!problem.startsWith(head) || !problem.endsWith(tail) || problem.size() <= head.size() + tail.size())
+            return false;
+        middle = problem.mid(head.size(), problem.size() - head.size() - tail.size());
+        return true;
+    };
+    QString middle;
+    if (between({}, " cannot be trusted, nor anything inside it.", middle))
+        return I18n::tr("%1 cannot be trusted, nor anything inside it.").arg(middle);
+    if (between({}, " cannot be trusted as a whole. Choose a folder inside it.", middle))
+        return I18n::tr("%1 cannot be trusted as a whole. Choose a folder inside it.").arg(middle);
+    if (between("Folders inside ", " cannot be trusted.", middle))
+        return I18n::tr("Folders inside %1 cannot be trusted.").arg(middle);
+    if (between("This folder is a link to ", ". Trust the real folder instead.", middle))
+        return I18n::tr("This folder is a link to %1. Trust the real folder instead.").arg(middle);
+    if (between("This folder holds ", ", which cannot be trusted.", middle))
+        return I18n::tr("This folder holds %1, which cannot be trusted.").arg(middle);
+    return problem;
 }
 
 } // namespace Gate::FolderTrust

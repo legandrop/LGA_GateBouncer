@@ -11,6 +11,11 @@ qt_standard_project_setup(REQUIRES 6.8)
 add_compile_definitions(GATEBOUNCER_VERSION="${PROJECT_VERSION}")
 # Auto-update de las apps LGA: libs/lgaupdate es la copia idéntica de LGA_Base_QT_C_Py (ver su README).
 add_subdirectory(libs/lgaupdate)
+# Idioma de la interfaz (inglés o español): la tabla y I18n::tr, para la ventana, el aviso y la bandeja.
+qt_add_library(gatebouncer_i18n STATIC src/i18n.cpp src/i18n.h src/i18n_es.cpp)
+target_include_directories(gatebouncer_i18n PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(gatebouncer_i18n PUBLIC Qt6::Core)
+target_compile_options(gatebouncer_i18n PRIVATE -Wall -Wextra -Wpedantic)
 add_subdirectory(src/data)
 add_subdirectory(src/assistance)
 add_subdirectory(src/localfacts)
@@ -81,7 +86,7 @@ qt_add_library(GateBouncerGuiStage SHARED
     resources/app.rc
 )
 set_source_files_properties(src/main.cpp PROPERTIES COMPILE_DEFINITIONS "main=GateBouncerGuiMain")
-target_link_libraries(GateBouncerGuiStage PRIVATE Qt6::Widgets Qt6::Network gatebouncer_explain gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle advapi32)
+target_link_libraries(GateBouncerGuiStage PRIVATE Qt6::Widgets Qt6::Network gatebouncer_explain gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle gatebouncer_i18n advapi32)
 # engine/: la validación de las reglas por carpeta es la misma del motor (folder_rule.cpp, Win32 sin Qt).
 target_include_directories(GateBouncerGuiStage PRIVATE src common engine)
 target_compile_options(GateBouncerGuiStage PRIVATE -Wall -Wextra -Wpedantic)
@@ -114,7 +119,7 @@ if(GATEBOUNCER_OBSERVER_SOURCE)
     target_include_directories(GateBouncerObserver PRIVATE src common engine)
     target_link_libraries(GateBouncerObserver PRIVATE Qt6::Widgets Qt6::Network gatebouncer_data gatebouncer_assistance
         gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire
-        gatebouncer_lifecycle gatebouncer_native_ii advapi32 shell32 fwpuclnt)
+        gatebouncer_lifecycle gatebouncer_i18n gatebouncer_native_ii advapi32 shell32 fwpuclnt)
 endif()
 
 # Componentes de decisiones: no habilitan endpoints ni ejecución elevada.
@@ -162,10 +167,10 @@ if(GATEBOUNCER_TOAST_TEST_SOURCE)
     find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
     qt_add_executable(GateBouncerToastTests "${GATEBOUNCER_TOAST_TEST_SOURCE}" src/accesstoast.cpp src/accesstoast.h
         src/appicon.cpp src/appicon.h src/engine/FirewallClient.cpp src/engine/FirewallClient.h
-        src/customtooltip.cpp src/customtooltip.h src/foldertrust.cpp src/foldertrust.h engine/folder_rule.cpp
-        src/i18n.cpp src/i18n.h src/i18n_es.cpp)
+        src/customtooltip.cpp src/customtooltip.h src/foldertrust.cpp src/foldertrust.h engine/folder_rule.cpp)
     target_include_directories(GateBouncerToastTests PRIVATE src engine)
-    target_link_libraries(GateBouncerToastTests PRIVATE Qt6::Widgets Qt6::Network Qt6::Test gatebouncer_explain)
+    target_link_libraries(GateBouncerToastTests PRIVATE Qt6::Widgets Qt6::Network Qt6::Test gatebouncer_explain
+        gatebouncer_i18n)
 endif()
 
 set_target_properties(GateBouncerGuiStage PROPERTIES PREFIX "" AUTOMOC ON)
@@ -174,11 +179,11 @@ set_target_properties(GateBouncerGuiStage PROPERTIES PREFIX "" AUTOMOC ON)
 get_target_property(gatebouncer_app_sources GateBouncerGuiStage SOURCES)
 list(FILTER gatebouncer_app_sources EXCLUDE REGEX "deployment_ordinary_stage.cpp|src/main.cpp")
 qt_add_executable(GateBouncer WIN32 ${gatebouncer_app_sources} src/app_main.cpp src/firewallwindow.cpp src/firewallwindow.h
-    src/platform/WindowFrame.h src/platform/WindowFrameWin.cpp src/uiscale.cpp src/uiscale.h src/i18n.cpp src/i18n.h src/i18n_es.cpp)
+    src/platform/WindowFrame.h src/platform/WindowFrameWin.cpp src/uiscale.cpp src/uiscale.h)
 target_include_directories(GateBouncer PRIVATE src common engine)
 target_link_libraries(GateBouncer PRIVATE Qt6::Widgets Qt6::Network gatebouncer_explain gatebouncer_data gatebouncer_assistance
     gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire
-    gatebouncer_lifecycle gatebouncer_native_ii LGAUpdate advapi32 shell32 fwpuclnt dwmapi)
+    gatebouncer_lifecycle gatebouncer_i18n gatebouncer_native_ii LGAUpdate advapi32 shell32 fwpuclnt dwmapi)
 target_compile_options(GateBouncer PRIVATE -Wall -Wextra -Wpedantic)
 qt_add_resources(GateBouncer "gatebouncer_app_assets"
     PREFIX "/gatebouncer"

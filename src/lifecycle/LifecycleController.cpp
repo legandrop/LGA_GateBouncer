@@ -1,4 +1,5 @@
 #include "LifecycleController.h"
+#include "i18n.h"
 #include <QAction>
 #include <QCloseEvent>
 #include <QLocale>
@@ -44,14 +45,14 @@ LifecycleController::LifecycleController(QWidget *window, std::unique_ptr<TraySu
     status_->setObjectName(QStringLiteral("trayEngineStatus"));
     status_->setEnabled(false);
     menu_->addSeparator();
-    auto *open = menu_->addAction(tr("Open"));
+    auto *open = menu_->addAction(I18n::trc("tray", "Open"));
     open->setObjectName(QStringLiteral("trayOpen"));
-    pending_ = menu_->addAction(tr("Pending"));
+    pending_ = menu_->addAction(QString{}); // el texto, con el contador, lo pone updatePresentation()
     pending_->setObjectName(QStringLiteral("trayPending"));
-    auto *settings = menu_->addAction(tr("Settings"));
+    auto *settings = menu_->addAction(I18n::tr("Settings"));
     settings->setObjectName(QStringLiteral("traySettings"));
     menu_->addSeparator();
-    auto *quit = menu_->addAction(tr("Quit"));
+    auto *quit = menu_->addAction(I18n::trc("tray", "Quit"));
     quit->setObjectName(QStringLiteral("trayQuit"));
     connect(open, &QAction::triggered, this, &LifecycleController::openWindow);
     connect(pending_, &QAction::triggered, this, [this] {
@@ -157,21 +158,24 @@ void LifecycleController::applyEngineSnapshot(const EngineSnapshot &snapshot) {
     updatePresentation();
 }
 QString LifecycleController::statusText() const {
-    if (!snapshot_.current) return tr("Engine not running");
-    if (snapshot_.simulation) return tr("Simulation: no traffic filtering");
+    if (!snapshot_.current) return I18n::tr("Engine not running");
+    if (snapshot_.simulation) return I18n::tr("Simulation: no traffic filtering");
     switch (snapshot_.state) {
     case EngineState::Active:
-        return snapshot_.asking ? tr("Asking before new apps connect") : tr("Not asking: new apps connect");
-    case EngineState::Degraded: return tr("Engine degraded");
-    case EngineState::Unavailable: return tr("Engine unavailable");
+        return snapshot_.asking ? I18n::tr("Asking before new apps connect") : I18n::tr("Not asking: new apps connect");
+    case EngineState::Degraded: return I18n::tr("Engine degraded");
+    case EngineState::Unavailable: return I18n::tr("Engine unavailable");
     }
-    return tr("Engine unavailable");
+    return I18n::tr("Engine unavailable");
 }
 void LifecycleController::updatePresentation() {
     status_->setText(statusText());
     // El contador es una lectura; cerrar o navegar nunca modifica el DTO.
-    pending_->setText(tr("Pending (%1)").arg(QLocale().toString(snapshot_.pendingCount)));
-    if (tray_) tray_->setToolTip(tr("LGA GateBouncer\n%1\n%2 pending requests")
-                                   .arg(statusText(), QLocale().toString(snapshot_.pendingCount)));
+    const QString count = QLocale().toString(snapshot_.pendingCount);
+    pending_->setText(I18n::tr("Pending (%1)").arg(count));
+    if (tray_)
+        tray_->setToolTip(snapshot_.pendingCount == 1
+                              ? I18n::tr("LGA GateBouncer\n%1\n1 pending request").arg(statusText())
+                              : I18n::tr("LGA GateBouncer\n%1\n%2 pending requests").arg(statusText(), count));
 }
 } // namespace Gate::Lifecycle

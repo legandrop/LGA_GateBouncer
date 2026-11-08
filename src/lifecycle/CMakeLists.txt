@@ -5,7 +5,7 @@ qt_add_library(gatebouncer_lifecycle STATIC
     StartupPreference.h
     NativeStartup.cpp
 )
-target_link_libraries(gatebouncer_lifecycle PUBLIC Qt6::Widgets)
+target_link_libraries(gatebouncer_lifecycle PUBLIC Qt6::Widgets PRIVATE gatebouncer_i18n)
 if(WIN32)
     target_link_libraries(gatebouncer_lifecycle PRIVATE advapi32)
 endif()

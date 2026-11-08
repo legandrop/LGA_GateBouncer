@@ -1,4 +1,5 @@
 #include "NetLimiterRules.h"
+#include "i18n.h"
 #include <QDir>
 #include <QFileInfo>
 #include <QHash>
@@ -44,7 +45,7 @@ std::unique_ptr<Node> parse(QIODevice &input, QString &error) {
         xml.readNext();
         if (xml.isStartElement()) {
             if (int(stack.size()) > DepthLimit) {
-                error = "The file is nested too deeply to be a NetLimiter settings file.";
+                error = I18n::tr("The file is nested too deeply to be a NetLimiter settings file.");
                 return nullptr;
             }
             auto node = std::make_unique<Node>();
@@ -61,7 +62,7 @@ std::unique_ptr<Node> parse(QIODevice &input, QString &error) {
         }
     }
     if (xml.hasError()) {
-        error = QString("This is not a valid XML file (line %1): %2").arg(xml.lineNumber()).arg(xml.errorString());
+        error = I18n::tr("This is not a valid XML file (line %1): %2").arg(xml.lineNumber()).arg(xml.errorString());
         return nullptr;
     }
     return root;
@@ -84,7 +85,7 @@ QString NetLimiterRules::defaultFolder() {
 QVector<NetLimiterRule> NetLimiterRules::read(QIODevice &input, QString &error) {
     QVector<NetLimiterRule> out;
     if (input.size() > SizeLimit) {
-        error = "The file is too large to be a NetLimiter settings file.";
+        error = I18n::tr("The file is too large to be a NetLimiter settings file.");
         return out;
     }
     const auto root = parse(input, error);
@@ -92,7 +93,7 @@ QVector<NetLimiterRule> NetLimiterRules::read(QIODevice &input, QString &error) 
     const Node *filters = find(root.get(), "Filters");
     const Node *rules = find(root.get(), "Rules");
     if (!filters || !rules) {
-        error = "No NetLimiter filters and rules were found in this file. Choose nl_settings.xml from NetLimiter.";
+        error = I18n::tr("No NetLimiter filters and rules were found in this file. Choose nl_settings.xml from NetLimiter.");
         return out;
     }
     // Filtro -> rutas, o el motivo por el que no es «sólo esta app».
@@ -108,36 +109,38 @@ QVector<NetLimiterRule> NetLimiterRules::read(QIODevice &input, QString &error) 
         filter.name = f->value("Name");
         const Node *functions = f->child("FunctionList");
         const Node *base = f->child("BaseFilters");
-        if (base && !base->children.empty()) filter.problem = "Combines other NetLimiter filters";
-        else if (!functions || functions->children.empty()) filter.problem = "Filter without conditions";
-        else if (functions->children.size() > 1) filter.problem = "Also limited by destination, port or other conditions";
+        if (base && !base->children.empty()) filter.problem = I18n::tr("Combines other NetLimiter filters");
+        else if (!functions || functions->children.empty()) filter.problem = I18n::tr("Filter without conditions");
+        else if (functions->children.size() > 1)
+            filter.problem = I18n::tr("Also limited by destination, port or other conditions");
         else {
             const Node *fn = functions->children.front().get();
             const QString match = fn->value("match").toLower();
-            if (fn->type != "FFAppIdEqual") filter.problem = "Not an application filter";
-            else if (!match.isEmpty() && match != "false") filter.problem = "Inverted application filter";
+            if (fn->type != "FFAppIdEqual") filter.problem = I18n::tr("Not an application filter");
+            else if (!match.isEmpty() && match != "false") filter.problem = I18n::tr("Inverted application filter");
             else if (const Node *values = fn->child("Values"))
                 for (const auto &v : values->children)
                     if (!v->value("Path").isEmpty()) filter.paths << QDir::toNativeSeparators(v->value("Path"));
-            if (filter.problem.isEmpty() && filter.paths.isEmpty()) filter.problem = "Application not identified by path";
+            if (filter.problem.isEmpty() && filter.paths.isEmpty())
+                filter.problem = I18n::tr("Application not identified by path");
         }
         byId.insert(f->value("Id"), filter);
     }
     QHash<QString, int> decided; // ruta en minúsculas -> índice en out, para detectar Allow y Deny a la vez
     QSet<QString> conflicted;    // rutas con Allow y Deny: quedan fuera aunque aparezcan más reglas suyas
-    const QString Conflict = QStringLiteral("Both Allow and Deny rules exist for this application");
+    const QString Conflict = I18n::tr("Both Allow and Deny rules exist for this application");
     for (const auto &r : rules->children) {
         if (r->name != "rule" || r->type != "fwRule") continue;
         const auto filter = byId.constFind(r->value("FilterId"));
         const QString action = r->value("action"), direction = r->value("Dir");
         const bool enabled = r->value("IsEnabled").compare("true", Qt::CaseInsensitive) == 0;
         QString reason;
-        if (filter == byId.constEnd()) reason = "Its filter is missing from the file";
+        if (filter == byId.constEnd()) reason = I18n::tr("Its filter is missing from the file");
         else if (!filter->problem.isEmpty()) reason = filter->problem;
-        else if (!enabled) reason = "Disabled in NetLimiter";
-        else if (direction != "Out" && direction != "Both") reason = "Incoming connections only";
-        else if (action == "Ask") reason = "Ask rule: GateBouncer already asks";
-        else if (action != "Allow" && action != "Deny" && action != "Block") reason = "Unknown action";
+        else if (!enabled) reason = I18n::tr("Disabled in NetLimiter");
+        else if (direction != "Out" && direction != "Both") reason = I18n::tr("Incoming connections only");
+        else if (action == "Ask") reason = I18n::tr("Ask rule: GateBouncer already asks");
+        else if (action != "Allow" && action != "Deny" && action != "Block") reason = I18n::tr("Unknown action");
         const QStringList paths = filter != byId.constEnd() && !filter->paths.isEmpty() ? filter->paths : QStringList{QString()};
         for (const QString &path : paths) {
             NetLimiterRule item;
@@ -146,7 +149,7 @@ QVector<NetLimiterRule> NetLimiterRules::read(QIODevice &input, QString &error) 
             item.action = action == "Block" ? QStringLiteral("Deny") : action;
             item.allow = action == "Allow";
             item.reason = reason;
-            if (reason.isEmpty() && !QFileInfo::exists(item.path)) item.reason = "File not found on this PC";
+            if (reason.isEmpty() && !QFileInfo::exists(item.path)) item.reason = I18n::tr("File not found on this PC");
             item.importable = item.reason.isEmpty();
             if (item.importable) {
                 const QString key = item.path.toLower();

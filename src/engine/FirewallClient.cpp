@@ -1,5 +1,6 @@
 #include "FirewallClient.h"
 #include "folder_rule.h"
+#include "i18n.h"
 #include <QDateTime>
 #include <QDir>
 #include <QFileInfo>
@@ -27,7 +28,7 @@ QString FirewallClient::fileName(const QString &path) { return QFileInfo(path).f
 
 QString FirewallClient::protocolName(int protocol) {
     return protocol == 6 ? "TCP" : protocol == 17 ? "UDP" : protocol == 1 ? "ICMP" : protocol == 58 ? "ICMPv6"
-         : protocol ? "IP " + QString::number(protocol) : QString("Unknown");
+         : protocol ? "IP " + QString::number(protocol) : I18n::trc("protocol", "Unknown");
 }
 
 QString FirewallClient::destinationKind(const QString &address) {
@@ -43,6 +44,12 @@ QString FirewallClient::destinationKind(const QString &address) {
     if (a.isPrivateUse() || a.isLinkLocal() || a.isMulticast() || a.isBroadcast() || a.isUniqueLocalUnicast())
         return "Local network";
     return "Internet";
+}
+
+QString FirewallClient::destinationKindLabel(const QString &kind) {
+    if (kind == QLatin1String("This PC")) return I18n::tr("This PC");
+    if (kind == QLatin1String("Local network")) return I18n::tr("Local network");
+    return kind; // Internet y Tailscale se dicen igual
 }
 
 void FirewallClient::setActive(bool active) {

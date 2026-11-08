@@ -24,7 +24,7 @@ namespace {
 // toastclick:<objectName> (botón del aviso fijo), type:<objectName>=<texto> (un campo; «%2C» es una coma),
 // combo:<objectName>=<índice> (un desplegable de la ventana o del aviso, elegido como lo haría el usuario: también
 // emite activated) y dialogshot:<archivo.png> (el diálogo abierto).
-// Al terminar los pasos sale.
+// Al terminar los pasos sale. GATEBOUNCER_QA_LANGUAGE=es|en elige el idioma de la corrida (no se guarda).
 QWidget *qaFind(Gate::FirewallWindow *window, const QString &name) {
     // Primero lo visible de la ventana (incluye sus diálogos); después el aviso fijo.
     for (auto *w : window->findChildren<QWidget *>(name))
@@ -115,7 +115,9 @@ int main(int argc, char **argv) {
     Gate::UiScale::applyBeforeApp(Gate::UiScale::readSavedLevel());
     QApplication app(argc, argv);
     Gate::UiScale::clearEnvironmentAfterApp();
-    Gate::I18n::setLanguage(Gate::I18n::readSaved());
+    // QA: GATEBOUNCER_QA_LANGUAGE=es|en fija el idioma de esta corrida sin guardarlo.
+    const QString qaLanguage = qEnvironmentVariable("GATEBOUNCER_QA_LANGUAGE");
+    Gate::I18n::setLanguage(qaLanguage.isEmpty() ? Gate::I18n::readSaved() : Gate::I18n::fromCode(qaLanguage));
     // Una sola ventana por usuario: arranca sola al iniciar sesión y abrirla de nuevo trae al frente la que corre.
     // Las corridas de QA van en un escritorio aparte y no se cruzan con la del usuario.
     const bool qa = !qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") || !qEnvironmentVariableIsEmpty("LGA_HEADLESS_DESKTOP");

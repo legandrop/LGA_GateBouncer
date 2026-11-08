@@ -83,8 +83,10 @@ class FirewallClient final : public QObject {
 
     static QString fileName(const QString &path);
     static QString protocolName(int protocol);
-    // "Internet", "Local network", "Tailscale" o "This PC"; vacío si no es una dirección.
+    // "Internet", "Local network", "Tailscale" o "This PC"; vacío si no es una dirección. Es la clave que se compara:
+    // para mostrarla, destinationKindLabel.
     static QString destinationKind(const QString &address);
+    static QString destinationKindLabel(const QString &kind);
     // Texto de una regla por firma o por carpeta: "any version of node.exe from OpenJS Foundation", "all apps in
     // C:\Portable\LGA_DayTrace".
     static QString describe(const RuleItem &rule);
