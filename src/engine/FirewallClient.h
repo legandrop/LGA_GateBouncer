@@ -30,9 +30,10 @@ class FirewallClient final : public QObject {
         QString id; // la ruta, o «ruta|dirección» en modo por destino
     };
     // Alcances del motor: "path" (ruta exacta), "app" (firmante + nombre del exe, cualquier carpeta), "publisher"
-    // (todo lo del firmante) y "covered" (una ruta que una regla app/publisher ya permitió o bloqueó).
+    // (todo lo del firmante), "folder" (todo exe dentro de una carpeta, o sólo los que se llaman name) y "covered" (una
+    // ruta que una regla app, publisher o folder ya permitió o bloqueó).
     struct RuleItem {
-        QString path; // path y covered; vacío en app y publisher
+        QString path; // path y covered: la ruta; folder: la carpeta; vacío en app y publisher
         bool allow = true;
         qint64 created = 0, lastBlock = 0;
         QString scope = "path", signer, name, id; // id: lo que se manda en REMOVE
@@ -59,14 +60,22 @@ class FirewallClient final : public QObject {
     const PendingItem *pendingById(const QString &id) const;
     // Regla de la app entera de esa ruta o cobertura de una regla por firma (las reglas por destino no cuentan).
     const RuleItem *ruleFor(const QString &path) const;
+    // La regla por carpeta que tiene adentro a esa ruta, o nada. Por texto, para mostrar: el motor decide por la ruta
+    // final del archivo.
+    const RuleItem *folderRuleFor(const QString &path) const;
     const RuleItem *ruleById(const QString &id) const;
     bool busy() const { return commandsInFlight_ > 0; }
 
-    // scope: "path", "app" o "publisher". La firma la verifica el motor, no la ventana.
+    // scope: "path", "app" o "publisher". La firma la verifica el motor, no la ventana. También "folder:<carpeta>"
+    // (todo programa de esa carpeta) o "foldername:<carpeta>" (los que se llaman como este): una regla por carpeta, que
+    // es para la app entera, así que ignora destination.
     // duration: "always", "restart" (hasta que el motor se reinicie) o segundos ("900").
     // destination: vacío para la app entera; si no, sólo ese destino (la app pasa a modo por destino).
     void decide(const QString &path, bool allow, const QString &scope = "path", const QString &duration = "always",
                 const QString &destination = {});
+    // Regla por carpeta: todo exe dentro de folder y sus subcarpetas, o sólo los que se llaman name (vacío: todos). El
+    // motor valida la carpeta (ni raíces de unidad ni carpetas del sistema o del usuario) y responde el motivo.
+    void trustFolder(const QString &folder, const QString &name, bool allow = true, const QString &duration = "always");
     void removeRule(const QString &id);
     void setAsk(bool ask);
     void setLocalNetwork(bool allow);
@@ -76,7 +85,8 @@ class FirewallClient final : public QObject {
     static QString protocolName(int protocol);
     // "Internet", "Local network", "Tailscale" o "This PC"; vacío si no es una dirección.
     static QString destinationKind(const QString &address);
-    // Texto de una regla por firma: "any version of node.exe from OpenJS Foundation".
+    // Texto de una regla por firma o por carpeta: "any version of node.exe from OpenJS Foundation", "all apps in
+    // C:\Portable\LGA_DayTrace".
     static QString describe(const RuleItem &rule);
     // Igual que el motor: un firmante de Microsoft no admite «All apps from».
     static bool publisherRuleAllowed(const QString &signer);

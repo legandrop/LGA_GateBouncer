@@ -1,11 +1,11 @@
 # Roadmap
 
-**No release yet.** Updated November 2, 2026.
+**No release yet.** Updated November 7, 2026.
 
 **First usable version:** block unknown outbound connections and ask Allow/Block, keep permanent or temporary rules per
-application or per destination, provide searchable applications, activity and rule cleanup, import NetLimiter rules,
-and offer optional AI explanations with your own Anthropic or NVIDIA key. Advice never authorizes traffic. No
-bandwidth control.
+application, per trusted folder or per destination, provide searchable applications, activity and rule cleanup,
+import NetLimiter rules, and offer optional AI explanations with your own Anthropic or NVIDIA key. Advice never
+authorizes traffic. No bandwidth control.
 
 The engine is driverless (Windows Filtering Platform from an elevated service). A decision applies to the
 application's next attempt; the attempt that produced the request has already been blocked.
@@ -19,6 +19,12 @@ Checkboxes mean **verified on Windows**, not only implemented.
   application in two folders: **This app, any version** and **All apps from** a publisher allow the copy in the other
   folder after its first blocked attempt, and keep working after the engine restarts. Unsigned applications only
   accept a rule for the exact file; Microsoft signers do not accept a whole-publisher rule.
+- [ ] **Trusted folders.** Implemented: a folder rule covers one file name, or every program, in a folder and its
+  subfolders, so unsigned programs rebuilt in new folders (a worktree per branch) don't ask again. The notice offers
+  the program by name in its Git repository, preselected when it is unsigned; Apps → Folders adds any folder by hand.
+  Verified without the service: folder checks with real
+  folders and junctions (a junction that leads outside, a drive root, Downloads, Temp and system folders are refused),
+  and the window and notice against a simulated engine. Done when it is checked with the installed service.
 - [x] **Desktop notice.** Verified on Windows 11 with the installed service: a notice stays in the corner until you
   decide, and Allow with **This app, any version** let a blocked application connect on its next attempt.
 - [x] **Temporary decisions.** Verified on Windows 11 with the installed service and a test application: a one-minute

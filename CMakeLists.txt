@@ -55,6 +55,12 @@ qt_add_library(GateBouncerGuiStage SHARED
     src/accesstoast.h
     src/appicon.cpp
     src/appicon.h
+    src/customtooltip.cpp
+    src/customtooltip.h
+    src/foldertrust.cpp
+    src/foldertrust.h
+    engine/folder_rule.cpp
+    engine/folder_rule.h
     src/toggleswitch.cpp
     src/toggleswitch.h
     src/productcontroller.cpp
@@ -71,7 +77,8 @@ qt_add_library(GateBouncerGuiStage SHARED
 )
 set_source_files_properties(src/main.cpp PROPERTIES COMPILE_DEFINITIONS "main=GateBouncerGuiMain")
 target_link_libraries(GateBouncerGuiStage PRIVATE Qt6::Widgets Qt6::Network gatebouncer_explain gatebouncer_data gatebouncer_assistance gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire gatebouncer_lifecycle advapi32)
-target_include_directories(GateBouncerGuiStage PRIVATE src common)
+# engine/: la validación de las reglas por carpeta es la misma del motor (folder_rule.cpp, Win32 sin Qt).
+target_include_directories(GateBouncerGuiStage PRIVATE src common engine)
 target_compile_options(GateBouncerGuiStage PRIVATE -Wall -Wextra -Wpedantic)
 qt_add_resources(GateBouncerGuiStage "gatebouncer_assets"
     PREFIX "/gatebouncer"
@@ -95,7 +102,7 @@ if(GATEBOUNCER_OBSERVER_SOURCE)
     qt_add_executable(GateBouncerObserver WIN32 ${observer_sources}
         controller/deployment_observer_main.cpp "${GATEBOUNCER_OBSERVER_SOURCE}")
     target_compile_definitions(GateBouncerObserver PRIVATE GATEBOUNCER_OBSERVER)
-    target_include_directories(GateBouncerObserver PRIVATE src common)
+    target_include_directories(GateBouncerObserver PRIVATE src common engine)
     target_link_libraries(GateBouncerObserver PRIVATE Qt6::Widgets Qt6::Network gatebouncer_data gatebouncer_assistance
         gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire
         gatebouncer_lifecycle gatebouncer_native_ii advapi32 shell32 fwpuclnt)
@@ -145,8 +152,9 @@ endif()
 if(GATEBOUNCER_TOAST_TEST_SOURCE)
     find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
     qt_add_executable(GateBouncerToastTests "${GATEBOUNCER_TOAST_TEST_SOURCE}" src/accesstoast.cpp src/accesstoast.h
-        src/appicon.cpp src/appicon.h src/engine/FirewallClient.cpp src/engine/FirewallClient.h)
-    target_include_directories(GateBouncerToastTests PRIVATE src)
+        src/appicon.cpp src/appicon.h src/engine/FirewallClient.cpp src/engine/FirewallClient.h
+        src/customtooltip.cpp src/customtooltip.h src/foldertrust.cpp src/foldertrust.h engine/folder_rule.cpp)
+    target_include_directories(GateBouncerToastTests PRIVATE src engine)
     target_link_libraries(GateBouncerToastTests PRIVATE Qt6::Widgets Qt6::Network Qt6::Test gatebouncer_explain)
 endif()
 
@@ -157,7 +165,7 @@ get_target_property(gatebouncer_app_sources GateBouncerGuiStage SOURCES)
 list(FILTER gatebouncer_app_sources EXCLUDE REGEX "deployment_ordinary_stage.cpp|src/main.cpp")
 qt_add_executable(GateBouncer WIN32 ${gatebouncer_app_sources} src/app_main.cpp src/firewallwindow.cpp src/firewallwindow.h
     src/platform/WindowFrame.h src/platform/WindowFrameWin.cpp)
-target_include_directories(GateBouncer PRIVATE src common)
+target_include_directories(GateBouncer PRIVATE src common engine)
 target_link_libraries(GateBouncer PRIVATE Qt6::Widgets Qt6::Network gatebouncer_explain gatebouncer_data gatebouncer_assistance
     gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire
     gatebouncer_lifecycle gatebouncer_native_ii advapi32 shell32 fwpuclnt dwmapi)

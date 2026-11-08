@@ -71,6 +71,9 @@ class FirewallWindow final : public QMainWindow {
     void finishQuit();
     void message(const QString &text);
     void showHelp();
+    // «Trust a folder»: una regla por carpeta, con la carpeta y el nombre del exe (vacío: todos) ya propuestos. Valida
+    // mientras se escribe con la misma regla del motor, que igual la vuelve a validar al crearla.
+    void trustFolderDialog(const QString &folder, const QString &name);
 
     QWidget *overviewPage();
     QWidget *requestsPage();

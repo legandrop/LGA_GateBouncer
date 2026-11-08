@@ -72,6 +72,9 @@ class AccessToast final : public QWidget {
   private:
     void rebuildScopes();
     void rebuildTargets();
+    // Una regla por carpeta es para la app entera: el destino queda en «Any destination» y se explica qué cubre.
+    bool folderScope() const;
+    void syncFolderScope();
     void applyWidth(int width);
     void keepInside();
     void remember();
@@ -100,9 +103,11 @@ class AccessToast final : public QWidget {
     // Regla y decisión.
     QWidget *choices_ = nullptr;
     QComboBox *scope_ = nullptr, *duration_ = nullptr, *target_ = nullptr;
+    QLabel *folderNote_ = nullptr; // con una opción de carpeta: la carpeta entera y qué cubre
     QLabel *footer_ = nullptr;
     QPushButton *block_ = nullptr, *allow_ = nullptr;
     bool targetChosen_ = false; // el usuario tocó «Destination»
+    QString chosenTarget_;      // lo que eligió ahí (vacío: Any destination), para volver a eso al dejar una carpeta
     // Esquina de abajo a la derecha, en coordenadas de pantalla: el aviso crece hacia arriba desde ahí.
     QPoint anchor_;
     bool anchored_ = false;

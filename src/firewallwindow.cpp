@@ -1,6 +1,9 @@
 #include "firewallwindow.h"
 #include "appicon.h"
+#include "customtooltip.h"
 #include "explain/KnownApps.h"
+#include "folder_rule.h"
+#include "foldertrust.h"
 #include "platform/WindowFrame.h"
 #include "toggleswitch.h"
 #include <QAbstractButton>
@@ -29,6 +32,7 @@
 #include <QScrollBar>
 #include <QSettings>
 #include <QShowEvent>
+#include <QStyle>
 #include <QTableWidget>
 #include <QWindow>
 #include <QVBoxLayout>
@@ -245,12 +249,16 @@ class ElideLabel final : public QLabel {
         const QRect r = contentsRect();
         const QString shown = fontMetrics().elidedText(text(), mode_, r.width());
         p.drawText(r, int(alignment()) | Qt::TextSingleLine, shown);
-        const QString tip = shown == text() ? QString() : text();
-        if (toolTip() != tip) const_cast<ElideLabel *>(this)->setToolTip(tip);
+        const QString tip = shown == text() ? QString() : text().toHtmlEscaped();
+        if (tip_ != tip) {
+            tip_ = tip;
+            CustomTooltip::instance()->setToolTip(this, tip);
+        }
     }
 
   private:
     Qt::TextElideMode mode_;
+    QString tip_; // el tooltip propio que ya tiene: se registra sólo cuando cambia, no en cada repintado
 };
 
 // Tabla de una vista (Apps, Activity): encabezado fijo con columnas que se ensanchan arrastrando, y sólo las filas se
@@ -514,10 +522,7 @@ QString parentWildcard(const QString &host) {
 }
 // Opciones del aviso, para elegir lo mismo desde la ventana. Primero va lo que el aviso preselecciona.
 QVector<QPair<QString, QString>> scopeOptions(const FirewallClient::PendingItem &p) {
-    if (p.signer.isEmpty()) return {{"This file only", "path"}};
-    QVector<QPair<QString, QString>> s{{"This app, any version", "app"}, {"This file only", "path"}};
-    if (FirewallClient::publisherRuleAllowed(p.signer)) s.push_back({"All apps from " + p.signer, "publisher"});
-    return s;
+    return FolderTrust::scopeChoices(p.path, p.signer, p.perDestination);
 }
 QVector<QPair<QString, QString>> durationOptions() {
     QVector<QPair<QString, QString>> d{{"Always", "always"}};
@@ -1037,6 +1042,125 @@ void FirewallWindow::showHelp() {
     d->open();
 }
 
+void FirewallWindow::trustFolderDialog(const QString &folder, const QString &name) {
+    auto *d = new QDialog(this, Qt::Dialog | Qt::FramelessWindowHint);
+    d->setObjectName("trust-folder-dialog");
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    d->setStyleSheet("QDialog { background: #1e1e1e; border: 1px solid #3a3544; }");
+    constexpr int Wide = 470;
+    auto *l = column(d, 18, 8);
+    l->addWidget(text("Trust a folder", "cardtitle"));
+    auto *intro = text("The rule covers one program name, or every program, inside the folder and its subfolders, also "
+                       "builds made or copied there later. A rule for a file, an app or a publisher comes first. Trust "
+                       "only folders where you build or install programs yourself: whatever is saved there with that "
+                       "name gets the same access.",
+                       "sub", true);
+    intro->setFixedWidth(Wide);
+    l->addWidget(intro);
+    l->addSpacing(6);
+    l->addWidget(text("Folder", "colhead"));
+    auto *fr = row(8);
+    auto *path = new QLineEdit(QDir::toNativeSeparators(folder));
+    path->setObjectName("trust-folder-path");
+    path->setPlaceholderText("C:\\Projects\\MyApp");
+    fr->addWidget(path, 1);
+    auto *browse = button("Browse…");
+    browse->setObjectName("trust-folder-browse");
+    fr->addWidget(browse);
+    l->addLayout(fr);
+    auto *status = text({}, "sub", true);
+    status->setObjectName("trust-folder-status");
+    status->setFixedWidth(Wide);
+    l->addWidget(status);
+    l->addSpacing(6);
+    l->addWidget(text("Program name (optional)", "colhead"));
+    auto *program = new QLineEdit(name);
+    program->setObjectName("trust-folder-name");
+    program->setPlaceholderText("Every program, or one name such as MyApp.exe");
+    l->addWidget(program);
+    l->addSpacing(10);
+    auto *buttons = row(8);
+    buttons->addStretch();
+    auto *cancel = button("Cancel");
+    cancel->setObjectName("trust-folder-cancel");
+    auto *block = button("Block", "block");
+    block->setObjectName("trust-folder-block");
+    auto *allow = button("Allow", "allow");
+    allow->setObjectName("trust-folder-allow");
+    for (auto *b : {cancel, block, allow}) {
+        b->setMinimumWidth(84);
+        buttons->addWidget(b);
+    }
+    l->addLayout(buttons);
+
+    // Lo validado: la carpeta por su ruta final y el nombre en minúsculas, o vacío si todavía no se puede crear.
+    auto resolved = std::make_shared<QPair<QString, QString>>();
+    const auto check = [this, path, program, status, block, allow, resolved] {
+        gbe::FinalPath place;
+        std::wstring exe;
+        const QString typed = path->text().trimmed();
+        const QString problem =
+            typed.isEmpty() ? QString() : QString::fromStdWString(gbe::resolveTrustedFolder(typed.toStdWString(), place));
+        const bool nameOk = gbe::normalizeFolderRuleName(program->text().toStdWString(), exe);
+        QString message, tone = "sub";
+        if (typed.isEmpty()) {
+            message = "Choose the folder of a project or an app, such as C:\\Portable\\LGA_DayTrace.";
+        } else if (!problem.isEmpty()) {
+            message = problem;
+            tone = "bad";
+        } else if (!nameOk) {
+            message = "Use a file name such as MyApp.exe, or leave it empty for every program.";
+            tone = "bad";
+        } else {
+            const QString where = QString::fromStdWString(place.dos);
+            message = (exe.empty() ? QStringLiteral("✓ Every program in ") : "✓ " + program->text().trimmed() + " in ") +
+                      where + " and its subfolders.";
+            tone = "ok";
+            // El nombre como se escribió, para el mensaje («DayTrace.exe»): el motor lo pasa a minúsculas.
+            *resolved = {where, exe.empty() ? QString() : program->text().trimmed()};
+        }
+        if (tone != "ok") *resolved = {};
+        status->setText(message);
+        status->setProperty("r", tone);
+        status->style()->unpolish(status);
+        status->style()->polish(status);
+        block->setEnabled(canDecide() && !resolved->first.isEmpty());
+        allow->setEnabled(canDecide() && !resolved->first.isEmpty());
+    };
+    // Validar lee el disco y el registro: se espera a que se deje de escribir.
+    auto *later = new QTimer(d);
+    later->setSingleShot(true);
+    later->setInterval(250);
+    connect(later, &QTimer::timeout, d, check);
+    connect(path, &QLineEdit::textChanged, later, qOverload<>(&QTimer::start));
+    connect(program, &QLineEdit::textChanged, later, qOverload<>(&QTimer::start));
+    check();
+    connect(browse, &QPushButton::clicked, d, [d, path] {
+        auto *dialog = new QFileDialog(d, "Choose the folder to trust", path->text().trimmed());
+        dialog->setObjectName("trust-folder-picker");
+        dialog->setOption(QFileDialog::DontUseNativeDialog);
+        dialog->setOption(QFileDialog::ShowDirsOnly);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setFileMode(QFileDialog::Directory);
+        connect(dialog, &QFileDialog::fileSelected, path,
+                [path](const QString &chosen) { path->setText(QDir::toNativeSeparators(chosen)); });
+        dialog->open();
+    });
+    connect(cancel, &QPushButton::clicked, d, &QDialog::close);
+    for (auto *b : {block, allow})
+        connect(b, &QPushButton::clicked, d, [this, d, later, check, resolved, allowed = b == allow] {
+            // Lo que se ve es lo que se manda: si había una validación pendiente, se hace ya.
+            if (later->isActive()) {
+                later->stop();
+                check();
+            }
+            if (resolved->first.isEmpty()) return;
+            firewall_.trustFolder(resolved->first, resolved->second, allowed);
+            d->close();
+        });
+    d->open();
+}
+
 // ------------------------------------------------------------------------------------------------------------------
 // Protection: el estado, lo que espera decisión y un resumen.
 
@@ -1175,9 +1299,10 @@ QWidget *FirewallWindow::overviewPage() {
             wl->addSpacing(10);
             auto *tip = new QLabel("Block and Allow here use the choices the notice would preselect: <b "
                                    "style='color:#aaa;font-weight:500'>this app, any version</b> when it is signed, <b "
-                                   "style='color:#aaa;font-weight:500'>this file</b> when it is not, and <b "
-                                   "style='color:#aaa;font-weight:500'>only that server</b> for an app that already has "
-                                   "server rules. Open the request to choose another.");
+                                   "style='color:#aaa;font-weight:500'>this app in its repository</b> for an unsigned "
+                                   "build inside a Git repository, <b style='color:#aaa;font-weight:500'>this file</b> "
+                                   "otherwise, and <b style='color:#aaa;font-weight:500'>only that server</b> for an app "
+                                   "that already has server rules. Open the request to choose another.");
             tip->setProperty("r", "faint");
             tip->setWordWrap(true);
             wl->addWidget(tip);
@@ -1221,7 +1346,10 @@ QWidget *FirewallWindow::overviewPage() {
         if (soonest) {
             const QString who = soonest->scope == "app"         ? soonest->name
                                 : soonest->scope == "publisher" ? "Apps from " + soonest->signer
-                                                                : FirewallClient::fileName(soonest->path);
+                                : soonest->scope == "folder"
+                                    ? (soonest->name.isEmpty() ? QStringLiteral("Apps") : soonest->name) + " in " +
+                                          FolderTrust::label(soonest->path)
+                                    : FirewallClient::fileName(soonest->path);
             rl->addWidget(text(QString("%1 can %2 %3.")
                                    .arg(who, soonest->allow ? "connect" : "stay blocked",
                                         soonest->expires < 0 ? QString("until restart")
@@ -1435,7 +1563,11 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
         leftCol->addWidget(n);
     }
     if (p.signer.isEmpty()) {
-        auto *n = text("No signature: a rule can only cover this exact file. If the file changes, it asks again.",
+        const bool repository = FolderTrust::isFolderScope(scopeOptions(p).first().second);
+        auto *n = text(repository ? "No signature: the rule can't follow a publisher, only this file or this app's name "
+                                    "inside its repository."
+                                  : "No signature: a rule can only cover this exact file. If the file changes, it asks "
+                                    "again.",
                        "body", true);
         n->setStyleSheet("background: #2f2716; border: 1px solid #4d3e19; border-radius: 6px; padding: 7px 9px; "
                          "color: #e6c16a;");
@@ -1471,7 +1603,7 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
     rightCol->setSpacing(8);
     auto &choice = choices_[p.id.toLower()];
     const auto addCombo = [&](const QString &label, const QVector<QPair<QString, QString>> &options, QString &value,
-                              const char *name) {
+                              const char *name) -> Combo * {
         rightCol->addWidget(text(label, "colhead"));
         auto *combo = new Combo;
         combo->setObjectName(name);
@@ -1489,11 +1621,31 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
             else c.target = v;
         });
         rightCol->addWidget(combo);
+        return combo;
     };
-    addCombo("Apply to", scopeOptions(p), choice.scope, "request-scope");
+    auto *scopeBox = addCombo("Apply to", scopeOptions(p), choice.scope, "request-scope");
     addCombo("For", durationOptions(), choice.duration, "request-duration");
-    addCombo("Destination", targetOptions(p), choice.target, "request-target");
+    auto *targetBox = addCombo("Destination", targetOptions(p), choice.target, "request-target");
     choice.set = true;
+    // Una regla por carpeta es para la app entera: el destino queda en «Any destination» y se dice qué carpeta abre.
+    auto *folderNote = text({}, "faint", true);
+    folderNote->setObjectName("request-folder-note");
+    rightCol->addWidget(folderNote);
+    const auto syncFolder = [this, scopeBox, targetBox, folderNote, id = p.id.toLower(), path = p.path] {
+        const QString scope = scopeBox->currentData().toString();
+        const bool folder = FolderTrust::isFolderScope(scope);
+        {
+            // Sin tocar lo elegido (choices_): una carpeta muestra «Any destination» y, al dejarla, vuelve lo de antes.
+            const QSignalBlocker quiet(targetBox);
+            const int at = folder ? targetBox->findData(QString()) : targetBox->findData(choices_.value(id).target);
+            if (at >= 0) targetBox->setCurrentIndex(at);
+        }
+        targetBox->setEnabled(canDecide() && targetBox->count() > 1 && !folder);
+        folderNote->setText(FolderTrust::note(scope, path));
+        folderNote->setVisible(folder);
+    };
+    connect(scopeBox, &QComboBox::currentIndexChanged, this, syncFolder);
+    syncFolder();
     rightCol->addSpacing(6);
     auto *buttons = row(8);
     auto *block = button("Block", "block");
@@ -1573,9 +1725,11 @@ QVector<FirewallWindow::AppEntry> FirewallWindow::appEntries() const {
     const auto &rules = firewall_.rules();
     for (const auto &r : rules) {
         if (r.scope == "covered") continue;
-        const QString key = r.scope == "path"  ? "path|" + r.path.toLower()
-                            : r.scope == "app" ? "app|" + r.signer.toLower() + "|" + r.name.toLower()
-                                               : "pub|" + r.signer.toLower();
+        // La clave de una regla por carpeta ya es «folder|carpeta|nombre» (la del motor).
+        const QString key = r.scope == "path"     ? "path|" + r.path.toLower()
+                            : r.scope == "app"    ? "app|" + r.signer.toLower() + "|" + r.name.toLower()
+                            : r.scope == "folder" ? r.id.toLower()
+                                                  : "pub|" + r.signer.toLower();
         int at = index.value(key, -1);
         if (at < 0) {
             AppEntry e;
@@ -1590,6 +1744,11 @@ QVector<FirewallWindow::AppEntry> FirewallWindow::appEntries() const {
             } else if (r.scope == "app") {
                 e.title = r.name;
                 e.subtitle = "Any version · " + r.signer;
+            } else if (r.scope == "folder") {
+                // Con nombre: como una regla de app («node.exe · Any version»), pero por carpeta.
+                e.title = r.name.isEmpty() ? "All apps in " + FolderTrust::label(r.path) : r.name;
+                e.subtitle = (r.name.isEmpty() ? "Folder rule · " : "Anywhere in ") + QDir::toNativeSeparators(r.path);
+                if (r.name.isEmpty()) e.iconPath = r.path; // el ícono de carpeta de Windows
             } else {
                 e.title = "All apps from " + r.signer;
                 e.subtitle = "Publisher rule";
@@ -1601,12 +1760,17 @@ QVector<FirewallWindow::AppEntry> FirewallWindow::appEntries() const {
         entries[at].rules.push_back(r);
         if (!r.destination.isEmpty()) entries[at].perServer = true;
     }
-    // Ícono y archivos de las reglas por firma: los que ya cubrieron.
+    // Ícono y archivos de las reglas por firma o por carpeta: los que ya cubrieron (si no, el de la carpeta).
     for (auto &e : entries) {
         if (!e.iconPath.isEmpty()) continue;
         for (const auto &r : e.rules)
             for (const auto &c : rules)
                 if (c.scope == "covered" && c.name == r.id && e.iconPath.isEmpty()) e.iconPath = c.path;
+        if (e.iconPath.isEmpty() && e.scope == "folder") e.iconPath = e.path;
+        // El motor guarda el nombre en minúsculas: un archivo cubierto trae las mayúsculas reales («DayTrace.exe»).
+        if (e.scope == "folder" && !e.rules.first().name.isEmpty() && e.iconPath != e.path &&
+            FirewallClient::fileName(e.iconPath).compare(e.title, Qt::CaseInsensitive) == 0)
+            e.title = FirewallClient::fileName(e.iconPath);
     }
     std::sort(entries.begin(), entries.end(),
               [](const AppEntry &a, const AppEntry &b) { return a.title.compare(b.title, Qt::CaseInsensitive) < 0; });
@@ -1652,7 +1816,9 @@ QStringList FirewallWindow::runningWithoutRule() const {
     QStringList result;
     const QString self = QDir::toNativeSeparators(QCoreApplication::applicationFilePath()).toLower();
     for (const auto &path : running_) {
-        if (path.toLower() == self || firewall_.ruleFor(path) || firewall_.pendingFor(path)) continue;
+        // Una carpeta de confianza también es una regla: no le pregunta nada a nadie (su primer intento igual se pierde).
+        if (path.toLower() == self || firewall_.ruleFor(path) || firewall_.folderRuleFor(path) || firewall_.pendingFor(path))
+            continue;
         result << path;
     }
     std::sort(result.begin(), result.end(), [](const QString &a, const QString &b) {
@@ -1665,7 +1831,9 @@ QWidget *FirewallWindow::appsPage() {
     auto *page = new QWidget;
     auto *l = column(page, 18, 10);
     l->setContentsMargins(18, 16, 18, 16);
-    l->addWidget(header(headIcon("apps"), "Apps", "Every application with a rule. A signed app keeps its rule across updates."));
+    l->addWidget(header(headIcon("apps"), "Apps",
+                        "Every application with a rule. A signed app keeps its rule across updates; a rule in a folder "
+                        "also covers builds made there later."));
     auto *bar = row(8);
     auto *search = new QLineEdit(appsQuery_);
     search->setObjectName("apps-search");
@@ -1678,6 +1846,11 @@ QWidget *FirewallWindow::appsPage() {
     sl->setContentsMargins(2, 2, 2, 2);
     sl->setSpacing(2);
     bar->addWidget(appsSeg_);
+    auto *trust = button("Trust a folder…");
+    trust->setObjectName("apps-trust-folder");
+    trust->setEnabled(canDecide());
+    connect(trust, &QPushButton::clicked, this, [this] { trustFolderDialog({}, {}); });
+    bar->addWidget(trust);
     l->addLayout(bar);
     connect(search, &QLineEdit::textChanged, this, [this](const QString &v) {
         appsQuery_ = v;
@@ -1705,7 +1878,7 @@ void FirewallWindow::fillApps() {
     armedAt_ = QDateTime::currentMSecsSinceEpoch() + 600;
     const auto entries = appEntries();
     const QStringList loose = runningWithoutRule();
-    int allow = 0, block = 0, perServer = 0, temporary = 0;
+    int allow = 0, block = 0, perServer = 0, temporary = 0, folders = 0;
     const auto classify = [](const AppEntry &e) {
         if (e.perServer) return QString("server");
         const auto &r = e.rules.first();
@@ -1718,6 +1891,7 @@ void FirewallWindow::fillApps() {
         block += c == "block";
         perServer += c == "server";
         temporary += c == "temp";
+        folders += e.scope == "folder";
     }
     // Filtros: se rehacen con los números del momento.
     auto *sl = static_cast<QHBoxLayout *>(appsSeg_->layout());
@@ -1734,6 +1908,7 @@ void FirewallWindow::fillApps() {
                                                             {"block", "Block", block},
                                                             {"server", "Per server", perServer},
                                                             {"temp", "Temporary", temporary},
+                                                            {"folder", "Folders", folders},
                                                             {"running", "Running, no rule", int(loose.size())}};
     for (const auto &[id, name, n] : filters) {
         auto *b = button(QString("%1  %2").arg(name).arg(n), "seg");
@@ -1803,7 +1978,8 @@ void FirewallWindow::fillApps() {
         t->viewport()->setCursor(Qt::PointingHandCursor);
         for (const auto &e : entries) {
             const QString c = classify(e);
-            if (appsFilter_ != "all" && appsFilter_ != c) continue;
+            // «Folders» junta las reglas por carpeta (con o sin nombre de exe), sean Allow, Block o temporales.
+            if (appsFilter_ == "folder" ? e.scope != "folder" : appsFilter_ != "all" && appsFilter_ != c) continue;
             QString hay = e.title + " " + e.subtitle + " " + e.path + " " + e.signer;
             for (const auto &r : e.rules) hay += " " + r.destination;
             if (!matches(hay)) continue;
@@ -1831,13 +2007,19 @@ void FirewallWindow::fillApps() {
                            cell(dest), cell(policy, Qt::AlignRight), cell(when)});
             t->item(r, 0)->setData(Qt::UserRole, "rule:" + e.key);
         }
-        appsTip_->clear();
+        if (appsFilter_ == "folder")
+            appsTip_->setText("A folder rule covers programs in that folder and its subfolders, also ones built or copied "
+                              "there later. A notice offers it for one app in its repository; Trust a folder… adds any "
+                              "folder by hand, for one program name or for all of them.");
+        else
+            appsTip_->clear();
     }
     if (t->rowCount() == 0) {
         t->insertRow(0);
         auto *empty = new ElideLabel(runningView ? "Every running application of this session has a rule or is waiting."
-                                     : appsQuery_.isEmpty() ? "No rules here yet."
-                                                            : "No app matches the search.",
+                                     : !appsQuery_.isEmpty()   ? "No app matches the search."
+                                     : appsFilter_ == "folder" ? "No folder rules yet."
+                                                               : "No rules here yet.",
                                      "sub");
         fillRow(t, 0, {cell(empty)});
         t->setSpan(0, 0, 1, t->columnCount());
@@ -1867,9 +2049,13 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
         return page;
     }
     const auto &r0 = e->rules.first();
-    QString where = e->scope == "path"  ? QDir::toNativeSeparators(e->path)
-                    : e->scope == "app" ? "Any version signed by " + e->signer
-                                        : "Any application signed by " + e->signer;
+    // e->title es el nombre con sus mayúsculas reales si ya cubrió un archivo (appEntries).
+    const QString folderText = (r0.name.isEmpty() ? QStringLiteral("Every program in ") : e->title + " anywhere in ") +
+                               FolderTrust::shown(e->path) + " and its subfolders";
+    QString where = e->scope == "path"     ? QDir::toNativeSeparators(e->path)
+                    : e->scope == "app"    ? "Any version signed by " + e->signer
+                    : e->scope == "folder" ? folderText
+                                           : "Any application signed by " + e->signer;
     if (e->scope == "app" && !e->iconPath.isEmpty())
         where = QDir::toNativeSeparators(e->iconPath) + " · any version signed by " + e->signer;
     l->addWidget(header(appIcon(e->iconPath, 38), e->title, where));
@@ -1912,7 +2098,7 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
             h->addWidget(pw);
             auto *x = button("×", "x");
             x->setObjectName("remove-server-rule");
-            x->setToolTip("Remove only this server rule");
+            CustomTooltip::instance()->setToolTip(x, "Remove only this server rule");
             x->setEnabled(can);
             connect(x, &QPushButton::clicked, this, [this, id = r.id] { firewall_.removeRule(id); });
             h->addWidget(x);
@@ -1948,28 +2134,77 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
                                       : pill(r0.allow ? "Allow" : "Block", r0.allow ? "allow" : "block"));
         pl->addStretch();
         kv("Decision", pw);
-        kv("Applies to", text(e->scope == "path"  ? QString("This file only")
-                              : e->scope == "app" ? "Any version of " + r0.name + " signed by this publisher"
-                                                  : "Any application signed by " + r0.signer,
+        kv("Applies to", text(e->scope == "path"     ? QString("This file only")
+                              : e->scope == "app"    ? "Any version of " + r0.name + " signed by this publisher"
+                              : e->scope == "folder" ? folderText + ", also programs built or copied there later. A "
+                                                                    "rule for a file, an app or a publisher comes first."
+                                                     : "Any application signed by " + r0.signer,
                               "body", true));
         if (e->scope != "path") kv("Files seen", text(QString::number(covered), "body"));
         kv("Created", text(clockFull(r0.created), "body"));
         kv("Last blocked attempt", text(r0.allow ? QString("—") : clockFull(r0.lastBlock), "body"));
         cl->addLayout(grid);
-        if (e->scope == "path" && r0.expires == 0) {
-            // Una regla por ruta se puede invertir aquí; las de firma se cambian en el próximo aviso que coincida.
+        if ((e->scope == "path" || e->scope == "folder") && r0.expires == 0) {
+            // Una regla por ruta o por carpeta se puede invertir aquí; las de firma se cambian en el próximo aviso que
+            // coincida.
             auto *actions = row(8);
             actions->addStretch();
             auto *flip = button(r0.allow ? "Change to Block" : "Change to Allow", r0.allow ? "block" : "allow");
             flip->setObjectName("rule-flip");
             flip->setEnabled(can);
-            connect(flip, &QPushButton::clicked, this, [this, path = e->path, allow = !r0.allow] {
-                firewall_.decide(path, allow);
-            });
+            connect(flip, &QPushButton::clicked, this,
+                    [this, folder = e->scope == "folder", path = e->path, name = r0.name, allow = !r0.allow] {
+                        if (folder) firewall_.trustFolder(path, name, allow);
+                        else firewall_.decide(path, allow);
+                    });
             actions->addWidget(flip);
             cl->addLayout(actions);
         }
         l->addWidget(c);
+    }
+    // Una regla de un archivo no sigue a los builds nuevos: dentro de un repositorio se ofrece la regla del programa en
+    // todo el repositorio. Si ya está dentro de una carpeta de confianza, se dice quién decide.
+    const auto *inside = e->scope == "path" && !e->perServer ? firewall_.folderRuleFor(e->path) : nullptr;
+    if (e->scope == "path" && !e->perServer) {
+        bool inRepository = false;
+        const QString folder = inside ? QString() : FolderTrust::suggestion(e->path, &inRepository);
+        if (inside || (r0.allow && inRepository && !folder.isEmpty())) {
+            auto *c = card();
+            c->setObjectName("detail-folder-card");
+            auto *ch = new QHBoxLayout(c);
+            ch->setContentsMargins(14, 12, 14, 12);
+            ch->setSpacing(12);
+            auto *ct = new QVBoxLayout;
+            ct->setSpacing(2);
+            if (inside && inside->allow) {
+                ct->addWidget(text("Inside a trusted folder", "strong"));
+                ct->addWidget(text(QString("%1 is a trusted folder. This file rule comes first; if you remove it, the "
+                                           "folder rule takes over after one blocked attempt.")
+                                       .arg(FolderTrust::shown(inside->path)),
+                                   "small", true));
+            } else if (inside) {
+                ct->addWidget(text("Inside a blocked folder", "strong"));
+                ct->addWidget(text(QString("A folder rule blocks %1 in %2. This file rule comes first; if you remove it, "
+                                           "the folder rule blocks it without asking.")
+                                       .arg(e->title, FolderTrust::shown(inside->path)),
+                                   "small", true));
+            } else {
+                ct->addWidget(text("Cover new builds too", "strong"));
+                ct->addWidget(text(QString("This rule covers only this file: a build of %1 in another folder asks "
+                                           "again. A rule for %1 anywhere in %2 covers every build there.")
+                                       .arg(e->title, FolderTrust::shown(folder)),
+                                   "small", true));
+            }
+            ch->addLayout(ct, 1);
+            if (!inside) {
+                auto *b = button("Cover all builds…");
+                b->setObjectName("detail-trust-folder");
+                b->setEnabled(can);
+                connect(b, &QPushButton::clicked, this, [this, folder, name = e->title] { trustFolderDialog(folder, name); });
+                ch->addWidget(b, 0, Qt::AlignVCenter);
+            }
+            l->addWidget(c);
+        }
     }
     auto *remove = card();
     auto *rh = new QHBoxLayout(remove);
@@ -1978,9 +2213,14 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
     auto *rt = new QVBoxLayout;
     rt->setSpacing(2);
     rt->addWidget(text(e->rules.size() > 1 ? "Remove all rules for " + e->title : "Remove this rule", "strong"));
-    rt->addWidget(text(e->scope == "path" ? e->title + " asks again the next time it connects."
-                                          : e->title + " asks again the next time it connects. To change a rule like "
-                                                       "this one, decide on its next notice.",
+    rt->addWidget(text(inside && inside->allow ? "The trusted folder decides for " + e->title + " after one blocked attempt."
+                       : inside            ? "The folder rule blocks " + e->title + " without asking."
+                       : e->scope == "path" ? e->title + " asks again the next time it connects."
+                       : e->scope == "folder"
+                           ? "Programs in " + FolderTrust::shown(e->path) +
+                                 " ask again the next time they connect, unless another rule covers them."
+                           : e->title + " asks again the next time it connects. To change a rule like this one, decide "
+                                        "on its next notice.",
                        "small", true));
     rh->addLayout(rt, 1);
     auto *rb = button(e->rules.size() > 1 ? "Remove rules" : "Remove rule");
@@ -2441,7 +2681,7 @@ QWidget *FirewallWindow::importPage() {
             av->addWidget(text(r.path.isEmpty() ? r.ruleName : QFileInfo(r.path).fileName(), "body"));
             if (!r.path.isEmpty()) {
                 auto *p = text(QDir::toNativeSeparators(QFileInfo(r.path).path()), "small");
-                p->setToolTip(QDir::toNativeSeparators(r.path));
+                CustomTooltip::instance()->setToolTip(p, QDir::toNativeSeparators(r.path).toHtmlEscaped());
                 av->addWidget(p);
             }
             grid->addWidget(app, gr, 0);

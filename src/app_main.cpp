@@ -4,6 +4,9 @@
 #include "firewallwindow.h"
 #include <QAbstractButton>
 #include <QApplication>
+#include <QComboBox>
+#include <QDialog>
+#include <QLineEdit>
 #include <QLocalServer>
 #include <QLocalSocket>
 #include <QTableWidget>
@@ -15,8 +18,20 @@ namespace {
 // Recorrido de QA sin abrir nada en el escritorio del usuario (se corre en un escritorio aparte):
 // GATEBOUNCER_QA_SHOT="<vista>;<pasos separados por coma>"; pasos: wait:<ms>, view:<vista>, size:<ancho>x<alto>,
 // row:<fila> (clic en una fila de la tabla),
-// click:<objectName> (botón), shot:<archivo.png>, toastshot:<archivo.png> (el aviso fijo) y
-// toastclick:<objectName> (botón del aviso fijo). Al terminar los pasos sale.
+// click:<objectName> (botón), shot:<archivo.png>, toastshot:<archivo.png> (el aviso fijo),
+// toastclick:<objectName> (botón del aviso fijo), type:<objectName>=<texto> (un campo; «%2C» es una coma),
+// combo:<objectName>=<índice> (un desplegable de la ventana o del aviso, elegido como lo haría el usuario: también
+// emite activated) y dialogshot:<archivo.png> (el diálogo abierto).
+// Al terminar los pasos sale.
+QWidget *qaFind(Gate::FirewallWindow *window, const QString &name) {
+    // Primero lo visible de la ventana (incluye sus diálogos); después el aviso fijo.
+    for (auto *w : window->findChildren<QWidget *>(name))
+        if (w->isVisible()) return w;
+    if (auto *toast = window->accessToast())
+        if (auto *w = toast->findChild<QWidget *>(name)) return w;
+    return nullptr;
+}
+
 void runSteps(Gate::FirewallWindow *window, QStringList steps) {
     if (steps.isEmpty()) {
         QApplication::exit(0);
@@ -54,6 +69,25 @@ void runSteps(Gate::FirewallWindow *window, QStringList steps) {
             if (b->isVisible()) target = b;
         if (target && target->isEnabled()) target->click();
         else std::fprintf(stderr, "QA: botón ausente o deshabilitado: %s\n", qPrintable(step));
+    } else if (step.startsWith("type:") || step.startsWith("combo:")) {
+        const QString spec = step.mid(step.indexOf(':') + 1);
+        const QString name = spec.section('=', 0, 0), value = spec.section('=', 1, -1).replace("%2C", ",");
+        QWidget *target = qaFind(window, name);
+        if (auto *edit = qobject_cast<QLineEdit *>(target)) {
+            edit->setText(value);
+        } else if (auto *combo = qobject_cast<QComboBox *>(target)) {
+            combo->setCurrentIndex(value.toInt());
+            emit combo->activated(value.toInt());
+        } else {
+            std::fprintf(stderr, "QA: campo o desplegable ausente: %s\n", qPrintable(step));
+        }
+    } else if (step.startsWith("dialogshot:")) {
+        QWidget *dialog = QApplication::activeModalWidget();
+        if (!dialog)
+            for (auto *d : window->findChildren<QDialog *>())
+                if (d->isVisible()) dialog = d;
+        if (dialog) dialog->grab().save(step.mid(11));
+        else std::fprintf(stderr, "QA: no hay diálogo abierto\n");
     }
     QTimer::singleShot(next, qApp, [window, steps] { runSteps(window, steps); });
 }

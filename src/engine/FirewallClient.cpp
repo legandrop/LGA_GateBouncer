@@ -1,5 +1,7 @@
 #include "FirewallClient.h"
+#include "folder_rule.h"
 #include <QDateTime>
+#include <QDir>
 #include <QFileInfo>
 #include <QHostAddress>
 #include <QLocalSocket>
@@ -75,6 +77,26 @@ const FirewallClient::RuleItem *FirewallClient::ruleFor(const QString &path) con
     return nullptr;
 }
 
+const FirewallClient::RuleItem *FirewallClient::folderRuleFor(const QString &path) const {
+    // Como el motor: la carpeta más profunda; en la misma, la que nombra el exe; a igualdad, Block.
+    const auto beats = [](const RuleItem &a, const RuleItem &b) {
+        if (a.path.size() != b.path.size()) return a.path.size() > b.path.size();
+        if (a.name.isEmpty() != b.name.isEmpty()) return !a.name.isEmpty();
+        return !a.allow && b.allow;
+    };
+    const QString p = path.toLower().replace('/', '\\');
+    const QString name = fileName(path).toLower();
+    const RuleItem *best = nullptr;
+    for (const auto &r : rules_) {
+        if (r.scope != "folder" || r.path.isEmpty()) continue;
+        const QString f = r.path.toLower().replace('/', '\\');
+        if (p.size() <= f.size() + 1 || !p.startsWith(f) || p.at(f.size()) != '\\') continue;
+        if (!r.name.isEmpty() && r.name.toLower() != name) continue;
+        if (!best || beats(r, *best)) best = &r;
+    }
+    return best;
+}
+
 int FirewallClient::ruleCount() const {
     int n = 0;
     for (const auto &r : rules_) n += r.scope != "covered";
@@ -90,6 +112,9 @@ const FirewallClient::RuleItem *FirewallClient::ruleById(const QString &id) cons
 QString FirewallClient::describe(const RuleItem &rule) {
     const QString who = rule.scope == "app"         ? QString("any version of %1 from %2").arg(rule.name, rule.signer)
                         : rule.scope == "publisher" ? "all apps from " + rule.signer
+                        : rule.scope == "folder"    ? QString("%1 in %2").arg(rule.name.isEmpty() ? QString("all apps")
+                                                                                                  : rule.name,
+                                                                              rule.path)
                                                     : fileName(rule.path);
     return rule.destination.isEmpty() ? who : who + " to " + rule.destination;
 }
@@ -117,6 +142,17 @@ QString FirewallClient::remaining(const RuleItem &rule) {
 
 void FirewallClient::decide(const QString &path, bool allow, const QString &scope, const QString &duration,
                             const QString &destination) {
+    // Las opciones de carpeta del aviso traen la carpeta en el alcance: una regla por carpeta es para la app entera.
+    if (scope.startsWith("folder:")) {
+        trustFolder(scope.mid(7), {}, allow, duration);
+        return;
+    }
+    if (scope.startsWith("foldername:")) {
+        // El nombre largo: WFP puede informar el corto 8.3 («GATEBO~1.EXE»), y el motor compara con el de la ruta final.
+        const QString full = QString::fromStdWString(gbe::longPathOf(QDir::toNativeSeparators(path).toStdWString()));
+        trustFolder(scope.mid(11), fileName(full), allow, duration);
+        return;
+    }
     const auto *p = pendingFor(path);
     const QString signer = p ? p->signer : QString();
     QString what = fileName(path);
@@ -132,6 +168,20 @@ void FirewallClient::decide(const QString &path, bool allow, const QString &scop
     enqueue(line, Request::Command,
             QString("%1%2 saved for %3. The next connection attempt uses this rule.")
                 .arg(allow ? "Allow" : "Block", span, what));
+    poll();
+}
+
+void FirewallClient::trustFolder(const QString &folder, const QString &name, bool allow, const QString &duration) {
+    const QString where = QDir::toNativeSeparators(folder);
+    QString line = QString("FOLDER\t%1\t%2\t%3").arg(allow ? "allow" : "block", where, name.isEmpty() ? "*" : name);
+    if (duration != "always") line += "\t" + duration;
+    const QString span = duration == "restart" ? QStringLiteral(" until restart")
+                         : duration == "always" ? QString()
+                                                : " for " + describeDuration(duration.toLongLong());
+    const QString who = name.isEmpty() ? QStringLiteral("Every program") : name;
+    enqueue(line, Request::Command,
+            allow ? QString("%1 in %2 can connect%3, also new builds there.").arg(who, where, span)
+                  : QString("%1 in %2 stays blocked%3.").arg(who, where, span));
     poll();
 }
 
@@ -304,6 +354,7 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
             r.expires = f.size() >= 8 ? f[7].toLongLong() : 0;
             r.destination = f.size() == 10 ? f[8] : QString();
             if (r.scope == "path" || r.scope == "covered") r.path = f.size() == 10 ? f[9] : r.id;
+            if (r.scope == "folder") r.path = f.size() == 10 ? f[9] : QString(); // la carpeta
             rules_.push_back(r);
         }
         break;

@@ -1,6 +1,8 @@
 #include "accesstoast.h"
 #include "appicon.h"
+#include "customtooltip.h"
 #include "engine/FirewallClient.h"
+#include "foldertrust.h"
 #include "explain/Explainer.h"
 #include "explain/KnownApps.h"
 #include <QAbstractItemView>
@@ -82,7 +84,7 @@ void elide(QLabel *label, const QString &text, int width, Qt::TextElideMode mode
     label->ensurePolished();
     const QString shown = label->fontMetrics().elidedText(text, mode, width);
     label->setText(shown);
-    label->setToolTip(shown != text ? text : QString());
+    CustomTooltip::instance()->setToolTip(label, shown != text ? text.toHtmlEscaped() : QString());
 }
 
 // Ancho fijo y alto justo para un texto que se parte en renglones: así el aviso nunca corta un párrafo.
@@ -258,6 +260,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
             padding:0 10px; min-height:25px; max-height:25px; }
         #accessToast QPushButton#toastExplain:hover { background:#333333; color:#e6e6e6; }
         #accessToast QLabel#toastRuleLabel { font-size:11px; color:#7d7d7d; }
+        #accessToast QLabel#toastFolderNote { font-size:11px; color:#9a9a9a; }
         #accessToast QComboBox { background:#242424; border:1px solid #363636; border-radius:5px; color:#d0d0d0;
             font-size:12px; padding:0 0 0 8px; min-height:24px; max-height:26px; }
         #accessToast QComboBox:hover { background:#292929; border-color:#424242; }
@@ -310,7 +313,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     close->setFixedSize(28, 26);
     close->setIcon(headerIcon(true));
     close->setIconSize(QSize(14, 14));
-    close->setToolTip("Close and keep it waiting");
+    CustomTooltip::instance()->setToolTip(close, "Close and keep it waiting");
     close->setAccessibleName("Close and keep it waiting");
     close->setCursor(Qt::PointingHandCursor);
     barRow->addWidget(close);
@@ -360,8 +363,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
         layout->addWidget(holder);
         return holder;
     };
-    warnBox_ = noteBox("toastWarn", warn_, Qt::PlainText);
-    warn_->setText("No signature: a rule can only cover this exact file. If the file changes, it asks again.");
+    warnBox_ = noteBox("toastWarn", warn_, Qt::PlainText); // el texto depende de si hay carpeta que ofrecer
     infoBox_ = noteBox("toastInfo", info_, Qt::RichText);
     info_->setText("Allow or Block applies to this server only. Choose <b>Any destination (whole app)</b> in the menu "
                    "to replace its server rules.");
@@ -514,6 +516,10 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     rule->addWidget(ruleLabel);
     choices_ = new QWidget(this);
     rule->addWidget(choices_);
+    folderNote_ = label(this, "toastFolderNote", true);
+    folderNote_->setContentsMargins(0, 2, 0, 0);
+    folderNote_->hide();
+    rule->addWidget(folderNote_);
     layout->addLayout(rule);
     scope_ = new ScopeCombo(choices_);
     scope_->setObjectName("toastScope");
@@ -540,7 +546,15 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
             layoutChoices();
         });
     }
-    connect(target_, qOverload<int>(&QComboBox::activated), this, [this] { targetChosen_ = true; });
+    connect(target_, qOverload<int>(&QComboBox::activated), this, [this] {
+        targetChosen_ = true;
+        chosenTarget_ = target_->currentData().toString();
+    });
+    connect(scope_, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
+        if (request_.id.isEmpty()) return;
+        syncFolderScope();
+        relayout();
+    });
     duration_->view()->window()->installEventFilter(this);
     connect(duration_, qOverload<int>(&QComboBox::activated), this,
             [this](int index) { trace(QString("toastDuration elegido=%1").arg(duration_->itemText(index))); });
@@ -589,6 +603,7 @@ void AccessToast::setRequest(const Request &request) {
         icon_->setPixmap(appIconPixmap(request.path, IconGlyph, qApp->devicePixelRatio()));
         rebuildScopes();
         targetChosen_ = false;
+        chosenTarget_.clear();
         rebuildTargets();
         duration_->setCurrentIndex(0);
         explanation_ = {};
@@ -624,8 +639,9 @@ void AccessToast::setRequest(const Request &request) {
 
 void AccessToast::rebuildTargets() {
     // Lo que eligió el usuario se conserva si sigue estando (el nombre llegó tarde y se agregan opciones). Si ya no
-    // está, se cae a la opción más estrecha, nunca a la app entera.
-    const QString chosen = target_->currentData().toString();
+    // está, se cae a la opción más estrecha, nunca a la app entera. Con una opción de carpeta elegida el destino se ve en
+    // «Any destination», pero lo elegido sigue guardado.
+    const QString chosen = targetChosen_ ? chosenTarget_ : target_->currentData().toString();
     const QSignalBlocker quiet(target_);
     target_->clear();
     const QString host = request_.host;
@@ -644,8 +660,30 @@ void AccessToast::rebuildTargets() {
     if (request_.perDestination) target_->addItem("Any destination (whole app)", QString());
     const int keep = targetChosen_ ? target_->findData(chosen) : -1;
     const int narrowest = targets.isEmpty() ? 0 : target_->findData(targets.first());
-    target_->setCurrentIndex(keep >= 0 ? keep : targetChosen_ ? narrowest : 0);
-    target_->setEnabled(target_->count() > 1);
+    target_->setCurrentIndex(folderScope() ? qMax(0, target_->findData(QString()))
+                             : keep >= 0  ? keep
+                             : targetChosen_ ? narrowest
+                                             : 0);
+    target_->setEnabled(target_->count() > 1 && !folderScope());
+}
+
+bool AccessToast::folderScope() const { return FolderTrust::isFolderScope(scope_->currentData().toString()); }
+
+void AccessToast::syncFolderScope() {
+    const QString scope = scope_->currentData().toString();
+    const bool folder = FolderTrust::isFolderScope(scope);
+    // Sin señales: no cuenta como una elección del usuario (targetChosen_). Si después se elige otra opción, el destino
+    // vuelve a lo que el usuario había elegido.
+    const QSignalBlocker quiet(target_);
+    if (folder) {
+        target_->setCurrentIndex(qMax(0, target_->findData(QString())));
+    } else if (targetChosen_) {
+        const int back = target_->findData(chosenTarget_);
+        if (back >= 0) target_->setCurrentIndex(back);
+    }
+    folderNote_->setText(FolderTrust::note(scope, request_.path));
+    folderNote_->setVisible(folder);
+    updateCounters();
 }
 
 // Firma, destino y quién la lanzó, recortados al ancho actual.
@@ -663,7 +701,7 @@ void AccessToast::renderDestination() {
                             ? "<span style=\"color:#d4a437\">None</span>" + place
                             : "<span style=\"color:#9bbf73\">&#10003;</span> " + request_.signer.toHtmlEscaped() +
                                   place);
-    signature_->setToolTip(full);
+    CustomTooltip::instance()->setToolTip(signature_, full.toHtmlEscaped());
     fit(signature_, value);
 
     const QString kind = FirewallClient::destinationKind(request_.remote);
@@ -705,19 +743,23 @@ void AccessToast::renderKnown() {
 }
 
 void AccessToast::rebuildScopes() {
+    const QSignalBlocker quiet(scope_); // setRequest rehace el alto al final
     scope_->clear();
-    const auto &signer = request_.signer;
-    if (signer.isEmpty()) {
-        scope_->addItem("This file only", "path");
-    } else {
-        scope_->addItem("This app, any version", "app");
-        scope_->addItem("This file only", "path");
-        // Igual que el motor: «todo Microsoft» incluiría herramientas de Windows que descargan archivos.
-        if (!signer.startsWith("Microsoft", Qt::CaseInsensitive)) scope_->addItem("All apps from " + signer, "publisher");
+    // Las mismas opciones que Requests, en el mismo orden: un build sin firma dentro de un repositorio preselecciona el
+    // programa en todo el repositorio («This app in LGA_DayTrace»), así los builds nuevos no vuelven a preguntar.
+    bool repository = false;
+    for (const auto &[text, data] : FolderTrust::scopeChoices(request_.path, request_.signer, request_.perDestination)) {
+        scope_->addItem(text, data);
+        repository = repository || FolderTrust::isFolderScope(data);
     }
     scope_->setCurrentIndex(0);
     scope_->setEnabled(scope_->count() > 1);
-    warnBox_->setVisible(signer.isEmpty());
+    warn_->setText(repository ? QStringLiteral("No signature: the rule can't follow a publisher, only this file or this "
+                                               "app's name inside its repository.")
+                              : QStringLiteral("No signature: a rule can only cover this exact file. If the file "
+                                               "changes, it asks again."));
+    warnBox_->setVisible(request_.signer.isEmpty());
+    syncFolderScope();
 }
 
 void AccessToast::updateCounters() {
@@ -725,7 +767,7 @@ void AccessToast::updateCounters() {
     allow_->setEnabled(request_.canDecide && armed_);
     scope_->setEnabled(request_.canDecide && armed_ && scope_->count() > 1);
     duration_->setEnabled(request_.canDecide && armed_);
-    target_->setEnabled(request_.canDecide && armed_ && target_->count() > 1);
+    target_->setEnabled(request_.canDecide && armed_ && target_->count() > 1 && !folderScope());
     QStringList parts;
     if (request_.attempts > 0)
         parts << (request_.attempts == 1 ? QStringLiteral("1 attempt") : QString("%1 attempts").arg(request_.attempts));
@@ -843,6 +885,7 @@ void AccessToast::relayout() {
     // La píldora y el estado van en una sola línea con su enlace o botón a la derecha.
     suggestion_->setFixedWidth(suggestion_->sizeHint().width());
     layoutChoices();
+    fit(folderNote_, section);
     // Los recuadros internos recalculan su layout recién en el próximo ciclo de eventos: se fuerza ya, de adentro
     // hacia afuera, para que el alto que sigue (también al achicarse con «Less») sea el nuevo.
     const auto boxes = findChildren<QWidget *>();
