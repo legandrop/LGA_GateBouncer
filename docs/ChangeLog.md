@@ -9,6 +9,11 @@ v1.01:
   `GATEBOUNCER_TOAST_TRACE`. El paquete deja de llevar plugins de imagen, SVG y táctiles que no se usan (-1,5 MB).
 - El updater (`libs/lgaupdate` rev 4) habla en el idioma de la app. La versión ya no se sube en cada cambio:
   `bump_version.bat` la sube al publicar, como en Mighty Tools. Logo de la barra a 20 px.
+- Base para paletas de color: los colores seguían fijos en `theme.h` y en las hojas de estilo. Ahora `src/palette.*`
+  los agrupa en 16 roles con un color base cada uno (fondos, bordes, títulos, rótulos del índice, cuatro niveles de
+  texto, acento, interruptores, estados) y deriva los demás tonos en HSL; `Theme::css`/`Theme::color` traducen y la
+  ventana se rearma en vivo. Con la paleta de fábrica todo queda igual. Editor sólo de desarrollo
+  (`GATEBOUNCER_PALETTE_EDITOR=1`) y siete paletas de prueba en `resources/palettes/`.
 
 v1.00:
 - Primera versión publicada. El firewall es `GateBouncerEngine.exe`, un servicio que filtra con WFP en modo usuario:

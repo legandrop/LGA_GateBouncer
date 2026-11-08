@@ -1,6 +1,8 @@
 // Punto de entrada del GateBouncer.exe común (Qt): la ventana del firewall sin driver (FirewallWindow). La ventana
 // vieja (MainWindow) sigue en la etapa del lanzador protegido. El motor se instala aparte (GateBouncerEngine.exe).
 #include "bootstrap.h"
+#include "dev/paletteeditor.h"
+#include "palette.h"
 #include "firewallwindow.h"
 #include "i18n.h"
 #include "uiscale.h"
@@ -22,6 +24,7 @@ namespace {
 // row:<fila> (clic en una fila de la tabla),
 // click:<objectName> (botón), shot:<archivo.png>, toastshot:<archivo.png> (el aviso fijo),
 // toastclick:<objectName> (botón del aviso fijo), type:<objectName>=<texto> (un campo; «%2C» es una coma),
+// palette:<archivo.json> (cambia la paleta en vivo; vacío = la de fábrica), editorshot:<archivo.png> (el editor),
 // combo:<objectName>=<índice> (un desplegable de la ventana o del aviso, elegido como lo haría el usuario: también
 // emite activated) y dialogshot:<archivo.png> (el diálogo abierto).
 // Al terminar los pasos sale. GATEBOUNCER_QA_LANGUAGE=es|en elige el idioma de la corrida (no se guarda).
@@ -54,6 +57,16 @@ void runSteps(Gate::FirewallWindow *window, QStringList steps) {
         auto *target = toast ? toast->findChild<QAbstractButton *>(step.mid(11)) : nullptr;
         if (target && target->isEnabled()) target->click();
         else std::fprintf(stderr, "QA: botón del aviso ausente o deshabilitado: %s\n", qPrintable(step));
+    } else if (step.startsWith("editorshot:")) {
+        // El editor de paletas (GATEBOUNCER_PALETTE_EDITOR=1).
+        for (auto *w : QApplication::topLevelWidgets())
+            if (w->objectName() == "paletteEditor" && w->isVisible()) w->grab().save(step.mid(11));
+    } else if (step.startsWith("palette:")) {
+        // Cambia la paleta en vivo (lo mismo que hace el editor): «palette:» solo vuelve a la de fábrica.
+        Gate::Palette::Data data = Gate::Palette::factory();
+        if (step.size() > 8 && !Gate::Palette::load(step.mid(8), &data))
+            std::fprintf(stderr, "QA: paleta ilegible: %s\n", qPrintable(step));
+        Gate::Palette::apply(data);
     } else if (step.startsWith("view:")) {
         window->selectView(step.mid(5));
     } else if (step.startsWith("size:")) {
@@ -123,8 +136,11 @@ int main(int argc, char **argv) {
     const bool qa = !qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") || !qEnvironmentVariableIsEmpty("LGA_HEADLESS_DESKTOP");
     const QString instanceName = "LGA.GateBouncer.Window." + qEnvironmentVariable("USERNAME");
     const bool minimized = app.arguments().contains("--start-minimized");
+    // Desarrollo: GATEBOUNCER_PALETTE_EDITOR=1 abre el editor de paletas junto a la ventana. Corre al lado de la
+    // instalada (no toma la instancia única) y no busca actualizaciones.
+    const bool paletteEditor = !qEnvironmentVariableIsEmpty("GATEBOUNCER_PALETTE_EDITOR");
     QLocalServer instance;
-    if (!qa) {
+    if (!qa && !paletteEditor) {
         // El mutex decide de forma atómica quién es la primera instancia de esta sesión de Windows. Un relanzamiento
         // (cambio de zoom o idioma) espera hasta 10 s a que la ventana anterior termine de cerrarse.
         const bool relaunch = app.arguments().contains("--relaunch");
@@ -155,6 +171,12 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "No se pudo cargar la fuente del producto.\n");
         return 2;
     }
+    // Desarrollo y QA: GATEBOUNCER_PALETTE=<archivo .json> arranca con esa paleta (el editor la puede cambiar).
+    if (const QString file = qEnvironmentVariable("GATEBOUNCER_PALETTE"); !file.isEmpty()) {
+        Gate::Palette::Data data;
+        if (Gate::Palette::load(file, &data)) Gate::Palette::apply(data);
+        Gate::applyPalette(app);
+    }
     Gate::FirewallWindow window;
     QObject::connect(&instance, &QLocalServer::newConnection, &window, [&instance, &window] {
         while (auto *client = instance.nextPendingConnection()) {
@@ -163,5 +185,10 @@ int main(int argc, char **argv) {
         }
     });
     window.startLifecycle(Gate::Lifecycle::makeNativeTraySurface(), minimized);
+    std::unique_ptr<Gate::PaletteEditor> editor;
+    if (paletteEditor) {
+        editor = std::make_unique<Gate::PaletteEditor>(Gate::PaletteEditor::folderFromEnvironment());
+        editor->show();
+    }
     return app.exec();
 }

@@ -3,10 +3,24 @@
 #include <QFontInfo>
 #include <QIcon>
 #include <QPalette>
+#include "palette.h"
 
 namespace Gate {
 static QString family;
 QString embeddedFontFamily() { return family; }
+// La paleta de Qt (lo que no pinta la hoja de estilo) con los colores de la paleta elegida.
+void applyPalette(QApplication &app) {
+    QPalette palette;
+    palette.setColor(QPalette::Window, Palette::map("#17171B"));
+    palette.setColor(QPalette::Base, Palette::map("#15151A"));
+    palette.setColor(QPalette::WindowText, Palette::map("#C4C3C9"));
+    palette.setColor(QPalette::Text, Palette::map("#C4C3C9"));
+    palette.setColor(QPalette::ButtonText, Palette::map("#E3E1DA"));
+    palette.setColor(QPalette::Button, Palette::map("#2A2A31"));
+    palette.setColor(QPalette::Highlight, Palette::map("#25223B"));
+    palette.setColor(QPalette::HighlightedText, Palette::map("#ECE9E2"));
+    app.setPalette(palette);
+}
 bool initialize(QApplication &app) {
     app.setApplicationName("LGA GateBouncer");
     app.setOrganizationName("LGA");
@@ -33,16 +47,7 @@ bool initialize(QApplication &app) {
     if (!QFontInfo(font).family().startsWith("Inter"))
         return false;
     app.setWindowIcon(QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png"));
-    QPalette palette;
-    palette.setColor(QPalette::Window, QColor("#17171B"));
-    palette.setColor(QPalette::Base, QColor("#15151A"));
-    palette.setColor(QPalette::WindowText, QColor("#C4C3C9"));
-    palette.setColor(QPalette::Text, QColor("#C4C3C9"));
-    palette.setColor(QPalette::ButtonText, QColor("#E3E1DA"));
-    palette.setColor(QPalette::Button, QColor("#2A2A31"));
-    palette.setColor(QPalette::Highlight, QColor("#25223B"));
-    palette.setColor(QPalette::HighlightedText, QColor("#ECE9E2"));
-    app.setPalette(palette);
+    applyPalette(app);
     app.setStyleSheet(R"(
         QWidget { color: #b2b2b2; font-family: 'Inter'; font-size: 13px; }
         QMainWindow, QWidget#root, QWidget#workspace, QWidget#page { background: #161616; }

@@ -1,0 +1,22 @@
+{
+    "name": "Pizarra cálida y turquesa",
+    "liked": false,
+    "colors": {
+        "desk": "#100F0D",
+        "sheet": "#191715",
+        "card": "#211F1C",
+        "control": "#2C2A26",
+        "border": "#322F2B",
+        "title": "#F4EFE6",
+        "section": "#6FC3C3",
+        "ink1": "#E8E3DA",
+        "ink2": "#C7C1B7",
+        "ink3": "#928C83",
+        "ink4": "#6F6A62",
+        "accent": "#1D6F75",
+        "switch": "#3FC6C9",
+        "ok": "#3FC6C9",
+        "warn": "#F2CB3F",
+        "error": "#F0645C"
+    }
+}

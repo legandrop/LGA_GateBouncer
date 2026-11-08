@@ -1,5 +1,6 @@
 #include "firewallwindow.h"
 #include "appicon.h"
+#include "bootstrap.h"
 #include "customtooltip.h"
 #include "explain/KnownApps.h"
 #include "folder_rule.h"
@@ -74,12 +75,12 @@ QWidget#fwWorkspace, QWidget#fwPage, QScrollArea#fwScroll, QScrollArea#fwScroll 
 QScrollArea#fwScroll { border: 0; }
 QFrame#fwTitle { background: #0D0D0F; border: 0; }
 QLabel { background: transparent; }
-QLabel[r="appname"] { color: #ECE9E2; font-family: @title; font-size: 14px; font-weight: 700; }
-QLabel[r="big"] { color: #ECE9E2; font-family: @title; font-size: 34px; font-weight: 800; }
+QLabel[r="appname"] { color: @color(title); font-family: @title; font-size: 14px; font-weight: 700; }
+QLabel[r="big"] { color: @color(title); font-family: @title; font-size: 34px; font-weight: 800; }
 QLabel[r="desc"] { color: #A6A5AC; font-size: 13.5px; }
-QLabel[r="cardtitle"] { color: #ECE9E2; font-family: @title; font-size: 16px; font-weight: 700; }
-QLabel[r="midtitle"] { color: #ECE9E2; font-family: @title; font-size: 24px; font-weight: 800; }
-QLabel[r="brand"] { color: #ECE9E2; font-family: @title; font-size: 15px; font-weight: 700; }
+QLabel[r="cardtitle"] { color: @color(title); font-family: @title; font-size: 16px; font-weight: 700; }
+QLabel[r="midtitle"] { color: @color(title); font-family: @title; font-size: 24px; font-weight: 800; }
+QLabel[r="brand"] { color: @color(title); font-family: @title; font-size: 15px; font-weight: 700; }
 QLabel[r="strong"] { color: #E3E1DA; font-size: 14px; font-weight: 500; }
 QLabel[r="body"] { color: #C4C3C9; font-size: 13px; }
 QLabel[r="value"] { color: #E3E1DA; font-size: 13px; }
@@ -88,8 +89,8 @@ QLabel[r="small"] { color: #9C9BA2; font-size: 12.5px; }
 QLabel[r="faint"] { color: #8C8B93; font-size: 12px; }
 QLabel[r="colhead"] { color: #8C8B93; font-size: 11.5px; }
 QLabel[r="label"] { color: #8C8B93; font-size: 11px; font-weight: 600; }
-QLabel[r="section"] { color: #8C8B93; font-size: 11px; font-weight: 600; }
-QLabel[r="stat"] { color: #ECE9E2; font-family: @title; font-size: 30px; font-weight: 800; }
+QLabel[r="section"] { color: @color(section); font-size: 11px; font-weight: 600; }
+QLabel[r="stat"] { color: @color(title); font-family: @title; font-size: 30px; font-weight: 800; }
 QLabel[r="ok"] { color: #4CC9EE; font-size: 12.5px; }
 QLabel[r="warn"] { color: #F2CB3F; font-size: 12.5px; }
 QLabel[r="bad"] { color: #F0645C; font-size: 12.5px; }
@@ -100,7 +101,7 @@ QLabel[r="sidestatus"] { color: #8C8B93; font-size: 12px; }
 QLabel[r="sidestatus"][tone="ok"] { color: #4CC9EE; }
 QLabel[r="sidestatus"][tone="warn"] { color: #F2CB3F; }
 QLabel[r="sidestatus"][tone="bad"] { color: #F0645C; }
-QLabel[r="hownumber"] { color: #ECE9E2; font-family: @title; font-size: 19px; font-weight: 800; }
+QLabel[r="hownumber"] { color: @color(title); font-family: @title; font-size: 19px; font-weight: 800; }
 QLabel[r="howtitle"] { color: #DCDAD3; font-size: 13px; font-weight: 600; }
 QLabel[r="howstep"] { color: #C4C3C9; font-size: 13.5px; }
 QLabel[r="note"] { color: #F2CB3F; font-size: 12.5px; background: rgba(242,203,63,15); border: 1px solid #5A4E26; border-radius: 8px; padding: 8px 10px; }
@@ -317,7 +318,7 @@ class Combo final : public QComboBox {
         sp.end();
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
-        p.setPen(QPen(QColor(isEnabled() ? "#9C9BA2" : "#5E5D66"), 1.2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+        p.setPen(QPen(Theme::color(isEnabled() ? "#9C9BA2" : "#5E5D66"), 1.2, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
         const QPointF c(width() - 12, height() / 2.0);
         QPainterPath chevron;
         chevron.moveTo(c + QPointF(-3, -1.5));
@@ -653,7 +654,7 @@ class RuleRowDelegate final : public QStyledItemDelegate {
         if (kind == "app") {
             const QRect tile(area.left(), area.center().y() - 14, 30, 30);
             painter->setPen(Qt::NoPen);
-            painter->setBrush(QColor("#2A2A31"));
+            painter->setBrush(Theme::color("#2A2A31"));
             painter->drawRoundedRect(tile, 7, 7);
             const qreal dpr = painter->device()->devicePixelRatioF();
             const QPixmap icon = AppIcons::get(index.data(RoleIconPath).toString(), 20, dpr);
@@ -674,11 +675,11 @@ class RuleRowDelegate final : public QStyledItemDelegate {
             const int indent = fm.horizontalAdvance(QLatin1Char('x')) / 2, pad = 1 + 8 + indent;
             const int w = qMin(area.width(), fm.horizontalAdvance(value) + 2 * pad);
             const QRectF box(area.left() + 0.5, area.center().y() - 10.5, w - 1, 22);
-            painter->setPen(QPen(QColor(c[1]), 1));
-            painter->setBrush(c[0].isEmpty() ? QBrush(Qt::NoBrush) : QBrush(QColor(c[0])));
+            painter->setPen(QPen(Palette::map(c[1]), 1));
+            painter->setBrush(c[0].isEmpty() ? QBrush(Qt::NoBrush) : QBrush(Palette::map(c[0])));
             painter->drawRoundedRect(box, 4, 4);
             painter->setFont(f);
-            painter->setPen(QColor(c[2]));
+            painter->setPen(Palette::map(c[2]));
             painter->drawText(QRectF(area.left() + pad, box.top(), w - 2 * pad, box.height()),
                               Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine,
                               fm.elidedText(value, Qt::ElideRight, w - 2 * pad));
@@ -717,16 +718,16 @@ class RuleRowDelegate final : public QStyledItemDelegate {
             const int half = (area.height() - 1) / 2;
             const auto mode = Qt::TextElideMode(index.data(RoleElide).toInt());
             if (subtitle.isEmpty()) {
-                out.push_back({index.data(RoleText).toString(), titleFont, QColor("#E3E1DA"), QRect(left, area.top(), width, area.height())});
+                out.push_back({index.data(RoleText).toString(), titleFont, Theme::color("#E3E1DA"), QRect(left, area.top(), width, area.height())});
             } else {
-                out.push_back({index.data(RoleText).toString(), titleFont, QColor("#E3E1DA"), QRect(left, area.top(), width, half)});
-                out.push_back({subtitle, subFont, QColor("#8C8B93"),
+                out.push_back({index.data(RoleText).toString(), titleFont, Theme::color("#E3E1DA"), QRect(left, area.top(), width, half)});
+                out.push_back({subtitle, subFont, Theme::color("#8C8B93"),
                                QRect(left, area.top() + half + 1, width, area.height() - half - 1),
                                Qt::AlignLeft | Qt::AlignVCenter, mode});
             }
         } else if (kind == "text" || kind == "time") {
             out.push_back({index.data(RoleText).toString(), roleFont(option.font, 12.5, QFont::Normal),
-                           QColor(kind == "time" ? "#8C8B93" : "#9C9BA2"), area,
+                           Theme::color(kind == "time" ? "#8C8B93" : "#9C9BA2"), area,
                            (kind == "time" ? Qt::AlignRight : Qt::AlignLeft) | Qt::AlignVCenter});
         }
         return out;
@@ -1082,8 +1083,8 @@ class ChromeButton final : public QAbstractButton {
             return;
         }
         if (hover) {
-            p.fillRect(rect(), QColor(kind_ == "close" ? "#C42B1C" : "#1B1B20"));
-            ink = QColor(kind_ == "close" ? "#FFFFFF" : Theme::kTextStrong);
+            p.fillRect(rect(), kind_ == "close" ? QColor("#C42B1C") : Theme::color("#1B1B20"));
+            ink = kind_ == "close" ? QColor("#FFFFFF") : Theme::color(Theme::kTextStrong);
         }
         p.setPen(QPen(ink, 1.2));
         p.setBrush(Qt::NoBrush);
@@ -1121,7 +1122,7 @@ class StripHeader final : public QAbstractButton {
 // El resaltado de un paso (<b>…</b>) va en el blanco de los títulos.
 QString stepHtml(const QString &html) {
     QString out = html;
-    out.replace("<b>", QString("<span style=\"color:%1; font-weight:600;\">").arg(Theme::kTextBright));
+    out.replace("<b>", QString("<span style=\"color:%1; font-weight:600;\">").arg(Theme::hex(Theme::kTextBright)));
     out.replace("</b>", "</span>");
     return out;
 }
@@ -1193,7 +1194,7 @@ class SideItem final : public QWidget {
             p.drawRoundedRect(QRectF(tabRect()).adjusted(0, 1, -4, -1), kTabRadius, kTabRadius);
         }
         drawIcon(p, icon_, QRectF(kTabInset + 12, (height() - 20) / 2.0, 20, 20),
-                 QColor(selected_ ? Theme::kTextBright : "#CFCDD4"));
+                 Theme::color(selected_ ? Theme::kTextBright : "#CFCDD4"));
     }
     void mouseReleaseEvent(QMouseEvent *e) override {
         // Un clic que empezó en el switch (deshabilitado o soltado fuera) no navega: el switch no es la fila.
@@ -1283,7 +1284,19 @@ FirewallWindow::FirewallWindow(QWidget *parent) : QMainWindow(parent) {
     QSize saved = tableStore().value("window/size", QSize(1100, 720)).toSize();
     if (const QScreen *screen = QGuiApplication::primaryScreen()) saved = saved.boundedTo(screen->availableGeometry().size());
     resize(saved.expandedTo(minimumSize()));
-    setStyleSheet(Theme::css(kStyle));
+    Theme::sheet(this, kStyle);
+    // Otra paleta (el editor de desarrollo, por ahora): las hojas se vuelven a traducir y la vista se rearma, porque los
+    // textos con color propio se arman al construirla. Un arrastre del selector manda muchos cambios: van juntos.
+    auto *paletteTimer = new QTimer(this);
+    paletteTimer->setSingleShot(true);
+    paletteTimer->setInterval(30);
+    connect(Palette::Notifier::instance(), &Palette::Notifier::changed, paletteTimer, qOverload<>(&QTimer::start));
+    connect(paletteTimer, &QTimer::timeout, this, [this] {
+        applyPalette(*qApp);
+        Theme::reapplySheets();
+        render(true);
+        for (QWidget *w : QApplication::allWidgets()) w->update();
+    });
     howOpen_ = rememberSizes() && tableStore().value("window/howItWorks", false).toBool();
     buildShell();
     static_cast<ChromeButton *>(helpButton_.data())->setActive(howOpen_);
@@ -1373,7 +1386,7 @@ void FirewallWindow::buildShell() {
     bl->addSpacing(6);
     auto *sep = new QFrame;
     sep->setFixedSize(1, 14);
-    sep->setStyleSheet(QString("background: %1;").arg(Theme::kDivider));
+    Theme::sheet(sep, QString("background: %1;").arg(Theme::kDivider));
     bl->addWidget(sep);
     bl->addSpacing(4);
     const struct { const char *kind, *name; QString access; } chrome[] = {
@@ -1733,7 +1746,7 @@ void FirewallWindow::trustFolderDialog(const QString &folder, const QString &nam
     auto *d = new QDialog(this, Qt::Dialog | Qt::FramelessWindowHint);
     d->setObjectName("trust-folder-dialog");
     d->setAttribute(Qt::WA_DeleteOnClose);
-    d->setStyleSheet("QDialog { background: #17171B; border: 1px solid #2E2E36; }");
+    Theme::sheet(d, "QDialog { background: #17171B; border: 1px solid #2E2E36; }");
     constexpr int Wide = 470;
     auto *l = column(d, 18, 8);
     l->addWidget(text(I18n::tr("Trust a folder"), "cardtitle"));
@@ -1879,7 +1892,7 @@ QWidget *FirewallWindow::overviewPage() {
     auto *dot = new QLabel;
     dot->setFixedSize(8, 8);
     const char *tone = !s.connected ? Theme::kError : (s.ask && s.allApps) ? Theme::kOk : Theme::kWarn;
-    dot->setStyleSheet(QString("background: %1; border-radius: 4px;").arg(tone));
+    Theme::sheet(dot, QString("background: %1; border-radius: 4px;").arg(tone));
     sh->addWidget(dot, 0, Qt::AlignVCenter);
     sh->addSpacing(3);
     auto *st = new QVBoxLayout;
@@ -1905,7 +1918,7 @@ QWidget *FirewallWindow::overviewPage() {
         sub = parts.join(" · ");
     }
     auto *stt = text(title, "strong");
-    stt->setStyleSheet(QString("color: %1; font-weight: 600;").arg(Theme::kTextBright));
+    Theme::sheet(stt, QString("color: %1; font-weight: 600;").arg(Theme::kTextBright));
     st->addWidget(stt);
     st->addWidget(text(sub, "sub", true));
     sh->addLayout(st, 1);
@@ -1998,7 +2011,7 @@ QWidget *FirewallWindow::overviewPage() {
         if (!pending.isEmpty()) {
             wl->addWidget(divider());
             wl->addSpacing(10);
-            const QString em = QString("<span style='color:%1;font-weight:500'>").arg(Theme::kTextStrong);
+            const QString em = QString("<span style='color:%1;font-weight:500'>").arg(Theme::hex(Theme::kTextStrong));
             auto *tip = new QLabel(I18n::tr("Block and Allow here use the choices the notice would preselect: "
                                             "%1this app, any version</span> when it is signed, %1this app in its "
                                             "repository</span> for an unsigned build inside a Git repository, %1this "
@@ -2231,8 +2244,8 @@ QWidget *FirewallWindow::requestCard(const FirewallClient::PendingItem &p, bool 
     info->addWidget(name);
     const QString signature =
         p.signer.isEmpty()
-            ? QString("<span style='color:%1;font-weight:500'>%2</span>").arg(Theme::kWarn, I18n::tr("Not signed").toHtmlEscaped())
-            : QString("<span style='color:%1;font-weight:500'>%2</span>").arg(Theme::kOk, p.signer.toHtmlEscaped());
+            ? QString("<span style='color:%1;font-weight:500'>%2</span>").arg(Theme::hex(Theme::kWarn), I18n::tr("Not signed").toHtmlEscaped())
+            : QString("<span style='color:%1;font-weight:500'>%2</span>").arg(Theme::hex(Theme::kOk), p.signer.toHtmlEscaped());
     // La firma en color y, recortados al medio si no entran, la carpeta y los intentos (una sola línea).
     auto *metaRow = row(0);
     auto *signed_ = new QLabel(signature + " · ");
@@ -3300,7 +3313,7 @@ QWidget *FirewallWindow::settingsPage() {
                                     "GateBouncer off completely, run %1 as administrator.")
                                .arg(QString("<span style=\"background:%1; color:%2; font-weight:600;\">&nbsp;"
                                             "GateBouncerEngine.exe --remove-filters&nbsp;</span>")
-                                        .arg(Theme::kTile, Theme::kTextStrong)));
+                                        .arg(Theme::hex(Theme::kTile), Theme::hex(Theme::kTextStrong))));
     off->setProperty("r", "sub");
     off->setWordWrap(true);
     fl->addWidget(off);
@@ -3928,7 +3941,7 @@ void FirewallWindow::startLifecycle(std::unique_ptr<Lifecycle::TraySurface> tray
 int FirewallWindow::updateDialog(QWidget *parent, const LgaUpdateDialogSpec &spec) {
     QDialog d(parent, Qt::Dialog | Qt::FramelessWindowHint);
     d.setObjectName("update-dialog");
-    d.setStyleSheet("QDialog { background: #17171B; border: 1px solid #2E2E36; }");
+    Theme::sheet(&d, "QDialog { background: #17171B; border: 1px solid #2E2E36; }");
     constexpr int Wide = 470;
     auto *l = column(&d, 18, 8);
     l->addWidget(text(spec.title, "cardtitle"));
@@ -3948,7 +3961,7 @@ int FirewallWindow::updateDialog(QWidget *parent, const LgaUpdateDialogSpec &spe
         box->setWidget(notes);
         box->setWidgetResizable(true);
         box->setFixedSize(Wide, 200);
-        box->setStyleSheet("QScrollArea#update-notes { background: #15151A; border: 1px solid #2F2F37; border-radius: 6px; }");
+        Theme::sheet(box, "QScrollArea#update-notes { background: #15151A; border: 1px solid #2F2F37; border-radius: 6px; }");
         l->addWidget(box);
     }
     if (!spec.details.isEmpty()) {
@@ -3983,7 +3996,9 @@ int FirewallWindow::updateDialog(QWidget *parent, const LgaUpdateDialogSpec &spe
 
 void FirewallWindow::setupUpdates() {
     // Las corridas de QA no buscan actualizaciones.
-    if (!qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") || !qEnvironmentVariableIsEmpty("LGA_HEADLESS_DESKTOP")) return;
+    if (!qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") || !qEnvironmentVariableIsEmpty("LGA_HEADLESS_DESKTOP") ||
+        !qEnvironmentVariableIsEmpty("GATEBOUNCER_PALETTE_EDITOR"))
+        return;
     LgaUpdateConfig config;
     config.productId = "LGA_GateBouncer";
     config.displayName = "LGA GateBouncer";

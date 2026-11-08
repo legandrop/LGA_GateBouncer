@@ -1,0 +1,22 @@
+{
+    "name": "Grafito y ámbar",
+    "liked": false,
+    "colors": {
+        "desk": "#0E0E0E",
+        "sheet": "#171717",
+        "card": "#1F1F1F",
+        "control": "#2A2A2A",
+        "border": "#2F2F2F",
+        "title": "#F3EEE4",
+        "section": "#C79A5B",
+        "ink1": "#E6E2DA",
+        "ink2": "#C3C0B9",
+        "ink3": "#8F8C86",
+        "ink4": "#6D6A65",
+        "accent": "#8F4E17",
+        "switch": "#E39A3B",
+        "ok": "#3FC59A",
+        "warn": "#F2CB3F",
+        "error": "#F0645C"
+    }
+}

@@ -1,9 +1,13 @@
 #pragma once
+#include <QApplication>
 #include <QColor>
+#include <QVariant>
+#include <QWidget>
 #include <QFont>
 #include <QFontDatabase>
 #include <QRegularExpression>
 #include <QString>
+#include "palette.h"
 
 // Tokens del Pliego (los de src/ui/Theme.h de LGA Mighty Tools) con el acento violeta de las apps LGA en lugar del
 // magenta: botón principal, links, selección y ayuda abierta. Cian = funciona, amarillo = pide atención, rojo = error.
@@ -63,7 +67,12 @@ inline constexpr const char *kSwitchKnobOn = "#4CC9EE";
 inline constexpr const char *kKeyBorder = "#3B3B44";
 inline constexpr const char *kKeyBottom = "#0F0F12";
 
-inline QColor color(const char *token) { return QColor(QString::fromLatin1(token)); }
+// Con la paleta elegida (palette.h): los tokens guardan el valor de fábrica y se traducen al usarlos.
+inline QColor color(const char *token) { return Palette::map(QString::fromLatin1(token)); }
+inline QColor colorIn(const char *roleId, const char *token) {
+    return Palette::mapIn(QString::fromLatin1(roleId), QString::fromLatin1(token));
+}
+inline QString hex(const char *token) { return Palette::hex(QString::fromLatin1(token)); }
 
 // Títulos en Bricolage Grotesque (tres pesos embebidos); si no cargó, Inter SemiBold.
 inline bool hasTitleFamily() { return QFontDatabase::families().contains(QStringLiteral("Bricolage Grotesque")); }
@@ -91,7 +100,19 @@ inline QString css(QString sheet) {
         last = m.capturedEnd();
     }
     out += sheet.mid(last);
-    return out.replace(QStringLiteral("@title"), titleFamilyCss());
+    return Palette::remapSheet(out.replace(QStringLiteral("@title"), titleFamilyCss()));
+}
+
+// Pone una hoja en un widget y guarda la de fábrica: al cambiar la paleta, reapplySheets() la vuelve a traducir.
+inline void sheet(QWidget *widget, const QString &raw) {
+    widget->setProperty("gbSheet", raw);
+    widget->setStyleSheet(css(raw));
+}
+inline void reapplySheets() {
+    for (QWidget *w : QApplication::allWidgets()) {
+        const QVariant raw = w->property("gbSheet");
+        if (raw.isValid()) w->setStyleSheet(css(raw.toString()));
+    }
 }
 
 } // namespace Gate::Theme

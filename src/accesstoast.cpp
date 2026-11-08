@@ -176,7 +176,7 @@ class ScopeCombo final : public QComboBox {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
         const bool on = isEnabled();
-        p.setPen(QColor(on && underMouse() ? PickHoverBorder : Theme::kFieldBorder));
+        p.setPen(Theme::color(on && underMouse() ? PickHoverBorder : Theme::kFieldBorder));
         p.setBrush(Theme::color(Theme::kField));
         p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6);
         p.setFont(font());
@@ -262,11 +262,11 @@ QString toastSheet() {
         #accessToast QLabel, #accessToast QPushButton, #accessToast QComboBox { background:transparent; border:0;
             color:%text%; font-family:'Inter'; font-size:13px; font-weight:400; padding:0; }
         #accessToast QPushButton { min-height:0; }
-        #accessToast QLabel#toastHeader { font-family:@title; font-size:13px; font-weight:700; color:%textBright%; }
+        #accessToast QLabel#toastHeader { font-family:@title; font-size:13px; font-weight:700; color:@color(title); }
         #accessToast QLabel#toastAppIcon { background:%tile%; border-radius:8px; }
         #accessToast QPushButton#toastMenu, #accessToast QPushButton#toastClose { border-radius:6px; }
         #accessToast QPushButton#toastMenu:hover, #accessToast QPushButton#toastClose:hover { background:%rowHover%; }
-        #accessToast QLabel#toastTitle { font-family:@title; font-size:16px; font-weight:700; color:%textBright%; }
+        #accessToast QLabel#toastTitle { font-family:@title; font-size:16px; font-weight:700; color:@color(title); }
         #accessToast QLabel#toastBody { font-size:12.5px; color:%textCaption%; }
         #accessToast QWidget#toastWarn { background:rgba(242,203,63,15); border:1px solid %warnBorder%;
             border-radius:8px; }
@@ -363,7 +363,7 @@ QString toastSheet() {
         {"%blockHoverBorder%", BlockHoverBorder},
     };
     for (const auto &[name, value] : tokens) s.replace(QLatin1String(name), QLatin1String(value));
-    return css(s);
+    return s;
 }
 } // namespace
 
@@ -378,7 +378,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     setMouseTracking(true);
     width_ = Width;
     setFixedWidth(Width);
-    setStyleSheet(toastSheet());
+    Theme::sheet(this, toastSheet());
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -465,7 +465,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     infoBox_ = noteBox("toastInfo", info_, Qt::RichText);
     info_->setText(I18n::tr("Allow or Block applies to this server only. Choose <b style=\"color:%1\">Any destination "
                             "(whole app)</b> in the menu to replace its server rules.")
-                       .arg(Theme::kTextStrong));
+                       .arg(Theme::hex(Theme::kTextStrong)));
 
     // Datos en grilla bajo una línea: firma, a dónde quería ir y quién la lanzó.
     auto *line = new QWidget(this);
@@ -808,9 +808,9 @@ void AccessToast::renderDestination() {
     // entra; la ruta entera va en el tooltip de las dos.
     signature_->setText(request_.signer.isEmpty()
                             ? QString("<span style=\"color:%1; font-weight:500\">%2</span>")
-                                  .arg(Theme::kWarn, I18n::tr("Not signed").toHtmlEscaped())
+                                  .arg(Theme::hex(Theme::kWarn), I18n::tr("Not signed").toHtmlEscaped())
                             : I18n::tr("<span style=\"color:%1; font-weight:500\">%2</span> · valid")
-                                  .arg(QLatin1String(Theme::kOk), request_.signer.toHtmlEscaped()));
+                                  .arg(Theme::hex(Theme::kOk), request_.signer.toHtmlEscaped()));
     CustomTooltip::instance()->setToolTip(signature_, full.toHtmlEscaped());
     fit(signature_, value);
     signatureDetail_->setFixedWidth(value);

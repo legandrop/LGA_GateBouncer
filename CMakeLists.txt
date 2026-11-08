@@ -73,6 +73,8 @@ qt_add_library(GateBouncerGuiStage SHARED
     src/toggleswitch.cpp
     src/toggleswitch.h
     src/theme.h
+    src/palette.cpp
+    src/palette.h
     src/productcontroller.cpp
     src/productcontroller.h
     src/engine/EngineViewClient.cpp
@@ -167,7 +169,8 @@ if(GATEBOUNCER_TOAST_TEST_SOURCE)
     find_package(Qt6 6.8 REQUIRED COMPONENTS Test)
     qt_add_executable(GateBouncerToastTests "${GATEBOUNCER_TOAST_TEST_SOURCE}" src/accesstoast.cpp src/accesstoast.h
         src/appicon.cpp src/appicon.h src/engine/FirewallClient.cpp src/engine/FirewallClient.h
-        src/customtooltip.cpp src/customtooltip.h src/foldertrust.cpp src/foldertrust.h engine/folder_rule.cpp)
+        src/customtooltip.cpp src/customtooltip.h src/foldertrust.cpp src/foldertrust.h engine/folder_rule.cpp
+        src/palette.cpp src/palette.h)
     target_include_directories(GateBouncerToastTests PRIVATE src engine)
     target_link_libraries(GateBouncerToastTests PRIVATE Qt6::Widgets Qt6::Network Qt6::Test gatebouncer_explain
         gatebouncer_i18n)
@@ -179,7 +182,9 @@ set_target_properties(GateBouncerGuiStage PROPERTIES PREFIX "" AUTOMOC ON)
 get_target_property(gatebouncer_app_sources GateBouncerGuiStage SOURCES)
 list(FILTER gatebouncer_app_sources EXCLUDE REGEX "deployment_ordinary_stage.cpp|src/main.cpp")
 qt_add_executable(GateBouncer WIN32 ${gatebouncer_app_sources} src/app_main.cpp src/firewallwindow.cpp src/firewallwindow.h
-    src/platform/WindowFrame.h src/platform/WindowFrameWin.cpp src/uiscale.cpp src/uiscale.h)
+    src/platform/WindowFrame.h src/platform/WindowFrameWin.cpp src/uiscale.cpp src/uiscale.h
+    # Editor de paletas, sólo con GATEBOUNCER_PALETTE_EDITOR=1 (desarrollo).
+    src/dev/paletteeditor.cpp src/dev/paletteeditor.h src/dev/LgaColorPickerDialog.cpp src/dev/LgaColorPickerDialog.h)
 target_include_directories(GateBouncer PRIVATE src common engine)
 target_link_libraries(GateBouncer PRIVATE Qt6::Widgets Qt6::Network gatebouncer_explain gatebouncer_data gatebouncer_assistance
     gatebouncer_assistance_ui gatebouncer_general_live gatebouncer_service_view_ui gatebouncer_wire

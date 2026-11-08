@@ -1,0 +1,22 @@
+{
+    "name": "Niebla (menos negro)",
+    "liked": false,
+    "colors": {
+        "desk": "#18181C",
+        "sheet": "#202025",
+        "card": "#28282E",
+        "control": "#33333B",
+        "border": "#3A3A43",
+        "title": "#F2EFE8",
+        "section": "#A9A1D8",
+        "ink1": "#E8E6E0",
+        "ink2": "#CBCAD0",
+        "ink3": "#9998A0",
+        "ink4": "#7A7982",
+        "accent": "#4A3F9C",
+        "switch": "#4CC9EE",
+        "ok": "#4CC9EE",
+        "warn": "#F2CB3F",
+        "error": "#F0645C"
+    }
+}

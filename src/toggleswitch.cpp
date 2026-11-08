@@ -13,12 +13,12 @@
 namespace {
 // Colores del interruptor del Pliego de Mighty Tools (Theme.h: kSwitchOn, kSwitchOnBorder, kSwitchOff,
 // kSwitchOffBorder, kSwitchKnobOff, kSwitchKnobOn): prendido es cian, el color de lo que funciona.
-const QColor kOnFill(Gate::Theme::kSwitchOn);
-const QColor kOnBorder(Gate::Theme::kSwitchOnBorder);
-const QColor kOffFill(Gate::Theme::kSwitchOff);
-const QColor kOffBorder(Gate::Theme::kSwitchOffBorder);
-const QColor kKnobOff(Gate::Theme::kSwitchKnobOff);
-const QColor kKnobOn(Gate::Theme::kSwitchKnobOn);
+QColor kOnFill() { return Gate::Theme::colorIn("switch", Gate::Theme::kSwitchOn); }
+QColor kOnBorder() { return Gate::Theme::colorIn("switch", Gate::Theme::kSwitchOnBorder); }
+QColor kOffFill() { return Gate::Theme::color(Gate::Theme::kSwitchOff); }
+QColor kOffBorder() { return Gate::Theme::color(Gate::Theme::kSwitchOffBorder); }
+QColor kKnobOff() { return Gate::Theme::color(Gate::Theme::kSwitchKnobOff); }
+QColor kKnobOn() { return Gate::Theme::colorIn("switch", Gate::Theme::kSwitchKnobOn); }
 // Deshabilitado: Mighty Tools no lo dibuja distinto; aca hay consentimientos que esperan un estado, asi que el
 // switch entero se atenua para que no parezca disponible.
 constexpr qreal kDisabledOpacity = 0.4;
@@ -118,11 +118,11 @@ void ToggleSwitch::paintEvent(QPaintEvent *) {
         painter.setOpacity(kDisabledOpacity);
     const QRectF box = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
     const qreal radius = box.height() / 2.0;
-    painter.setPen(QPen(mix(kOffBorder, kOnBorder, tint_), 1.0));
-    painter.setBrush(mix(kOffFill, kOnFill, tint_));
+    painter.setPen(QPen(mix(kOffBorder(), kOnBorder(), tint_), 1.0));
+    painter.setBrush(mix(kOffFill(), kOnFill(), tint_));
     painter.drawRoundedRect(box, radius, radius);
     painter.setPen(Qt::NoPen);
-    painter.setBrush(mix(kKnobOff, kKnobOn, tint_));
+    painter.setBrush(mix(kKnobOff(), kKnobOn(), tint_));
     const qreal knob = large_ ? 6.0 : 5.0;
     const qreal from = height() / 2.0;
     const qreal to = width() - height() / 2.0;

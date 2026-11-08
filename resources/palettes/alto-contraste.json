@@ -1,0 +1,22 @@
+{
+    "name": "Alto contraste",
+    "liked": false,
+    "colors": {
+        "desk": "#000000",
+        "sheet": "#0C0C0E",
+        "card": "#141418",
+        "control": "#222228",
+        "border": "#3A3A44",
+        "title": "#FFFFFF",
+        "section": "#B9ADFF",
+        "ink1": "#F5F5F7",
+        "ink2": "#DADAE0",
+        "ink3": "#ABABB4",
+        "ink4": "#85858E",
+        "accent": "#5443CF",
+        "switch": "#5AD4F5",
+        "ok": "#5AD4F5",
+        "warn": "#FFD43B",
+        "error": "#FF6A61"
+    }
+}
