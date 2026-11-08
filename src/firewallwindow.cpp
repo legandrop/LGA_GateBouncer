@@ -67,6 +67,7 @@ QLabel[r="big"] { color: #ECE9E2; font-family: @title; font-size: 34px; font-wei
 QLabel[r="desc"] { color: #A6A5AC; font-size: 13.5px; }
 QLabel[r="cardtitle"] { color: #ECE9E2; font-family: @title; font-size: 16px; font-weight: 700; }
 QLabel[r="midtitle"] { color: #ECE9E2; font-family: @title; font-size: 24px; font-weight: 800; }
+QLabel[r="brand"] { color: #ECE9E2; font-family: @title; font-size: 15px; font-weight: 700; }
 QLabel[r="strong"] { color: #E3E1DA; font-size: 14px; font-weight: 500; }
 QLabel[r="body"] { color: #C4C3C9; font-size: 13px; }
 QLabel[r="value"] { color: #E3E1DA; font-size: 13px; }
@@ -90,8 +91,8 @@ QLabel[r="sidestatus"][tone="bad"] { color: #F0645C; }
 QLabel[r="hownumber"] { color: #ECE9E2; font-family: @title; font-size: 19px; font-weight: 800; }
 QLabel[r="howtitle"] { color: #DCDAD3; font-size: 13px; font-weight: 600; }
 QLabel[r="howstep"] { color: #C4C3C9; font-size: 13.5px; }
-QLabel[r="note"] { color: #E6C870; font-size: 12.5px; background: #1F1C12; border: 1px solid #5A4E26; border-radius: 8px; padding: 8px 10px; }
-QLabel[r="info"] { color: #B7B0E8; font-size: 12.5px; background: #1D1B2C; border: 1px solid #3A3466; border-radius: 8px; padding: 8px 10px; }
+QLabel[r="note"] { color: #F2CB3F; font-size: 12.5px; background: rgba(242,203,63,15); border: 1px solid #5A4E26; border-radius: 8px; padding: 8px 10px; }
+QLabel[r="info"] { color: #A6A5AC; font-size: 12.5px; background: #1E1E23; border: 1px solid #3A3A43; border-radius: 8px; padding: 8px 10px; }
 QFrame[r="card"] { background: #1E1E23; border: 1px solid #25252B; border-radius: 10px; }
 QFrame[r="alert"] { background: #1E1E23; border: 1px solid #5A4E26; border-radius: 10px; }
 QFrame[r="danger"] { background: #1E1E23; border: 1px solid #6B2E31; border-radius: 10px; }
@@ -124,7 +125,6 @@ QLabel[chip="mute"] { background: transparent; border: 1px solid #3A3A43; color:
 QLabel[chip="warn"] { background: #F2CB3F; border: 0; color: #1C1606; }
 QLabel[chip="ok"] { background: transparent; border: 1px solid #24586A; color: #57CDEF; }
 QLabel#fwBadge { background: #F2CB3F; color: #1C1606; border-radius: 4px; font-size: 12px; font-weight: 600; }
-QLabel[key="1"] { background: #2A2A31; border: 1px solid #3B3B44; border-bottom: 3px solid #0F0F12; border-radius: 4px; color: #E3E1DA; font-size: 11.5px; font-weight: 600; padding: 0 6px; }
 QPushButton { border: 1px solid #3A3A43; border-radius: 6px; background: #2A2A31; color: #E3E1DA; padding: 0 14px; min-height: 28px; font-size: 13px; font-weight: 500; }
 QPushButton:hover { background: #34343C; border: 1px solid #4A4A55; }
 QPushButton:disabled { background: #222227; border: 1px solid #2E2E36; color: #6E6D75; }
@@ -132,8 +132,8 @@ QPushButton[k="primary"], QPushButton[k="allow"] { background: #443A91; border: 
 QPushButton[k="primary"]:hover, QPushButton[k="allow"]:hover { background: #5446B4; border: 1px solid #7060D0; }
 QPushButton[k="block"] { background: #361B1D; border: 1px solid #6B2E31; color: #F0645C; font-weight: 600; }
 QPushButton[k="block"]:hover { background: #4A2326; border: 1px solid #8A3A3E; }
-QPushButton[k="allow"][rec="1"] { border: 1px solid #9D8FE0; }
-QPushButton[k="block"][rec="1"] { border: 1px solid #F0645C; }
+QPushButton[k="allow"][rec="1"] { border: 1px solid #7060D0; }
+QPushButton[k="block"][rec="1"] { border: 1px solid #8A3A3E; }
 QPushButton[k="primary"]:disabled, QPushButton[k="allow"]:disabled, QPushButton[k="block"]:disabled { background: #222227; border: 1px solid #2E2E36; color: #6E6D75; }
 QPushButton[k="ghost"] { background: transparent; }
 QPushButton[k="ghost"]:hover { background: #26262D; }
@@ -592,13 +592,6 @@ QWidget *header(const QString &title, const QString &description, QWidget *right
     if (lead) line->addWidget(lead, 0, Qt::AlignVCenter);
     auto *big = new ElideLabel(title, lead ? "midtitle" : "big");
     big->setObjectName("page-title");
-    if (!lead) {
-        QFont f = Theme::titleFont(34, 800);
-        f.setLetterSpacing(QFont::PercentageSpacing, 98);
-        big->setFont(f);
-    } else {
-        big->setFont(Theme::titleFont(26, 800));
-    }
     big->setFixedHeight(40);
     line->addWidget(big, 1);
     t->addLayout(line);
@@ -987,6 +980,8 @@ class SideItem final : public QWidget {
                  QColor(selected_ ? Theme::kTextBright : "#CFCDD4"));
     }
     void mouseReleaseEvent(QMouseEvent *e) override {
+        // Un clic que empezó en el switch (deshabilitado o soltado fuera) no navega: el switch no es la fila.
+        if (switch_ && switch_->geometry().contains(e->position().toPoint())) return;
         if (e->button() == Qt::LeftButton && rect().contains(e->position().toPoint()) && onClick) onClick();
     }
     void enterEvent(QEnterEvent *) override { update(); }
@@ -1076,8 +1071,15 @@ FirewallWindow::FirewallWindow(QWidget *parent) : QMainWindow(parent) {
     // El aviso sigue al motor en cada cambio: pedidos nuevos o resueltos, el nombre del servidor que llega tarde, el
     // motor caído. Después de que el cliente termine de leer: el aviso necesita los datos completos.
     connect(&firewall_, &FirewallClient::changed, this, [this] { QTimer::singleShot(0, this, &FirewallWindow::updateToast); });
-    connect(&firewall_, &FirewallClient::commandFinished, this, [this](bool, const QString &t) {
-        if (!closing_) message(t);
+    connect(&firewall_, &FirewallClient::commandFinished, this, [this](bool ok, const QString &t) {
+        if (closing_) return;
+        message(t);
+        // Un pedido que el motor rechazó: los switches y la página vuelven a mostrar el estado real, no el elegido.
+        if (!ok) {
+            updateSidebar();
+            lastKey_.clear();
+            engineChanged();
+        }
     });
     connect(&explainer_, &Explain::Explainer::finished, this,
             [this](const QString &id, bool ok, const Explain::Answer &a, const QString &error) {
@@ -1191,6 +1193,7 @@ void FirewallWindow::buildShell() {
     };
     auto *protection = add("overview", "shield", "Protection", true);
     protection->toggle()->setObjectName("nav-ask-switch");
+    protection->toggle()->setAccessibleName("Ask before unknown applications connect");
     // clicked y no toggled: reflejar el estado con setChecked no es un pedido del usuario.
     connect(protection->toggle(), &QAbstractButton::clicked, this, [this](bool on) { firewall_.setAsk(on); });
     label("Firewall");
@@ -1829,8 +1832,9 @@ QWidget *FirewallWindow::overviewPage() {
             auto *t = text(clock(e.time), "time");
             t->setFixedWidth(40);
             hl->addWidget(t);
-            auto *what = new ElideLabel(FirewallClient::fileName(e.path) + "  ·  " + reasons[i].text.toLower(), "value");
-            hl->addWidget(what, 1);
+            auto *what = text(FirewallClient::fileName(e.path), "value");
+            hl->addWidget(what);
+            hl->addWidget(new ElideLabel("·  " + reasons[i].text.toLower(), "faint"), 1);
             al->addWidget(h);
             ++shown;
         }
@@ -2556,6 +2560,11 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
     if (e->scope == "app" && !e->iconPath.isEmpty())
         where = QDir::toNativeSeparators(e->iconPath) + " · any version signed by " + e->signer;
     l->addWidget(header(e->title, where, nullptr, appIcon(e->iconPath, 36)));
+    l->addWidget(how({"The <b>Rule</b> card says what this rule covers and when it last blocked an attempt.",
+                      "A rule for a file or a folder can change between <b>Allow</b> and <b>Block</b> here; a rule for a "
+                      "signed app changes on its next notice.",
+                      "<b>Remove</b> drops the rule: the program asks again the next time it connects, unless a folder "
+                      "rule covers it."}));
     const bool can = canDecide();
     int covered = 0;
     for (const auto &r : e->rules)
@@ -3133,8 +3142,7 @@ QWidget *FirewallWindow::settingsPage() {
     auto *cv = new QVBoxLayout;
     cv->setSpacing(2);
     auto *ct = row(8);
-    auto *cn = text("LGA GateBouncer", "cardtitle");
-    cn->setFont(Theme::titleFont(15, 700));
+    auto *cn = text("LGA GateBouncer", "brand");
     ct->addWidget(cn);
     ct->addWidget(text("Development build", "sub"));
     ct->addStretch();
@@ -3181,6 +3189,10 @@ QWidget *FirewallWindow::importPage() {
                                                         .arg(QFileInfo(netLimiterFile_).fileName())
                                                         .arg(netLimiterRules_.size())
                                                         .arg(importable)));
+    l->addWidget(how({"Choose the <b>nl_settings.xml</b> file of NetLimiter.",
+                      "Rules for one application, outgoing, active, Allow or Deny, can be imported; the rest are listed "
+                      "with the reason.",
+                      "Press <b>Import</b> to add them as GateBouncer rules for those files."}));
     auto *choose = card();
     auto *ch = new QHBoxLayout(choose);
     ch->setContentsMargins(18, 15, 18, 16);

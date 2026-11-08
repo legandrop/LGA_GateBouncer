@@ -45,6 +45,10 @@ Source: "{#SourceDir}\*"; Excludes: ".gatebouncer-deploy"; DestDir: "{app}"; Fla
 ; desinstalador.
 Source: "tools\close_by_path.ps1"; Flags: dontcopy
 Source: "tools\close_by_path.ps1"; DestDir: "{app}\tools"; Flags: ignoreversion
+; Las fuentes van embebidas en GateBouncer.exe; la licencia OFL pide que su texto acompañe la distribución.
+Source: "resources\fonts\LICENSE.txt"; DestDir: "{app}\licenses"; DestName: "Inter-LICENSE.txt"; Flags: ignoreversion
+Source: "resources\fonts\LICENSE-BricolageGrotesque.txt"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "docs\ThirdPartyNotices.md"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"

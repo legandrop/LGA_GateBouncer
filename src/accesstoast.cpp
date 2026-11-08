@@ -808,7 +808,12 @@ void AccessToast::renderDestination() {
     CustomTooltip::instance()->setToolTip(signature_, full.toHtmlEscaped());
     fit(signature_, value);
     signatureDetail_->setFixedWidth(value);
-    elide(signatureDetail_, QDir::toNativeSeparators(QFileInfo(request_.path).path()), value);
+    // La carpeta corta: las dos últimas partes (las que dicen qué programa es), sin el nombre de la cuenta de Windows
+    // del medio; la ruta entera queda en el tooltip.
+    const QStringList parts = QDir::fromNativeSeparators(QFileInfo(request_.path).path()).split('/', Qt::SkipEmptyParts);
+    const QString folder = parts.size() <= 3 ? QDir::toNativeSeparators(QFileInfo(request_.path).path())
+                                             : parts.first() + QString::fromUtf8("\\…\\") + parts.mid(parts.size() - 2).join('\\');
+    elide(signatureDetail_, folder, value);
     CustomTooltip::instance()->setToolTip(signatureDetail_, full.toHtmlEscaped());
 
     const QString kind = FirewallClient::destinationKind(request_.remote);

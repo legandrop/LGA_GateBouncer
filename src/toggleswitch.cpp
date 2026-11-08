@@ -110,7 +110,7 @@ void ToggleSwitch::animateTo(qreal target) {
 
 void ToggleSwitch::paintEvent(QPaintEvent *) {
     // Medidas del Pliego (`.sw`): caja de 30 x 16 (42 x 22 la grande) con borde de 1 y radio de media altura; la
-    // perilla es un círculo de 10 (14 en la grande) cuyo centro va de 8 a 22 (de 11 a 31 en la grande). Durante la
+    // perilla es un círculo de 10 (12 en la grande) cuyo centro va de 8 a 22 (de 11 a 31 en la grande). Durante la
     // animación los colores se mezclan por tint_ y la perilla va por knob_.
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
@@ -123,7 +123,7 @@ void ToggleSwitch::paintEvent(QPaintEvent *) {
     painter.drawRoundedRect(box, radius, radius);
     painter.setPen(Qt::NoPen);
     painter.setBrush(mix(kKnobOff, kKnobOn, tint_));
-    const qreal knob = large_ ? 7.0 : 5.0;
+    const qreal knob = large_ ? 6.0 : 5.0;
     const qreal from = height() / 2.0;
     const qreal to = width() - height() / 2.0;
     painter.drawEllipse(QPointF(from + (to - from) * knob_, height() / 2.0), knob, knob);

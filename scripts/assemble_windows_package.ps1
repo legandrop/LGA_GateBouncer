@@ -281,6 +281,7 @@ try {
     if ($source.Count -ne $sourceCount) { throw 'Administrative inventory count is inconsistent' }
     $notices=[ordered]@{
         'Inter-LICENSE.txt'=Join-Path $repo 'resources\fonts\LICENSE.txt'
+        'BricolageGrotesque-LICENSE.txt'=Join-Path $repo 'resources\fonts\LICENSE-BricolageGrotesque.txt'
         'GCC-COPYING3.txt'=Join-Path $MinGwRoot 'licenses\gcc\COPYING3'
         'GCC-COPYING3-LIB.txt'=Join-Path $MinGwRoot 'licenses\gcc\COPYING3.LIB'
         'GCC-RUNTIME-EXCEPTION.txt'=Join-Path $MinGwRoot 'licenses\gcc\COPYING.RUNTIME'
@@ -301,7 +302,7 @@ try {
     foreach ($suffix in $guiAttributions) { $name='qtgui-attribution-'+$suffix+'.html'; $notices[$name]=Join-Path $QtDocsRoot ('qtgui\'+$name) }
     foreach ($module in @('qtcore','qtgui','qtwidgets')) { $name=$module+'-index.html'; $notices[$name]=Join-Path $QtDocsRoot ($module+'\'+$name) }
     foreach ($name in @('licensing.html','licenses-used-in-qt.html','qtentrypoint.html')) { $notices[$name]=Join-Path $QtDocsRoot ('qtdoc\'+$name) }
-    if ($notices.Count -ne 68) { throw 'Notice input set must contain exactly 68 original files' }
+    if ($notices.Count -ne 69) { throw 'Notice input set must contain exactly 69 original files' }
     $readers=[ordered]@{}
     foreach ($name in $source.Keys) { if ($null -ne $source[$name]) { $readers[$name]=Hold-File $source[$name] } }
     $guiCoreHash=[System.BitConverter]::ToString([GateBouncer.Package.Native]::Hash([GateBouncer.Package.Native]::Read($readers['Qt6Core.dll'])))
