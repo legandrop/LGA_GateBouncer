@@ -19,6 +19,8 @@ en_from: "1.01"
   en: GateBouncer uses fewer resources while its window is closed and takes up less disk space.
 - [improved] Con la app en castellano, el aviso de actualización y su ventana también están en castellano, y las novedades que muestra salen en el idioma que elegiste para GateBouncer.
   en: With the app in Spanish, the update notice and its window are in Spanish too, and the what's new list they show is in the language you chose for GateBouncer.
+- [new] Settings suma Colors: seis paletas para la ventana y el aviso, que se aplican al instante y quedan guardadas.
+  en: Settings adds Colors: six palettes for the window and the notice, applied instantly and remembered.
 - [improved] Permitir tiene su propio verde en toda la ventana y en el aviso (botones, etiquetas de Apps y la sugerencia de la IA), como Bloquear tiene su rojo.
   en: Allow has its own green across the window and the notice (buttons, Apps tags and the AI suggestion), just like Block has its red.
 

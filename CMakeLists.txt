@@ -109,6 +109,13 @@ qt_add_resources(GateBouncerGuiStage "gatebouncer_assets"
         resources/icons/tray/tray_32.png
         resources/icons/tray/tray_40.png
         resources/icons/tray/tray_48.png
+        # Paletas de Settings (palette.cpp: presetIds).
+        resources/palettes/default-1.json
+        resources/palettes/default-2.json
+        resources/palettes/alto-contraste.json
+        resources/palettes/grafito-ambar.json
+        resources/palettes/niebla.json
+        resources/palettes/pizarra-turquesa.json
 )
 
 # El observador externo reutiliza el binario real; no forma parte del producto.
@@ -208,4 +215,11 @@ qt_add_resources(GateBouncer "gatebouncer_app_assets"
         resources/icons/tray/tray_32.png
         resources/icons/tray/tray_40.png
         resources/icons/tray/tray_48.png
+        # Paletas de Settings (palette.cpp: presetIds).
+        resources/palettes/default-1.json
+        resources/palettes/default-2.json
+        resources/palettes/alto-contraste.json
+        resources/palettes/grafito-ambar.json
+        resources/palettes/niebla.json
+        resources/palettes/pizarra-turquesa.json
 )

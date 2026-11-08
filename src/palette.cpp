@@ -5,6 +5,7 @@
 #include <QJsonObject>
 #include <QRegularExpression>
 #include <QSaveFile>
+#include <QSettings>
 #include <algorithm>
 #include <cmath>
 
@@ -108,9 +109,11 @@ const Role *role(const QString &id) {
     return nullptr;
 }
 
+// Los colores tal cual están escritos en theme.h y las hojas. No es la paleta que ve el usuario de fábrica: esa es la
+// primera de presetIds() (Violet), que se aplica al arrancar.
 Data factory() {
     Data d;
-    d.name = QStringLiteral("Violeta (fábrica)");
+    d.name = QStringLiteral("Base del código (theme.h)");
     for (const auto &r : kRoles) d.bases.insert(r.id, QColor(r.base));
     return d;
 }
@@ -209,6 +212,32 @@ QString remapSheet(const QString &sheet) {
         last = m.capturedEnd();
     }
     return out + s.mid(last);
+}
+
+QStringList presetIds() {
+    return {QStringLiteral("default-1"), QStringLiteral("default-2"), QStringLiteral("alto-contraste"),
+            QStringLiteral("grafito-ambar"), QStringLiteral("niebla"), QStringLiteral("pizarra-turquesa")};
+}
+
+namespace {
+QSettings presetStore() { return QSettings(QSettings::NativeFormat, QSettings::UserScope, "LGA", "GateBouncer"); }
+} // namespace
+
+QString savedPreset() {
+    const QString id = presetStore().value("app/palette").toString();
+    return presetIds().contains(id) ? id : presetIds().first();
+}
+
+void savePreset(const QString &id) {
+    if (presetIds().contains(id)) presetStore().setValue("app/palette", id);
+}
+
+bool applyPreset(const QString &id) {
+    Data d;
+    if (!presetIds().contains(id) || !load(QStringLiteral(":/gatebouncer/resources/palettes/%1.json").arg(id), &d))
+        return false;
+    apply(d);
+    return true;
 }
 
 bool load(const QString &path, Data *out, QString *error) {

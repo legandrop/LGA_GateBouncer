@@ -185,12 +185,16 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "No se pudo cargar la fuente del producto.\n");
         return 2;
     }
-    // Desarrollo y QA: GATEBOUNCER_PALETTE=<archivo .json> arranca con esa paleta (el editor la puede cambiar).
+    // La paleta elegida en Settings (Violet de fábrica). Desarrollo y QA: GATEBOUNCER_PALETTE=<archivo .json> arranca con
+    // otra (el editor la puede cambiar).
     if (const QString file = qEnvironmentVariable("GATEBOUNCER_PALETTE"); !file.isEmpty()) {
         Gate::Palette::Data data;
         if (Gate::Palette::load(file, &data)) Gate::Palette::apply(data);
-        Gate::applyPalette(app);
+    } else {
+        // QA: siempre la de fábrica (Violet), no la que eligió quien usa la PC: capturas comparables.
+        Gate::Palette::applyPreset(qa ? Gate::Palette::presetIds().first() : Gate::Palette::savedPreset());
     }
+    Gate::applyPalette(app);
     Gate::FirewallWindow window;
     QObject::connect(&instance, &QLocalServer::newConnection, &window, [&instance, &window] {
         while (auto *client = instance.nextPendingConnection()) {

@@ -3630,6 +3630,25 @@ QWidget *FirewallWindow::appCard() {
         sl->addWidget(b);
     }
     grid->addWidget(seg, 1, 1, Qt::AlignVCenter | Qt::AlignLeft);
+
+    // Paleta de colores: se aplica en vivo (no reinicia la ventana) y queda guardada.
+    grid->addWidget(text(I18n::tr("Colors"), "strong"), 2, 0, Qt::AlignVCenter);
+    auto *colors = new Combo;
+    colors->setObjectName("app-palette");
+    const QHash<QString, QString> paletteNames{
+        {"default-1", I18n::tr("Violet")},         {"default-2", I18n::tr("Plum")},
+        {"alto-contraste", I18n::tr("High contrast")}, {"grafito-ambar", I18n::tr("Graphite and amber")},
+        {"niebla", I18n::tr("Mist")},               {"pizarra-turquesa", I18n::tr("Warm slate and teal")}};
+    for (const QString &id : Palette::presetIds()) colors->addItem(paletteNames.value(id, id), id);
+    colors->setCurrentIndex(qMax(0, colors->findData(Palette::savedPreset())));
+    colors->setFixedWidth(210);
+    grid->addWidget(colors, 2, 1, Qt::AlignVCenter | Qt::AlignLeft);
+    connect(colors, &QComboBox::activated, this, [colors](int index) {
+        const QString id = colors->itemData(index).toString();
+        if (id == Palette::savedPreset()) return;
+        // Se guarda sólo si se aplicó: el desplegable y la ventana nunca dicen paletas distintas.
+        if (Palette::applyPreset(id)) Palette::savePreset(id);
+    });
     cl->addLayout(grid);
     cl->addSpacing(6);
     cl->addWidget(text(I18n::tr("%1 is the default. Changing the zoom or the language restarts the window.")

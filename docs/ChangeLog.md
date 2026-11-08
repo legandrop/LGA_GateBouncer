@@ -18,6 +18,9 @@ v1.01:
 - Permitir usaba el cian de «funciona» (etiquetas) o el violeta del botón principal (botones). Ahora tiene su verde
   (`kAllow*`, rol `allow`) en etiquetas, sugerencia de IA y botones Allow, que pasan al estilo de Block. Las reglas
   temporales dejan el violeta y toman el color de su decisión.
+- Settings → App suma Colors: seis paletas JSON embebidas (`Palette::presetIds`), la elegida en HKCU `app/palette`,
+  aplicada al arrancar y en vivo; Violet (`default-1`) es la de fábrica. Canal `LGA.GateBouncer.Control.<usuario>`
+  («quit») para que el lanzador de desarrollo cierre la ventana como «Salir».
 - Las novedades del aviso de update salían siempre en castellano, aunque la ventana estuviera en inglés. Ahora
   `libs/lgaupdate` es la rev 5 (`LgaWhatsNew::displayText()` elige el `text_en` de cada ítem si la app está en inglés)
   y `docs/WhatsNew.md` es bilingüe desde la v1.01 (`languages: [es, en]`, una línea `en:` por ítem).

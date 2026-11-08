@@ -48,6 +48,13 @@ QString hex(const QString &factoryHex); // map() como #RRGGBB
 // grupo; los títulos y los rótulos del índice no comparten valor de fábrica con otros textos).
 QString remapSheet(const QString &sheet);
 
+// Las paletas que ofrece Settings, embebidas en :/gatebouncer/resources/palettes/<id>.json; la primera es la de
+// fábrica. La elegida se guarda en HKCU (app/palette) y se aplica en vivo.
+QStringList presetIds();
+QString savedPreset();
+void savePreset(const QString &id);
+bool applyPreset(const QString &id);
+
 bool load(const QString &path, Data *out, QString *error = nullptr);
 bool save(const QString &path, const Data &data, QString *error = nullptr);
 
