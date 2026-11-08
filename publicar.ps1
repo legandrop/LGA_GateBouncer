@@ -1,4 +1,4 @@
-# Publica el instalador ya armado por instalador.bat como release de GitHub de este mismo repo (público), con sus notas
+﻿# Publica el instalador ya armado por instalador.bat como release de GitHub de este mismo repo (público), con sus notas
 # What's new, y le avisa al manifiesto de versiones de LGA (legandrop/LGA_Updates) para que las copias instaladas se
 # actualicen solas. No compila nada: primero instalador.bat --no-run, se revisa el resultado, y recién después esto.
 #
