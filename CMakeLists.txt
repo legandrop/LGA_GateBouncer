@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.21)
 # La versión del producto (centésimos, como las demás apps LGA): fuente única. instalador.bat se la pasa al .iss.
-project(LGA_GateBouncer VERSION 1.00 LANGUAGES CXX)
+project(LGA_GateBouncer VERSION 1.01 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
