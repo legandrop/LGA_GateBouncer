@@ -17,6 +17,7 @@ struct Role {
     const char *label;   // para el editor de desarrollo
     const char *base;    // color base de fábrica
     QStringList members; // los colores de fábrica que siguen a este grupo (incluye el base si se usa tal cual)
+    bool byValue = true; // false: sus tonos se piden por nombre (@color(rol:#HEX), mapIn), no por valor
 };
 
 const QVector<Role> &roles();
@@ -42,7 +43,6 @@ bool isFactory();
 QColor map(const QString &hex);
 QColor mapIn(const QString &roleId, const QString &hex);
 QString hex(const QString &factoryHex); // map() como #RRGGBB
-QStringList switchMembers(); // los tonos del interruptor encendido (se piden con mapIn("switch", …))
 
 // Una hoja de estilo con los colores actuales: cada #RRGGBB y rgba(r,g,b,a) de fábrica, y «@color(rol)» (el base del
 // grupo; los títulos y los rótulos del índice no comparten valor de fábrica con otros textos).

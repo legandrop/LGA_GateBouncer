@@ -116,7 +116,6 @@ QString slug(const QString &name) {
 }
 
 QStringList membersOf(const QString &roleId) {
-    if (roleId == QLatin1String("switch")) return Palette::switchMembers();
     const Palette::Role *r = Palette::role(roleId);
     return r ? r->members : QStringList();
 }

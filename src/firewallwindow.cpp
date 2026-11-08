@@ -141,9 +141,9 @@ QLabel[r="value"][weight="600"] { font-weight: 600; }
 QLabel[tile="30"] { background: #2A2A31; border: 0; border-radius: 7px; }
 QLabel[tile="36"] { background: #2A2A31; border: 0; border-radius: 8px; }
 QLabel[seg="name"] { color: #8C8B93; font-size: 12.5px; font-weight: 600; }
-QLabel[seg="name"][on="1"] { color: #DDDBEE; }
+QLabel[seg="name"][on="1"] { color: @color(chosen:#DDDBEE); }
 QLabel[seg="count"] { color: #6E6D75; font-size: 12.5px; font-weight: 500; }
-QLabel[seg="count"][on="1"] { color: #A39DD0; }
+QLabel[seg="count"][on="1"] { color: @color(chosen:#A39DD0); }
 QLabel#fwBadge { background: #F2CB3F; color: #1C1606; border-radius: 4px; font-size: 12px; font-weight: 600; }
 QPushButton { border: 1px solid #3A3A43; border-radius: 6px; background: #2A2A31; color: #E3E1DA; padding: 0 14px; min-height: 28px; font-size: 13px; font-weight: 500; }
 QPushButton:hover { background: #34343C; border: 1px solid #4A4A55; }
@@ -162,9 +162,12 @@ QPushButton[k="ghost"]:hover { background: #26262D; }
 QPushButton[k="link"] { background: transparent; border: 0; color: #9D8FE0; padding: 0; min-height: 0; font-size: 12.5px; font-weight: 600; }
 QPushButton[k="link"]:hover { color: #C5BBF4; border: 0; background: transparent; }
 QPushButton[k="link"]:disabled { color: #6E6D75; border: 0; background: transparent; }
+QPushButton#settings-site { color: @color(section); }
+QPushButton#settings-site:hover { color: @color(section:#B3B2B9); }
 QPushButton[k="seg"] { background: transparent; border: 1px solid transparent; color: #8C8B93; border-radius: 5px; min-height: 22px; padding: 0 11px; font-size: 12.5px; font-weight: 600; }
 QPushButton[k="seg"]:hover { background: #202026; color: #E3E1DA; border: 1px solid transparent; }
-QPushButton[k="seg"][on="1"] { background: #2A2552; border: 1px solid #5243A8; color: #DDDBEE; }
+QPushButton[k="seg"][on="1"] { background: @color(chosen:#2A2552); border: 1px solid @color(chosen:#5243A8);
+    color: @color(chosen:#DDDBEE); }
 QPushButton[k="seg"][inner="1"] { padding: 0; }
 QPushButton[k="x"] { background: transparent; border: 0; color: #9C9BA2; padding: 0; min-height: 22px; min-width: 22px; font-size: 14px; }
 QPushButton[k="x"]:hover { color: #F0645C; background: transparent; border: 0; }

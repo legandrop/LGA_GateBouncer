@@ -12,24 +12,27 @@ namespace Gate::Palette {
 
 namespace {
 
-// Cada color de fábrica en un solo grupo. «title», «section» y «switch» no tienen miembros por valor: se piden por
-// nombre (@color(rol) en las hojas, mapIn en el código que pinta), porque su valor de fábrica es el mismo de otro grupo.
+// Cada color de fábrica en un solo grupo. Los grupos con byValue=false (títulos, rótulos, interruptores, elegido) se
+// piden por nombre (@color(rol) o @color(rol:#HEX) en las hojas, mapIn en el código que pinta), porque sus valores de
+// fábrica son los mismos de otro grupo; sus «members» sólo son la lista de tonos del editor.
 const QVector<Role> kRoles = {
     {"desk", "Mesa: fondo exterior, barra de título e índice", "#0D0D0F", {"#0D0D0F", "#0F0F12", "#131317", "#1B1B20"}},
     {"sheet", "Hoja: fondo de cada página, del aviso y de los campos", "#17171B", {"#17171B", "#15151A", "#1A1A1F"}},
     {"card", "Tarjetas, filas y hover", "#1E1E23", {"#1E1E23", "#202026", "#222227", "#26262D"}},
     {"control", "Botones, cajas de ícono y divisores", "#2A2A31", {"#2A2A31", "#34343C"}},
     {"border", "Bordes", "#2E2E36", {"#25252B", "#2E2E36", "#2F2F37", "#3A3A43", "#3B3B44", "#44444E", "#4A4A55"}},
-    {"title", "Títulos (tarjetas, páginas, aviso)", "#ECE9E2", {}},
-    {"section", "Rótulos del índice (FIREWALL, APP)", "#8C8B93", {}},
+    {"title", "Títulos (tarjetas, páginas, aviso)", "#ECE9E2", {"#ECE9E2"}, false},
+    {"section", "Rótulos del índice (FIREWALL, APP) y el sitio lega.com.ar", "#8C8B93", {"#8C8B93", "#B3B2B9"}, false},
     {"ink1", "Texto blanco: valores, nombres, botones", "#E3E1DA", {"#ECE9E2", "#F3F0E9", "#E3E1DA", "#DCDAD3", "#CFCDD4"}},
     {"ink2", "Texto común: párrafos", "#C4C3C9", {"#C4C3C9", "#A6A5AC", "#A8A8A8"}},
     {"ink3", "Texto gris: subtítulos, columnas, horas", "#8C8B93", {"#9C9BA2", "#8C8B93"}},
     {"ink4", "Texto apagado: deshabilitado, contadores", "#6E6D75", {"#7A7982", "#77767E", "#6E6D75", "#5E5D66"}},
-    {"accent", "Acento (base = botón Allow): links, selección, elegido", "#443A91",
-     {"#443A91", "#5243A8", "#5446B4", "#7060D0", "#9D8FE0", "#C5BBF4", "#A39DD0", "#DDDBEE", "#2A2552", "#25223B",
-      "#1D1B2C", "#3A3466"}},
-    {"switch", "Interruptores encendidos", "#4CC9EE", {}},
+    {"accent", "Acento: links y textos violetas, selección, botón principal", "#443A91",
+     {"#443A91", "#5243A8", "#5446B4", "#7060D0", "#9D8FE0", "#C5BBF4", "#DDDBEE", "#2A2552", "#25223B", "#1D1B2C",
+      "#3A3466"}},
+    {"chosen", "Elegido en selectores (filtros de Apps y Actividad, Zoom)", "#443A91",
+     {"#2A2552", "#5243A8", "#DDDBEE", "#A39DD0"}, false},
+    {"switch", "Interruptores encendidos", "#4CC9EE", {"#4CC9EE", "#2A97BC", "#0D3542"}, false},
     {"ok", "Funciona: protección activa, firma válida, listo", "#4CC9EE", {"#4CC9EE", "#57CDEF", "#24586A", "#0D2A33"}},
     {"warn", "Pide atención", "#F2CB3F", {"#F2CB3F", "#5A4E26", "#1C1606"}},
     {"allow", "Permitir: botones, etiquetas y sugerencias", "#5ACB8B",
@@ -37,16 +40,14 @@ const QVector<Role> kRoles = {
     {"error", "Bloquear / error", "#F0645C", {"#F0645C", "#8A3A3E", "#6B2E31", "#4A2326", "#361B1D"}},
 };
 
-// Los tonos del interruptor encendido (theme.h), calculados dentro de «switch».
-const QStringList kSwitchMembers = {"#4CC9EE", "#2A97BC", "#0D3542"};
-
 QString norm(const QString &hex) { return hex.trimmed().toUpper(); }
 
 const QHash<QString, QString> &memberRole() {
     static const QHash<QString, QString> table = [] {
         QHash<QString, QString> t;
         for (const auto &r : kRoles)
-            for (const auto &m : r.members) t.insert(norm(m), QString::fromLatin1(r.id));
+            if (r.byValue)
+                for (const auto &m : r.members) t.insert(norm(m), QString::fromLatin1(r.id));
         return t;
     }();
     return table;
@@ -173,38 +174,38 @@ QColor map(const QString &hex) {
 QString hex(const QString &factoryHex) { return map(factoryHex).name(QColor::HexRgb).toUpper(); }
 
 QString remapSheet(const QString &sheet) {
-    static const QRegularExpression hexRe(QStringLiteral("#[0-9A-Fa-f]{6}(?![0-9A-Za-z_-])"));
-    static const QRegularExpression rgbaRe(QStringLiteral("rgba\\(\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,"));
-    static const QRegularExpression roleRe(QStringLiteral("@color\\((\\w+)\\)"));
-    QString s = sheet;
-    if (!isFactory()) {
-        QString out;
-        qsizetype last = 0;
-        for (auto it = hexRe.globalMatch(s); it.hasNext();) {
-            const auto m = it.next();
-            out += s.mid(last, m.capturedStart() - last) + hex(m.captured(0));
-            last = m.capturedEnd();
-        }
-        s = out + s.mid(last);
-        out.clear();
-        last = 0;
-        for (auto it = rgbaRe.globalMatch(s); it.hasNext();) {
-            const auto m = it.next();
-            const QColor c = map(QColor(m.captured(1).toInt(), m.captured(2).toInt(), m.captured(3).toInt())
-                                     .name(QColor::HexRgb));
-            out += s.mid(last, m.capturedStart() - last) +
-                   QStringLiteral("rgba(%1,%2,%3,").arg(c.red()).arg(c.green()).arg(c.blue());
-            last = m.capturedEnd();
-        }
-        s = out + s.mid(last);
-    }
-    // Después de los valores: el base que se pone acá ya es el actual.
+    // Una sola pasada para «@color(rol)», «@color(rol:#HEX)» y los #RRGGBB sueltos: así el #HEX de adentro de
+    // @color(...) no se traduce por su valor, y un color ya traducido no se vuelve a traducir.
+    static const QRegularExpression colorRe(
+        QStringLiteral(R"(@color\((\w+)(?::(#[0-9A-Fa-f]{6}))?\)|#[0-9A-Fa-f]{6}(?![0-9A-Za-z_-]))"));
+    static const QRegularExpression rgbaRe(QStringLiteral(R"(rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,)"));
+    const bool factoryNow = isFactory();
     QString out;
     qsizetype last = 0;
-    for (auto it = roleRe.globalMatch(s); it.hasNext();) {
+    for (auto it = colorRe.globalMatch(sheet); it.hasNext();) {
         const auto m = it.next();
-        const QColor c = base(m.captured(1));
-        out += s.mid(last, m.capturedStart() - last) + (c.isValid() ? c.name(QColor::HexRgb).toUpper() : QString("#FF00FF"));
+        QString value;
+        if (m.captured(0).startsWith('#')) {
+            value = factoryNow ? m.captured(0) : hex(m.captured(0));
+        } else {
+            // @color(rol): el base del grupo; @color(rol:#HEX): ese tono de fábrica calculado dentro del grupo.
+            const QColor c = m.captured(2).isEmpty() ? base(m.captured(1)) : mapIn(m.captured(1), m.captured(2));
+            value = c.isValid() ? c.name(QColor::HexRgb).toUpper() : QStringLiteral("#FF00FF");
+        }
+        out += sheet.mid(last, m.capturedStart() - last) + value;
+        last = m.capturedEnd();
+    }
+    out += sheet.mid(last);
+    if (factoryNow) return out;
+    QString s = out;
+    out.clear();
+    last = 0;
+    for (auto it = rgbaRe.globalMatch(s); it.hasNext();) {
+        const auto m = it.next();
+        const QColor c =
+            map(QColor(m.captured(1).toInt(), m.captured(2).toInt(), m.captured(3).toInt()).name(QColor::HexRgb));
+        out += s.mid(last, m.capturedStart() - last) +
+               QStringLiteral("rgba(%1,%2,%3,").arg(c.red()).arg(c.green()).arg(c.blue());
         last = m.capturedEnd();
     }
     return out + s.mid(last);
@@ -266,6 +267,5 @@ Notifier *Notifier::instance() {
     return &n;
 }
 
-QStringList switchMembers() { return kSwitchMembers; }
 
 } // namespace Gate::Palette

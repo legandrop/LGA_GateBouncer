@@ -10,8 +10,9 @@ v1.01:
 - El updater (`libs/lgaupdate` rev 4) habla en el idioma de la app. La versión ya no se sube en cada cambio:
   `bump_version.bat` la sube al publicar, como en Mighty Tools. Logo de la barra a 20 px.
 - Base para paletas de color: los colores seguían fijos en `theme.h` y en las hojas de estilo. Ahora `src/palette.*`
-  los agrupa en 17 roles con un color base cada uno (fondos, bordes, títulos, rótulos del índice, cuatro niveles de
-  texto, acento, interruptores, estados) y deriva los demás tonos en HSL; `Theme::css`/`Theme::color` traducen y la
+  los agrupa en 18 roles con un color base cada uno (fondos, bordes, títulos, rótulos del índice, cuatro niveles de
+  texto, acento, elegido en selectores, interruptores, estados) y deriva los demás tonos en HSL; `@color(rol:#HEX)`
+  pide un tono por grupo cuando el valor se comparte. `Theme::css`/`Theme::color` traducen y la
   ventana se rearma en vivo. Editor sólo de desarrollo (`GATEBOUNCER_PALETTE_EDITOR=1`) y paletas de prueba en
   `resources/palettes/`.
 - Permitir usaba el cian de «funciona» (etiquetas) o el violeta del botón principal (botones). Ahora tiene su verde
