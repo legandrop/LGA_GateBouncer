@@ -23,10 +23,12 @@ class QVBoxLayout;
 class QHBoxLayout;
 class QFrame;
 class QTableWidget;
+class QAbstractButton;
 
 namespace Gate {
 
 class SideItem;
+class Desk;
 
 class FirewallWindow final : public QMainWindow {
     Q_OBJECT
@@ -70,7 +72,8 @@ class FirewallWindow final : public QMainWindow {
     void requestQuit();
     void finishQuit();
     void message(const QString &text);
-    void showHelp();
+    QWidget *how(const QStringList &steps, const QString &note = {});
+    void setHowOpen(bool open);
     // «Trust a folder»: una regla por carpeta, con la carpeta y el nombre del exe (vacío: todos) ya propuestos. Valida
     // mientras se escribe con la misma regla del motor, que igual la vuelve a validar al crearla.
     void trustFolderDialog(const QString &folder, const QString &name);
@@ -131,6 +134,9 @@ class FirewallWindow final : public QMainWindow {
     QLabel *appsTip_ = nullptr;
     QWidget *appsSeg_ = nullptr;
     QHash<QString, SideItem *> side_;
+    Desk *desk_ = nullptr;
+    QPointer<QAbstractButton> helpButton_; // el «?» de la barra: marcado mientras How it works está abierta
+    bool howOpen_ = false;
 };
 
 } // namespace Gate
