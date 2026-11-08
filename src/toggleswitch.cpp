@@ -114,7 +114,10 @@ void ToggleSwitch::paintEvent(QPaintEvent *) {
     // animación los colores se mezclan por tint_ y la perilla va por knob_.
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
-    if (!isEnabled())
+    // El editor de paletas corre una copia de desarrollo que el motor deja sólo mirar: los interruptores del firewall
+    // quedan deshabilitados. Ahí se dibujan como en la ventana instalada, para juzgar los colores.
+    static const bool paletteEditor = !qEnvironmentVariableIsEmpty("GATEBOUNCER_PALETTE_EDITOR");
+    if (!isEnabled() && !paletteEditor)
         painter.setOpacity(kDisabledOpacity);
     const QRectF box = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
     const qreal radius = box.height() / 2.0;
