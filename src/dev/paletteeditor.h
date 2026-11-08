@@ -2,6 +2,7 @@
 #include <QPointer>
 #include <QString>
 #include <QWidget>
+#include <functional>
 
 class QCheckBox;
 class QComboBox;
@@ -22,6 +23,11 @@ class PaletteEditor final : public QWidget {
     explicit PaletteEditor(const QString &folder, QWidget *parent = nullptr);
     ~PaletteEditor() override;
     static QString folderFromEnvironment();
+    // Al cerrar el editor (la app de desarrollo se cierra con él, no queda en la bandeja).
+    std::function<void()> onClosed;
+
+  protected:
+    void closeEvent(QCloseEvent *event) override;
 
   private:
     void buildRows();

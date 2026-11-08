@@ -7,6 +7,7 @@
 #include "palette.h"
 
 #include <QCheckBox>
+#include <QCloseEvent>
 #include <QComboBox>
 #include <QCoreApplication>
 #include <QDesktopServices>
@@ -216,6 +217,13 @@ PaletteEditor::PaletteEditor(const QString &folder, QWidget *parent) : QWidget(p
 }
 
 PaletteEditor::~PaletteEditor() { delete toast_.data(); }
+
+void PaletteEditor::closeEvent(QCloseEvent *event) {
+    if (picker_) picker_->close();
+    if (toast_) toast_->hide();
+    QWidget::closeEvent(event);
+    if (onClosed) onClosed();
+}
 
 void PaletteEditor::buildRows() {
     for (const auto &role : Palette::roles()) {

@@ -140,6 +140,9 @@ int main(int argc, char **argv) {
     // instalada (no toma la instancia única) y no busca actualizaciones.
     const bool paletteEditor = !qEnvironmentVariableIsEmpty("GATEBOUNCER_PALETTE_EDITOR");
     QLocalServer instance;
+    // Canal de control aparte del de instancia única (ese, a una versión vieja, la trae al frente): «quit» cierra la app
+    // como «Salir» de la bandeja. Lo usa el lanzador del modo desarrollo para no tener dos ventanas abiertas.
+    QLocalServer control;
     if (!qa && !paletteEditor) {
         // El mutex decide de forma atómica quién es la primera instancia de esta sesión de Windows. Un relanzamiento
         // (cambio de zoom o idioma) espera hasta 10 s a que la ventana anterior termine de cerrarse.
@@ -166,6 +169,8 @@ int main(int argc, char **argv) {
         }
         instance.setSocketOptions(QLocalServer::UserAccessOption);
         instance.listen(instanceName);
+        control.setSocketOptions(QLocalServer::UserAccessOption);
+        control.listen("LGA.GateBouncer.Control." + qEnvironmentVariable("USERNAME"));
     }
     if (!Gate::initialize(app)) {
         std::fprintf(stderr, "No se pudo cargar la fuente del producto.\n");
@@ -184,10 +189,19 @@ int main(int argc, char **argv) {
             window.bringToFront();
         }
     });
+    QObject::connect(&control, &QLocalServer::newConnection, &window, [&control, &window] {
+        while (auto *client = control.nextPendingConnection()) {
+            QObject::connect(client, &QLocalSocket::disconnected, client, &QObject::deleteLater);
+            QObject::connect(client, &QLocalSocket::readyRead, &window, [client, &window] {
+                if (client->readAll().trimmed() == "quit") window.quitFromOutside();
+            });
+        }
+    });
     window.startLifecycle(Gate::Lifecycle::makeNativeTraySurface(), minimized);
     std::unique_ptr<Gate::PaletteEditor> editor;
     if (paletteEditor) {
         editor = std::make_unique<Gate::PaletteEditor>(Gate::PaletteEditor::folderFromEnvironment());
+        editor->onClosed = [&window] { window.quitFromOutside(); };
         editor->show();
     }
     return app.exec();

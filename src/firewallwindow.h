@@ -44,6 +44,8 @@ class FirewallWindow final : public QMainWindow {
     // Sólo QA: el aviso fijo actual, para capturarlo.
     AccessToast *accessToast() const { return toast_; }
     void startLifecycle(std::unique_ptr<Lifecycle::TraySurface> tray, bool minimized);
+    // Cerrar la app como «Salir» de la bandeja, pedido desde afuera (el lanzador del modo desarrollo).
+    void quitFromOutside() { quitApp(); }
 
   protected:
     bool eventFilter(QObject *object, QEvent *event) override;
