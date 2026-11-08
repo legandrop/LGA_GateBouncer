@@ -38,6 +38,9 @@ if (-not (Test-Path -LiteralPath $sums)) { Fail "no está $sums." }
 $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $setup).Hash.ToLower()
 if ((Get-Content -LiteralPath $sums -Raw) -notmatch [regex]::Escape($hash)) { Fail 'SHA256SUMS no corresponde al instalador.' }
 Write-Host "Versión $version · $setup"
+# CMakeLists.txt, el changelog y las notas tienen que decir lo mismo, con el bump commiteado (bump_version.bat).
+& powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'tools\bump_version.ps1') -Check
+if ($LASTEXITCODE -ne 0) { Fail 'la versión no está lista para publicar: correr bump_version.bat.' }
 
 # ---- el repo: main, limpio y publicado
 if ((git rev-parse --abbrev-ref HEAD) -ne 'main') { Fail 'no estoy en main.' }

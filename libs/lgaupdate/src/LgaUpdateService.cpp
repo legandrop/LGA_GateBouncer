@@ -1,6 +1,7 @@
 #include "lgaupdate/LgaUpdateService.h"
 
 #include "lgaupdate/LgaNetRetry.h"
+#include "lgaupdate/LgaUpdateI18n.h"
 #include "lgaupdate/LgaVersionCompare.h"
 #include "lgaupdate/LgaWhatsNew.h"
 
@@ -123,6 +124,17 @@ QString shellSafeText(QString text)
     }
     return text;
 }
+
+/// Texto de una notificacion del helper de macOS: va entre comillas dobles de AppleScript dentro
+/// de un `osascript -e '...'` de shell, asi que no puede llevar `'`, `"`, `\` ni saltos de linea.
+QString notificationSafeText(QString text)
+{
+    for (const QChar c : {QLatin1Char('\''), QLatin1Char('"'), QLatin1Char('\\'),
+                          QLatin1Char('\n'), QLatin1Char('\r')}) {
+        text.remove(c);
+    }
+    return text;
+}
 #endif
 
 /// Carpetas `updates/` del usuario (`CacheLocation` y `TempLocation`): el fallback de una
@@ -145,13 +157,23 @@ QStringList userUpdateDirectories()
 }
 
 #ifdef Q_OS_WIN
+// Texto para adentro de comillas simples de PowerShell. PowerShell toma como comilla simple tambien las tipograficas
+// (U+2018 a U+201B), y como el script se escribe con BOM las lee como tales: se pasan a ' y despues se duplican todas.
+QString powerShellSingleQuoted(QString text)
+{
+    for (const char16_t c : {u'‘', u'’', u'‚', u'‛'}) {
+        text.replace(QChar(c), QLatin1Char('\''));
+    }
+    return text.replace(QLatin1Char('\''), QStringLiteral("''"));
+}
+
 // Lista de PowerShell: 'a','b','c'
 QString powerShellQuotedList(const QStringList &values)
 {
     QStringList quoted;
     quoted.reserve(values.size());
     for (const QString &value : values) {
-        quoted << QStringLiteral("'%1'").arg(QString(value).replace('\'', QStringLiteral("''")));
+        quoted << QStringLiteral("'%1'").arg(powerShellSingleQuoted(value));
     }
     return quoted.isEmpty() ? QStringLiteral("''") : quoted.join(QStringLiteral(","));
 }
@@ -165,8 +187,7 @@ QString powerShellCommandLineMatch(const QStringList &patterns)
     QStringList conditions;
     conditions.reserve(patterns.size());
     for (const QString &pattern : patterns) {
-        conditions << QStringLiteral("$_.CommandLine -like '%1'")
-                          .arg(QString(pattern).replace('\'', QStringLiteral("''")));
+        conditions << QStringLiteral("$_.CommandLine -like '%1'").arg(powerShellSingleQuoted(pattern));
     }
     return conditions.join(QStringLiteral(" -or "));
 }
@@ -447,6 +468,9 @@ LgaUpdateService::LgaUpdateService(LgaUpdateConfig config, QWidget *parentWindow
     , m_config(std::move(config))
     , m_parentWindow(parentWindow)
 {
+    // El idioma que pidio la app, antes de cualquier texto: todos los tr() de la biblioteca se
+    // resuelven al mostrarse.
+    LgaUpdateI18n::setLanguage(m_config.language);
     if (m_config.networkFactory) {
         m_network = m_config.networkFactory(this);
     }
@@ -2380,7 +2404,7 @@ function Stop-Postponed([string]$What, [string]$PopupText) {
     Write-Log "Update postergado: $What sigue abierto"
     try {
         $shell = New-Object -ComObject WScript.Shell
-        $shell.Popup($PopupText, 0, '__DISPLAY_NAME__ Update', 48) | Out-Null
+        $shell.Popup($PopupText, 0, '__POPUP_TITLE__', 48) | Out-Null
     } catch {}
     # La app que pidio el update ya se cerro: una residente la necesita de vuelta (ver
     # `LgaUpdateConfig::relaunchWhenUpdatePostponed`).
@@ -2393,7 +2417,7 @@ function Stop-Postponed([string]$What, [string]$PopupText) {
 
 if (-not (Wait-UntilGone { Get-AppProcesses } $appWaitLimitMs)) {
     if (-not $forceClose) {
-        Stop-Postponed 'la app' 'The update was postponed because another __DISPLAY_NAME__ window is still open. Save your work, close every __DISPLAY_NAME__ window, and try again.'
+        Stop-Postponed 'la app' '__POSTPONED_APP_TEXT__'
     }
     # `closePolicy = Force`: una app con procesos de fondo no puede quedar a medio actualizar.
     Write-Log 'La app sigue abierta despues de 15 s; se cierra a la fuerza'
@@ -2402,7 +2426,7 @@ if (-not (Wait-UntilGone { Get-AppProcesses } $appWaitLimitMs)) {
 
 if (-not (Wait-UntilGone { Get-BackendProcesses } $backendWaitLimitMs)) {
     if (-not $forceClose) {
-        Stop-Postponed 'un proceso de fondo' 'The update was postponed because __DISPLAY_NAME__ is still finishing work in the background. Try again in a moment.'
+        Stop-Postponed 'un proceso de fondo' '__POSTPONED_BACKGROUND_TEXT__'
     }
     Write-Log 'Siguen procesos de fondo despues de 8 s; se cierran a la fuerza'
     Get-BackendProcesses | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
@@ -2430,8 +2454,23 @@ exit 2
     pythonProcessNames.removeDuplicates();
 
     QString helperScript = helperTemplate;
-    helperScript.replace(QStringLiteral("__EXECUTABLE_NAME__"), executableName);
-    helperScript.replace(QStringLiteral("__DISPLAY_NAME__"), QString(m_config.displayName).replace('\'', "''"));
+    // Los avisos del helper en el idioma de la app, dentro de comillas simples de PowerShell. Van
+    // antes que __DISPLAY_NAME__: ya traen el nombre puesto.
+    const auto psQuoted = [](const QString &text) { return powerShellSingleQuoted(text); };
+    helperScript.replace(QStringLiteral("__POPUP_TITLE__"),
+                         psQuoted(tr("%1 Update").arg(m_config.displayName)));
+    helperScript.replace(
+        QStringLiteral("__POSTPONED_APP_TEXT__"),
+        psQuoted(tr("The update was postponed because another %1 window is still open. Save your "
+                    "work, close every %1 window, and try again.")
+                     .arg(m_config.displayName)));
+    helperScript.replace(
+        QStringLiteral("__POSTPONED_BACKGROUND_TEXT__"),
+        psQuoted(tr("The update was postponed because %1 is still finishing work in the "
+                    "background. Try again in a moment.")
+                     .arg(m_config.displayName)));
+    helperScript.replace(QStringLiteral("__EXECUTABLE_NAME__"), powerShellSingleQuoted(executableName));
+    helperScript.replace(QStringLiteral("__DISPLAY_NAME__"), powerShellSingleQuoted(m_config.displayName));
     helperScript.replace(QStringLiteral("__RELAUNCH_WHEN_POSTPONED__"),
                          m_config.relaunchWhenUpdatePostponed ? QStringLiteral("true")
                                                               : QStringLiteral("false"));
@@ -2447,7 +2486,9 @@ exit 2
                          powerShellCommandLineMatch(m_config.windowsPythonCommandLineMatches));
 
     QSaveFile helperFile(helperPath);
-    const QByteArray helperBytes = helperScript.toUtf8();
+    // Con BOM: Windows PowerShell 5.1 lee un .ps1 sin BOM en la pagina de codigos ANSI, y un aviso
+    // con acentos saldria roto.
+    const QByteArray helperBytes = QByteArray("\xEF\xBB\xBF") + helperScript.toUtf8();
     if (!helperFile.open(QIODevice::WriteOnly)
         || helperFile.write(helperBytes) != helperBytes.size() || !helperFile.commit()) {
         setError(tr("Could not prepare update helper script."));
@@ -2593,13 +2634,13 @@ cleanup() {
         if [ "$RELAUNCH_ALLOWED" = true ] && [ -x "$TARGET_EXEC" ]; then
             "$TARGET_EXEC" >/dev/null 2>&1 &
         fi
-        /usr/bin/osascript -e 'display notification "The update was postponed because another __DISPLAY_NAME__ window is still open. Save your work, close every __DISPLAY_NAME__ window, and try again." with title "__DISPLAY_NAME__ Update"' >/dev/null 2>&1 || true
+        /usr/bin/osascript -e 'display notification "__POSTPONED_APP_TEXT__" with title "__POPUP_TITLE__"' >/dev/null 2>&1 || true
     else
         log "Update fallido en el paso '$STEP' (estado=$EXIT_STATUS). Se reabre la app que funcionaba."
         if [ -x "$TARGET_EXEC" ]; then
             "$TARGET_EXEC" >/dev/null 2>&1 &
         fi
-        /usr/bin/osascript -e 'display notification "The update could not finish. __DISPLAY_NAME__ was restored; details were saved in the update log." with title "__DISPLAY_NAME__ Update"' >/dev/null 2>&1 || true
+        /usr/bin/osascript -e 'display notification "__UPDATE_FAILED_TEXT__" with title "__POPUP_TITLE__"' >/dev/null 2>&1 || true
     fi
     # El asset se borra SIEMPRE, salga bien o mal: ya se extrajo, pesa cientos de MB y se puede
     # volver a bajar. El barrido del arranque siguiente es la red para cuando esto no corre.
@@ -2761,6 +2802,20 @@ INSTALL_COMPLETE=true
     helperScript.replace(QStringLiteral("__UPDATE_LOG__"),
                          shellSafeText(updateLog));
     helperScript.replace(QStringLiteral("__PRODUCT_ID__"), m_config.productId);
+    // Los avisos del helper en el idioma de la app. Van antes que __DISPLAY_NAME__: ya traen el
+    // nombre puesto.
+    helperScript.replace(QStringLiteral("__POPUP_TITLE__"),
+                         notificationSafeText(tr("%1 Update").arg(m_config.displayName)));
+    helperScript.replace(
+        QStringLiteral("__POSTPONED_APP_TEXT__"),
+        notificationSafeText(tr("The update was postponed because another %1 window is still "
+                                "open. Save your work, close every %1 window, and try again.")
+                                 .arg(m_config.displayName)));
+    helperScript.replace(
+        QStringLiteral("__UPDATE_FAILED_TEXT__"),
+        notificationSafeText(tr("The update could not finish. %1 was restored; details were "
+                                "saved in the update log.")
+                                 .arg(m_config.displayName)));
     helperScript.replace(QStringLiteral("__DISPLAY_NAME__"), m_config.displayName);
     helperScript.replace(QStringLiteral("__RELAUNCH_WHEN_POSTPONED__"),
                          m_config.relaunchWhenUpdatePostponed ? QStringLiteral("true")

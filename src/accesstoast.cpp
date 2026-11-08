@@ -70,7 +70,10 @@ constexpr int ShortTextRole = Qt::UserRole + 1;
 QSettings store() { return QSettings(QSettings::NativeFormat, QSettings::UserScope, "LGA", "GateBouncer"); }
 
 // shortcut: registro temporal de los desplegables del aviso (una elección que no queda); se quita al cerrar ese error.
+// Sólo con GATEBOUNCER_TOAST_TRACE=1: escribir a disco en cada pedido y en cada clic no va en el uso normal.
 void trace(const QString &line) {
+    static const bool enabled = qEnvironmentVariable("GATEBOUNCER_TOAST_TRACE") == QLatin1String("1");
+    if (!enabled) return;
     QFile f(QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation) + "/toast-trace.log");
     if (f.size() > 512 * 1024) f.remove();
     QDir().mkpath(QFileInfo(f).absolutePath());

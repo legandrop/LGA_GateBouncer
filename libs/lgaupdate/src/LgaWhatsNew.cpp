@@ -332,9 +332,10 @@ int itemCount(const QList<VersionNotes> &versions)
 QString kindTitle(Kind kind)
 {
     switch (kind) {
-    case Kind::New: return QStringLiteral("New");
-    case Kind::Improved: return QStringLiteral("Improved");
-    case Kind::Fixed: return QStringLiteral("Fixed");
+    // En el idioma del updater (`LgaUpdateConfig::language`, tabla en LgaUpdateI18n.cpp).
+    case Kind::New: return QCoreApplication::translate("LgaWhatsNew", "New");
+    case Kind::Improved: return QCoreApplication::translate("LgaWhatsNew", "Improved");
+    case Kind::Fixed: return QCoreApplication::translate("LgaWhatsNew", "Fixed");
     }
     return {};
 }

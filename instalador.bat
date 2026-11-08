@@ -52,7 +52,7 @@ type nul > "%GATEBOUNCER_DEPLOY_DIR%\.gatebouncer-deploy"
 copy /y "%GATEBOUNCER_BUILD_DIR%\GateBouncer.exe" "%GATEBOUNCER_DEPLOY_DIR%\" >nul || exit /b 1
 copy /y "%GATEBOUNCER_ENGINE_BUILD_DIR%\GateBouncerEngine.exe" "%GATEBOUNCER_DEPLOY_DIR%\" >nul || exit /b 1
 set "PATH=C:\Qt\Tools\mingw1310_64\bin;%QT_ROOT%\bin;%PATH%"
-"%QT_ROOT%\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-compiler-runtime "%GATEBOUNCER_DEPLOY_DIR%\GateBouncer.exe"
+"%QT_ROOT%\bin\windeployqt.exe" --release --no-translations --no-system-d3d-compiler --no-opengl-sw --no-compiler-runtime --skip-plugin-types imageformats,iconengines,generic --exclude-plugins qcertonlybackend "%GATEBOUNCER_DEPLOY_DIR%\GateBouncer.exe"
 if errorlevel 1 exit /b 1
 rem Runtime de MinGW: windeployqt no lo copia con --no-compiler-runtime, se toma del compilador usado.
 for %%D in (libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll) do (

@@ -8,11 +8,13 @@
 # README.md). No se edita en la app.
 add_library(LGAUpdate STATIC
     src/LgaUpdateDialog.cpp
+    src/LgaUpdateI18n.cpp
     src/LgaUpdateService.cpp
     src/LgaVersionCompare.cpp
     src/LgaWhatsNew.cpp
     include/lgaupdate/LgaNetRetry.h
     include/lgaupdate/LgaUpdateDialog.h
+    include/lgaupdate/LgaUpdateI18n.h
     include/lgaupdate/LgaUpdateService.h
     include/lgaupdate/LgaVersionCompare.h
     include/lgaupdate/LgaWhatsNew.h

@@ -26,8 +26,10 @@
  *       de HTTP/2 o 408/429/5xx se vuelve a mandar 3 veces POR SERVIDOR (tope 10 en total), 5 s
  *       entre intentos (chequeo, manifiesto de las notas, notas y descarga, que ademas reanuda
  *       por `Range`).
+ *   4 — textos en ingles o castellano segun `LgaUpdateConfig::language` (`LgaUpdateI18n.h`):
+ *       carteles, descarga, rotulos de las notas y avisos del helper. Default: ingles, como antes.
  */
-#define LGAUPDATE_REVISION 3
+#define LGAUPDATE_REVISION 4
 
 class QNetworkAccessManager;
 class QNetworkReply;
@@ -217,6 +219,14 @@ struct LgaUpdateConfig {
      * `updateDownloadProgressDialog`). Vacia (default) = el estilo de la app.
      */
     QString progressDialogStyleSheet;
+    /**
+     * Idioma de los textos del updater, el que eligio el usuario en la app: "es" los muestra en
+     * castellano (carteles, dialogo de la descarga, rotulos de las notas y avisos del helper);
+     * vacio (default) o cualquier otro valor, en ingles. Las notas mismas no se traducen: vienen
+     * escritas en el WhatsNew.md del producto. Acepta "es_AR" o "es-ES". Vale para todo el proceso: manda
+     * el ultimo servicio creado (una app tiene uno solo). Detalle en `LgaUpdateI18n.h`.
+     */
+    QString language;
 
     // ------------------------------------------------------------ notas ("What's new")
     /**

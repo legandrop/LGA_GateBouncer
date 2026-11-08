@@ -9,6 +9,10 @@
 #include "theme.h"
 #include "toggleswitch.h"
 #include "uiscale.h"
+#include <lgaupdate/LgaUpdateService.h>
+#if LGAUPDATE_REVISION < 4
+#error "libs/lgaupdate tiene que ser la rev 4 o mas nueva (el updater en castellano): copiarla de LGA_Base_QT_C_Py."
+#endif
 #include <QAbstractButton>
 #include <QApplication>
 #include <QProcess>
@@ -20,6 +24,7 @@
 #include <QUrl>
 #include <QDialog>
 #include <QDir>
+#include <QElapsedTimer>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -41,7 +46,9 @@
 #include <QScrollBar>
 #include <QSettings>
 #include <QShowEvent>
+#include <QPersistentModelIndex>
 #include <QStyle>
+#include <QStyledItemDelegate>
 #include <QStyleOptionComboBox>
 #include <QStylePainter>
 #include <QTableWidget>
@@ -129,6 +136,14 @@ QLabel[chip="block"] { background: #361B1D; border: 1px solid #6B2E31; color: #F
 QLabel[chip="mute"] { background: transparent; border: 1px solid #3A3A43; color: #9C9BA2; font-weight: 500; }
 QLabel[chip="warn"] { background: #F2CB3F; border: 0; color: #1C1606; }
 QLabel[chip="ok"] { background: transparent; border: 1px solid #24586A; color: #57CDEF; }
+QLabel[r="value"][weight="500"] { font-weight: 500; }
+QLabel[r="value"][weight="600"] { font-weight: 600; }
+QLabel[tile="30"] { background: #2A2A31; border: 0; border-radius: 7px; }
+QLabel[tile="36"] { background: #2A2A31; border: 0; border-radius: 8px; }
+QLabel[seg="name"] { color: #8C8B93; font-size: 12.5px; font-weight: 600; }
+QLabel[seg="name"][on="1"] { color: #DDDBEE; }
+QLabel[seg="count"] { color: #6E6D75; font-size: 12.5px; font-weight: 500; }
+QLabel[seg="count"][on="1"] { color: #A39DD0; }
 QLabel#fwBadge { background: #F2CB3F; color: #1C1606; border-radius: 4px; font-size: 12px; font-weight: 600; }
 QPushButton { border: 1px solid #3A3A43; border-radius: 6px; background: #2A2A31; color: #E3E1DA; padding: 0 14px; min-height: 28px; font-size: 13px; font-weight: 500; }
 QPushButton:hover { background: #34343C; border: 1px solid #4A4A55; }
@@ -148,9 +163,11 @@ QPushButton[k="link"]:disabled { color: #6E6D75; border: 0; background: transpar
 QPushButton[k="seg"] { background: transparent; border: 1px solid transparent; color: #8C8B93; border-radius: 5px; min-height: 22px; padding: 0 11px; font-size: 12.5px; font-weight: 600; }
 QPushButton[k="seg"]:hover { background: #202026; color: #E3E1DA; border: 1px solid transparent; }
 QPushButton[k="seg"][on="1"] { background: #2A2552; border: 1px solid #5243A8; color: #DDDBEE; }
+QPushButton[k="seg"][inner="1"] { padding: 0; }
 QPushButton[k="x"] { background: transparent; border: 0; color: #9C9BA2; padding: 0; min-height: 22px; min-width: 22px; font-size: 14px; }
 QPushButton[k="x"]:hover { color: #F0645C; background: transparent; border: 0; }
 QPushButton[sm="1"] { min-height: 24px; padding: 0 10px; font-size: 12.5px; }
+QPushButton[dec="1"] { padding: 0; }
 QPushButton:focus { outline: none; }
 QLineEdit { background: #15151A; border: 1px solid #2F2F37; border-radius: 6px; color: #E3E1DA; padding: 0 10px; min-height: 28px; font-size: 13px; selection-background-color: #2A2552; }
 QLineEdit:hover { border: 1px solid #44444E; }
@@ -223,7 +240,7 @@ QPushButton *button(const QString &label, const char *kind = nullptr, bool small
 QPushButton *decision(const QString &label, const char *kind) {
     auto *b = button(label, kind, true);
     b->setFixedSize(72, 26);
-    b->setStyleSheet("padding: 0;");
+    b->setProperty("dec", "1"); // sin aire a los costados (regla de la hoja: una hoja por botón cuesta)
     return b;
 }
 // Rótulo en versalitas con aire entre letras (`FIREWALL`, `RULE`).
@@ -573,15 +590,190 @@ QPixmap iconPixmap(const QString &name, int size, const QColor &color, qreal dpr
     return pm;
 }
 
-// Ícono real del programa (el de Windows), en su caja (`.tile`, 36 o 30); si no hay archivo, uno genérico.
+// Ícono real del programa (el de Windows), en su caja (`.tile`, 36 o 30); si no hay archivo, uno genérico. Llega en
+// segundo plano (AppIcons): mientras tanto, el genérico.
 QLabel *appIcon(const QString &path, int box = 30) {
     auto *l = new QLabel;
     l->setFixedSize(box, box);
     l->setAlignment(Qt::AlignCenter);
-    l->setStyleSheet(QString("background: #2A2A31; border: 0; border-radius: %1px;").arg(box >= 36 ? 8 : 7));
-    l->setPixmap(appIconPixmap(path, box >= 36 ? 24 : 20, qApp->devicePixelRatio()));
+    l->setProperty("tile", box >= 36 ? "36" : "30");
+    AppIcons::apply(l, path, box >= 36 ? 24 : 20, qApp->devicePixelRatio());
     return l;
 }
+
+// ---- Filas de reglas de Apps pintadas a mano
+// Una fila con widgets son 11 piezas con su estilo: con cientos de reglas, armar la tabla tardaba más de un segundo y
+// cada filtro la volvía a armar. Estas filas guardan sus datos en el ítem y las pinta el delegado, con los mismos
+// colores y tamaños que las piezas de la hoja de estilo (strong, faint, small, time, pill, chip, tile).
+enum RowRole {
+    RoleKind = Qt::UserRole + 1, // "app", "text", "chip", "pill:<tipo>", "time"
+    RoleText,
+    RoleSubtitle,
+    RoleIconPath,
+    RoleElide,
+};
+
+QFont roleFont(const QFont &base, qreal px, int weight) {
+    QFont f(base);
+    // Como Theme::css: un medio píxel no entra en un tamaño entero de píxeles, va en puntos (1px = 0,75pt).
+    if (qFuzzyCompare(px, qRound(px))) f.setPixelSize(qRound(px));
+    else f.setPointSizeF(px * 0.75);
+    f.setWeight(QFont::Weight(weight));
+    return f;
+}
+
+class RuleRowDelegate final : public QStyledItemDelegate {
+  public:
+    using QStyledItemDelegate::QStyledItemDelegate;
+
+    // Lo que no entra y se ve recortado, entero, para el tooltip propio (vacío si todo entra).
+    QString clippedText(const QStyleOptionViewItem &option, const QModelIndex &index) const {
+        QStringList clipped;
+        for (const auto &t : texts(option, index))
+            if (QFontMetrics(t.font).horizontalAdvance(t.text) > t.rect.width()) clipped << t.text;
+        // Una píldora o un chip recortados (una regla temporal larga), con la misma cuenta que paint().
+        const QString kind = index.data(RoleKind).toString();
+        if (kind.startsWith("pill:") || kind == "chip") {
+            const QFontMetrics fm(roleFont(option.font, 12, QFont::DemiBold));
+            const QString value = index.data(RoleText).toString();
+            const int pad = 1 + 8 + fm.horizontalAdvance(QLatin1Char('x')) / 2;
+            if (fm.horizontalAdvance(value) + 2 * pad > option.rect.width() - 28) clipped << value;
+        }
+        return clipped.join("\n");
+    }
+
+    void paint(QPainter *painter, const QStyleOptionViewItem &option, const QModelIndex &index) const override {
+        // Fondo, línea de abajo y hover: los de la hoja de estilo (::item), como cualquier fila.
+        QStyledItemDelegate::paint(painter, option, index);
+        const QString kind = index.data(RoleKind).toString();
+        if (kind.isEmpty()) return;
+        painter->save();
+        painter->setRenderHint(QPainter::Antialiasing);
+        const QRect area = option.rect.adjusted(14, 0, -14, 0);
+        if (kind == "app") {
+            const QRect tile(area.left(), area.center().y() - 14, 30, 30);
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(QColor("#2A2A31"));
+            painter->drawRoundedRect(tile, 7, 7);
+            const qreal dpr = painter->device()->devicePixelRatioF();
+            const QPixmap icon = AppIcons::get(index.data(RoleIconPath).toString(), 20, dpr);
+            const QSizeF size = QSizeF(icon.size()) / icon.devicePixelRatio();
+            painter->drawPixmap(QPointF(tile.center().x() + 1 - size.width() / 2, tile.center().y() + 1 - size.height() / 2),
+                                icon);
+        } else if (kind.startsWith("pill:") || kind == "chip") {
+            static const QHash<QString, QStringList> colors{
+                // fondo, borde, texto (los de QLabel[pill=…] y QLabel[chip="1"])
+                {"pill:allow", {"#0D2A33", "#24586A", "#57CDEF"}}, {"pill:block", {"#361B1D", "#6B2E31", "#F0645C"}},
+                {"pill:temp", {"#25223B", "#5243A8", "#C5BBF4"}},  {"pill:dest", {"#2A2A31", "#3A3A43", "#C4C3C9"}},
+                {"chip", {"", "#3A3A43", "#9C9BA2"}}};
+            const QStringList c = colors.value(kind, colors.value("pill:dest"));
+            const QFont f = roleFont(option.font, 12, QFont::DemiBold);
+            const QFontMetrics fm(f);
+            const QString value = index.data(RoleText).toString();
+            // Como el QLabel con borde de la hoja: 1 de borde, 8 de aire y la sangría de Qt (media «x») a cada lado.
+            const int indent = fm.horizontalAdvance(QLatin1Char('x')) / 2, pad = 1 + 8 + indent;
+            const int w = qMin(area.width(), fm.horizontalAdvance(value) + 2 * pad);
+            const QRectF box(area.left() + 0.5, area.center().y() - 10.5, w - 1, 22);
+            painter->setPen(QPen(QColor(c[1]), 1));
+            painter->setBrush(c[0].isEmpty() ? QBrush(Qt::NoBrush) : QBrush(QColor(c[0])));
+            painter->drawRoundedRect(box, 4, 4);
+            painter->setFont(f);
+            painter->setPen(QColor(c[2]));
+            painter->drawText(QRectF(area.left() + pad, box.top(), w - 2 * pad, box.height()),
+                              Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine,
+                              fm.elidedText(value, Qt::ElideRight, w - 2 * pad));
+        }
+        for (const auto &t : texts(option, index)) {
+            painter->setFont(t.font);
+            painter->setPen(t.color);
+            painter->drawText(t.rect, int(t.align) | Qt::TextSingleLine,
+                              QFontMetrics(t.font).elidedText(t.text, t.elide, t.rect.width()));
+        }
+        painter->restore();
+    }
+
+  private:
+    struct Text {
+        QString text;
+        QFont font;
+        QColor color;
+        QRect rect;
+        Qt::Alignment align = Qt::AlignLeft | Qt::AlignVCenter;
+        Qt::TextElideMode elide = Qt::ElideRight;
+    };
+
+    // Los textos de la celda con su lugar: los mismos para pintar y para saber qué quedó recortado.
+    QVector<Text> texts(const QStyleOptionViewItem &option, const QModelIndex &index) const {
+        QVector<Text> out;
+        const QString kind = index.data(RoleKind).toString();
+        const QRect area = option.rect.adjusted(14, 0, -14, 0);
+        if (kind == "app") {
+            // Nombre (strong) y debajo qué cubre (faint), a 11 de la caja del ícono. Como las dos etiquetas de antes:
+            // cada una centrada en su mitad de la fila, con 1 de separación; sin subtítulo, el nombre en el medio.
+            const QFont titleFont = roleFont(option.font, 14, QFont::Medium);
+            const QFont subFont = roleFont(option.font, 12, QFont::Normal);
+            const QString subtitle = index.data(RoleSubtitle).toString();
+            const int left = area.left() + 30 + 11, width = qMax(0, area.right() - left + 1);
+            const int half = (area.height() - 1) / 2;
+            const auto mode = Qt::TextElideMode(index.data(RoleElide).toInt());
+            if (subtitle.isEmpty()) {
+                out.push_back({index.data(RoleText).toString(), titleFont, QColor("#E3E1DA"), QRect(left, area.top(), width, area.height())});
+            } else {
+                out.push_back({index.data(RoleText).toString(), titleFont, QColor("#E3E1DA"), QRect(left, area.top(), width, half)});
+                out.push_back({subtitle, subFont, QColor("#8C8B93"),
+                               QRect(left, area.top() + half + 1, width, area.height() - half - 1),
+                               Qt::AlignLeft | Qt::AlignVCenter, mode});
+            }
+        } else if (kind == "text" || kind == "time") {
+            out.push_back({index.data(RoleText).toString(), roleFont(option.font, 12.5, QFont::Normal),
+                           QColor(kind == "time" ? "#8C8B93" : "#9C9BA2"), area,
+                           (kind == "time" ? Qt::AlignRight : Qt::AlignLeft) | Qt::AlignVCenter});
+        }
+        return out;
+    }
+};
+
+// Tooltip propio de las filas pintadas: lo que quedó recortado con «…», entero, al quedarse el mouse encima.
+class ClippedTextTips final : public QObject {
+  public:
+    ClippedTextTips(QTableWidget *table, RuleRowDelegate *delegate) : QObject(table), table_(table), delegate_(delegate) {
+        table->viewport()->installEventFilter(this);
+    }
+
+  protected:
+    bool eventFilter(QObject *, QEvent *event) override {
+        if (event->type() == QEvent::MouseMove) {
+            const QPoint pos = static_cast<QMouseEvent *>(event)->position().toPoint();
+            const QModelIndex index = table_->indexAt(pos);
+            QString tip;
+            if (index.isValid()) {
+                QStyleOptionViewItem option;
+                option.initFrom(table_->viewport());
+                option.font = table_->font();
+                option.rect = table_->visualRect(index);
+                tip = delegate_->clippedText(option, index);
+            }
+            if (index != shown_ || tip != tip_) {
+                shown_ = index;
+                tip_ = tip;
+                if (tip.isEmpty()) CustomTooltip::instance()->hideToolTip();
+                else CustomTooltip::instance()->requestToolTip(tip.toHtmlEscaped().replace("\n", "<br>"), table_->viewport(),
+                                                               table_->viewport()->mapToGlobal(pos));
+            }
+        } else if (event->type() == QEvent::Leave) {
+            shown_ = QPersistentModelIndex();
+            tip_.clear();
+            CustomTooltip::instance()->hideToolTip();
+        }
+        return false;
+    }
+
+  private:
+    QTableWidget *table_;
+    RuleRowDelegate *delegate_;
+    QPersistentModelIndex shown_;
+    QString tip_;
+};
 
 // Encabezado de una página (`.ph`): el título grande en Bricolage, la descripción debajo y, a la derecha, lo que se
 // pase (el switch grande, un selector). Con `lead`, una caja a la izquierda del título (el ícono de una app).
@@ -1027,6 +1219,8 @@ class Desk final : public QWidget {
         return QRect(kNavWidth, kSheetTop, width() - kNavWidth - kSheetMargin, height() - kSheetTop - kSheetMargin);
     }
     void setSelected(SideItem *item) {
+        // Es el fondo de toda la ventana: repintarlo sin cambio era repintar la ventana entera con cada aviso del motor.
+        if (selected_ == item) return;
         selected_ = item;
         update();
     }
@@ -1095,6 +1289,11 @@ FirewallWindow::FirewallWindow(QWidget *parent) : QMainWindow(parent) {
     static_cast<ChromeButton *>(helpButton_.data())->setActive(howOpen_);
     connect(&firewall_, &FirewallClient::changed, this, &FirewallWindow::engineChanged);
     connect(&firewall_, &FirewallClient::changed, this, &FirewallWindow::updateLifecycle);
+    // Con reglas nuevas, la lista de Apps se arma (y pide sus íconos en segundo plano) aunque la ventana esté en la
+    // bandeja: al abrir Apps ya están.
+    connect(&firewall_, &FirewallClient::changed, this, [this] {
+        if (entriesVersion_ != firewall_.rulesVersion()) appEntries();
+    });
     // El aviso sigue al motor en cada cambio: pedidos nuevos o resueltos, el nombre del servidor que llega tarde, el
     // motor caído. Después de que el cliente termine de leer: el aviso necesita los datos completos.
     connect(&firewall_, &FirewallClient::changed, this, [this] { QTimer::singleShot(0, this, &FirewallWindow::updateToast); });
@@ -1154,7 +1353,9 @@ void FirewallWindow::buildShell() {
     bl->setContentsMargins(14, 0, 0, 0);
     bl->setSpacing(0);
     auto *logo = new QLabel;
-    logo->setPixmap(QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png").pixmap(QSize(22, 22), devicePixelRatio()));
+    // 20 px (antes 22: Lega lo pidió un 10 % más chico). Con el zoom de 110 % la escala es fraccionaria: devicePixelRatioF
+    // para que no se pinte borroso.
+    logo->setPixmap(QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png").pixmap(QSize(20, 20), devicePixelRatioF()));
     logo->setAttribute(Qt::WA_TransparentForMouseEvents);
     bl->addWidget(logo);
     bl->addSpacing(10);
@@ -1337,7 +1538,35 @@ void FirewallWindow::selectView(const QString &view) {
                                    "pending", "rules", "processes"};
     if (!known.contains(view) && !view.startsWith("detail:")) return;
     view_ = view == "pending" ? "requests" : view == "rules" || view == "processes" ? "apps" : view;
-    render();
+    qaMeasure("vista " + view_, [this] { render(); });
+    // Fuera de Overview y Activity el historial se pide cada 5 s: al entrar a una de ellas, ya.
+    if (view_ == "overview" || view_ == "activity") firewall_.refreshNow();
+}
+
+void FirewallWindow::updateRefreshRates() {
+    const bool shown = isVisible() && !isMinimized();
+    const bool showsActivity = view_ == "overview" || view_ == "activity";
+    // Escondida: reglas cada 30 s (y en el acto si llega un pedido nuevo, para el aviso) y sin historial.
+    firewall_.setRefresh(shown ? 1000 : 30000, shown ? (showsActivity ? 1000 : 5000) : 0);
+}
+
+// QA: con GATEBOUNCER_QA_TIMING=<archivo>, cada cambio de vista o de filtro anota cuánto tardó hasta quedar pintado
+// (armar la página, acomodar y pintar, forzado en el acto). Sin la variable no hace nada.
+void FirewallWindow::qaMeasure(const QString &what, const std::function<void()> &action) {
+    static const QString file = qEnvironmentVariable("GATEBOUNCER_QA_TIMING");
+    if (file.isEmpty()) {
+        action();
+        return;
+    }
+    QElapsedTimer clock;
+    clock.start();
+    action();
+    const qint64 built = clock.elapsed();
+    QCoreApplication::sendPostedEvents();
+    repaint();
+    QFile out(file);
+    if (out.open(QIODevice::Append | QIODevice::Text))
+        out.write(QString("%1\tarmar %2 ms\tpintado %3 ms\n").arg(what).arg(built).arg(clock.elapsed()).toUtf8());
 }
 
 bool FirewallWindow::armed() const { return QDateTime::currentMSecsSinceEpoch() >= armedAt_; }
@@ -1385,6 +1614,11 @@ QString FirewallWindow::pageKey() const {
 }
 
 void FirewallWindow::engineChanged() {
+    // Escondida en la bandeja o minimizada no se rearma nada: nadie la ve. Se pone al día al volver (showEvent).
+    if (!isVisible() || isMinimized()) {
+        staleWhileHidden_ = true;
+        return;
+    }
     updateSidebar();
     if (closing_) return;
     // Con un desplegable abierto no se rearma la página: se cerraría bajo el puntero. Se reintenta al rato.
@@ -1418,6 +1652,8 @@ void FirewallWindow::render(bool keepScroll) {
     scroll_area_->setVerticalScrollBarPolicy(tableView ? Qt::ScrollBarAlwaysOff : Qt::ScrollBarAsNeeded);
     // La fila que sube bajo el puntero al decidir otra no recibe el clic siguiente: un instante sin decidir.
     if (view_ == "overview" || view_ == "requests" || view_ == "apps") armedAt_ = QDateTime::currentMSecsSinceEpoch() + 600;
+    // Los programas abiertos, antes de armar Apps: si llegaban después, la tabla se armaba dos veces.
+    if (view_ == "apps") scanRunning();
     QWidget *page = view_ == "requests"           ? requestsPage()
                     : view_ == "apps"             ? appsPage()
                     : view_.startsWith("detail:") ? detailPage(view_.mid(7))
@@ -1430,12 +1666,9 @@ void FirewallWindow::render(bool keepScroll) {
     scroll_area_->setWidget(page);
     if (old) old->deleteLater();
     lastKey_ = pageKey();
-    if (view_ == "apps") {
-        refreshRunning();
-        runningTimer_.start();
-    } else {
-        runningTimer_.stop();
-    }
+    if (view_ == "apps") runningTimer_.start();
+    else runningTimer_.stop();
+    updateRefreshRates();
     updateSidebar();
     QPointer<QTableWidget> table = page->findChild<QTableWidget *>("fwTable");
     QTimer::singleShot(0, this, [this, scroll, table, tableScrolled = tableScroll_.value(view_)] {
@@ -2235,6 +2468,7 @@ void FirewallWindow::decideDefault(const FirewallClient::PendingItem &p, bool al
 // Apps: una fila por app con reglas. Las reglas por destino de una misma app se juntan en «Per server».
 
 QVector<FirewallWindow::AppEntry> FirewallWindow::appEntries() const {
+    if (entriesVersion_ == firewall_.rulesVersion()) return entriesCache_;
     QVector<AppEntry> entries;
     QHash<QString, int> index;
     const auto &rules = firewall_.rules();
@@ -2276,12 +2510,15 @@ QVector<FirewallWindow::AppEntry> FirewallWindow::appEntries() const {
         entries[at].rules.push_back(r);
         if (!r.destination.isEmpty()) entries[at].perServer = true;
     }
-    // Ícono y archivos de las reglas por firma o por carpeta: los que ya cubrieron (si no, el de la carpeta).
+    // Ícono y archivos de las reglas por firma o por carpeta: los que ya cubrieron (si no, el de la carpeta). El primer
+    // archivo cubierto de cada regla, en una sola pasada.
+    QHash<QString, QString> firstCovered;
+    for (const auto &c : rules)
+        if (c.scope == "covered" && !firstCovered.contains(c.name)) firstCovered.insert(c.name, c.path);
     for (auto &e : entries) {
         if (!e.iconPath.isEmpty()) continue;
         for (const auto &r : e.rules)
-            for (const auto &c : rules)
-                if (c.scope == "covered" && c.name == r.id && e.iconPath.isEmpty()) e.iconPath = c.path;
+            if (e.iconPath.isEmpty()) e.iconPath = firstCovered.value(r.id);
         if (e.iconPath.isEmpty() && e.scope == "folder") e.iconPath = e.path;
         // El motor guarda el nombre en minúsculas: un archivo cubierto trae las mayúsculas reales («DayTrace.exe»).
         if (e.scope == "folder" && !e.rules.first().name.isEmpty() && e.iconPath != e.path &&
@@ -2290,11 +2527,21 @@ QVector<FirewallWindow::AppEntry> FirewallWindow::appEntries() const {
     }
     std::sort(entries.begin(), entries.end(),
               [](const AppEntry &a, const AppEntry &b) { return a.title.compare(b.title, Qt::CaseInsensitive) < 0; });
+    // Los íconos de Apps se piden ya, sin apuro: así la lista abre con ellos.
+    QStringList icons;
+    for (const auto &e : entries) icons << e.iconPath;
+    AppIcons::prefetch(icons, 20, devicePixelRatioF());
+    entriesCache_ = entries;
+    entriesVersion_ = firewall_.rulesVersion();
     return entries;
 }
 
-// Exes que corren en esta sesión de Windows (las apps del usuario, no los servicios).
 void FirewallWindow::refreshRunning() {
+    if (scanRunning()) engineChanged();
+}
+
+// Exes que corren en esta sesión de Windows (las apps del usuario, no los servicios). true si cambió la lista.
+bool FirewallWindow::scanRunning() {
     QStringList found;
     DWORD session = 0;
     ProcessIdToSessionId(GetCurrentProcessId(), &session);
@@ -2322,10 +2569,9 @@ void FirewallWindow::refreshRunning() {
         CloseHandle(snap);
     }
     std::sort(found.begin(), found.end(), [](const QString &a, const QString &b) { return a.compare(b, Qt::CaseInsensitive) < 0; });
-    if (found != running_) {
-        running_ = found;
-        engineChanged();
-    }
+    if (found == running_) return false;
+    running_ = found;
+    return true;
 }
 
 QStringList FirewallWindow::runningWithoutRule() const {
@@ -2382,15 +2628,25 @@ QWidget *FirewallWindow::appsPage() {
     filters->addWidget(appsSeg_);
     filters->addStretch();
     l->addLayout(filters);
-    connect(search, &QLineEdit::textChanged, this, [this](const QString &v) {
+    // La búsqueda filtra al dejar de tipear un momento, no con cada letra.
+    auto *searchPause = new QTimer(search);
+    searchPause->setSingleShot(true);
+    searchPause->setInterval(150);
+    connect(search, &QLineEdit::textChanged, searchPause, [this, searchPause](const QString &v) {
         appsQuery_ = v;
-        fillApps();
+        searchPause->start();
     });
+    connect(searchPause, &QTimer::timeout, this, [this] { fillApps(); });
     // La tabla ocupa el resto de la página: el encabezado queda fijo y sólo se desplazan las filas.
     auto *list = card();
     auto *ll = new QVBoxLayout(list);
     ll->setContentsMargins(1, 1, 1, 1);
     appsTable_ = makeTable("apps", 54);
+    // Las filas de reglas las pinta el delegado; las de «Running, no rule» siguen con widgets (tienen botones).
+    auto *rowPainter = new RuleRowDelegate(appsTable_);
+    appsTable_->setItemDelegate(rowPainter);
+    new ClippedTextTips(appsTable_, rowPainter);
+    AppIcons::onLoaded(appsTable_, [table = appsTable_] { table->viewport()->update(); });
     ll->addWidget(appsTable_);
     connect(appsTable_, &QTableWidget::cellClicked, this, [this](int row, int) {
         const QString key = appsTable_->item(row, 0) ? appsTable_->item(row, 0)->data(Qt::UserRole).toString() : QString();
@@ -2423,16 +2679,8 @@ void FirewallWindow::fillApps() {
         temporary += c == "temp";
         folders += e.scope == "folder";
     }
-    // Filtros: se rehacen con los números del momento.
+    // Filtros: se crean una vez por página; después sólo cambian el número y cuál está elegido.
     auto *sl = static_cast<QHBoxLayout *>(appsSeg_->layout());
-    while (auto *item = sl->takeAt(0)) {
-        // Diferido: el clic que rearma los filtros viene de uno de estos botones.
-        if (auto *old = item->widget()) {
-            old->hide();
-            old->deleteLater();
-        }
-        delete item;
-    }
     const QVector<std::tuple<QString, QString, int>> filters{{"all", I18n::tr("All"), int(entries.size())},
                                                             {"allow", I18n::trc("filter", "Allow"), allow},
                                                             {"block", I18n::trc("filter", "Block"), block},
@@ -2442,36 +2690,58 @@ void FirewallWindow::fillApps() {
                                                             {"running", I18n::tr("Running, no rule"), int(loose.size())}};
     for (const auto &[id, name, n] : filters) {
         // El número va más apagado que el nombre (`.seg em`): dos textos dentro del botón, que no toman el mouse.
-        const bool on = appsFilter_ == id;
-        auto *b = button({}, "seg");
-        b->setAccessibleName(QString("%1 %2").arg(name).arg(n));
-        auto *bl = new QHBoxLayout(b);
-        bl->setContentsMargins(11, 0, 11, 0);
-        bl->setSpacing(5);
-        auto *nameLabel = new QLabel(name);
-        auto *countLabel = new QLabel(QString::number(n));
-        nameLabel->setStyleSheet(QString("color: %1; font-size: %2; font-weight: 600;")
-                                     .arg(on ? Theme::kOnAccent : Theme::kTextFaint, "9.375pt"));
-        countLabel->setStyleSheet(QString("color: %1; font-size: %2; font-weight: 500;")
-                                      .arg(on ? "#A39DD0" : "#6E6D75", "9.375pt"));
-        for (auto *x : {nameLabel, countLabel}) {
-            x->setAttribute(Qt::WA_TransparentForMouseEvents);
-            bl->addWidget(x);
+        const QString on = appsFilter_ == id ? "1" : "0";
+        auto *b = appsSeg_->findChild<QPushButton *>("apps-filter-" + id, Qt::FindDirectChildrenOnly);
+        if (!b) {
+            b = button({}, "seg");
+            auto *bl = new QHBoxLayout(b);
+            bl->setContentsMargins(11, 0, 11, 0);
+            bl->setSpacing(5);
+            for (const char *part : {"name", "count"}) {
+                auto *x = new QLabel(part == QLatin1String("name") ? name : QString());
+                x->setObjectName(QString("seg-") + part);
+                x->setProperty("seg", part);
+                x->setAttribute(Qt::WA_TransparentForMouseEvents);
+                // La letra de la hoja (12.5px, 600 / 500) también puesta acá, para medir el ancho (abajo) sin esperar
+                // a que la hoja se aplique.
+                QFont f = x->font();
+                f.setPointSizeF(9.375);
+                f.setWeight(part == QLatin1String("name") ? QFont::DemiBold : QFont::Medium);
+                x->setFont(f);
+                bl->addWidget(x);
+            }
+            b->setFixedHeight(24);
+            // Sin el padding de la hoja (`QPushButton[k="seg"]`): el aire lo dan los márgenes del layout. Con los dos,
+            // la hoja sumaba 22 px al aplicarse, después de medir, y las etiquetas cortaban su última letra.
+            b->setProperty("inner", "1");
+            b->setObjectName("apps-filter-" + id);
+            connect(b, &QPushButton::clicked, this, [this, id = id] {
+                appsFilter_ = id;
+                qaMeasure("filtro " + id, [this] { fillApps(); });
+            });
+            sl->addWidget(b);
         }
-        b->setMinimumWidth(bl->sizeHint().width());
-        b->setFixedHeight(24);
-        b->setObjectName("apps-filter-" + id);
-        b->setProperty("on", on ? "1" : "0");
-        connect(b, &QPushButton::clicked, this, [this, id = id] {
-            appsFilter_ = id;
-            fillApps();
-        });
-        sl->addWidget(b);
+        auto *countLabel = b->findChild<QLabel *>("seg-count");
+        countLabel->setText(QString::number(n));
+        b->setAccessibleName(QString("%1 %2").arg(name).arg(n));
+        if (b->property("on").toString() != on)
+            for (QWidget *w : {static_cast<QWidget *>(b), static_cast<QWidget *>(b->findChild<QLabel *>("seg-name")),
+                               static_cast<QWidget *>(countLabel)}) {
+                w->setProperty("on", on);
+                w->style()->unpolish(w);
+                w->style()->polish(w);
+            }
+        // Ancho medido con la letra de cada texto: 11 de aire y 1 de borde a cada lado, 5 entre nombre y número.
+        auto *nameLabel = b->findChild<QLabel *>("seg-name");
+        b->setFixedWidth(2 * (11 + 1) + 5 + QFontMetrics(nameLabel->font()).horizontalAdvance(nameLabel->text()) +
+                         QFontMetrics(countLabel->font()).horizontalAdvance(countLabel->text()) + 2);
     }
 
-    // Filas. El desplazamiento se conserva: la tabla se rehace con cada cambio del motor.
+    // Filas. El desplazamiento se conserva: la tabla se rehace con cada cambio del motor. Se arma de una sola pasada
+    // y sin pintar: agregar filas de a una con la tabla en pantalla hace que Qt reacomode todas las anteriores.
     auto *t = appsTable_;
     const int scrolled = t->verticalScrollBar()->value();
+    t->setUpdatesEnabled(false);
     t->setRowCount(0);
     t->clearSpans();
     const bool runningView = appsFilter_ == "running";
@@ -2496,10 +2766,12 @@ void FirewallWindow::fillApps() {
         setColumns(t, "running",
                    {{I18n::tr("APPLICATION"), 260}, {I18n::tr("FOLDER"), 340}, {I18n::tr("RULE FOR THIS FILE"), 190}});
         t->viewport()->setCursor(Qt::ArrowCursor);
-        for (const auto &path : loose) {
-            if (!matches(path)) continue;
-            const int r = t->rowCount();
-            t->insertRow(r);
+        QStringList shown;
+        for (const auto &path : loose)
+            if (matches(path)) shown << path;
+        t->setRowCount(int(shown.size()));
+        for (int r = 0; r < shown.size(); ++r) {
+            const QString &path = shown[r];
             auto *folder = new ElideLabel(QDir::toNativeSeparators(QFileInfo(path).path()), "small", Qt::ElideMiddle);
             // Una regla para este archivo, sin esperar a que pida: como «This file only» en el aviso.
             auto *decide = new QWidget;
@@ -2522,39 +2794,52 @@ void FirewallWindow::fillApps() {
                                    "time they connect, or Allow and Block here save a rule for that file now."));
     } else {
         setColumns(t, "rules",
-                   {{I18n::tr("APPLICATION"), 330}, {I18n::tr("DESTINATION"), 120}, {I18n::tr("RULE"), 170},
+                   {{I18n::tr("APPLICATION"), 300}, {I18n::tr("DESTINATION"), 150}, {I18n::tr("RULE"), 170},
                     {I18n::tr("WHEN"), 130, Qt::AlignRight}});
         t->viewport()->setCursor(Qt::PointingHandCursor);
+        QVector<const AppEntry *> shown;
         for (const auto &e : entries) {
             const QString c = classify(e);
             // «Folders» junta las reglas por carpeta (con o sin nombre de exe), sean Allow, Block o temporales.
             if (appsFilter_ == "folder" ? e.scope != "folder" : appsFilter_ != "all" && appsFilter_ != c) continue;
             QString hay = e.title + " " + e.subtitle + " " + e.path + " " + e.signer;
             for (const auto &r : e.rules) hay += " " + r.destination;
-            if (!matches(hay)) continue;
-            const int r = t->rowCount();
-            t->insertRow(r);
+            if (matches(hay)) shown.push_back(&e);
+        }
+        t->setRowCount(int(shown.size()));
+        const auto item = [](const QString &kind, const QString &value) {
+            auto *i = new QTableWidgetItem;
+            i->setData(RoleKind, kind);
+            i->setData(RoleText, value);
+            // Sin DisplayRole (lo pinta el delegado): el texto, para lectores de pantalla.
+            i->setData(Qt::AccessibleTextRole, value);
+            return i;
+        };
+        for (int r = 0; r < shown.size(); ++r) {
+            const AppEntry &e = *shown[r];
+            const QString c = classify(e);
             const auto &r0 = e.rules.first();
-            QWidget *dest = e.perServer ? static_cast<QWidget *>(chip(e.rules.size() == 1 ? I18n::tr("1 server")
-                                                                                          : I18n::tr("%1 servers").arg(e.rules.size())))
-                                        : new ElideLabel(I18n::tr("Anywhere"), "small");
-            QLabel *policy = c == "server" ? pill(I18n::tr("Per server"), "dest")
-                             : c == "temp" ? pill(temporaryRule(r0.allow, r0.expires), "temp")
-                             : c == "allow" ? pill(I18n::tr("Allow"), "allow")
-                                            : pill(I18n::tr("Block"), "block");
+            auto *app = item("app", e.title);
+            app->setData(Qt::UserRole, "rule:" + e.key);
+            app->setData(RoleSubtitle, e.subtitle);
+            app->setData(RoleIconPath, e.iconPath);
+            // Una ruta se recorta al medio (se ve el final); un editor, al final.
+            app->setData(RoleElide, int(e.scope == "path" ? Qt::ElideMiddle : Qt::ElideRight));
+            t->setItem(r, 0, app);
+            t->setItem(r, 1, e.perServer ? item("chip", e.rules.size() == 1 ? I18n::tr("1 server")
+                                                                           : I18n::tr("%1 servers").arg(e.rules.size()))
+                                         : item("text", I18n::tr("Anywhere")));
+            t->setItem(r, 2, c == "server"  ? item("pill:dest", I18n::tr("Per server"))
+                             : c == "temp"  ? item("pill:temp", temporaryRule(r0.allow, r0.expires))
+                             : c == "allow" ? item("pill:allow", I18n::tr("Allow"))
+                                            : item("pill:block", I18n::tr("Block")));
             qint64 lastBlock = 0, created = 0;
             for (const auto &x : e.rules) {
                 lastBlock = qMax(lastBlock, x.allow ? 0 : x.lastBlock);
                 if (!created || x.created < created) created = x.created;
             }
-            auto *when = new ElideLabel(lastBlock ? I18n::tr("blocked %1").arg(clock(lastBlock))
-                                                  : I18n::tr("added %1").arg(clock(created)),
-                                        "time");
-            when->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-            // Una ruta se recorta al medio (se ve el final); un editor, al final.
-            fillRow(t, r, {cell(nameCell(e.iconPath, e.title, e.subtitle, e.scope == "path" ? Qt::ElideMiddle : Qt::ElideRight)),
-                           cell(dest), cell(policy), cell(when)});
-            t->item(r, 0)->setData(Qt::UserRole, "rule:" + e.key);
+            t->setItem(r, 3, item("time", lastBlock ? I18n::tr("blocked %1").arg(clock(lastBlock))
+                                                    : I18n::tr("added %1").arg(clock(created))));
         }
         if (appsFilter_ == "folder")
             appsTip_->setText(I18n::tr("A folder rule covers programs in that folder and its subfolders, also ones "
@@ -2576,6 +2861,7 @@ void FirewallWindow::fillApps() {
         t->setSpan(0, 0, 1, t->columnCount());
         t->viewport()->setCursor(Qt::ArrowCursor);
     }
+    t->setUpdatesEnabled(true);
     appsTip_->setVisible(!appsTip_->text().isEmpty());
     QTimer::singleShot(0, t, [t, scrolled] { t->verticalScrollBar()->setValue(scrolled); });
 }
@@ -2889,13 +3175,14 @@ QWidget *FirewallWindow::activityPage() {
         if (!row.hits.contains(dest)) row.destinations << dest;
         ++row.hits[dest];
     }
-    for (const auto &row : rows) {
+    // De una sola pasada: la cantidad de filas primero, después su contenido.
+    t->setRowCount(int(rows.size()));
+    for (int r = 0; r < rows.size(); ++r) {
+        const auto &row = rows[r];
         const auto &e = *row.newest;
         // Los intentos se cuentan por destino: una app que prueba 8 direcciones 4 veces muestra «4 times».
         int repeats = 0;
         for (const int n : row.hits) repeats = std::max(repeats, n);
-        const int r = t->rowCount();
-        t->insertRow(r);
         auto *when = new ElideLabel(clock(e.time), "time");
         auto *app = new QWidget;
         auto *ah = new QHBoxLayout(app);
@@ -2903,7 +3190,7 @@ QWidget *FirewallWindow::activityPage() {
         ah->setSpacing(10);
         if (!e.path.isEmpty()) ah->addWidget(appIcon(e.path, 30));
         auto *appName = new ElideLabel(e.path.isEmpty() ? QString("GateBouncer") : FirewallClient::fileName(e.path), "value");
-        appName->setStyleSheet("font-weight: 500;");
+        appName->setProperty("weight", "500");
         ah->addWidget(appName, 1);
         if (repeats > 1) ah->addWidget(text(I18n::tr("%1 times").arg(repeats), "time"));
         if (blockedView) {
@@ -2926,7 +3213,7 @@ QWidget *FirewallWindow::activityPage() {
             const qsizetype colon = e.kind.indexOf(": ");
             if (colon > 0) {
                 auto *lead = text(e.kind.left(colon + 1), "value");
-                lead->setStyleSheet("font-weight: 600;");
+                lead->setProperty("weight", "600");
                 wh->addWidget(lead);
                 wh->addWidget(new ElideLabel(e.kind.mid(colon + 2), "sub"), 1);
             } else {
@@ -3702,6 +3989,8 @@ void FirewallWindow::setupUpdates() {
     config.displayName = "LGA GateBouncer";
     config.releaseRepoSlug = "legandrop/LGA_GateBouncer";
     config.windowsExecutableName = "GateBouncer.exe";
+    // Los carteles del updater en el idioma de la ventana (lgaupdate rev 4 trae la tabla en castellano).
+    config.language = I18n::code(I18n::language());
     // La carpeta de la instalación es sólo de administradores (el servicio confía en ella): la descarga va a la carpeta
     // del usuario.
     config.updateCacheDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
@@ -3790,6 +4079,18 @@ void FirewallWindow::showEvent(QShowEvent *event) {
         frameApplied_ = WindowFrame::apply(this, true);
     }
     QMainWindow::showEvent(event);
+    // Vuelve de la bandeja o de minimizada: se pide todo al motor y se pone al día lo que cambió mientras no se veía.
+    // Diferido: al restaurar, el estado de minimizada cambia después de este evento.
+    QTimer::singleShot(0, this, [this] {
+        if (!isVisible() || isMinimized()) return;
+        updateRefreshRates();
+        firewall_.refreshNow();
+        if (view_ == "apps") runningTimer_.start();
+        if (staleWhileHidden_) {
+            staleWhileHidden_ = false;
+            engineChanged();
+        }
+    });
 }
 
 void FirewallWindow::hideEvent(QHideEvent *event) {
@@ -3799,6 +4100,9 @@ void FirewallWindow::hideEvent(QHideEvent *event) {
         store.setValue("window/size", normalGeometry().size());
     }
     QMainWindow::hideEvent(event);
+    // Escondida no se revisan los programas abiertos ni se pide el historial (ver updateRefreshRates).
+    runningTimer_.stop();
+    QTimer::singleShot(0, this, [this] { updateRefreshRates(); });
 }
 
 bool FirewallWindow::nativeEvent(const QByteArray &eventType, void *message, qintptr *result) {

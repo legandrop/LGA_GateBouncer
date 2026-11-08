@@ -53,6 +53,15 @@ Source: "docs\ThirdPartyNotices.md"; DestDir: "{app}\licenses"; Flags: ignorever
 [Icons]
 Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
 
+; Plugins de Qt que la v1.00 instalaba y la app no usa (solo carga PNG embebidos e íconos de Windows):
+; instalador.bat ya no los despliega, y una actualización los saca de la carpeta.
+[InstallDelete]
+Type: files; Name: "{app}\Qt6Svg.dll"
+Type: filesandordirs; Name: "{app}\generic"
+Type: filesandordirs; Name: "{app}\iconengines"
+Type: filesandordirs; Name: "{app}\imageformats"
+Type: files; Name: "{app}\tls\qcertonlybackend.dll"
+
 ; Lo que el motor o la ventana dejan en la carpeta (copias .old de una actualización en uso, el script de emergencia
 ; de una instalación a mano). Las reglas viven en ProgramData y se tratan aparte, abajo.
 [UninstallDelete]

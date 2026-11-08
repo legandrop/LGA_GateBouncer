@@ -65,6 +65,7 @@ class FirewallWindow final : public QMainWindow {
     };
 
     void buildShell();
+    void qaMeasure(const QString &what, const std::function<void()> &action);
     void render(bool keepScroll = false);
     void engineChanged();
     QString pageKey() const;
@@ -104,6 +105,9 @@ class FirewallWindow final : public QMainWindow {
     QVector<AppEntry> appEntries() const;
     QStringList runningWithoutRule() const;
     void refreshRunning();
+    bool scanRunning();
+    // Cada cuánto se piden reglas e historial al motor, según si la ventana se ve y qué muestra.
+    void updateRefreshRates();
     bool canDecide() const;
     void decideDefault(const FirewallClient::PendingItem &p, bool allow);
     // Estado de la explicación de un pedido, sin pedirla.
@@ -135,6 +139,10 @@ class FirewallWindow final : public QMainWindow {
     QVector<NetLimiterRule> netLimiterRules_;
     QString netLimiterFile_;
     bool closing_ = false;
+    bool staleWhileHidden_ = false; // el motor cambió algo mientras la ventana no se veía
+    // appEntries() sale de las reglas: se recalcula sólo cuando llegan reglas distintas.
+    mutable QVector<AppEntry> entriesCache_;
+    mutable quint64 entriesVersion_ = ~quint64(0);
     bool shownOnce_ = false, frameApplied_ = false; // marco nativo: bordes para estirar, sombra, acomodo
 
     QWidget *workspace_ = nullptr;

@@ -2,6 +2,7 @@
 // Cliente del motor sin driver (GateBouncerEngine.exe) por su canal local.
 // Pregunta el estado cada segundo y manda las decisiones; nunca filtra nada por sí mismo.
 class QLocalSocket;
+#include <QHash>
 #include <QObject>
 #include <QSet>
 #include <QTimer>
@@ -79,7 +80,14 @@ class FirewallClient final : public QObject {
     void removeRule(const QString &id);
     void setAsk(bool ask);
     void setLocalNetwork(bool allow);
+    // Pide todo en la vuelta siguiente (reglas e historial incluidos).
     void refreshNow();
+    // Cada cuánto se piden las reglas y el historial (ms; 0 = nunca, salvo refreshNow). Estado y pedidos van siempre,
+    // cada segundo: los necesitan el aviso y la bandeja. El historial pesa (hasta 2000 líneas): la ventana lo pide
+    // seguido sólo cuando lo muestra, y nada escondida.
+    void setRefresh(int rulesMs, int activityMs);
+    // Sube cada vez que llegan reglas distintas: para no recalcular lo que sale de ellas.
+    quint64 rulesVersion() const { return rulesVersion_; }
 
     static QString fileName(const QString &path);
     static QString protocolName(int protocol);
@@ -124,6 +132,11 @@ class FirewallClient final : public QObject {
     int commandsInFlight_ = 0;
     QByteArray buffer_;
     QByteArray lastRaw_[4];
+    int rulesMs_ = 1000, activityMs_ = 1000;
+    qint64 rulesAt_ = 0, activityAt_ = 0; // cuándo se pidieron por última vez
+    bool forceFull_ = true;
+    quint64 rulesVersion_ = 0;
+    QHash<QString, int> pathIndex_; // ruta en minúsculas -> primera regla de la app entera con esa ruta (ruleFor)
     Status status_;
     QVector<PendingItem> pending_;
     QVector<RuleItem> rules_;

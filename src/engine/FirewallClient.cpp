@@ -63,7 +63,15 @@ void FirewallClient::setActive(bool active) {
     }
 }
 
-void FirewallClient::refreshNow() { poll(); }
+void FirewallClient::refreshNow() {
+    forceFull_ = true;
+    poll();
+}
+
+void FirewallClient::setRefresh(int rulesMs, int activityMs) {
+    rulesMs_ = rulesMs;
+    activityMs_ = activityMs;
+}
 
 const FirewallClient::PendingItem *FirewallClient::pendingFor(const QString &path) const {
     for (const auto &p : pending_)
@@ -79,9 +87,10 @@ const FirewallClient::PendingItem *FirewallClient::pendingById(const QString &id
 
 const FirewallClient::RuleItem *FirewallClient::ruleFor(const QString &path) const {
     if (path.isEmpty()) return nullptr;
-    for (const auto &r : rules_)
-        if (r.destination.isEmpty() && key(r.path) == key(path)) return &r;
-    return nullptr;
+    // Por el índice de rutas (la primera regla de la app entera de cada ruta): Apps lo pregunta por cada programa
+    // abierto, y recorrer todas las reglas cada vez se notaba.
+    const auto found = pathIndex_.constFind(key(path));
+    return found == pathIndex_.constEnd() ? nullptr : &rules_[*found];
 }
 
 const FirewallClient::RuleItem *FirewallClient::folderRuleFor(const QString &path) const {
@@ -95,7 +104,7 @@ const FirewallClient::RuleItem *FirewallClient::folderRuleFor(const QString &pat
     const QString name = fileName(path).toLower();
     const RuleItem *best = nullptr;
     for (const auto &r : rules_) {
-        if (r.scope != "folder" || r.path.isEmpty()) continue;
+        if (r.scope != QLatin1String("folder") || r.path.isEmpty()) continue;
         const QString f = r.path.toLower().replace('/', '\\');
         if (p.size() <= f.size() + 1 || !p.startsWith(f) || p.at(f.size()) != '\\') continue;
         if (!r.name.isEmpty() && r.name.toLower() != name) continue;
@@ -234,8 +243,18 @@ void FirewallClient::poll() {
         if (r.kind == Request::Status) return;
     enqueue("STATUS", Request::Status);
     enqueue("PENDING", Request::Pending);
-    enqueue("RULES", Request::Rules);
-    enqueue("ACTIVITY", Request::Activity);
+    // Reglas e historial, cuando toca (un poco antes de la hora, para no perder una vuelta por milisegundos).
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    const auto due = [&](int every, qint64 last) { return forceFull_ || (every > 0 && now - last >= every - 250); };
+    if (due(rulesMs_, rulesAt_)) {
+        rulesAt_ = now;
+        enqueue("RULES", Request::Rules);
+    }
+    if (due(activityMs_, activityAt_)) {
+        activityAt_ = now;
+        enqueue("ACTIVITY", Request::Activity);
+    }
+    forceFull_ = false;
 }
 
 void FirewallClient::sendNext() {
@@ -268,8 +287,17 @@ void FirewallClient::onReadyRead() {
     QStringList lines = QString::fromUtf8(raw).split('\n');
     while (!lines.isEmpty() && (lines.last().isEmpty() || lines.last() == "END")) lines.removeLast();
     const int slot = int(request.kind);
-    if (request.kind == Request::Command || raw != lastRaw_[slot]) {
-        if (request.kind != Request::Command) lastRaw_[slot] = raw;
+    QByteArray compared = raw;
+    if (request.kind == Request::Status) {
+        // Los contadores de DNS de STATUS («names») cambian con cualquier consulta de la PC y la ventana no los usa:
+        // contarlos como cambio rearmaba la ventana cada segundo sin motivo.
+        QList<QByteArray> kept;
+        for (const auto &line : raw.split('\n'))
+            if (!line.startsWith("names\t")) kept << line;
+        compared = kept.join('\n');
+    }
+    if (request.kind == Request::Command || compared != lastRaw_[slot]) {
+        if (request.kind != Request::Command) lastRaw_[slot] = compared;
         apply(request, lines);
     }
     sendNext();
@@ -281,9 +309,12 @@ void FirewallClient::onDisconnected() {
     const bool wasConnected = status_.connected;
     status_ = {};
     for (auto &raw : lastRaw_) raw.clear();
+    forceFull_ = true; // al volver, todo de nuevo
     // Sin motor no hay datos vigentes: se vacía todo para no mostrar reglas o pedidos viejos como actuales.
     pending_.clear();
     rules_.clear();
+    pathIndex_.clear();
+    ++rulesVersion_;
     activity_.clear();
     while (!queue_.empty()) {
         if (queue_.front().kind == Request::Command) {
@@ -301,6 +332,8 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
         --commandsInFlight_;
         const QString error = !ok && !lines.isEmpty() ? lines.first().section('\t', 1) : I18n::tr("No reply");
         emit commandFinished(ok, ok ? request.okMessage : error);
+        // Una decisión cambia reglas y pedidos: se pide todo, también con la ventana escondida.
+        forceFull_ = true;
         poll();
         return;
     }
@@ -345,12 +378,18 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
             pending_.push_back(p);
             now.insert(key(p.id));
             // También los que ya esperaban al conectar: la ventana arranca con la sesión y tiene que avisarlos.
-            if (!knownPending_.contains(key(p.id))) emit newPending(p.id);
+            if (!knownPending_.contains(key(p.id))) {
+                // El aviso cuenta las reglas de esa app: con la ventana escondida, las reglas se piden en la vuelta
+                // siguiente en vez de esperar su turno.
+                rulesAt_ = 0;
+                emit newPending(p.id);
+            }
         }
         knownPending_ = now;
         break;
     }
     case Request::Rules:
+        ++rulesVersion_;
         rules_.clear();
         for (const auto &row : rows) {
             const auto f = row.split('\t');
@@ -371,6 +410,10 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
             if (r.scope == "folder") r.path = f.size() == 10 ? f[9] : QString(); // la carpeta
             rules_.push_back(r);
         }
+        pathIndex_.clear();
+        for (int i = 0; i < rules_.size(); ++i)
+            if (rules_[i].destination.isEmpty() && !rules_[i].path.isEmpty() && !pathIndex_.contains(key(rules_[i].path)))
+                pathIndex_.insert(key(rules_[i].path), i);
         break;
     case Request::Activity:
         activity_.clear();

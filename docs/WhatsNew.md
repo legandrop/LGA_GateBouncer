@@ -10,6 +10,11 @@ platforms: [win]
 
 ## Unreleased
 
+## v1.01
+- [improved] Apps abre al instante, también la primera vez, y cambiar entre permitidas, bloqueadas y todas ya no se demora.
+- [improved] GateBouncer usa menos recursos mientras la ventana está cerrada y ocupa menos espacio en el disco.
+- [improved] Con la app en castellano, el aviso de actualización y su ventana también están en castellano.
+
 ## v1.00
 - [new] Primera versión de LGA GateBouncer: un firewall por aplicación para Windows que avisa cuando un programa sin regla quiere conectarse a internet y deja elegir Allow o Block desde el mismo aviso.
 - [new] Las reglas pueden valer para un archivo, para todas las versiones de una app o para todas las apps de una misma firma, por un rato o para siempre, y con «Trust a folder» para todo lo que se compila o instala en una carpeta.

@@ -1,6 +1,6 @@
 # lgaupdate — auto-update de las apps LGA
 
-**Pieza canónica de `LGA_Base_QT_C_Py`, rev 3 (2026-11-04).** Cada app la copia **idéntica** a su
+**Pieza canónica de `LGA_Base_QT_C_Py`, rev 4 (2026-11-08).** Cada app la copia **idéntica** a su
 `libs/lgaupdate`, este README incluido, y no la edita: un cambio se hace acá, se sube la revisión
 y se vuelve a copiar a todas. Así comparar una copia con la canónica es un `diff -r` sin
 excepciones.
@@ -10,7 +10,7 @@ rsync -a --delete ../LGA_Base_QT_C_Py/libs/lgaupdate/ libs/lgaupdate/
 diff -r ../LGA_Base_QT_C_Py/libs/lgaupdate libs/lgaupdate && echo identica
 ```
 
-La usan FrameRev, Media Tools (con el Shot Player), Theta Explorer y Video Downloader. La rev 2
+La usan FrameRev, Media Tools (con el Shot Player), Theta Explorer, Video Downloader y GateBouncer. La rev 2
 existe para que FileManager S3 y PipeSync, que tenían su propio `FM_UpdateService` (del que esta
 biblioteca es un port), se muden a ella sin perder nada. `LGAUPDATE_REVISION` (en `LgaUpdateService.h`) dice qué revisión trae una
 copia: una app que necesita algo nuevo la exige con `#if LGAUPDATE_REVISION < N` / `#error`.
@@ -136,6 +136,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File <Base>\tools\qa\run_headless
     -Exe <carpeta>\lgaupdate_tests\lgaupdate_retry_tests.exe -Arguments '<carpeta de trabajo nueva>' -TimeoutSec 240
 ```
 
+### Rev 4: textos en inglés o castellano (`language`)
+
+Hasta la rev 3 los carteles salían siempre en inglés, aunque la app estuviera en castellano.
+Ahora la app pide el idioma con `LgaUpdateConfig::language`: `"es"` pasa a castellano los
+carteles, el diálogo de la descarga, los rótulos de las notas (NUEVO, MEJORADO, CORREGIDO) y los
+avisos que muestra el helper; vacío (default) o cualquier otro valor deja el inglés, así que una
+app que solo re-copia se ve igual. Las notas de cada versión no se traducen: ya vienen escritas en
+el `WhatsNew.md` del producto.
+
+- `LgaUpdateI18n.h` / `src/LgaUpdateI18n.cpp`: la tabla en castellano vive en el código (sin
+  `.qm`) y un `QTranslator` propio la instala el constructor del servicio. Solo contesta los
+  contextos de la biblioteca (`LgaUpdateService`, `LgaWhatsNew`): no pisa los traductores de la
+  app. El idioma vale para todo el proceso; cambiarlo es crear el servicio con otro `language`.
+- Los avisos del helper (otra ventana abierta, procesos de fondo, update fallido en macOS) dejan
+  de estar fijos en el script: los arma la app con `tr()` y se insertan escapados. El `.ps1` del
+  helper de Windows se escribe con BOM, para que PowerShell 5.1 lea bien los acentos.
+- `tests/check_i18n.ps1` confronta la tabla con los `tr()`: al agregar un texto, correrlo. Sale 1
+  si falta una traducción o sobra una clave.
+- Estilo de las traducciones: el de las apps LGA en castellano (infinitivo o impersonal, nunca vos
+  ni tú). Las letras de los atajos no cambian (las fija el código): «Act&ualizar ahora» sigue en U.
+
 ## Historia
 
 Antes de la rev 1 había tres copias que ya diferían: la de Theta Explorer (la más nueva), la de
@@ -155,3 +176,5 @@ red simulada, y `tests/TestLgaWhatsNew.cpp`, con los casos de ediciones y audien
 `FM_WhatsNewTest`).
 
 La rev 3 suma los reintentos de red de la regla de LGA y su banco de pruebas propio, en `tests/`.
+
+La rev 4 suma el idioma: la app pide inglés o castellano con `language` y la biblioteca trae su tabla en castellano. Salió de GateBouncer, que tiene la interfaz en los dos idiomas y mostraba el updater en inglés.

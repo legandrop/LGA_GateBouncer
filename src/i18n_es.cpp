@@ -5,8 +5,8 @@
 // pantalla.
 // Lo que no está acá queda en inglés a propósito: el nombre de la app, nombres de programas, archivos, carpetas y
 // servidores, lo que escribe el motor (sus errores y el historial «Rule saved: …»; las confirmaciones de cada comando las
-// arma la ventana y sí se traducen), las respuestas de la IA, el catálogo de apps conocidas y los textos del updater
-// (libs/lgaupdate).
+// arma la ventana y sí se traducen), las respuestas de la IA y el catálogo de apps conocidas. Los textos del updater
+// (libs/lgaupdate) traen su propia tabla en castellano: la ventana le pasa el idioma (LgaUpdateConfig::language).
 // Estilo, como Mighty Tools: infinitivo o impersonal, nunca vos ni tú. Vocabulario fijo: Protection -> Protección,
 // Requests -> Pedidos, Apps -> Apps, Activity -> Actividad, Settings -> Ajustes, Allow -> Permitir, Block -> Bloquear,
 // How it works -> Cómo funciona, rule -> regla (una Block rule es una «regla de bloqueo»), notice -> aviso,
