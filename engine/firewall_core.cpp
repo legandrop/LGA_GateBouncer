@@ -103,10 +103,12 @@ constexpr int FullRecheckEvery = 10; // vueltas de CoverageRecheck
 // Las reglas temporales se revisan con esta frecuencia: vencen con hasta este retraso.
 constexpr auto ExpiryCheck = std::chrono::seconds(10);
 
-// Texto del historial para una regla por firma o por destino.
+// Texto del historial para una regla por firma, por carpeta o por destino.
 std::wstring describe(const Rule &rule) {
     const std::wstring who = rule.scope == Scope::App         ? L"any version of " + rule.name + L" from " + rule.signer
                              : rule.scope == Scope::Publisher ? L"all apps from " + rule.signer
+                             : rule.scope == Scope::Folder    ? (rule.name.empty() ? L"all apps" : rule.name) + L" in " +
+                                                                 rule.path
                                                               : FirewallCore::fileName(rule.path);
     return rule.destination.empty() ? who : who + L" to " + rule.destination;
 }
@@ -141,6 +143,7 @@ std::wstring FirewallCore::identityKey(const Rule &rule) {
     // Las rutas empiezan con letra de unidad o barra: nunca chocan con estas claves.
     if (rule.scope == Scope::App) return L"app|" + key(rule.signer) + L"|" + rule.name;
     if (rule.scope == Scope::Publisher) return L"publisher|" + key(rule.signer);
+    if (rule.scope == Scope::Folder) return L"folder|" + key(rule.path) + L"|" + rule.name;
     return key(rule.path);
 }
 
@@ -214,14 +217,14 @@ bool FirewallCore::start(std::wstring &error) {
             ok = false;
         }
     }
-    // Coberturas de reglas por firma: el archivo se vuelve a verificar. Si cambió de firmante, falta o ya tiene una
-    // regla propia, la cobertura se descarta y esa ruta vuelve a pasar por la verificación en su próximo bloqueo.
+    // Coberturas de reglas por firma o por carpeta: el archivo se vuelve a verificar. Si cambió de firmante, salió de la
+    // carpeta, falta o ya tiene una regla propia, la cobertura se descarta y esa ruta vuelve a pasar por la verificación
+    // en su próximo bloqueo.
     for (auto it = covered_.begin(); ok && it != covered_.end();) {
         const auto rule = rules_.find(it->second.ruleKey);
         const auto own = rules_.find(it->first);
         if (rule == rules_.end() || rule->second.scope == Scope::Path || own != rules_.end() ||
-            !stampOf(it->second.path, it->second.stamp) ||
-            !matches(rule->second, it->second.path, signerOf(it->second.path))) {
+            !stampOf(it->second.path, it->second.stamp) || !coverValid(rule->second, it->second.path)) {
             it = covered_.erase(it);
             continue;
         }
@@ -296,6 +299,8 @@ bool FirewallCore::start(std::wstring &error) {
         lastError_ += (lastError_.empty() ? L"" : L"; ") + std::wstring(L"Destination names unavailable: ") + dnsError;
     verifyStop_ = false;
     verifyThread_ = std::thread([this] { verifyLoop(); });
+    // Las coberturas por carpeta se reinstalaron con su dueña de antes: se revisa enseguida que ninguna otra regla le gane.
+    if (hasFolderRules()) requestFolderReview();
     if (!wfp_.subscribeDrops([this](const DropEvent &d) { onDrop(d); }, error)) return false;
     started_ = now();
     return true;
@@ -349,8 +354,37 @@ bool FirewallCore::installRule(Rule &rule, std::wstring &error) {
 }
 
 bool FirewallCore::matches(const Rule &rule, const std::wstring &path, const std::wstring &signer) const {
-    if (rule.scope == Scope::Path || signer.empty() || key(rule.signer) != key(signer)) return false;
+    // Sólo reglas por firma: las de carpeta no miran la firma (coverValid).
+    if (rule.scope == Scope::Path || rule.scope == Scope::Folder || signer.empty() || key(rule.signer) != key(signer))
+        return false;
     return rule.scope == Scope::Publisher || rule.name == fileName(path);
+}
+
+const Rule *FirewallCore::folderRuleFor(const FinalPath &place, const std::wstring &name) const {
+    const Rule *best = nullptr;
+    for (const auto &[k, r] : rules_) {
+        if (r.scope != Scope::Folder || !volumePathInside(place.volume, r.volume)) continue;
+        if (!r.name.empty() && r.name != name) continue;
+        if (!best || folderRuleBeats(r.volume, !r.name.empty(), r.action == Action::Block, best->volume,
+                                     !best->name.empty(), best->action == Action::Block))
+            best = &r;
+    }
+    return best;
+}
+
+bool FirewallCore::hasFolderRules() const {
+    for (const auto &[k, r] : rules_)
+        if (r.scope == Scope::Folder) return true;
+    return false;
+}
+
+bool FirewallCore::coverValid(const Rule &rule, const std::wstring &path) const {
+    if (rule.scope != Scope::Folder) return matches(rule, path, signerOf(path));
+    // Dentro de la carpeta por su ruta final, sin enlaces en el medio y, si la regla nombra un exe, con ese nombre (el
+    // largo: la ruta informada puede traer el corto 8.3).
+    FinalPath place;
+    return placeOf(path, place) && volumePathInside(place.volume, rule.volume) &&
+           (rule.name.empty() || rule.name == folderNameKey(place.dos));
 }
 
 const Rule *FirewallCore::signerRuleFor(const std::wstring &path, const std::wstring &signer) const {
@@ -708,6 +742,8 @@ bool FirewallCore::decide(const std::wstring &path, Action action, Scope scope, 
                  (action == Action::Allow ? L"Rule saved: Allow " : L"Rule saved: Block ") + describe(rule) +
                      describeExpiry(expires, now()),
                  L"", 0, 0});
+    // Una regla de firma va antes que las carpetas: los archivos que una carpeta cubría y ahora coinciden pasan a ella.
+    if (hasFolderRules()) requestFolderReview();
     return save(error);
 }
 
@@ -789,6 +825,111 @@ bool FirewallCore::decideDestination(const std::wstring &path, Action action, Sc
                  (action == Action::Allow ? L"Rule saved: Allow " : L"Rule saved: Block ") + describe(rule) +
                      describeExpiry(expires, now()),
                  L"", 0, 0});
+    // El modo por destino de una identidad va antes que las carpetas: sus archivos cubiertos por una carpeta la pierden.
+    if (hasFolderRules()) requestFolderReview();
+    return save(error);
+}
+
+bool FirewallCore::decideFolder(const std::wstring &folder, const std::wstring &name, Action action,
+                                std::wstring &error, std::int64_t expires) {
+    if (expires != 0 && expires != UntilRestart && expires <= now()) {
+        error = L"Invalid duration";
+        return false;
+    }
+    std::wstring exe;
+    if (!normalizeFolderRuleName(name, exe)) {
+        error = L"Invalid program name: use a file name such as MyApp.exe, or * for every program.";
+        return false;
+    }
+    // La carpeta se valida y se resuelve antes de tomar el mutex: lee el disco y el registro.
+    FinalPath place;
+    error = resolveTrustedFolder(folder, place);
+    if (!error.empty()) return false;
+    Rule rule;
+    rule.scope = Scope::Folder;
+    rule.path = place.dos;
+    rule.volume = place.volume;
+    rule.name = exe;
+    rule.action = action;
+    rule.expires = expires;
+    const auto rk = ruleKey(rule);
+    // Pedidos de la app entera que esta regla resuelve. Dónde está de verdad cada uno se mira sin el mutex, con el sello
+    // tomado antes (un cambio entre las dos cosas queda como archivo cambiado, igual que con la firma).
+    struct Candidate {
+        std::wstring k, path, signer;
+        FileStamp stamp;
+        FinalPath place;
+    };
+    std::vector<Candidate> candidates;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &[pk, p] : pending_)
+            if (!p.perDestination && !rules_.count(pk)) candidates.push_back({pk, p.path, p.signer, {}, {}});
+    }
+    std::vector<Candidate> inside;
+    for (auto &c : candidates) {
+        if (!stampOf(c.path, c.stamp) || !placeOf(c.path, c.place) || !volumePathInside(c.place.volume, rule.volume))
+            continue;
+        if (!exe.empty() && folderNameKey(c.place.dos) != exe) continue;
+        inside.push_back(std::move(c));
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto existing = rules_.find(rk);
+    rule.created = existing != rules_.end() && existing->second.action == action ? existing->second.created : now();
+    rule.lastBlock = existing != rules_.end() ? existing->second.lastBlock : 0;
+    std::map<std::wstring, std::pair<std::wstring, FileStamp>> targets; // clave -> ruta y sello
+    for (const auto &c : inside) {
+        // Lo que cambió mientras se ubicaban: una regla propia o una cobertura nueva, una regla de firma (va primero),
+        // otra carpeta que le gana (más profunda, o la misma con el nombre del exe).
+        if (rules_.count(c.k) || covered_.count(c.k) || !pending_.count(c.k) || signerRuleFor(c.path, c.signer))
+            continue;
+        const Rule *other = folderRuleFor(c.place, folderNameKey(c.place.dos));
+        if (other && ruleKey(*other) != rk &&
+            !folderRuleBeats(rule.volume, !rule.name.empty(), action == Action::Block, other->volume,
+                             !other->name.empty(), other->action == Action::Block))
+            continue;
+        targets[c.k] = {c.path, c.stamp};
+    }
+    // Las rutas que esta regla ya cubría (cambia la acción) se rehacen con la nueva; un archivo que ya no está no frena
+    // la decisión: su filtro se retira con ella.
+    for (auto c = covered_.begin(); c != covered_.end();) {
+        if (c->second.ruleKey != rk) {
+            ++c;
+        } else if (!isFile(c->second.path)) {
+            for (auto id : c->second.filters) wfp_.removeFilter(id);
+            c = covered_.erase(c);
+        } else {
+            targets[c->first] = {c->second.path, c->second.stamp};
+            ++c;
+        }
+    }
+    std::map<std::wstring, std::vector<std::uint64_t>> fresh;
+    if (!wfp_.begin(error)) return false;
+    for (const auto &[tk, target] : targets) {
+        auto &ids = fresh[tk];
+        if (!wfp_.addAppFilter(target.first, action, Direction::Outbound, weightFor(action), ids, error)) {
+            wfp_.abort();
+            return false;
+        }
+        const auto old = covered_.find(tk);
+        if (old != covered_.end())
+            for (auto id : old->second.filters) wfp_.removeFilter(id);
+    }
+    if (!wfp_.commit(error)) return false;
+    for (const auto &[tk, target] : targets) {
+        Covered c{target.first, rk, fresh[tk]};
+        c.stamp = target.second;
+        covered_[tk] = c;
+        erasePendingOf(tk);
+    }
+    rules_[rk] = rule;
+    addActivity({now(), L"",
+                 (action == Action::Allow ? L"Rule saved: Allow " : L"Rule saved: Block ") + describe(rule) +
+                     describeExpiry(expires, now()),
+                 L"", 0, 0});
+    // Los archivos que otra carpeta ya cubría y ésta le gana (más profunda, o la misma con el nombre del exe) pasan a
+    // ésta, con su acción.
+    requestFolderReview();
     return save(error);
 }
 
@@ -945,15 +1086,18 @@ void FirewallCore::verifyLoop() {
     for (;;) {
         DropEvent drop;
         DnsHint hint;
-        bool hasDrop = false, hasHint = false;
+        bool hasDrop = false, hasHint = false, review = false;
         {
             std::unique_lock<std::mutex> lock(verifyMutex_);
             auto wake = std::min(nextRecheck, std::chrono::steady_clock::now() + ExpiryCheck);
             // Un bloqueo que espera su nombre se decide al vencer la espera aunque no llegue nada más.
             if (const auto held = nameWait_.nextDeadline()) wake = std::min(wake, *held);
-            verifyWake_.wait_until(lock, wake,
-                                   [this] { return verifyStop_ || !verifyQueue_.empty() || !hintQueue_.empty(); });
+            verifyWake_.wait_until(lock, wake, [this] {
+                return verifyStop_ || !verifyQueue_.empty() || !hintQueue_.empty() || reviewFolders_;
+            });
             if (verifyStop_) return;
+            review = reviewFolders_;
+            reviewFolders_ = false;
             // Las consultas DNS primero: el permiso tiene que estar antes de que llegue el intento de conexión.
             if (!hintQueue_.empty()) {
                 hint = std::move(hintQueue_.front());
@@ -967,6 +1111,7 @@ void FirewallCore::verifyLoop() {
         }
         if (hasHint) applyHint(hint);
         if (hasDrop) classify(drop, cachedSigner(drop.appPath));
+        if (review) reviewFolderCoverage();
         // Los que esperaban un nombre: ya llegó (la consulta DNS se procesó arriba) o venció la espera.
         for (const auto &held : nameWait_.release(std::chrono::steady_clock::now(), [this](const DropEvent &d) {
                  return !dns_.nameFor(DnsNames::normalize(d.remoteAddress), key(d.appPath)).empty();
@@ -982,28 +1127,32 @@ void FirewallCore::verifyLoop() {
 
 void FirewallCore::recheckCoverage(bool full) {
     // Un archivo cubierto que cambió (reemplazado en una carpeta que el usuario puede escribir) se vuelve a verificar
-    // y pierde el filtro si su firma ya no coincide con la regla. En la vuelta completa se verifica todo, aunque el
-    // sello coincida. Sin mutex mientras se verifica: puede tardar.
+    // y pierde el filtro si su firma ya no coincide con la regla, o si una regla por carpeta ya no lo tiene adentro (la
+    // ruta pasa ahora por un enlace). Un exe recompilado en su lugar sigue cubierto por su carpeta. En la vuelta completa
+    // se verifica todo, aunque el sello coincida. Sin mutex mientras se verifica: puede tardar.
     struct Seen {
         std::wstring path, ruleKey;
         FileStamp stamp;
+        Rule rule; // copia de la regla dueña, para verificar sin el mutex
     };
     std::vector<std::pair<std::wstring, Seen>> seen;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto &[k, c] : covered_)
-            if (!c.filters.empty()) seen.push_back({k, {c.path, c.ruleKey, c.stamp}});
+        for (const auto &[k, c] : covered_) {
+            const auto rule = rules_.find(c.ruleKey);
+            if (!c.filters.empty() && rule != rules_.end()) seen.push_back({k, {c.path, c.ruleKey, c.stamp, rule->second}});
+        }
     }
     for (const auto &[k, s] : seen) {
         FileStamp stamp;
         const bool present = stampOf(s.path, stamp);
         if (present && !full && stamp == s.stamp) continue;
-        const std::wstring signer = present ? signerOf(s.path) : std::wstring();
+        const bool valid = present && coverValid(s.rule, s.path);
         std::lock_guard<std::mutex> lock(mutex_);
         const auto c = covered_.find(k);
         const auto rule = rules_.find(s.ruleKey);
         if (c == covered_.end() || c->second.ruleKey != s.ruleKey || rule == rules_.end()) continue;
-        if (present && matches(rule->second, s.path, signer)) {
+        if (valid) {
             c->second.stamp = stamp;
             continue;
         }
@@ -1051,6 +1200,141 @@ void FirewallCore::recheckCoverage(bool full) {
         grants_.erase(g);
         save(error);
     }
+    // En la vuelta completa, también quién cubre cada archivo de una carpeta (por si una revisión pedida se perdió), y en
+    // cualquier vuelta si la última revisión no pudo ubicar algún archivo.
+    if (full || reviewAgain_) reviewFolderCoverage();
+}
+
+void FirewallCore::requestFolderReview() {
+    {
+        std::lock_guard<std::mutex> queue(verifyMutex_);
+        reviewFolders_ = true;
+    }
+    verifyWake_.notify_one();
+}
+
+void FirewallCore::reviewFolderCoverage() {
+    struct Seen {
+        std::wstring k, path, owner, signer;
+        FinalPath place;
+        FileStamp stamp;
+        bool placed = false, verified = false;
+    };
+    std::vector<Seen> seen;
+    bool signerRules = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto &[rk, r] : rules_) signerRules = signerRules || r.scope == Scope::App || r.scope == Scope::Publisher;
+        for (const auto &[k, c] : covered_) {
+            const auto owner = rules_.find(c.ruleKey);
+            if (!c.filters.empty() && owner != rules_.end() && owner->second.scope == Scope::Folder) {
+                Seen s;
+                s.k = k;
+                s.path = c.path;
+                s.owner = c.ruleKey;
+                seen.push_back(std::move(s));
+            }
+        }
+    }
+    reviewAgain_ = false;
+    if (seen.empty()) return;
+    // Dónde está cada archivo y su firmante de la caché. Uno que no se puede ubicar (el linker todavía lo escribe) se
+    // revisa otra vez en la vuelta siguiente, no recién en la completa; si se fue de verdad, lo retira recheckCoverage.
+    for (auto &s : seen) {
+        s.placed = placeOf(s.path, s.place);
+        if (s.placed && signerRules) s.signer = cachedSigner(s.path);
+        if (!s.placed) reviewAgain_ = true;
+    }
+    // Los que una regla de firma le gana a su carpeta se verifican de nuevo sobre el archivo actual, sin caché y con el
+    // sello primero (como classify): esa regla pasa a cubrirlos con su acción. Soltarlos para que los verifique el
+    // próximo intento no alcanza: con «Ask» apagado ese intento no se bloquea y nunca llega a la verificación.
+    if (signerRules) {
+        std::vector<Seen *> verify;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (auto &s : seen)
+                if (s.placed && signerRuleFor(s.path, s.signer)) verify.push_back(&s);
+        }
+        for (auto *s : verify) {
+            s->verified = stampOf(s->path, s->stamp);
+            s->signer = s->verified ? signerOf(s->path) : std::wstring();
+        }
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    struct Change {
+        std::wstring k;
+        const Rule *to = nullptr; // nada: se retira la cobertura
+        std::wstring reason;
+        std::vector<std::uint64_t> ids;
+        const FileStamp *stamp = nullptr; // una regla de firma: el sello de su verificación
+    };
+    std::vector<Change> changes;
+    for (const auto &s : seen) {
+        const auto c = covered_.find(s.k);
+        if (c == covered_.end() || c->second.ruleKey != s.owner || c->second.filters.empty() || rules_.count(s.k) ||
+            !rules_.count(s.owner))
+            continue;
+        // Si ya no está adentro (se fue, o su ruta pasa por un enlace), lo retira recheckCoverage con su motivo.
+        if (!s.placed) continue;
+        bool perDestination = false;
+        destinationRuleFor(s.path, s.signer, {}, {}, perDestination);
+        if (perDestination) {
+            changes.push_back({s.k, nullptr, L"its destination rules come first", {}, nullptr});
+        } else if (const Rule *bySigner = s.verified ? signerRuleFor(s.path, s.signer) : nullptr) {
+            // Si la firma no se pudo verificar, la carpeta sigue siendo la dueña.
+            changes.push_back({s.k, bySigner, {}, {}, &s.stamp});
+        } else if (const Rule *best = folderRuleFor(s.place, folderNameKey(s.place.dos));
+                   best && ruleKey(*best) != s.owner) {
+            changes.push_back({s.k, best, {}, {}, nullptr});
+        }
+    }
+    if (changes.empty()) return;
+    std::wstring error;
+    if (!wfp_.begin(error)) {
+        lastError_ = L"Could not review folder rules: " + error;
+        return;
+    }
+    for (auto &ch : changes) {
+        const Covered &c = covered_.at(ch.k);
+        const Rule &owner = rules_.at(c.ruleKey);
+        if (ch.to && ch.to->action == owner.action) continue; // sólo cambia de dueña: el filtro sirve igual
+        if (ch.to && !wfp_.addAppFilter(c.path, ch.to->action, Direction::Outbound, weightFor(ch.to->action), ch.ids,
+                                        error)) {
+            if (error.rfind(L"FwpmGetAppIdFromFileName0", 0) != 0) {
+                wfp_.abort();
+                lastError_ = L"Could not apply " + describe(*ch.to) + L": " + error;
+                return;
+            }
+            // El archivo ya no está: se retira, como hace el arranque.
+            ch.to = nullptr;
+            ch.reason = L"file not found";
+        }
+        for (auto id : c.filters) wfp_.removeFilter(id);
+    }
+    if (!wfp_.commit(error)) {
+        lastError_ = L"Could not review folder rules: " + error;
+        return;
+    }
+    const auto t = now();
+    for (auto &ch : changes) {
+        const auto c = covered_.find(ch.k);
+        const Rule &owner = rules_.at(c->second.ruleKey);
+        if (!ch.to) {
+            addActivity({t, c->second.path, L"No longer covered by " + describe(owner) + L": " + ch.reason, L"", 0, 0});
+            covered_.erase(c);
+            continue;
+        }
+        if (ch.to->action != owner.action) {
+            c->second.filters = std::move(ch.ids);
+            addActivity({t, c->second.path,
+                         (ch.to->action == Action::Allow ? L"Now allowed by rule: " : L"Now blocked by rule: ") +
+                             describe(*ch.to),
+                         L"", 0, 0});
+        }
+        c->second.ruleKey = ruleKey(*ch.to);
+        if (ch.stamp) c->second.stamp = *ch.stamp;
+    }
+    save(error);
 }
 
 std::wstring FirewallCore::cachedSigner(const std::wstring &path) {
@@ -1073,11 +1357,32 @@ std::wstring FirewallCore::cachedSigner(const std::wstring &path) {
     return signer;
 }
 
+bool FirewallCore::coverWith(const DropEvent &drop, const Rule &rule, const FileStamp &stamp, std::wstring &error) {
+    std::vector<std::uint64_t> ids;
+    if (!wfp_.begin(error)) return false;
+    if (!wfp_.addAppFilter(drop.appPath, rule.action, Direction::Outbound, weightFor(rule.action), ids, error)) {
+        wfp_.abort();
+        return false;
+    }
+    if (!wfp_.commit(error)) return false;
+    const auto k = key(drop.appPath);
+    Covered c{drop.appPath, ruleKey(rule), ids};
+    c.stamp = stamp;
+    covered_[k] = c;
+    pending_.erase(k);
+    addActivity({fileTimeToUnix(drop.time), drop.appPath,
+                 (rule.action == Action::Allow ? L"Allowed by rule: " : L"Blocked by rule: ") + describe(rule) +
+                     (rule.action == Action::Allow ? L" · next attempt connects" : L""),
+                 drop.remoteAddress, drop.remotePort, drop.protocol});
+    save(error);
+    return true;
+}
+
 void FirewallCore::classify(const DropEvent &drop, const std::wstring &cached, bool waited) {
     const auto k = key(drop.appPath);
     const auto t = fileTimeToUnix(drop.time);
     std::wstring signer = cached;
-    bool perDestination = false;
+    bool perDestination = false, folders = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const auto rule = rules_.find(k);
@@ -1088,15 +1393,28 @@ void FirewallCore::classify(const DropEvent &drop, const std::wstring &cached, b
         if (rule == rules_.end()) destinationRuleFor(drop.appPath, cached, {}, {}, perDestination);
         // Una regla de ruta propia (sin filtro porque faltaba el exe al arrancar) manda: se pregunta, sin firma.
         if (!perDestination && (rule != rules_.end() || !signerRuleFor(drop.appPath, signer))) signer.clear();
+        // Las carpetas de confianza van después de todo lo demás: sólo para quien no tiene otra regla.
+        folders = !perDestination && rule == rules_.end() && hasFolderRules();
     }
     if (perDestination) {
         classifyDestination(drop, cached, waited);
         return;
     }
-    // Antes de dar un filtro por firma, la firma se verifica de nuevo sobre el archivo actual, sin caché.
+    // Antes de dar un filtro por firma, la firma se verifica de nuevo sobre el archivo actual, sin caché. Antes de darlo
+    // por carpeta, se mira dónde está el archivo de verdad. El sello va primero en los dos casos.
     FileStamp stamp;
     const bool fresh = !signer.empty();
-    if (fresh) signer = stampOf(drop.appPath, stamp) ? signerOf(drop.appPath) : std::wstring();
+    bool stamped = false;
+    if (fresh) {
+        stamped = stampOf(drop.appPath, stamp);
+        signer = stamped ? signerOf(drop.appPath) : std::wstring();
+    }
+    FinalPath place;
+    bool placed = false;
+    if (folders) {
+        if (!fresh) stamped = stampOf(drop.appPath, stamp);
+        placed = stamped && placeOf(drop.appPath, place);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     const auto rule = rules_.find(k);
     if (rule != rules_.end() && !rule->second.filters.empty()) return;
@@ -1106,29 +1424,13 @@ void FirewallCore::classify(const DropEvent &drop, const std::wstring &cached, b
     // Sin verificación fresca, el aviso muestra la firma de la caché (no da permisos). Si la fresca falló, el aviso no
     // puede decir «valid signature» de un archivo que acaba de dejar de tenerla.
     if (!fresh) signer = cached;
-    if (byPublisher) {
+    const Rule *byFolder =
+        !byPublisher && placed && rule == rules_.end() ? folderRuleFor(place, folderNameKey(place.dos)) : nullptr;
+    if (const Rule *covering = byPublisher ? byPublisher : byFolder) {
         std::wstring error;
-        std::vector<std::uint64_t> ids;
-        if (wfp_.begin(error)) {
-            if (!wfp_.addAppFilter(drop.appPath, byPublisher->action, Direction::Outbound,
-                                   weightFor(byPublisher->action), ids, error)) {
-                wfp_.abort();
-            } else if (wfp_.commit(error)) {
-                Covered c{drop.appPath, ruleKey(*byPublisher), ids};
-                c.stamp = stamp;
-                covered_[k] = c;
-                pending_.erase(k);
-                addActivity({t, drop.appPath,
-                             (byPublisher->action == Action::Allow ? L"Allowed by rule: " : L"Blocked by rule: ") +
-                                 describe(*byPublisher) +
-                                 (byPublisher->action == Action::Allow ? L" · next attempt connects" : L""),
-                             drop.remoteAddress, drop.remotePort, drop.protocol});
-                save(error);
-                return;
-            }
-        }
+        if (coverWith(drop, *covering, stamp, error)) return;
         // Sin el filtro, la app no queda en el limbo: se pregunta como cualquier otra.
-        lastError_ = L"Could not apply " + describe(*byPublisher) + L": " + error;
+        lastError_ = L"Could not apply " + describe(*covering) + L": " + error;
     }
     auto &p = pending_[k];
     if (p.attempts == 0) {
@@ -1330,6 +1632,25 @@ void FirewallCore::load() {
             r.name = r.scope == Scope::App ? key(fromUtf8(f[6])) : std::wstring();
             r.expires = f.size() == 8 ? std::atoll(f[7].c_str()) : 0;
             if (r.expires <= 0 || r.expires > now()) rules_[ruleKey(r)] = r;
+        } else if (f[0] == "folder" && f.size() == 8 && (f[1] == "allow" || f[1] == "block") && !f[4].empty() &&
+                   validFolderVolume(fromUtf8(f[5]))) {
+            // folder <acción> <creada> <último bloqueo> <carpeta> <carpeta por volumen> <nombre o vacío> <vencimiento>
+            // Una línea editada a mano con un volumen entero o un nombre con carpeta no se carga.
+            std::wstring exe;
+            if (!normalizeFolderRuleName(fromUtf8(f[6]), exe)) {
+                invalid += (invalid.empty() ? L"" : L", ") + std::to_wstring(number);
+                continue;
+            }
+            Rule r;
+            r.scope = Scope::Folder;
+            r.action = action(f[1]);
+            r.created = std::atoll(f[2].c_str());
+            r.lastBlock = std::atoll(f[3].c_str());
+            r.path = fromUtf8(f[4]);
+            r.volume = fromUtf8(f[5]);
+            r.name = exe;
+            r.expires = std::atoll(f[7].c_str());
+            if (r.expires <= 0 || r.expires > now()) rules_[ruleKey(r)] = r;
         } else if (f[0] == "covered" && f.size() == 3 && !f[1].empty() && !f[2].empty()) {
             coverage.push_back({fromUtf8(f[2]), key(fromUtf8(f[1])), {}});
         } else if (f[0] == "dest" && f.size() == 10 && (f[1] == "path" || f[1] == "app" || f[1] == "publisher") &&
@@ -1385,7 +1706,8 @@ void FirewallCore::load() {
 bool FirewallCore::save(std::wstring &error) {
     if (options_.dataDir.empty()) return true;
     std::ostringstream out;
-    out << "# LGA GateBouncer rules v2\n";
+    // v3: líneas «folder» (reglas por carpeta). Un motor anterior las saltea como inválidas y guarda rules.tsv.bad.
+    out << "# LGA GateBouncer rules v3\n";
     out << "mode\t" << (ask_ ? "ask" : "off") << "\n";
     out << "lan\t" << (localNetwork_ ? "allow" : "ask") << "\n";
     for (const auto &[k, r] : rules_) {
@@ -1394,7 +1716,10 @@ bool FirewallCore::save(std::wstring &error) {
         if (r.expires == UntilRestart) continue;
         const char *action = r.action == Action::Allow ? "allow" : "block";
         const std::string expiry = r.expires > 0 ? "\t" + std::to_string(r.expires) : std::string();
-        if (!r.destination.empty())
+        if (r.scope == Scope::Folder)
+            out << "folder\t" << action << "\t" << r.created << "\t" << r.lastBlock << "\t" << toUtf8(r.path) << "\t"
+                << toUtf8(r.volume) << "\t" << toUtf8(r.name) << "\t" << (r.expires > 0 ? r.expires : 0) << "\n";
+        else if (!r.destination.empty())
             out << "dest\t" << (r.scope == Scope::App ? "app" : r.scope == Scope::Publisher ? "publisher" : "path") << "\t"
                 << action << "\t" << r.created << "\t" << r.lastBlock << "\t" << toUtf8(r.path) << "\t"
                 << toUtf8(r.signer) << "\t" << toUtf8(r.name) << "\t" << toUtf8(r.destination) << "\t"

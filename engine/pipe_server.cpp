@@ -216,8 +216,9 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     const std::string &command = f[0];
     std::ostringstream out;
     if (command == "HELLO") {
-        // Versión 4: reglas por destino (PENDING y RULES con un campo más, DECIDE con destino).
-        out << "OK\tGateBouncerEngine\t4\t" << (mayChange ? "control" : "view") << "\nEND\n";
+        // Versión 4: reglas por destino (PENDING y RULES con un campo más, DECIDE con destino). Versión 5: reglas por
+        // carpeta (FOLDER, y filas «folder» en RULES).
+        out << "OK\tGateBouncerEngine\t5\t" << (mayChange ? "control" : "view") << "\nEND\n";
         return out.str();
     }
     if (command == "STATUS") {
@@ -245,15 +246,19 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         return out.str();
     }
     if (command == "RULES") {
-        // acción, creada, último bloqueo, alcance (path/app/publisher/covered), firmante, nombre, id, vencimiento.
-        // id: la ruta (path y covered) o la clave de la regla (app y publisher). Una fila covered es la ruta que
-        // una regla de firma ya permitió o bloqueó; su nombre es la clave de esa regla. Vencimiento: 0 permanente,
-        // -1 hasta reiniciar el motor, o el momento Unix en que se retira. Versión 4 suma destino (vacío: la app
-        // entera) y la ruta de las reglas de ruta. Una regla por destino tiene como id su clave, incluso si es de ruta.
+        // acción, creada, último bloqueo, alcance (path/app/publisher/folder/covered), firmante, nombre, id, vencimiento.
+        // id: la ruta (path y covered) o la clave de la regla (app, publisher y folder). Una fila covered es la ruta que
+        // una regla de firma o de carpeta ya permitió o bloqueó; su nombre es la clave de esa regla. Vencimiento: 0
+        // permanente, -1 hasta reiniciar el motor, o el momento Unix en que se retira. Versión 4 suma destino (vacío: la
+        // app entera) y la ruta de las reglas de ruta. Una regla por destino tiene como id su clave, incluso si es de
+        // ruta. Una regla folder lleva como ruta la carpeta y como nombre el exe que cubre (vacío: todos).
         out << "OK\n";
         const auto rules = core_.rules();
         for (const auto &r : rules) {
-            const char *scope = r.scope == Scope::App ? "app" : r.scope == Scope::Publisher ? "publisher" : "path";
+            const char *scope = r.scope == Scope::App         ? "app"
+                                : r.scope == Scope::Publisher ? "publisher"
+                                : r.scope == Scope::Folder    ? "folder"
+                                                              : "path";
             out << (r.action == Action::Allow ? "allow" : "block") << "\t" << r.created << "\t" << r.lastBlock << "\t"
                 << scope << "\t" << field(r.signer) << "\t" << field(r.name) << "\t"
                 << field(r.scope == Scope::Path && r.destination.empty() ? r.path : FirewallCore::ruleKey(r)) << "\t"
@@ -276,7 +281,8 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         out << "END\n";
         return out.str();
     }
-    const bool changes = command == "DECIDE" || command == "REMOVE" || command == "MODE" || command == "LAN";
+    const bool changes =
+        command == "DECIDE" || command == "FOLDER" || command == "REMOVE" || command == "MODE" || command == "LAN";
     if (!changes) return err(L"Unknown command");
     if (!mayChange) return err(L"Only GateBouncer or an administrator can change rules");
     std::wstring error;
@@ -284,9 +290,10 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     // DECIDE <allow|block> <ruta> (sólo esa ruta) o DECIDE <allow|block> <path|app|publisher> <ruta> [duración
     // [destino]]. Duración: "always", "restart" (hasta que el motor se reinicie) o segundos, de un minuto a una semana.
     // Destino: un host, «*.dominio» o una IP; sin destino, la app entera.
+    // FOLDER <allow|block> <carpeta> <nombre del exe, o vacío o * para todos> [duración]: una regla por carpeta.
     std::int64_t expires = 0;
     bool durationOk = true;
-    if (command == "DECIDE" && (f.size() == 5 || f.size() == 6)) {
+    if ((command == "DECIDE" && (f.size() == 5 || f.size() == 6)) || (command == "FOLDER" && f.size() == 5)) {
         if (f[4] == "restart") {
             expires = UntilRestart;
         } else if (f[4] != "always") {
@@ -303,6 +310,8 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         ok = core_.decide(wide(f[3]), f[1] == "allow" ? Action::Allow : Action::Block,
                           f[2] == "app" ? Scope::App : f[2] == "publisher" ? Scope::Publisher : Scope::Path, error,
                           expires, f.size() == 6 ? wide(f[5]) : std::wstring());
+    else if (command == "FOLDER" && (f.size() == 4 || f.size() == 5) && durationOk && (f[1] == "allow" || f[1] == "block"))
+        ok = core_.decideFolder(wide(f[2]), wide(f[3]), f[1] == "allow" ? Action::Allow : Action::Block, error, expires);
     else if (command == "REMOVE" && f.size() == 2)
         ok = core_.removeRule(wide(f[1]), error);
     else if (command == "MODE" && f.size() == 2 && (f[1] == "ask" || f[1] == "off"))

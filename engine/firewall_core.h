@@ -3,13 +3,16 @@
 // Una app sin regla queda bloqueada por el filtro por defecto; su bloqueo genera una solicitud pendiente.
 // Allow o Block crea una regla persistente y el próximo intento de la app usa esa regla.
 //
-// Tres alcances de regla:
+// Cuatro alcances de regla:
 //  - Path: la ruta exacta del ejecutable (WFP filtra así).
 //  - App: editor firmado + nombre del ejecutable, en cualquier carpeta («any version»).
 //  - Publisher: todo ejecutable firmado por ese editor.
-// WFP no sabe de firmas: las reglas App y Publisher viven en el motor. Cuando una app sin regla de ruta se bloquea,
-// el motor verifica su firma y, si coincide con una de esas reglas, agrega el filtro de esa ruta (una «cobertura»).
-// El primer intento igual se pierde; el siguiente pasa sin preguntar.
+//  - Folder: todo ejecutable dentro de una carpeta y sus subcarpetas, o sólo los que tienen un nombre (folder_rule.h).
+// WFP no sabe de firmas ni de carpetas: las reglas App, Publisher y Folder viven en el motor. Cuando una app sin regla
+// de ruta se bloquea, el motor verifica su firma o dónde está de verdad y, si coincide con una de esas reglas, agrega el
+// filtro de esa ruta (una «cobertura»). El primer intento igual se pierde; el siguiente pasa sin preguntar. Orden: la
+// regla de la ruta, las reglas por destino, la de la app, la del editor y por último la de carpeta: una carpeta de
+// confianza sólo decide por los programas que no tienen otra regla.
 //
 // Reglas por destino: cualquiera de los tres alcances puede llevar un destino (un host, «*.dominio» o una IP). Una app
 // con reglas por destino está en «modo por destino»: no tiene filtro de app entera y cada servidor nuevo pregunta por
@@ -17,6 +20,7 @@
 // esas IPs para esa app (un «permiso de destino»). Una regla de la app entera y las reglas por destino de esa misma
 // identidad se excluyen: decidir una reemplaza a las otras.
 #include "dns_names.h"
+#include "folder_rule.h"
 #include "name_wait.h"
 #include "wfp_engine.h"
 #include <atomic>
@@ -29,13 +33,14 @@
 
 namespace gbe {
 
-enum class Scope { Path, App, Publisher };
+enum class Scope { Path, App, Publisher, Folder };
 
 struct Rule {
     Scope scope = Scope::Path;
-    std::wstring path;          // Path: la ruta; App/Publisher: vacío
+    std::wstring path;          // Path: la ruta; Folder: la carpeta (ruta final); App/Publisher: vacío
+    std::wstring volume;        // Folder: la carpeta por su volumen («\\?\Volume{…}\…»), con la que se compara
     std::wstring signer;        // App/Publisher: el firmante tal como lo muestra Windows
-    std::wstring name;          // App: nombre del ejecutable en minúsculas
+    std::wstring name;          // App: nombre del ejecutable en minúsculas; Folder: ídem, o vacío para todos
     // Vacío: la app entera. Si no: «host.ejemplo.com», «*.ejemplo.com» (el dominio y sus subdominios) o una IP.
     std::wstring destination;
     Action action = Action::Allow;
@@ -132,6 +137,10 @@ class FirewallCore {
     // destination vacío: la app entera; si no, sólo ese destino (y la app pasa a modo por destino).
     bool decide(const std::wstring &path, Action action, Scope scope, std::wstring &error, std::int64_t expires = 0,
                 const std::wstring &destination = {});
+    // Regla por carpeta: todo ejecutable dentro de folder y sus subcarpetas, o sólo los que se llaman name (vacío:
+    // todos). La carpeta se valida y se resuelve acá (resolveTrustedFolder); los pedidos de adentro se cubren ya.
+    bool decideFolder(const std::wstring &folder, const std::wstring &name, Action action, std::wstring &error,
+                      std::int64_t expires = 0);
     // id: la ruta de una regla Path o la clave de una regla App/Publisher.
     bool removeRule(const std::wstring &id, std::wstring &error);
 
@@ -168,12 +177,25 @@ class FirewallCore {
     void addGrantActivity(std::int64_t t, const std::wstring &path, const std::wstring &address, const Rule &rule,
                           const std::wstring &remote, std::uint16_t port, std::uint8_t protocol);
     void recheckCoverage(bool full);
+    // Vuelve a decidir cada archivo cubierto por una carpeta con la precedencia entera: una regla de firma que coincide
+    // (con la firma verificada de nuevo) u otra carpeta que gana (más profunda, la misma con el nombre del exe) pasa a
+    // cubrirlo, con su acción; el modo por destino de su identidad le saca la cobertura (el próximo intento se decide
+    // por destino). Hace E/S: sin mutex_, en el hilo de verificación.
+    void reviewFolderCoverage();
+    // Pide esa revisión al hilo de verificación (después de guardar una regla). Con o sin mutex_.
+    void requestFolderReview();
     void expireRules();
     // Retira los filtros de la regla (o de sus coberturas) y la borra. Con mutex_ tomado.
     bool dropRule(std::map<std::wstring, Rule>::iterator it, const std::wstring &reason, std::wstring &error);
     std::wstring cachedSigner(const std::wstring &path);
     const Rule *signerRuleFor(const std::wstring &path, const std::wstring &signer) const;
     bool matches(const Rule &rule, const std::wstring &path, const std::wstring &signer) const;
+    // La regla por carpeta de un archivo ya ubicado (placeOf), o nada. Con mutex_ tomado.
+    const Rule *folderRuleFor(const FinalPath &place, const std::wstring &name) const;
+    bool hasFolderRules() const;
+    // Una cobertura sigue valiendo: el archivo sigue firmado por quien pide la regla, o sigue dentro de la carpeta. Hace
+    // E/S (firma o ruta final): mejor sin mutex_.
+    bool coverValid(const Rule &rule, const std::wstring &path) const;
     // Modo por destino. any: la app tiene alguna regla por destino. Devuelve la regla que corresponde a ese destino
     // (la más específica; a igual especificidad, Block), o nada.
     const Rule *destinationRuleFor(const std::wstring &path, const std::wstring &signer, const std::wstring &host,
@@ -191,8 +213,8 @@ class FirewallCore {
     void erasePendingOf(const std::wstring &pathKey);
     void applyHint(const DnsHint &hint);
     void onResolved(const std::wstring &app, const std::wstring &host, const std::vector<std::wstring> &addresses);
-    bool cover(const std::wstring &path, const std::wstring &ruleKey, Action action, std::wstring &error);
-    void uncover(const std::wstring &pathKey);
+    // Pone el filtro de una ruta por una regla de firma o de carpeta (una cobertura) y deja el historial. Con mutex_.
+    bool coverWith(const DropEvent &drop, const Rule &rule, const FileStamp &stamp, std::wstring &error);
     bool applyAskFilters(std::wstring &error);
     bool removeAskFilters(std::wstring &error);
     bool installRule(Rule &rule, std::wstring &error);
@@ -229,8 +251,10 @@ class FirewallCore {
     std::deque<DropEvent> verifyQueue_;
     std::deque<DnsHint> hintQueue_;
     bool verifyStop_ = false;
+    bool reviewFolders_ = false; // protegido por verifyMutex_
     std::thread verifyThread_;
     int recheckRound_ = 0; // sólo lo usa el hilo de verificación
+    bool reviewAgain_ = false; // ídem: la última revisión de carpetas no pudo ubicar algún archivo
     // Bloqueos en modo por destino que llegaron antes que su consulta DNS: esperan el nombre antes de preguntar.
     // Sólo lo usa el hilo de verificación.
     NameWait<DropEvent> nameWait_{std::chrono::seconds(2), 1000};

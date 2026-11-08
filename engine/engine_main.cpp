@@ -10,6 +10,7 @@
 //                                  corre en primer plano (pruebas). --dynamic: nada sobrevive al cierre.
 //                                  --scope: sólo esas apps quedan bajo «preguntar»; el resto de la PC no se toca.
 //   --signer <exe>                 muestra el firmante que usan las reglas por editor (no hace falta administrador)
+//   --folder <carpeta> [<exe>]     dice si se puede confiar en esa carpeta y si el exe queda adentro (sin administrador)
 #include "pipe_server.h"
 #include "signature.h"
 #include <aclapi.h>
@@ -573,7 +574,29 @@ int wmain(int argc, wchar_t **argv) {
         wprintf(L"%ls\n", signer.empty() ? L"(no valid signature)" : signer.c_str());
         return signer.empty() ? 1 : 0;
     }
+    if (mode == L"--folder" && (argc == 3 || argc == 4)) {
+        // La misma validación que una regla nueva, leída con la cuenta de quien la corre (como SYSTEM, el motor ve
+        // además las carpetas de los otros usuarios con sesión).
+        gbe::FinalPath folder;
+        const std::wstring problem = gbe::resolveTrustedFolder(argv[2], folder);
+        if (!problem.empty()) {
+            wprintf(L"Cannot trust: %ls\n", problem.c_str());
+            return 1;
+        }
+        wprintf(L"Folder: %ls\nVolume: %ls\n", folder.dos.c_str(), folder.volume.c_str());
+        if (argc == 3) return 0;
+        gbe::FinalPath file;
+        if (!gbe::finalPathOf(argv[3], false, file)) {
+            wprintf(L"Program: not found on a local drive\n");
+            return 1;
+        }
+        const bool inside = gbe::placeOf(argv[3], file) && gbe::volumePathInside(file.volume, folder.volume);
+        wprintf(L"Program: %ls\nInside: %ls\n", file.dos.c_str(),
+                inside ? L"yes" : gbe::placeOf(argv[3], file) ? L"no" : L"no (the path goes through a link)");
+        return inside ? 0 : 1;
+    }
     fwprintf(stderr, L"Usage: GateBouncerEngine.exe --install [--ui <exe>] [--allow-unprotected-folder] | --uninstall | "
-                     L"--remove-filters | --update <folder> | --send <field>... | --console ... | --signer <exe>\n");
+                     L"--remove-filters | --update <folder> | --send <field>... | --console ... | --signer <exe> | "
+                     L"--folder <folder> [<exe>]\n");
     return 2;
 }
