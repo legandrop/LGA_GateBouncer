@@ -5,6 +5,7 @@
 #include "foldertrust.h"
 #include "explain/Explainer.h"
 #include "explain/KnownApps.h"
+#include "theme.h"
 #include <QAbstractItemView>
 #include <QComboBox>
 #include <QDateTime>
@@ -22,7 +23,6 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QPushButton>
-#include <QRegularExpression>
 #include <QScreen>
 #include <QSettings>
 #include <QSignalBlocker>
@@ -36,25 +36,35 @@
 
 namespace Gate {
 namespace {
-// Medidas del diseño aprobado (rediseño 2026-11): aviso de 360 px, secciones con 14 px de margen y la tarjeta de la
-// explicación con 10 px.
-constexpr int Width = 360; // ancho inicial y mínimo
+// Medidas de la maqueta «Pliego» (2026-11-07): aviso de 368 px con borde de 1 px y 16 px de margen interior, de modo
+// que el contenido mide 334 px como en la maqueta.
+constexpr int Width = 368; // ancho inicial y mínimo
 constexpr int MaxWidth = 760;
 constexpr int Margin = 15;
 constexpr int Edge = 6;          // franja de los bordes izquierdo y derecho que ensancha
-constexpr int Pad = 14;          // margen lateral de las secciones
-constexpr int CardPad = 10;      // margen lateral de la tarjeta de la explicación
-constexpr int CardInset = 11;    // relleno interior de la tarjeta
-constexpr int IconSize = 38;     // caja del ícono del programa
-constexpr int IconGlyph = 32;    // tamaño propio de Windows: no se reescala ni queda blando
-constexpr int IconGap = 11;
-constexpr int KeyColumn = 70;    // columna de rótulos de la grilla de datos
+constexpr int Pad = 17;          // borde de 1 px + 16 px de margen lateral
+constexpr int Gap = 12;          // separación entre bloques
+constexpr int CardInsetX = 12;   // relleno interior de la tarjeta de la explicación
+constexpr int CardInsetY = 11;
+constexpr int IconSize = 36;     // caja del ícono del programa
+constexpr int IconGlyph = 24;    // el mismo tamaño que la caja de 36 de la ventana
+constexpr int IconGap = 12;
+constexpr int KeyColumn = 76;    // columna de rótulos de la grilla de datos
 constexpr int ColumnGap = 8;
-constexpr int NoteInset = 9;     // relleno lateral de los recuadros de aviso
-constexpr int ChipHeight = 26;
-constexpr int ChipGap = 5;
-constexpr char HeaderIcon[] = "#888888";
-constexpr char HeaderIconActive[] = "#ececec";
+constexpr int NoteInsetX = 10;   // relleno de los recuadros de aviso
+constexpr int NoteInsetY = 8;
+constexpr int ChipHeight = 28;   // desplegables de la regla
+constexpr int ChipGap = 6;
+constexpr int DecisionWidth = 72; // Block y Allow
+// Estados de hover de la maqueta que todavía no tienen token en theme.h.
+constexpr char ButtonHover[] = "#34343C";
+constexpr char ButtonHoverBorder[] = "#4A4A55";
+constexpr char BlockHover[] = "#4A2326";
+constexpr char BlockHoverBorder[] = "#8A3A3E";
+constexpr char PickHoverBorder[] = "#44444E";
+
+// Rol de un texto corto para el desplegable cuando el texto entero no entra («Any destination (whole app)»).
+constexpr int ShortTextRole = Qt::UserRole + 1;
 
 QSettings store() { return QSettings(QSettings::NativeFormat, QSettings::UserScope, "LGA", "GateBouncer"); }
 
@@ -102,39 +112,25 @@ void restyle(QWidget *widget, const char *name, const QString &value) {
     widget->style()->polish(widget);
 }
 
-// La carpeta del programa sin la unidad, sin «Windows\» y sin la carpeta del usuario: «System32»,
-// «AppData\Local\Temp\is-4K2.tmp», «Program Files\BraveSoftware\Brave-Browser».
-QString shortFolder(const QString &path) {
-    QString dir = QDir::toNativeSeparators(QFileInfo(path).path());
-    static const QRegularExpression drive(R"(^[A-Za-z]:\\)");
-    dir.remove(drive);
-    if (dir.startsWith("Windows\\", Qt::CaseInsensitive)) dir = dir.mid(8);
-    else if (dir.startsWith("Users\\", Qt::CaseInsensitive)) {
-        const int next = dir.indexOf('\\', 6);
-        dir = next < 0 ? QString() : dir.mid(next + 1);
-    }
-    return dir;
-}
-
 // Íconos de la barra dibujados: los caracteres «⋯» y «×» no quedan centrados en botones chicos.
 QIcon headerIcon(bool close) {
     const qreal dpr = qMax(qreal(2), qApp->devicePixelRatio());
     QIcon icon;
-    for (const auto &[mode, color] :
-         {std::pair{QIcon::Normal, QColor(HeaderIcon)}, std::pair{QIcon::Active, QColor(HeaderIconActive)}}) {
-        QPixmap pixmap(QSize(14, 14) * dpr);
+    for (const auto &[mode, color] : {std::pair{QIcon::Normal, Theme::color(Theme::kTextCaption)},
+                                      std::pair{QIcon::Active, Theme::color(Theme::kTextBright)}}) {
+        QPixmap pixmap(QSize(16, 16) * dpr);
         pixmap.setDevicePixelRatio(dpr);
         pixmap.fill(Qt::transparent);
         QPainter p(&pixmap);
         p.setRenderHint(QPainter::Antialiasing);
         if (close) {
             p.setPen(QPen(color, 1.3, Qt::SolidLine, Qt::RoundCap));
-            p.drawLine(QPointF(3.5, 3.5), QPointF(10.5, 10.5));
-            p.drawLine(QPointF(10.5, 3.5), QPointF(3.5, 10.5));
+            p.drawLine(QPointF(4.5, 4.5), QPointF(11.5, 11.5));
+            p.drawLine(QPointF(11.5, 4.5), QPointF(4.5, 11.5));
         } else {
             p.setPen(Qt::NoPen);
             p.setBrush(color);
-            for (const qreal x : {3.0, 7.0, 11.0}) p.drawEllipse(QPointF(x, 7), 1.1, 1.1);
+            for (const qreal x : {3.6, 8.0, 12.4}) p.drawEllipse(QPointF(x, 8), 1.0, 1.0);
         }
         p.end();
         icon.addPixmap(pixmap, mode);
@@ -142,30 +138,75 @@ QIcon headerIcon(bool close) {
     return icon;
 }
 
-// Desplegable del aviso con forma de «chip»: la rueda nunca cambia lo elegido (el aviso aparece debajo del puntero
-// mientras se trabaja) y la flecha se dibuja, porque la hoja de estilo le saca la del sistema.
+// Desplegable de la regla («pick» de la maqueta), dibujado entero: fondo de campo, texto y flecha. La rueda nunca
+// cambia lo elegido (el aviso aparece debajo del puntero mientras se trabaja). Si el texto no entra se usa el corto
+// del ítem (recortado con «…» sólo si tampoco entra) y el entero va en el tooltip; la lista abierta se ensancha para
+// mostrar cada opción completa.
 class ScopeCombo final : public QComboBox {
   public:
     using QComboBox::QComboBox;
-    // Ancho justo para el texto elegido: relleno izquierdo, flecha y borde.
-    int chipWidth() {
+    Qt::TextElideMode elideMode = Qt::ElideRight;
+
+    QString shownText() {
         ensurePolished();
-        return fontMetrics().horizontalAdvance(currentText()) + 8 + 22 + 2 + 2;
+        const QString full = currentText();
+        const int room = textRect().width();
+        const QFontMetrics fm = fontMetrics();
+        if (fm.horizontalAdvance(full) <= room) return full;
+        const QString brief = currentData(ShortTextRole).toString();
+        return fm.elidedText(brief.isEmpty() ? full : brief, elideMode, room);
     }
 
   protected:
+    QRect textRect() const { return rect().adjusted(10, 0, -(9 + 14 + 6), 0); }
     void wheelEvent(QWheelEvent *event) override { event->ignore(); }
-    void paintEvent(QPaintEvent *event) override {
-        QComboBox::paintEvent(event);
+    void enterEvent(QEnterEvent *event) override {
+        update();
+        QComboBox::enterEvent(event);
+    }
+    void leaveEvent(QEvent *event) override {
+        update();
+        QComboBox::leaveEvent(event);
+    }
+    void paintEvent(QPaintEvent *) override {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
-        p.setPen(QPen(QColor(isEnabled() ? "#8a8a8a" : "#4f4f4f"), 1.4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
-        const QPointF c(width() - 12.5, height() / 2.0 + 0.5);
-        p.drawPolyline(QPolygonF({c + QPointF(-3.2, -1.6), c + QPointF(0, 1.6), c + QPointF(3.2, -1.6)}));
+        const bool on = isEnabled();
+        p.setPen(QColor(on && underMouse() ? PickHoverBorder : Theme::kFieldBorder));
+        p.setBrush(Theme::color(Theme::kField));
+        p.drawRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 6, 6);
+        p.setFont(font());
+        p.setPen(Theme::color(on ? Theme::kTextStrong : Theme::kTextFaint));
+        p.drawText(textRect(), Qt::AlignVCenter | Qt::AlignLeft, shownText());
+        // Flecha de 14 px (la «chev» de la maqueta) a 9 px del borde derecho.
+        const QPointF o(width() - 9 - 14, (height() - 14) / 2.0);
+        p.setPen(QPen(Theme::color(on ? Theme::kTextCaption : Theme::kTextDisabled), 1.3, Qt::SolidLine, Qt::RoundCap,
+                      Qt::RoundJoin));
+        p.setBrush(Qt::NoBrush);
+        p.drawPolyline(QPolygonF({o + QPointF(3.5, 5.6), o + QPointF(7, 9.1), o + QPointF(10.5, 5.6)}));
+    }
+    void showPopup() override {
+        QComboBox::showPopup();
+        // La lista abierta muestra cada opción entera: más ancha que el desplegable si hace falta, sin salir de la
+        // pantalla (el aviso vive abajo a la derecha).
+        QWidget *popup = view()->window();
+        const QFontMetrics fm = view()->fontMetrics();
+        int need = 0;
+        for (int i = 0; i < count(); ++i) need = qMax(need, fm.horizontalAdvance(itemText(i)));
+        need += 2 * 8 + 2 * 4 + 2 + 6; // relleno del ítem, de la lista, borde y aire
+        if (need <= popup->width()) return;
+        QRect g = popup->geometry();
+        g.setWidth(need);
+        if (const QScreen *s = screen()) {
+            const QRect area = s->availableGeometry();
+            if (g.right() > area.right()) g.moveRight(area.right());
+            if (g.left() < area.left()) g.moveLeft(area.left());
+        }
+        popup->setGeometry(g);
     }
 };
 
-// Indicador de «pidiendo»: un aro tenue con un tramo claro que gira.
+// Indicador de «pidiendo»: un aro tenue con un tramo de acento que gira.
 class Spinner final : public QWidget {
   public:
     using QWidget::QWidget;
@@ -176,9 +217,9 @@ class Spinner final : public QWidget {
         QPainter p(this);
         p.setRenderHint(QPainter::Antialiasing);
         const QRectF r = QRectF(rect()).adjusted(1, 1, -1, -1);
-        p.setPen(QPen(QColor("#4b4466"), 2));
+        p.setPen(QPen(Theme::color(Theme::kBorderStrong), 2));
         p.drawEllipse(r);
-        p.setPen(QPen(QColor("#b49cf2"), 2, Qt::SolidLine, Qt::FlatCap));
+        p.setPen(QPen(Theme::color(Theme::kAccent), 2, Qt::SolidLine, Qt::FlatCap));
         p.drawArc(r, (90 - angle) * 16, -90 * 16);
     }
 };
@@ -201,6 +242,125 @@ QPushButton *link(QWidget *parent, const char *name, const QString &text) {
     b->setCursor(Qt::PointingHandCursor);
     return b;
 }
+
+// Rótulo en versalitas con aire entre letras («RULE», «WHY IT CONNECTS»): la hoja de estilo no tiene letter-spacing.
+void smallCaps(QLabel *l) {
+    QFont f = l->font();
+    f.setCapitalization(QFont::AllUppercase);
+    f.setLetterSpacing(QFont::AbsoluteSpacing, 0.9);
+    l->setFont(f);
+}
+
+// Hoja del aviso con los tokens del Pliego: «%nombre%» se reemplaza por el color de theme.h.
+QString toastSheet() {
+    using namespace Theme;
+    QString s = QStringLiteral(R"(
+        #accessToast QLabel, #accessToast QPushButton, #accessToast QComboBox { background:transparent; border:0;
+            color:%text%; font-family:'Inter'; font-size:13px; font-weight:400; padding:0; }
+        #accessToast QPushButton { min-height:0; }
+        #accessToast QLabel#toastHeader { font-family:@title; font-size:13px; font-weight:700; color:%textBright%; }
+        #accessToast QLabel#toastAppIcon { background:%tile%; border-radius:8px; }
+        #accessToast QPushButton#toastMenu, #accessToast QPushButton#toastClose { border-radius:6px; }
+        #accessToast QPushButton#toastMenu:hover, #accessToast QPushButton#toastClose:hover { background:%rowHover%; }
+        #accessToast QLabel#toastTitle { font-family:@title; font-size:16px; font-weight:700; color:%textBright%; }
+        #accessToast QLabel#toastBody { font-size:12.5px; color:%textCaption%; }
+        #accessToast QWidget#toastWarn { background:rgba(242,203,63,15); border:1px solid %warnBorder%;
+            border-radius:8px; }
+        #accessToast QWidget#toastWarn QLabel { font-size:12.5px; color:%warn%; }
+        #accessToast QWidget#toastInfo { background:%card%; border:1px solid %borderStrong%; border-radius:8px; }
+        #accessToast QWidget#toastInfo QLabel { font-size:12.5px; color:%textMuted%; }
+        #accessToast QWidget#toastLine { background:%divider%; }
+        #accessToast QLabel#toastKey { font-size:12.5px; color:%textFaint%; }
+        #accessToast QLabel#toastValue { font-size:12.5px; color:%textStrong%; }
+        #accessToast QLabel#toastValueDetail { font-size:12px; color:%textFaint%; }
+        #accessToast QLabel#toastKnownPill { font-size:12px; font-weight:600; color:%textCaption%;
+            border:1px solid %borderStrong%; border-radius:11px; padding:0 9px; }
+        #accessToast QLabel#toastKnownText { font-size:12.5px; color:%textMuted%; }
+        #accessToast QWidget#toastExplainBox { background:%card%; border:1px solid %cardBorder%; border-radius:10px; }
+        #accessToast QWidget#toastExplainBox[tone="err"] { border-color:%errBorder%; }
+        #accessToast QLabel#toastExplainStatus { font-size:13px; color:%textCaption%; }
+        #accessToast QLabel#toastExplainStatus[tone="working"] { font-size:12.5px; color:%textMuted%; }
+        #accessToast QLabel#toastExplainStatus[tone="err"] { color:%error%; }
+        #accessToast QLabel#toastSuggestion { font-size:12px; font-weight:600; color:%textCaption%;
+            border:1px solid %borderStrong%; border-radius:11px; padding:0 9px; }
+        #accessToast QLabel#toastSuggestion[kind="block"] { color:%error%; border-color:%errBorder%;
+            background:%errBg%; }
+        #accessToast QLabel#toastSuggestion[kind="allow"] { color:%okText%; border-color:%okBorder%;
+            background:%okBg%; }
+        #accessToast QLabel#toastWhat { font-size:13px; color:%textStrong%; }
+        #accessToast QWidget#toastMoreLine { background:%divider%; }
+        #accessToast QLabel#toastMoreHead { font-size:11px; font-weight:600; color:%textFaint%; }
+        #accessToast QLabel#toastMoreBody { font-size:12.5px; color:%text%; }
+        #accessToast QLabel#toastExplainFoot { font-size:11.5px; color:%textFaint%; }
+        #accessToast QPushButton#toastDetails, #accessToast QPushButton#toastSettings,
+            #accessToast QPushButton#toastOpen { font-size:12.5px; font-weight:600; color:%accent%; }
+        #accessToast QPushButton#toastDetails:hover, #accessToast QPushButton#toastSettings:hover,
+            #accessToast QPushButton#toastOpen:hover { color:%accentHover%; }
+        #accessToast QPushButton#toastExplain { background:%tile%; color:%textStrong%; border:1px solid %borderStrong%;
+            border-radius:6px; font-size:12.5px; font-weight:500; padding:0 10px; min-height:24px; max-height:24px; }
+        #accessToast QPushButton#toastExplain:hover { background:%buttonHover%; border-color:%buttonHoverBorder%;
+            color:%textBright%; }
+        #accessToast QLabel#toastRuleLabel { font-size:11px; font-weight:600; color:%textFaint%; }
+        #accessToast QLabel#toastFolderNote { font-size:12px; color:%textFaint%; }
+        #accessToast QComboBox { font-size:13px; color:%textStrong%; }
+        #accessToast QComboBox QAbstractItemView { background:%card%; border:1px solid %borderStrong%;
+            color:%textStrong%; font-size:13px; outline:0; padding:4px; selection-background-color:%listSelected%;
+            selection-color:%textBright%; }
+        #accessToast QComboBox QAbstractItemView::item { min-height:26px; padding:0 8px; border-radius:4px; }
+        #accessToast QComboBox QAbstractItemView::item:hover { background:%rowHover%; }
+        #accessToast QComboBox QAbstractItemView::item:selected { background:%listSelected%; color:%textBright%; }
+        #accessToast QPushButton#toastBlock, #accessToast QPushButton#toastAllow { border-radius:6px;
+            font-size:12.5px; font-weight:600; min-width:70px; max-width:70px; min-height:24px; max-height:24px; }
+        #accessToast QPushButton#toastBlock { background:%errBg%; color:%error%; border:1px solid %errBorder%; }
+        #accessToast QPushButton#toastBlock:hover { background:%blockHover%; border-color:%blockHoverBorder%; }
+        #accessToast QPushButton#toastAllow { background:%primary%; color:%onAccent%; border:1px solid %primaryBorder%; }
+        #accessToast QPushButton#toastAllow:hover { background:%primaryHover%; border-color:%primaryHoverBorder%; }
+        #accessToast QPushButton#toastAllow[rec="1"] { border-color:%primaryHoverBorder%; }
+        #accessToast QPushButton#toastBlock[rec="1"] { border-color:%blockHoverBorder%; }
+        #accessToast QPushButton#toastBlock:disabled, #accessToast QPushButton#toastAllow:disabled {
+            background:%tile%; color:%textFaint%; border-color:%borderStrong%; }
+        #accessToast QLabel#toastFooter { font-size:12px; color:%textFaint%; }
+        #accessToast QMenu { background:%card%; border:1px solid %borderStrong%; padding:4px; }
+        #accessToast QMenu::item { color:%textStrong%; font-size:13px; padding:5px 12px; border-radius:4px; }
+        #accessToast QMenu::item:selected { background:%rowHover%; color:%textBright%; }
+    )");
+    const std::pair<const char *, const char *> tokens[] = {
+        {"%text%", kText},
+        {"%textBright%", kTextBright},
+        {"%textStrong%", kTextStrong},
+        {"%textMuted%", kTextMuted},
+        {"%textCaption%", kTextCaption},
+        {"%textFaint%", kTextFaint},
+        {"%tile%", kTile},
+        {"%card%", kCard},
+        {"%cardBorder%", kCardBorder},
+        {"%borderStrong%", kBorderStrong},
+        {"%divider%", kDivider},
+        {"%rowHover%", kRowHover},
+        {"%listSelected%", kListSelected},
+        {"%accent%", kAccent},
+        {"%accentHover%", kAccentHover},
+        {"%primary%", kPrimary},
+        {"%primaryBorder%", kPrimaryBorder},
+        {"%primaryHover%", kPrimaryHover},
+        {"%primaryHoverBorder%", kPrimaryHoverBorder},
+        {"%onAccent%", kOnAccent},
+        {"%okText%", kOkText},
+        {"%okBg%", kOkBg},
+        {"%okBorder%", kOkBorder},
+        {"%warn%", kWarn},
+        {"%warnBorder%", kWarnBorder},
+        {"%error%", kError},
+        {"%errBg%", kErrBg},
+        {"%errBorder%", kErrBorder},
+        {"%buttonHover%", ButtonHover},
+        {"%buttonHoverBorder%", ButtonHoverBorder},
+        {"%blockHover%", BlockHover},
+        {"%blockHoverBorder%", BlockHoverBorder},
+    };
+    for (const auto &[name, value] : tokens) s.replace(QLatin1String(name), QLatin1String(value));
+    return css(s);
+}
 } // namespace
 
 AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
@@ -214,74 +374,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     setMouseTracking(true);
     width_ = Width;
     setFixedWidth(Width);
-    // Los tamaños con decimales del diseño (14,5 / 12,5 / 11,5 px) van en puntos: la hoja de estilo sólo acepta
-    // píxeles enteros.
-    setStyleSheet(R"(
-        #accessToast QLabel, #accessToast QPushButton, #accessToast QComboBox { background:transparent; border:0;
-            color:#b2b2b2; font-family:'Inter'; font-size:13px; font-weight:400; padding:0; }
-        #accessToast QPushButton { min-height:0; }
-        #accessToast QLabel#toastHeader { font-size:12px; color:#8d8d8d; }
-        #accessToast QLabel#toastAppIcon { background:#242424; border-radius:9px; }
-        #accessToast QPushButton#toastMenu, #accessToast QPushButton#toastClose { border-radius:4px; }
-        #accessToast QPushButton#toastMenu:hover, #accessToast QPushButton#toastClose:hover { background:#2a2a2a; }
-        #accessToast QLabel#toastTitle { font-size:10.875pt; font-weight:600; color:#ececec; }
-        #accessToast QLabel#toastBody { font-size:12px; color:#999999; }
-        #accessToast QWidget#toastWarn { background:#2f2716; border:1px solid #4d3e19; border-radius:6px; }
-        #accessToast QWidget#toastWarn QLabel { font-size:12px; color:#e6c16a; }
-        #accessToast QWidget#toastInfo { background:#20232b; border:1px solid #2f3646; border-radius:6px; }
-        #accessToast QWidget#toastInfo QLabel { font-size:12px; color:#a9bfe0; }
-        #accessToast QWidget#toastLine { background:#2a2a2a; }
-        #accessToast QLabel#toastKey { font-size:12px; color:#777777; }
-        #accessToast QLabel#toastValue { font-size:12px; color:#c6c6c6; }
-        #accessToast QLabel#toastValueDetail { font-size:8.625pt; color:#7c7c7c; }
-        #accessToast QLabel#toastKnownPill { font-size:8.625pt; color:#9cc0ee; border:1px solid #33475f;
-            border-radius:10px; padding:0 8px; }
-        #accessToast QLabel#toastKnownText { font-size:12px; color:#c6c6c6; }
-        #accessToast QWidget#toastExplainBox { background:#222127; border:1px solid #2f2c3a; border-radius:8px; }
-        #accessToast QWidget#toastExplainBox[tone="quiet"] { background:#1f1f1f; border-color:#2c2c2c; }
-        #accessToast QWidget#toastExplainBox[tone="err"] { background:#261d1c; border-color:#43302d; }
-        #accessToast QLabel#toastExplainStatus { font-size:13px; color:#aaaaaa; }
-        #accessToast QLabel#toastExplainStatus[tone="working"] { font-size:9.375pt; color:#b9b0d6; }
-        #accessToast QLabel#toastExplainStatus[tone="err"] { color:#e7a196; }
-        #accessToast QLabel#toastSuggestion { font-size:8.625pt; color:#aaaaaa; border:1px solid #444444;
-            border-radius:10px; padding:0 8px; }
-        #accessToast QLabel#toastSuggestion[kind="block"] { color:#e7a196; border-color:#6a3a33; }
-        #accessToast QLabel#toastSuggestion[kind="allow"] { color:#b5d88b; border-color:#4c6233; }
-        #accessToast QLabel#toastWhat { font-size:9.375pt; color:#c9c9c9; }
-        #accessToast QWidget#toastMoreLine { background:#312e3c; }
-        #accessToast QLabel#toastMoreHead { font-size:11px; font-weight:500; color:#8f88a8; }
-        #accessToast QLabel#toastMoreBody { font-size:12px; color:#aeaeae; }
-        #accessToast QLabel#toastExplainFoot { font-size:11px; color:#6f6c7c; }
-        #accessToast QPushButton#toastDetails, #accessToast QPushButton#toastSettings { font-size:12px; color:#aa95ed; }
-        #accessToast QPushButton#toastOpen { font-size:8.625pt; color:#aa95ed; }
-        #accessToast QPushButton#toastDetails:hover, #accessToast QPushButton#toastSettings:hover,
-            #accessToast QPushButton#toastOpen:hover { text-decoration:underline; }
-        #accessToast QPushButton#toastExplain { background:#2b2b2b; color:#c4c4c4; border-radius:5px; font-size:12px;
-            padding:0 10px; min-height:25px; max-height:25px; }
-        #accessToast QPushButton#toastExplain:hover { background:#333333; color:#e6e6e6; }
-        #accessToast QLabel#toastRuleLabel { font-size:11px; color:#7d7d7d; }
-        #accessToast QLabel#toastFolderNote { font-size:11px; color:#9a9a9a; }
-        #accessToast QComboBox { background:#242424; border:1px solid #363636; border-radius:5px; color:#d0d0d0;
-            font-size:12px; padding:0 0 0 8px; min-height:24px; max-height:26px; }
-        #accessToast QComboBox:hover { background:#292929; border-color:#424242; }
-        #accessToast QComboBox:disabled { color:#8f8f8f; }
-        #accessToast QComboBox::drop-down { width:22px; border:0; }
-        #accessToast QComboBox::down-arrow { image:none; width:0; height:0; }
-        #accessToast QComboBox QAbstractItemView { background:#232323; border:1px solid #3a3a3a; color:#cfcfcf;
-            font-size:12px; outline:0; padding:4px; selection-background-color:#2f2a45; selection-color:#ececec; }
-        #accessToast QComboBox QAbstractItemView::item { min-height:26px; padding:0 8px; border-radius:4px; }
-        #accessToast QPushButton#toastBlock, #accessToast QPushButton#toastAllow { border-radius:5px; font-size:13px;
-            font-weight:600; min-height:32px; max-height:32px; }
-        #accessToast QPushButton#toastBlock { background:#3a2220; color:#f2b2a8; border:1px solid #5e3530; }
-        #accessToast QPushButton#toastBlock:hover { background:#452824; }
-        #accessToast QPushButton#toastAllow { background:#25301c; color:#c9e6a4; border:1px solid #45592f; }
-        #accessToast QPushButton#toastAllow:hover { background:#2d3a22; }
-        #accessToast QPushButton#toastAllow[rec="1"] { border-color:#7ea653; color:#e3f6c8; }
-        #accessToast QPushButton#toastBlock[rec="1"] { border-color:#a8564b; color:#ffd0c8; }
-        #accessToast QPushButton#toastBlock:disabled, #accessToast QPushButton#toastAllow:disabled {
-            background:#212121; color:#5c5c5c; border-color:#2e2e2e; }
-        #accessToast QLabel#toastFooter { font-size:8.625pt; color:#707070; }
-    )");
+    setStyleSheet(toastSheet());
 
     auto *layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
@@ -289,30 +382,30 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
 
     // Barra: la marca, «⋯» con el menú y «×» que cierra sin decidir.
     auto *bar = new QWidget(this);
-    bar->setFixedHeight(34);
+    bar->setFixedHeight(36);
     auto *barRow = new QHBoxLayout(bar);
-    barRow->setContentsMargins(12, 0, 6, 0);
+    barRow->setContentsMargins(13, 0, 9, 0);
     barRow->setSpacing(8);
     auto *small = new QLabel(bar);
-    small->setFixedSize(14, 14);
-    small->setPixmap(QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png").pixmap(14, 14));
+    small->setFixedSize(18, 18);
+    small->setPixmap(QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png").pixmap(18, 18));
     barRow->addWidget(small);
     auto *name = new QLabel("LGA GateBouncer", bar);
     name->setObjectName("toastHeader");
     barRow->addWidget(name, 1);
     auto *more = new QPushButton(bar);
     more->setObjectName("toastMenu");
-    more->setFixedSize(28, 26);
+    more->setFixedSize(26, 26);
     more->setIcon(headerIcon(false));
-    more->setIconSize(QSize(14, 14));
+    more->setIconSize(QSize(16, 16));
     more->setAccessibleName("More actions");
     more->setCursor(Qt::PointingHandCursor);
     barRow->addWidget(more);
     auto *close = new QPushButton(bar);
     close->setObjectName("toastClose");
-    close->setFixedSize(28, 26);
+    close->setFixedSize(26, 26);
     close->setIcon(headerIcon(true));
-    close->setIconSize(QSize(14, 14));
+    close->setIconSize(QSize(16, 16));
     CustomTooltip::instance()->setToolTip(close, "Close and keep it waiting");
     close->setAccessibleName("Close and keep it waiting");
     close->setCursor(Qt::PointingHandCursor);
@@ -325,36 +418,37 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     connect(more, &QPushButton::clicked, this, [more, menu] { menu->popup(more->mapToGlobal(QPoint(0, more->height()))); });
     connect(close, &QPushButton::clicked, this, [this] { emit dismissed(request_.id); });
 
-    // Cabecera: ícono del programa, nombre del archivo y qué pasó.
+    // Cabecera: ícono del programa, nombre del archivo y qué pasó, centrados en vertical.
     auto *head = new QHBoxLayout;
-    head->setContentsMargins(Pad, 2, Pad, 10);
+    head->setContentsMargins(Pad, 4, Pad, 0);
     head->setSpacing(IconGap);
     icon_ = new QLabel(this);
     icon_->setObjectName("toastAppIcon"); // la misma caja que en la ventana: un ícono oscuro se sigue leyendo
     icon_->setFixedSize(IconSize, IconSize);
     icon_->setAlignment(Qt::AlignCenter);
-    head->addWidget(icon_, 0, Qt::AlignTop);
+    head->addWidget(icon_, 0, Qt::AlignVCenter);
     auto *text = new QVBoxLayout;
     text->setSpacing(2);
+    text->addStretch(1);
     title_ = label(this, "toastTitle");
     text->addWidget(title_);
     body_ = label(this, "toastBody", true);
     text->addWidget(body_);
-    text->addStretch();
+    text->addStretch(1);
     head->addLayout(text, 1);
     layout->addLayout(head);
 
-    // Recuadros de aviso: sin firma (ámbar) y modo por destino (azul).
+    // Recuadros de aviso: sin firma (amarillo) y modo por destino (neutro).
     // El margen va en un contenedor que se oculta entero: un layout suelto con el recuadro oculto dejaría su margen.
     const auto noteBox = [this, layout](const char *name, QLabel *&note, Qt::TextFormat format) {
         auto *holder = new QWidget(this);
         auto *wrap = new QHBoxLayout(holder);
-        wrap->setContentsMargins(Pad, 0, Pad, 8);
+        wrap->setContentsMargins(Pad, Gap, Pad, 0);
         auto *box = new QWidget(holder);
         box->setObjectName(name);
         box->setAttribute(Qt::WA_StyledBackground);
         auto *inner = new QVBoxLayout(box);
-        inner->setContentsMargins(NoteInset, 7, NoteInset, 7);
+        inner->setContentsMargins(NoteInsetX, NoteInsetY, NoteInsetX, NoteInsetY);
         note = new QLabel(box);
         note->setWordWrap(true);
         note->setTextFormat(format);
@@ -365,22 +459,23 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     };
     warnBox_ = noteBox("toastWarn", warn_, Qt::PlainText); // el texto depende de si hay carpeta que ofrecer
     infoBox_ = noteBox("toastInfo", info_, Qt::RichText);
-    info_->setText("Allow or Block applies to this server only. Choose <b>Any destination (whole app)</b> in the menu "
-                   "to replace its server rules.");
+    info_->setText(QString("Allow or Block applies to this server only. Choose <b style=\"color:%1\">Any destination "
+                           "(whole app)</b> in the menu to replace its server rules.")
+                       .arg(Theme::kTextStrong));
 
-    // Datos en grilla: firma, a dónde quería ir y quién la lanzó.
+    // Datos en grilla bajo una línea: firma, a dónde quería ir y quién la lanzó.
     auto *line = new QWidget(this);
     line->setObjectName("toastLine");
     line->setAttribute(Qt::WA_StyledBackground);
     line->setFixedHeight(1);
     auto *lineRow = new QHBoxLayout;
-    lineRow->setContentsMargins(Pad, 0, Pad, 0);
+    lineRow->setContentsMargins(Pad, Gap, Pad, 0);
     lineRow->addWidget(line);
     layout->addLayout(lineRow);
     auto *facts = new QGridLayout;
-    facts->setContentsMargins(Pad, 9, Pad, 10);
+    facts->setContentsMargins(Pad, Gap, Pad, 0);
     facts->setHorizontalSpacing(ColumnGap);
-    facts->setVerticalSpacing(6);
+    facts->setVerticalSpacing(7);
     facts->setColumnMinimumWidth(0, KeyColumn);
     const auto key = [this](const QString &text) {
         auto *k = label(this, "toastKey");
@@ -389,15 +484,20 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
         return k;
     };
     facts->addWidget(key("Signature"), 0, 0, Qt::AlignTop);
+    auto *signature = new QVBoxLayout;
+    signature->setSpacing(1);
     signature_ = new QLabel(this);
     signature_->setObjectName("toastValue");
     signature_->setWordWrap(true);
     signature_->setTextFormat(Qt::RichText);
-    facts->addWidget(signature_, 0, 1, Qt::AlignTop);
+    signature->addWidget(signature_);
+    signatureDetail_ = label(this, "toastValueDetail");
+    signature->addWidget(signatureDetail_);
+    facts->addLayout(signature, 0, 1, Qt::AlignTop);
     wantsKey_ = key("Wants");
     facts->addWidget(wantsKey_, 1, 0, Qt::AlignTop);
     auto *wants = new QVBoxLayout;
-    wants->setSpacing(0);
+    wants->setSpacing(1);
     destination_ = label(this, "toastValue");
     wants->addWidget(destination_);
     destinationDetail_ = label(this, "toastValueDetail");
@@ -413,10 +513,10 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     // Catálogo de apps conocidas: al instante, sin pedir nada a nadie. Como la explicación, sólo ayuda a decidir.
     knownBox_ = new QWidget(this);
     auto *known = new QVBoxLayout(knownBox_);
-    known->setContentsMargins(Pad, 0, Pad, 8);
-    known->setSpacing(5);
+    known->setContentsMargins(Pad, Gap, Pad, 0);
+    known->setSpacing(6);
     knownPill_ = label(knownBox_, "toastKnownPill");
-    knownPill_->setFixedHeight(21);
+    knownPill_->setFixedHeight(22);
     known->addWidget(knownPill_, 0, Qt::AlignLeft);
     knownText_ = label(knownBox_, "toastKnownText", true);
     known->addWidget(knownText_);
@@ -427,7 +527,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     explainBox_->setObjectName("toastExplainBox");
     explainBox_->setAttribute(Qt::WA_StyledBackground);
     auto *card = new QVBoxLayout(explainBox_);
-    card->setContentsMargins(CardInset, 10, CardInset, 10);
+    card->setContentsMargins(CardInsetX, CardInsetY, CardInsetX, CardInsetY);
     card->setSpacing(0);
     auto *cardRow = new QHBoxLayout;
     cardRow->setSpacing(8);
@@ -435,9 +535,10 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     spinner_->setFixedSize(13, 13);
     cardRow->addWidget(spinner_);
     explainStatus_ = label(explainBox_, "toastExplainStatus");
+    explainStatus_->setMinimumHeight(26); // el alto del botón «Ask AI»: la tarjeta no salta entre estados
     cardRow->addWidget(explainStatus_);
     suggestion_ = label(explainBox_, "toastSuggestion");
-    suggestion_->setFixedHeight(21);
+    suggestion_->setFixedHeight(22);
     cardRow->addWidget(suggestion_);
     cardRow->addStretch(1);
     details_ = link(explainBox_, "toastDetails", "Details");
@@ -451,42 +552,38 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     card->addLayout(cardRow);
     // Las separaciones van como margen de cada texto (y no como espaciadores): así desaparecen con el texto oculto.
     what_ = label(explainBox_, "toastWhat", true);
-    what_->setContentsMargins(0, 7, 0, 0);
+    what_->setContentsMargins(0, 8, 0, 0);
     card->addWidget(what_);
     more_ = new QWidget(explainBox_);
     auto *moreLayout = new QVBoxLayout(more_);
-    moreLayout->setContentsMargins(0, 8, 0, 0);
+    moreLayout->setContentsMargins(0, 10, 0, 0);
     moreLayout->setSpacing(0);
     auto *moreLine = new QWidget(more_);
     moreLine->setObjectName("toastMoreLine");
     moreLine->setAttribute(Qt::WA_StyledBackground);
     moreLine->setFixedHeight(1);
     moreLayout->addWidget(moreLine);
-    moreLayout->addSpacing(8);
+    moreLayout->addSpacing(10);
     // La respuesta del modelo es texto no confiable: siempre plano, nunca HTML ni enlaces.
     const auto section = [this, moreLayout](const QString &title, QLabel *&head, QLabel *&body, bool last) {
         head = label(more_, "toastMoreHead");
         head->setText(title);
         moreLayout->addWidget(head);
-        moreLayout->addSpacing(1);
+        moreLayout->addSpacing(3);
         body = label(more_, "toastMoreBody", true);
         moreLayout->addWidget(body);
-        if (!last) moreLayout->addSpacing(7);
+        if (!last) moreLayout->addSpacing(9);
     };
     section("WHY IT CONNECTS", whyHead_, why_, false);
     section("WHY THIS SUGGESTION", reasonHead_, reason_, false);
     section("IS IT GENUINE", riskHead_, risk_, true);
-    for (auto *h : {whyHead_, reasonHead_, riskHead_}) {
-        QFont f = h->font();
-        f.setLetterSpacing(QFont::PercentageSpacing, 104);
-        h->setFont(f);
-    }
+    for (auto *h : {whyHead_, reasonHead_, riskHead_}) smallCaps(h);
     card->addWidget(more_);
     explainFoot_ = label(explainBox_, "toastExplainFoot", true);
     explainFoot_->setContentsMargins(0, 8, 0, 0);
     card->addWidget(explainFoot_);
     auto *cardWrap = new QHBoxLayout;
-    cardWrap->setContentsMargins(CardPad, 0, CardPad, 0);
+    cardWrap->setContentsMargins(Pad, Gap, Pad, 0);
     cardWrap->addWidget(explainBox_);
     layout->addLayout(cardWrap);
     spin_ = new QTimer(this);
@@ -507,17 +604,17 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
         relayout();
     });
 
-    // Regla: los tres desplegables en una fila que se parte en dos si no entra; el primero se estira.
+    // Regla en rejilla: «Apply to» a todo el ancho arriba; «For» y «Destination» a medias, con el mismo ancho, abajo.
     auto *rule = new QVBoxLayout;
-    rule->setContentsMargins(Pad, 10, Pad, 0);
-    rule->setSpacing(4);
+    rule->setContentsMargins(Pad, Gap, Pad, 0);
+    rule->setSpacing(6);
     auto *ruleLabel = label(this, "toastRuleLabel");
     ruleLabel->setText("Rule");
+    smallCaps(ruleLabel);
     rule->addWidget(ruleLabel);
     choices_ = new QWidget(this);
     rule->addWidget(choices_);
     folderNote_ = label(this, "toastFolderNote", true);
-    folderNote_->setContentsMargins(0, 2, 0, 0);
     folderNote_->hide();
     rule->addWidget(folderNote_);
     layout->addLayout(rule);
@@ -536,11 +633,13 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     target_ = new ScopeCombo(choices_);
     target_->setObjectName("toastTarget");
     target_->setAccessibleName("Destination");
+    static_cast<ScopeCombo *>(target_)->elideMode = Qt::ElideMiddle; // un nombre largo conserva su dominio
     for (auto *combo : {scope_, duration_, target_}) {
         // Con el delegado común la lista toma el estilo de cada fila de la hoja de estilo.
         combo->setItemDelegate(new QStyledItemDelegate(combo));
         combo->installEventFilter(this);
-        // El chip cambia de ancho con lo elegido.
+        combo->setCursor(Qt::PointingHandCursor);
+        // El texto que se ve (entero, corto o recortado) cambia con lo elegido: se rehace el tooltip.
         connect(combo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
             if (request_.id.isEmpty()) return;
             layoutChoices();
@@ -561,18 +660,21 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
     connect(duration_, qOverload<int>(&QComboBox::currentIndexChanged), this,
             [this](int index) { trace(QString("toastDuration ahora=%1").arg(duration_->itemText(index))); });
 
-    // Block y Allow con el mismo peso.
+    // Block y Allow chicos y del mismo ancho, a la derecha: Block en rojo, Allow en el color principal.
     auto *buttons = new QHBoxLayout;
-    buttons->setContentsMargins(Pad, 10, Pad, 0);
+    buttons->setContentsMargins(Pad, Gap, Pad, 0);
     buttons->setSpacing(8);
+    buttons->addStretch(1);
     block_ = new QPushButton("Block", this);
     block_->setObjectName("toastBlock");
     allow_ = new QPushButton("Allow", this);
     allow_->setObjectName("toastAllow");
-    // Alto 34: la hoja de estilo fija 32 de contenido más el borde (min-height no cuenta el borde, y un alto fijo en
-    // código lo pisa la hoja global de la app).
-    buttons->addWidget(block_, 1);
-    buttons->addWidget(allow_, 1);
+    // 72 x 26: la hoja de estilo fija 70 x 24 de contenido más el borde (un tamaño fijo en código lo pisa la hoja
+    // global de la app al volver a aplicar el estilo).
+    for (auto *b : {block_, allow_}) {
+        b->setCursor(Qt::PointingHandCursor);
+        buttons->addWidget(b);
+    }
     layout->addLayout(buttons);
     for (auto *b : {block_, allow_})
         connect(b, &QPushButton::clicked, this, [this, allowed = b == allow_] {
@@ -581,7 +683,7 @@ AccessToast::AccessToast(QWidget *parent) : QWidget(parent) {
         });
 
     auto *foot = new QHBoxLayout;
-    foot->setContentsMargins(Pad, 9, Pad, 11);
+    foot->setContentsMargins(Pad, 10, Pad, 15);
     foot->setSpacing(6);
     footer_ = label(this, "toastFooter");
     foot->addWidget(footer_, 1);
@@ -656,8 +758,15 @@ void AccessToast::rebuildTargets() {
     }
     // En modo por destino la decisión es sobre este destino; la app entera queda como última opción.
     if (!request_.perDestination) target_->addItem("Any destination", QString());
-    for (const auto &t : targets) target_->addItem("Only " + t, t);
-    if (request_.perDestination) target_->addItem("Any destination (whole app)", QString());
+    // A media fila «Only www.github.com» no suele entrar: el desplegable muestra el nombre solo antes que recortarlo.
+    for (const auto &t : targets) {
+        target_->addItem("Only " + t, t);
+        target_->setItemData(target_->count() - 1, t, ShortTextRole);
+    }
+    if (request_.perDestination) {
+        target_->addItem("Any destination (whole app)", QString());
+        target_->setItemData(target_->count() - 1, QStringLiteral("Any destination"), ShortTextRole);
+    }
     const int keep = targetChosen_ ? target_->findData(chosen) : -1;
     const int narrowest = targets.isEmpty() ? 0 : target_->findData(targets.first());
     target_->setCurrentIndex(folderScope() ? qMax(0, target_->findData(QString()))
@@ -690,19 +799,17 @@ void AccessToast::syncFolderScope() {
 void AccessToast::renderDestination() {
     const int value = width_ - 2 * Pad - KeyColumn - ColumnGap;
     const QString full = QDir::toNativeSeparators(request_.path);
-    // La carpeta corta, recortada al medio si no entra en un renglón; la ruta entera va en el tooltip.
-    QFont small = signature_->font();
-    small.setPointSizeF(8.625);
-    const QString folder = QFontMetrics(small).elidedText(shortFolder(request_.path), Qt::ElideMiddle, value);
-    const QString place = folder.isEmpty() ? QString()
-                                           : QString(" <span style=\"color:#7c7c7c; font-size:8.625pt\">· %1</span>")
-                                                 .arg(folder.toHtmlEscaped());
+    // La firma en color (cian válida, amarillo sin firma) y debajo la carpeta del programa, recortada al medio si no
+    // entra; la ruta entera va en el tooltip de las dos.
     signature_->setText(request_.signer.isEmpty()
-                            ? "<span style=\"color:#d4a437\">None</span>" + place
-                            : "<span style=\"color:#9bbf73\">&#10003;</span> " + request_.signer.toHtmlEscaped() +
-                                  place);
+                            ? QString("<span style=\"color:%1; font-weight:500\">Not signed</span>").arg(Theme::kWarn)
+                            : QString("<span style=\"color:%1; font-weight:500\">%2</span> · valid")
+                                  .arg(QLatin1String(Theme::kOk), request_.signer.toHtmlEscaped()));
     CustomTooltip::instance()->setToolTip(signature_, full.toHtmlEscaped());
     fit(signature_, value);
+    signatureDetail_->setFixedWidth(value);
+    elide(signatureDetail_, QDir::toNativeSeparators(QFileInfo(request_.path).path()), value);
+    CustomTooltip::instance()->setToolTip(signatureDetail_, full.toHtmlEscaped());
 
     const QString kind = FirewallClient::destinationKind(request_.remote);
     const bool known = !kind.isEmpty();
@@ -840,43 +947,34 @@ void AccessToast::renderExplanation() {
 }
 
 void AccessToast::layoutChoices() {
+    // «Apply to» a todo el ancho; «For» y «Destination» abajo con el mismo ancho (si sobra un píxel va al espacio).
     const int avail = width_ - 2 * Pad;
-    QList<QComboBox *> combos{scope_, duration_, target_};
-    QList<QRect> rects;
-    int x = 0, y = 0;
-    for (auto *combo : combos) {
-        const int w = qMin(static_cast<ScopeCombo *>(combo)->chipWidth(), avail);
-        if (x > 0 && x + w > avail) {
-            x = 0;
-            y += ChipHeight + ChipGap;
-        }
-        rects << QRect(x, y, w, ChipHeight);
-        x += w + ChipGap;
+    const int half = (avail - ChipGap) / 2;
+    scope_->setGeometry(0, 0, avail, ChipHeight);
+    duration_->setGeometry(0, ChipHeight + ChipGap, half, ChipHeight);
+    target_->setGeometry(avail - half, ChipHeight + ChipGap, half, ChipHeight);
+    choices_->setFixedSize(avail, 2 * ChipHeight + ChipGap);
+    // El texto entero en el tooltip sólo si el desplegable muestra uno corto o recortado.
+    for (auto *combo : {scope_, duration_, target_}) {
+        const QString shown = static_cast<ScopeCombo *>(combo)->shownText();
+        CustomTooltip::instance()->setToolTip(combo, shown != combo->currentText() ? combo->currentText().toHtmlEscaped()
+                                                                                  : QString());
+        combo->update();
     }
-    // El primero se estira hasta llenar su renglón; los que comparten ese renglón quedan a la derecha.
-    int lastInFirst = 0;
-    while (lastInFirst + 1 < rects.size() && rects[lastInFirst + 1].y() == 0) ++lastInFirst;
-    const int extra = avail - (rects[lastInFirst].right() + 1);
-    if (extra > 0) {
-        rects[0].setWidth(rects[0].width() + extra);
-        for (int i = 1; i <= lastInFirst; ++i) rects[i].translate(extra, 0);
-    }
-    for (int i = 0; i < combos.size(); ++i) combos[i]->setGeometry(rects[i]);
-    choices_->setFixedSize(avail, rects.last().bottom() + 1);
 }
 
 void AccessToast::relayout() {
     const int section = width_ - 2 * Pad;
-    const int card = width_ - 2 * CardPad - 2 - 2 * CardInset;
+    const int card = section - 2 - 2 * CardInsetX;
     const QString exe = QFileInfo(request_.path).fileName();
     title_->setFixedWidth(section - IconSize - IconGap);
     elide(title_, exe, title_->width());
     fit(body_, section - IconSize - IconGap);
-    fit(warn_, section - 2 - 2 * NoteInset);
-    fit(info_, section - 2 - 2 * NoteInset);
+    fit(warn_, section - 2 - 2 * NoteInsetX);
+    fit(info_, section - 2 - 2 * NoteInsetX);
     renderDestination();
     if (knownBox_->isVisibleTo(this)) {
-        elide(knownPill_, knownPill_->property("full").toString(), section - 18, Qt::ElideRight);
+        elide(knownPill_, knownPill_->property("full").toString(), section - 20, Qt::ElideRight);
         knownPill_->setFixedWidth(knownPill_->sizeHint().width());
         fit(knownText_, section);
     }
@@ -1019,12 +1117,13 @@ void AccessToast::resizeEvent(QResizeEvent *event) {
 }
 
 void AccessToast::paintEvent(QPaintEvent *) {
+    // La hoja del Pliego con su borde y esquinas de 12 px.
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing);
     QPainterPath path;
-    path.addRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 10, 10);
-    painter.fillPath(path, QColor("#1b1b1b"));
-    painter.setPen(QColor("#333333"));
+    path.addRoundedRect(QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5), 12, 12);
+    painter.fillPath(path, Theme::color(Theme::kSheet));
+    painter.setPen(Theme::color(Theme::kBorder));
     painter.drawPath(path);
 }
 

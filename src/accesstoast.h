@@ -95,7 +95,7 @@ class AccessToast final : public QWidget {
     QLabel *icon_ = nullptr, *title_ = nullptr, *body_ = nullptr;
     QWidget *warnBox_ = nullptr, *infoBox_ = nullptr;
     QLabel *warn_ = nullptr, *info_ = nullptr;
-    QLabel *signature_ = nullptr;
+    QLabel *signature_ = nullptr, *signatureDetail_ = nullptr; // firma y, debajo, la carpeta del programa
     QLabel *wantsKey_ = nullptr, *destination_ = nullptr, *destinationDetail_ = nullptr;
     QLabel *launchedKey_ = nullptr, *launched_ = nullptr;
     QWidget *knownBox_ = nullptr;
