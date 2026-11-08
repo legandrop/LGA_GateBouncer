@@ -1,7 +1,8 @@
 @echo off
 setlocal
-rem Arma el instalador local: compila la ventana y el motor, junta los archivos y corre Inno Setup.
-rem No publica, no instala ni ejecuta nada.
+rem Arma el instalador local: compila la ventana y el motor, junta los archivos y corre Inno Setup con la version de
+rem CMakeLists.txt (project ... VERSION x.yy). Deja installer\LGA_GateBouncer_Setup_v<x.yy>.exe y su SHA256SUMS.
+rem No publica, no instala ni ejecuta nada: publicar es publicar.bat, aparte.
 if not "%~1"=="--no-run" (
   echo Uso: instalador.bat --no-run
   exit /b 2
@@ -13,6 +14,13 @@ if not exist "%ISCC%" (
   echo No se encontro Inno Setup 6.
   exit /b 2
 )
+set "VERSION="
+for /f "tokens=3" %%V in ('findstr /R /C:"^project(LGA_GateBouncer VERSION " "%ROOT%CMakeLists.txt"') do set "VERSION=%%V"
+if not defined VERSION (
+  echo No se encontro la version en CMakeLists.txt.
+  exit /b 2
+)
+echo Version %VERSION%
 if not defined GATEBOUNCER_BUILD_DIR set "GATEBOUNCER_BUILD_DIR=%ROOT%build"
 if not defined GATEBOUNCER_ENGINE_BUILD_DIR set "GATEBOUNCER_ENGINE_BUILD_DIR=%ROOT%build-engine"
 if not defined GATEBOUNCER_DEPLOY_DIR set "GATEBOUNCER_DEPLOY_DIR=%ROOT%deploy"
@@ -22,6 +30,13 @@ call "%ROOT%compilar.bat" --no-run
 if errorlevel 1 exit /b 1
 call "%ROOT%engine\compilar.bat" --no-run
 if errorlevel 1 exit /b 1
+
+rem La version que queda dentro del exe tiene que ser la del instalador (un build viejo en la carpeta no sirve).
+findstr /C:"%VERSION%" "%GATEBOUNCER_BUILD_DIR%\GateBouncer.exe" >nul
+if errorlevel 1 (
+  echo GateBouncer.exe no tiene la version %VERSION%. Compilar desde cero.
+  exit /b 1
+)
 
 rem La carpeta de archivos se rehace entera para no arrastrar restos de otra version. Solo se borra si la creo este
 rem script (lleva su marca): una variable mal puesta nunca borra otra carpeta.
@@ -43,7 +58,15 @@ rem Runtime de MinGW: windeployqt no lo copia con --no-compiler-runtime, se toma
 for %%D in (libgcc_s_seh-1.dll libstdc++-6.dll libwinpthread-1.dll) do (
   copy /y "C:\Qt\Tools\mingw1310_64\bin\%%D" "%GATEBOUNCER_DEPLOY_DIR%\" >nul || exit /b 1
 )
-"%ISCC%" /Q /DSourceDir="%GATEBOUNCER_DEPLOY_DIR%" /O"%GATEBOUNCER_INSTALLER_DIR%" "%ROOT%GateBouncer_installer.iss"
+"%ISCC%" /Q /DSourceDir="%GATEBOUNCER_DEPLOY_DIR%" /DMyAppVersion=%VERSION% /O"%GATEBOUNCER_INSTALLER_DIR%" "%ROOT%GateBouncer_installer.iss"
 if errorlevel 1 exit /b 1
-echo Instalador listo en %GATEBOUNCER_INSTALLER_DIR%. No se ejecuto nada.
+set "SETUP=LGA_GateBouncer_Setup_v%VERSION%.exe"
+if not exist "%GATEBOUNCER_INSTALLER_DIR%\%SETUP%" (
+  echo No aparecio %SETUP%.
+  exit /b 1
+)
+rem SHA256SUMS del release: "<hash>  <archivo>", como las demas apps LGA.
+powershell -NoProfile -Command "$h=(Get-FileHash -Algorithm SHA256 -LiteralPath '%GATEBOUNCER_INSTALLER_DIR%\%SETUP%').Hash.ToLower(); [IO.File]::WriteAllText('%GATEBOUNCER_INSTALLER_DIR%\SHA256SUMS', $h + '  %SETUP%' + [char]10)"
+if errorlevel 1 exit /b 1
+echo Instalador listo: %GATEBOUNCER_INSTALLER_DIR%\%SETUP%. No se ejecuto nada.
 exit /b 0
