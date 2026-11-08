@@ -10,6 +10,7 @@ QString embeddedFontFamily() { return family; }
 bool initialize(QApplication &app) {
     app.setApplicationName("LGA GateBouncer");
     app.setOrganizationName("LGA");
+    app.setApplicationVersion(GATEBOUNCER_VERSION);
     app.setStyle("Fusion");
     for (const auto *name : {"Inter-Regular.ttf", "Inter-Medium.ttf", "Inter-SemiBold.ttf"}) {
         const int id = QFontDatabase::addApplicationFont(":/gatebouncer/resources/fonts/" +

@@ -2,6 +2,8 @@
 // vieja (MainWindow) sigue en la etapa del lanzador protegido. El motor se instala aparte (GateBouncerEngine.exe).
 #include "bootstrap.h"
 #include "firewallwindow.h"
+#include "i18n.h"
+#include "uiscale.h"
 #include <QAbstractButton>
 #include <QApplication>
 #include <QComboBox>
@@ -109,7 +111,11 @@ Q_COREAPP_STARTUP_FUNCTION(qaSteps)
 } // namespace
 
 int main(int argc, char **argv) {
+    // El zoom se fija antes de crear la aplicación: Qt lee el factor una sola vez.
+    Gate::UiScale::applyBeforeApp(Gate::UiScale::readSavedLevel());
     QApplication app(argc, argv);
+    Gate::UiScale::clearEnvironmentAfterApp();
+    Gate::I18n::setLanguage(Gate::I18n::readSaved());
     // Una sola ventana por usuario: arranca sola al iniciar sesión y abrirla de nuevo trae al frente la que corre.
     // Las corridas de QA van en un escritorio aparte y no se cruzan con la del usuario.
     const bool qa = !qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") || !qEnvironmentVariableIsEmpty("LGA_HEADLESS_DESKTOP");
@@ -117,9 +123,18 @@ int main(int argc, char **argv) {
     const bool minimized = app.arguments().contains("--start-minimized");
     QLocalServer instance;
     if (!qa) {
-        // El mutex decide de forma atómica quién es la primera instancia de esta sesión de Windows.
-        CreateMutexW(nullptr, TRUE, L"Local\\LGA.GateBouncer.Window");
-        if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // El mutex decide de forma atómica quién es la primera instancia de esta sesión de Windows. Un relanzamiento
+        // (cambio de zoom o idioma) espera hasta 10 s a que la ventana anterior termine de cerrarse.
+        const bool relaunch = app.arguments().contains("--relaunch");
+        HANDLE mutex = CreateMutexW(nullptr, TRUE, L"Local\\LGA.GateBouncer.Window");
+        bool taken = GetLastError() == ERROR_ALREADY_EXISTS;
+        for (int i = 0; relaunch && taken && i < 50; ++i) {
+            if (mutex) CloseHandle(mutex);
+            Sleep(200);
+            mutex = CreateMutexW(nullptr, TRUE, L"Local\\LGA.GateBouncer.Window");
+            taken = GetLastError() == ERROR_ALREADY_EXISTS;
+        }
+        if (taken) {
             // Un arranque al iniciar sesión (minimizado) no abre la ventana que ya corre; abrirla a mano, sí.
             if (!minimized) {
                 QLocalSocket running;

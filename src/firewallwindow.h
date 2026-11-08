@@ -8,6 +8,7 @@
 #include "engine/NetLimiterRules.h"
 #include "explain/Explainer.h"
 #include "lifecycle/LifecycleController.h"
+#include <lgaupdate/LgaUpdateService.h>
 #include <QHash>
 #include <QMainWindow>
 #include <QPointer>
@@ -85,6 +86,14 @@ class FirewallWindow final : public QMainWindow {
     QWidget *detailPage(const QString &key);
     QWidget *activityPage();
     QWidget *settingsPage();
+    // Tarjeta App de Settings: buscar actualizaciones al iniciar, idioma y zoom (como General de Mighty Tools).
+    QWidget *appCard();
+    // Zoom e idioma se aplican al arrancar: guarda lo elegido, abre una ventana nueva y cierra esta.
+    void relaunchWindow();
+    // Actualizaciones (lgaupdate): chequeo al iniciar y cada 3 h si está activado, y «Check now» de Settings.
+    void setupUpdates();
+    static int updateDialog(QWidget *parent, const LgaUpdateDialogSpec &spec);
+    QPointer<LgaUpdateService> updates_;
     QWidget *importPage();
     QWidget *requestCard(const FirewallClient::PendingItem &p, bool expanded);
     QWidget *aiCard(const FirewallClient::PendingItem &p);

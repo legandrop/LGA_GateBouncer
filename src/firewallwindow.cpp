@@ -4,11 +4,16 @@
 #include "explain/KnownApps.h"
 #include "folder_rule.h"
 #include "foldertrust.h"
+#include "i18n.h"
 #include "platform/WindowFrame.h"
 #include "theme.h"
 #include "toggleswitch.h"
+#include "uiscale.h"
 #include <QAbstractButton>
 #include <QApplication>
+#include <QProcess>
+#include <QScreen>
+#include <QStandardPaths>
 #include <QComboBox>
 #include <QDateTime>
 #include <QDesktopServices>
@@ -2953,6 +2958,7 @@ QWidget *FirewallWindow::settingsPage() {
     if (!s.connected)
         fl->addWidget(text("The engine is not running: these options apply when it starts again.", "warn", true));
     l->addWidget(fw);
+    l->addWidget(appCard());
 
     // Explicaciones: key, consentimiento y textos son del proveedor del modelo elegido.
     const auto settings = Explain::Settings::load();
@@ -3144,7 +3150,7 @@ QWidget *FirewallWindow::settingsPage() {
     auto *ct = row(8);
     auto *cn = text("LGA GateBouncer", "brand");
     ct->addWidget(cn);
-    ct->addWidget(text("Development build", "sub"));
+    ct->addWidget(text("v" + QCoreApplication::applicationVersion(), "sub"));
     ct->addStretch();
     cv->addLayout(ct);
     auto *by = row(4);
@@ -3162,6 +3168,117 @@ QWidget *FirewallWindow::settingsPage() {
     l->addLayout(colophon);
     l->addStretch();
     return page;
+}
+
+QWidget *FirewallWindow::appCard() {
+    auto *c = card();
+    auto *cl = cardColumn(c, 0);
+    cl->addWidget(text(I18n::tr("App"), "cardtitle"));
+    cl->addSpacing(4);
+
+    // Buscar actualizaciones al iniciar (y cada 3 h con la ventana abierta), como General de Mighty Tools.
+    auto *updatesRow = new QWidget;
+    auto *ur = new QHBoxLayout(updatesRow);
+    ur->setContentsMargins(0, 8, 0, 12);
+    ur->setSpacing(14);
+    auto *ut = new QVBoxLayout;
+    ut->setSpacing(2);
+    ut->addWidget(text(I18n::tr("Check for updates at startup"), "strong", true));
+    ut->addWidget(text(I18n::tr("Installed version: v%1").arg(QCoreApplication::applicationVersion()), "small", true));
+    ur->addLayout(ut, 1);
+    auto *checkNow = button(I18n::tr("Check now"));
+    checkNow->setObjectName("app-check-now");
+    connect(checkNow, &QPushButton::clicked, this, [this] {
+        if (updates_) updates_->checkForUpdates(true);
+        else message(I18n::tr("Updates are off in this copy."));
+    });
+    ur->addWidget(checkNow, 0, Qt::AlignVCenter);
+    auto *checkUpdates = new ToggleSwitch;
+    checkUpdates->setObjectName("app-check-updates");
+    checkUpdates->setChecked(tableStore().value("app/checkUpdatesAtStartup", true).toBool());
+    connect(checkUpdates, &ToggleSwitch::toggled, this, [](bool on) { tableStore().setValue("app/checkUpdatesAtStartup", on); });
+    ur->addWidget(checkUpdates, 0, Qt::AlignVCenter);
+    cl->addWidget(updatesRow);
+    cl->addWidget(divider());
+    cl->addSpacing(12);
+
+    // Idioma y zoom en una grilla, para que los dos controles arranquen en la misma columna (Mighty Tools).
+    auto *grid = new QGridLayout;
+    grid->setContentsMargins(0, 0, 0, 0);
+    grid->setHorizontalSpacing(12);
+    grid->setVerticalSpacing(8);
+    grid->setColumnStretch(2, 1);
+    grid->addWidget(text(I18n::tr("Language"), "strong"), 0, 0, Qt::AlignVCenter);
+    auto *language = new Combo;
+    language->setObjectName("app-language");
+    for (const auto option : {I18n::Language::English, I18n::Language::Spanish})
+        language->addItem(I18n::nativeName(option), I18n::code(option));
+    language->setCurrentIndex(I18n::language() == I18n::Language::Spanish ? 1 : 0);
+    language->setFixedWidth(130);
+    grid->addWidget(language, 0, 1, Qt::AlignVCenter | Qt::AlignLeft);
+    connect(language, &QComboBox::activated, this, [this, language](int index) {
+        const auto chosen = I18n::fromCode(language->itemData(index).toString());
+        if (chosen == I18n::language()) return;
+        I18n::save(chosen);
+        QTimer::singleShot(0, this, &FirewallWindow::relaunchWindow);
+    });
+
+    grid->addWidget(text(I18n::tr("Zoom"), "strong"), 1, 0, Qt::AlignVCenter);
+    auto *seg = card("seg");
+    seg->setFixedHeight(30);
+    auto *sl = new QHBoxLayout(seg);
+    sl->setContentsMargins(2, 2, 2, 2);
+    sl->setSpacing(2);
+    // Lo que no entra en la pantalla principal queda apagado. Qt da el área en píxeles lógicos de esta sesión; por el
+    // factor vuelve a la escala del sistema.
+    QSize area;
+    if (const QScreen *screen = QGuiApplication::primaryScreen()) {
+        const qreal f = UiScale::factor(UiScale::sessionLevel());
+        const QSize a = screen->availableGeometry().size();
+        area = QSize(qRound(a.width() * f), qRound(a.height() * f));
+    }
+    const int maxLevel = UiScale::maxFittingLevel(area);
+    const auto percent = [](int level) { return I18n::tr("%1%").arg(UiScale::percent(level)); };
+    for (int level = 0; level <= UiScale::kMaxLevel; ++level) {
+        auto *b = button(percent(level), "seg");
+        b->setFixedHeight(24);
+        b->setObjectName(QString("app-zoom-%1").arg(UiScale::percent(level)));
+        b->setProperty("on", level == UiScale::sessionLevel() ? "1" : "0");
+        b->setEnabled(level <= maxLevel);
+        connect(b, &QPushButton::clicked, this, [this, level] {
+            if (level == UiScale::sessionLevel()) return;
+            UiScale::saveLevel(level);
+            QTimer::singleShot(0, this, &FirewallWindow::relaunchWindow);
+        });
+        sl->addWidget(b);
+    }
+    grid->addWidget(seg, 1, 1, Qt::AlignVCenter | Qt::AlignLeft);
+    cl->addLayout(grid);
+    cl->addSpacing(6);
+    cl->addWidget(text(I18n::tr("%1 is the default. Changing the zoom or the language restarts the window.")
+                           .arg(percent(UiScale::kDefaultLevel)),
+                       "small", true));
+    if (maxLevel < UiScale::kMaxLevel)
+        cl->addWidget(text(maxLevel == 0 ? I18n::tr("Only %1 fits on this screen.").arg(percent(0))
+                                         : I18n::tr("Up to %1 fits on this screen.").arg(percent(maxLevel)),
+                           "small", true));
+    return c;
+}
+
+void FirewallWindow::relaunchWindow() {
+    // Las corridas de QA nunca relanzan nada.
+    if (!qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") || !qEnvironmentVariableIsEmpty("LGA_HEADLESS_DESKTOP")) {
+        render(true);
+        return;
+    }
+    // La copia nueva espera a que esta suelte la instancia única (--relaunch) y abre la ventana en el mismo lugar.
+    tableStore().setValue("window/size", size());
+    if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), {"--relaunch"})) {
+        message(I18n::tr("Could not restart the window. The change applies the next time it opens."));
+        return;
+    }
+    hide();
+    requestQuit();
 }
 
 QWidget *FirewallWindow::importPage() {
@@ -3443,6 +3560,86 @@ void FirewallWindow::startLifecycle(std::unique_ptr<Lifecycle::TraySurface> tray
     connect(lifecycle_, &Lifecycle::LifecycleController::quitRequested, this, &FirewallWindow::requestQuit);
     updateLifecycle();
     lifecycle_->start(minimized);
+    setupUpdates();
+}
+
+// Cartel del updater (lgaupdate) con el aspecto de la ventana: el mismo marco que «Trust a folder».
+int FirewallWindow::updateDialog(QWidget *parent, const LgaUpdateDialogSpec &spec) {
+    QDialog d(parent, Qt::Dialog | Qt::FramelessWindowHint);
+    d.setObjectName("update-dialog");
+    d.setStyleSheet("QDialog { background: #17171B; border: 1px solid #2E2E36; }");
+    constexpr int Wide = 470;
+    auto *l = column(&d, 18, 8);
+    l->addWidget(text(spec.title, "cardtitle"));
+    auto *msg = text(spec.messageHtml, spec.warning ? "warn" : "sub", true);
+    msg->setTextFormat(Qt::RichText);
+    msg->setFixedWidth(Wide);
+    l->addWidget(msg);
+    if (!spec.notesHtml.isEmpty()) {
+        auto *notes = new QLabel(spec.notesHtml);
+        notes->setProperty("r", "body");
+        notes->setTextFormat(Qt::RichText);
+        notes->setWordWrap(true);
+        notes->setAlignment(Qt::AlignTop | Qt::AlignLeft);
+        notes->setContentsMargins(12, 10, 12, 10);
+        auto *box = new QScrollArea;
+        box->setObjectName("update-notes");
+        box->setWidget(notes);
+        box->setWidgetResizable(true);
+        box->setFixedSize(Wide, 200);
+        box->setStyleSheet("QScrollArea#update-notes { background: #15151A; border: 1px solid #2F2F37; border-radius: 6px; }");
+        l->addWidget(box);
+    }
+    if (!spec.details.isEmpty()) {
+        auto *details = text(spec.details, "small", true);
+        details->setTextInteractionFlags(Qt::TextSelectableByMouse);
+        details->setFixedWidth(Wide);
+        l->addWidget(details);
+    }
+    l->addSpacing(10);
+    auto *buttons = row(8);
+    buttons->addStretch();
+    int chosen = spec.escapeIndex;
+    for (int i = 0; i < spec.buttons.size(); ++i) {
+        const auto &b = spec.buttons[i];
+        auto *pb = button(QString(b.text).remove('&'), b.primary ? "primary" : nullptr);
+        pb->setObjectName(QString("update-button-%1").arg(i));
+        if (i == spec.defaultIndex) pb->setDefault(true);
+        connect(pb, &QPushButton::clicked, &d, [&d, &chosen, i] {
+            chosen = i;
+            d.accept();
+        });
+        buttons->addWidget(pb);
+    }
+    l->addLayout(buttons);
+    d.exec();
+    return chosen;
+}
+
+void FirewallWindow::setupUpdates() {
+    // Las corridas de QA no buscan actualizaciones.
+    if (!qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") || !qEnvironmentVariableIsEmpty("LGA_HEADLESS_DESKTOP")) return;
+    LgaUpdateConfig config;
+    config.productId = "LGA_GateBouncer";
+    config.displayName = "LGA GateBouncer";
+    config.releaseRepoSlug = "legandrop/LGA_GateBouncer";
+    config.windowsExecutableName = "GateBouncer.exe";
+    // La carpeta de la instalación es sólo de administradores (el servicio confía en ella): la descarga va a la carpeta
+    // del usuario.
+    config.updateCacheDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    config.automaticChecksEnabled = [] { return tableStore().value("app/checkUpdatesAtStartup", true).toBool(); };
+    // Sólo se actualiza la copia instalada (la carpeta tiene el desinstalador): desde el build, el instalador iría a parar
+    // encima del árbol de desarrollo.
+    config.updateBlockedReason = []() -> QString {
+        return QFileInfo::exists(QCoreApplication::applicationDirPath() + "/unins000.exe")
+                   ? QString()
+                   : I18n::tr("This copy is not the installed one: it does not update itself.");
+    };
+    config.presentDialog = &FirewallWindow::updateDialog;
+    config.prepareForUpdatePrompt = [this] { bringToFront(); };
+    config.quitApplication = [this] { requestQuit(); };
+    updates_ = new LgaUpdateService(config, this);
+    updates_->scheduleAutomaticCheck();
 }
 
 void FirewallWindow::updateLifecycle() {
