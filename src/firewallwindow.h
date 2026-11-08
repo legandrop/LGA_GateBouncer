@@ -72,6 +72,9 @@ class FirewallWindow final : public QMainWindow {
     void updateLifecycle();
     void requestQuit();
     void finishQuit();
+    // Salir de la app por el camino de la bandeja (el mismo que «Salir» del menú), para que el cierre no lo frene el
+    // filtro que esconde la ventana: relanzar por zoom o idioma, y cerrar para instalar una actualización.
+    void quitApp();
     void message(const QString &text);
     QWidget *how(const QStringList &steps, const QString &note = {});
     void setHowOpen(bool open);

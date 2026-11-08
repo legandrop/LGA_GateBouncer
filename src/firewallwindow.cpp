@@ -1085,7 +1085,10 @@ FirewallWindow::FirewallWindow(QWidget *parent) : QMainWindow(parent) {
     setWindowTitle("LGA GateBouncer");
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint);
     setMinimumSize(900, 620);
-    resize(tableStore().value("window/size", QSize(1100, 720)).toSize().expandedTo(minimumSize()));
+    // El tamaño guardado, sin pasarse del área útil de la pantalla (con más zoom, la misma ventana ocupa más).
+    QSize saved = tableStore().value("window/size", QSize(1100, 720)).toSize();
+    if (const QScreen *screen = QGuiApplication::primaryScreen()) saved = saved.boundedTo(screen->availableGeometry().size());
+    resize(saved.expandedTo(minimumSize()));
     setStyleSheet(Theme::css(kStyle));
     howOpen_ = rememberSizes() && tableStore().value("window/howItWorks", false).toBool();
     buildShell();
@@ -3339,14 +3342,14 @@ void FirewallWindow::relaunchWindow() {
         render(true);
         return;
     }
-    // La copia nueva espera a que esta suelte la instancia única (--relaunch) y abre la ventana en el mismo lugar.
+    // La copia nueva espera a que esta suelte la instancia única (--relaunch) y abre la ventana con el mismo tamaño.
     tableStore().setValue("window/size", size());
     if (!QProcess::startDetached(QCoreApplication::applicationFilePath(), {"--relaunch"})) {
         message(I18n::tr("Could not restart the window. The change applies the next time it opens."));
         return;
     }
     hide();
-    requestQuit();
+    quitApp();
 }
 
 QWidget *FirewallWindow::importPage() {
@@ -3673,9 +3676,13 @@ int FirewallWindow::updateDialog(QWidget *parent, const LgaUpdateDialogSpec &spe
     int chosen = spec.escapeIndex;
     for (int i = 0; i < spec.buttons.size(); ++i) {
         const auto &b = spec.buttons[i];
-        auto *pb = button(QString(b.text).remove('&'), b.primary ? "primary" : nullptr);
+        // «&» marca el mnemónico; «&&» es un & de verdad.
+        QString label = b.text;
+        label.replace("&&", QChar(1)).remove('&').replace(QChar(1), "&");
+        auto *pb = button(label, b.primary ? "primary" : nullptr);
         pb->setObjectName(QString("update-button-%1").arg(i));
         if (i == spec.defaultIndex) pb->setDefault(true);
+        if (b.shortcut != Qt::Key_unknown) pb->setShortcut(QKeySequence(b.shortcut));
         connect(pb, &QPushButton::clicked, &d, [&d, &chosen, i] {
             chosen = i;
             d.accept();
@@ -3699,16 +3706,31 @@ void FirewallWindow::setupUpdates() {
     // del usuario.
     config.updateCacheDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     config.automaticChecksEnabled = [] { return tableStore().value("app/checkUpdatesAtStartup", true).toBool(); };
-    // Sólo se actualiza la copia instalada (la carpeta tiene el desinstalador): desde el build, el instalador iría a parar
-    // encima del árbol de desarrollo.
+    config.updateLogPath = config.updateCacheDir + "/Update.log";
+    // Sólo se actualiza la copia instalada: la carpeta de este exe tiene que ser la que registró el instalador (HKLM, sólo
+    // administradores). Desde el build, el instalador (que recibe /DIR con esta carpeta) iría a parar encima del árbol
+    // de desarrollo.
     config.updateBlockedReason = []() -> QString {
-        return QFileInfo::exists(QCoreApplication::applicationDirPath() + "/unins000.exe")
+        const QSettings uninstall("HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+                                  "{6B1F3C52-8E0A-4D7B-9C3E-2A5F1D9B7E41}_is1",
+                                  QSettings::NativeFormat);
+        const QString installed = QDir::cleanPath(QDir::fromNativeSeparators(uninstall.value("InstallLocation").toString()));
+        const QString here = QDir::cleanPath(QCoreApplication::applicationDirPath());
+        return !installed.isEmpty() && installed.compare(here, Qt::CaseInsensitive) == 0
                    ? QString()
                    : I18n::tr("This copy is not the installed one: it does not update itself.");
     };
     config.presentDialog = &FirewallWindow::updateDialog;
     config.prepareForUpdatePrompt = [this] { bringToFront(); };
-    config.quitApplication = [this] { requestQuit(); };
+    config.quitApplication = [this] { quitApp(); };
+    // Vive en la bandeja: si el update se posterga (otra ventana abierta), vuelve a abrir la que se cerró.
+    config.relaunchWhenUpdatePostponed = true;
+    config.busyCursorOnManualCheck = true;
+    // Los instaladores que dejó un update anterior: nadie más los borra (la app ya se cerró cuando corren).
+    if (QFileInfo::exists(QCoreApplication::applicationDirPath() + "/unins000.exe")) {
+        const QString productId = config.productId, cacheRoot = config.updateCacheDir;
+        std::thread([productId, cacheRoot] { LgaUpdateService::sweepUpdateCache(productId, cacheRoot); }).detach();
+    }
     updates_ = new LgaUpdateService(config, this);
     updates_->scheduleAutomaticCheck();
 }
@@ -3724,6 +3746,11 @@ void FirewallWindow::updateLifecycle() {
     snapshot.asking = s.ask;
     snapshot.pendingCount = quint64(firewall_.pending().size());
     lifecycle_->applyEngineSnapshot(snapshot);
+}
+
+void FirewallWindow::quitApp() {
+    if (lifecycle_) lifecycle_->requestQuit();
+    else requestQuit();
 }
 
 void FirewallWindow::requestQuit() {

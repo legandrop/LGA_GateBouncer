@@ -24,7 +24,8 @@ int maxFittingLevel(const QSize &unscaledArea);
 int readSavedLevel();
 void saveLevel(int level);
 
-// Antes de la QApplication: fija QT_SCALE_FACTOR y recuerda el nivel de esta sesión.
+// Antes de la QApplication: fija QT_SCALE_FACTOR y recuerda el nivel de esta sesión, recortado al que entra en la
+// pantalla principal (el de fábrica, 110 %, no entra en una laptop de 1080p al 150 %).
 void applyBeforeApp(int level);
 // Después: devuelve el entorno como estaba.
 void clearEnvironmentAfterApp();

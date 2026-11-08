@@ -141,15 +141,29 @@ QString problemText(const QString &problem) {
         return true;
     };
     QString middle;
-    if (between({}, " cannot be trusted, nor anything inside it.", middle))
+    // Los rótulos que no son el nombre de una carpeta (o que Windows muestra traducido): el motor los da en inglés.
+    const auto place = [](const QString &label) {
+        if (label == QLatin1String("A user profile")) return I18n::trc("folder", "A user profile");
+        if (label == QLatin1String("The Recycle Bin")) return I18n::trc("folder", "The Recycle Bin");
+        if (label == QLatin1String("Desktop")) return I18n::trc("folder", "Desktop");
+        if (label == QLatin1String("Documents")) return I18n::trc("folder", "Documents");
+        if (label == QLatin1String("Downloads")) return I18n::trc("folder", "Downloads");
+        return label;
+    };
+    const auto found = [&](const QString &head, const QString &tail) {
+        const bool ok = between(head, tail, middle);
+        if (ok) middle = place(middle);
+        return ok;
+    };
+    if (found({}, " cannot be trusted, nor anything inside it."))
         return I18n::tr("%1 cannot be trusted, nor anything inside it.").arg(middle);
-    if (between({}, " cannot be trusted as a whole. Choose a folder inside it.", middle))
+    if (found({}, " cannot be trusted as a whole. Choose a folder inside it."))
         return I18n::tr("%1 cannot be trusted as a whole. Choose a folder inside it.").arg(middle);
-    if (between("Folders inside ", " cannot be trusted.", middle))
+    if (found("Folders inside ", " cannot be trusted."))
         return I18n::tr("Folders inside %1 cannot be trusted.").arg(middle);
     if (between("This folder is a link to ", ". Trust the real folder instead.", middle))
         return I18n::tr("This folder is a link to %1. Trust the real folder instead.").arg(middle);
-    if (between("This folder holds ", ", which cannot be trusted.", middle))
+    if (found("This folder holds ", ", which cannot be trusted."))
         return I18n::tr("This folder holds %1, which cannot be trusted.").arg(middle);
     return problem;
 }

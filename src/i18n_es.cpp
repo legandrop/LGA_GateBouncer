@@ -4,8 +4,9 @@
 // placeholders; la traducción conserva los mismos %1, %2. "contexto|texto" es la clave de I18n::trc. Agrupada por
 // pantalla.
 // Lo que no está acá queda en inglés a propósito: el nombre de la app, nombres de programas, archivos, carpetas y
-// servidores, lo que llega del motor por el pipe (mensajes de los comandos, el historial «Rule saved: …»), las
-// respuestas de la IA, el catálogo de apps conocidas y los textos del updater (libs/lgaupdate).
+// servidores, lo que escribe el motor (sus errores y el historial «Rule saved: …»; las confirmaciones de cada comando las
+// arma la ventana y sí se traducen), las respuestas de la IA, el catálogo de apps conocidas y los textos del updater
+// (libs/lgaupdate).
 // Estilo, como Mighty Tools: infinitivo o impersonal, nunca vos ni tú. Vocabulario fijo: Protection -> Protección,
 // Requests -> Pedidos, Apps -> Apps, Activity -> Actividad, Settings -> Ajustes, Allow -> Permitir, Block -> Bloquear,
 // How it works -> Cómo funciona, rule -> regla (una Block rule es una «regla de bloqueo»), notice -> aviso,
@@ -35,6 +36,34 @@ const QHash<QString, QString> &spanishTable() {
         E("1 minute", "1 minuto"),
         E("%1 minutes", "%1 minutos"),
         E("1 hour", "1 hora"),
+        E("%1 hours", "%1 horas"),
+
+        // ---------- Confirmaciones de cada decisión (las arma la ventana al mandar el comando al motor)
+        E("any version of %1 from %2", "cualquier versión de %1 de %2"),
+        E("all apps from %1", "todas las apps de %1"),
+        E("all apps", "todas las apps"),
+        E("%1 to %2", "%1 hacia %2"),
+        E(" until restart", " hasta reiniciar"),
+        E(" for %1", " durante %1"),
+        E("Allow%1 saved for %2. The next connection attempt uses this rule.",
+          "Se guardó Permitir%1 para %2. El próximo intento de conexión usa esta regla."),
+        E("Block%1 saved for %2. The next connection attempt uses this rule.",
+          "Se guardó Bloquear%1 para %2. El próximo intento de conexión usa esta regla."),
+        E("Every program in %1 can connect%2, also new builds there.",
+          "Todos los programas de %1 pueden conectarse%2, también los builds nuevos de ahí."),
+        E("Every program in %1 stays blocked%2.", "Todos los programas de %1 siguen bloqueados%2."),
+        E("%1 in %2 can connect%3, also new builds there.",
+          "%1 en %2 puede conectarse%3, también los builds nuevos de ahí."),
+        E("%1 in %2 stays blocked%3.", "%1 en %2 sigue bloqueado%3."),
+        E("Rule removed for %1. The next connection will be blocked and ask again.",
+          "Se quitó la regla de %1. La próxima conexión se bloquea y vuelve a preguntar."),
+        E("Local network connections no longer ask.", "Las conexiones de la red local ya no preguntan."),
+        E("Local network connections ask like any other.", "Las conexiones de la red local preguntan como cualquier otra."),
+        E("Unknown applications can connect. Saved rules still apply.",
+          "Las apps desconocidas pueden conectarse. Las reglas guardadas siguen valiendo."),
+        E("GateBouncer engine is not running. Nothing was changed.",
+          "El motor de GateBouncer no está funcionando. No se cambió nada."),
+        E("No reply", "Sin respuesta"),
         E("Until restart", "Hasta reiniciar"),
         E("Until %1", "Hasta %1"),
         E("Any destination", "Cualquier destino"),
@@ -171,6 +200,12 @@ const QHash<QString, QString> &spanishTable() {
         E("Choose a folder on a local drive: not a network, removable or optical drive.",
           "Elegir una carpeta de un disco local: no de red, extraíble ni óptico."),
         E("%1 cannot be trusted, nor anything inside it.", "No se puede confiar en %1 ni en nada de lo que contiene."),
+        // Rótulos de carpetas protegidas que el motor da en inglés (van dentro de las oraciones de arriba).
+        E("folder|A user profile", "un perfil de usuario"),
+        E("folder|The Recycle Bin", "la Papelera de reciclaje"),
+        E("folder|Desktop", "Escritorio"),
+        E("folder|Documents", "Documentos"),
+        E("folder|Downloads", "Descargas"),
         E("%1 cannot be trusted as a whole. Choose a folder inside it.",
           "No se puede confiar en toda la carpeta %1. Elegir una carpeta dentro de ella."),
         E("This folder does not exist.", "Esta carpeta no existe."),
@@ -521,7 +556,7 @@ const QHash<QString, QString> &spanishTable() {
         E("Zoom", "Zoom"),
         E("%1%", "%1 %"),
         E("%1 is the default. Changing the zoom or the language restarts the window.",
-          "%1 es el normal. Cambiar el zoom o el idioma reinicia la ventana."),
+          "%1 es el predeterminado. Cambiar el zoom o el idioma reinicia la ventana."),
         E("Only %1 fits on this screen.", "En esta pantalla solo entra el %1."),
         E("Up to %1 fits on this screen.", "En esta pantalla entra hasta el %1."),
 

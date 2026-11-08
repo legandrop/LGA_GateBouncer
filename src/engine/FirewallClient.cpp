@@ -117,13 +117,13 @@ const FirewallClient::RuleItem *FirewallClient::ruleById(const QString &id) cons
 }
 
 QString FirewallClient::describe(const RuleItem &rule) {
-    const QString who = rule.scope == "app"         ? QString("any version of %1 from %2").arg(rule.name, rule.signer)
-                        : rule.scope == "publisher" ? "all apps from " + rule.signer
-                        : rule.scope == "folder"    ? QString("%1 in %2").arg(rule.name.isEmpty() ? QString("all apps")
-                                                                                                  : rule.name,
-                                                                              rule.path)
+    const QString who = rule.scope == "app"         ? I18n::tr("any version of %1 from %2").arg(rule.name, rule.signer)
+                        : rule.scope == "publisher" ? I18n::tr("all apps from %1").arg(rule.signer)
+                        : rule.scope == "folder"    ? I18n::tr("%1 in %2").arg(rule.name.isEmpty() ? I18n::tr("all apps")
+                                                                                                   : rule.name,
+                                                                               rule.path)
                                                     : fileName(rule.path);
-    return rule.destination.isEmpty() ? who : who + " to " + rule.destination;
+    return rule.destination.isEmpty() ? who : I18n::tr("%1 to %2").arg(who, rule.destination);
 }
 
 bool FirewallClient::publisherRuleAllowed(const QString &signer) {
@@ -133,8 +133,8 @@ bool FirewallClient::publisherRuleAllowed(const QString &signer) {
 QString FirewallClient::describeDuration(qint64 seconds) {
     const qint64 minutes = (seconds + 30) / 60;
     if (minutes >= 60 && minutes % 60 == 0)
-        return minutes == 60 ? QStringLiteral("1 hour") : QString("%1 hours").arg(minutes / 60);
-    return minutes == 1 ? QStringLiteral("1 minute") : QString("%1 minutes").arg(minutes);
+        return minutes == 60 ? I18n::tr("1 hour") : I18n::tr("%1 hours").arg(minutes / 60);
+    return minutes == 1 ? I18n::tr("1 minute") : I18n::tr("%1 minutes").arg(minutes);
 }
 
 QString FirewallClient::remaining(const RuleItem &rule) {
@@ -163,32 +163,39 @@ void FirewallClient::decide(const QString &path, bool allow, const QString &scop
     const auto *p = pendingFor(path);
     const QString signer = p ? p->signer : QString();
     QString what = fileName(path);
-    if (scope == "app") what = QString("any version of %1 from %2").arg(fileName(path), signer);
-    else if (scope == "publisher") what = "all apps from " + signer;
-    if (!destination.isEmpty()) what += " to " + destination;
+    if (scope == "app") what = I18n::tr("any version of %1 from %2").arg(fileName(path), signer);
+    else if (scope == "publisher") what = I18n::tr("all apps from %1").arg(signer);
+    if (!destination.isEmpty()) what = I18n::tr("%1 to %2").arg(what, destination);
     QString line = QString("DECIDE\t%1\t%2\t%3").arg(allow ? "allow" : "block", scope, path);
     if (duration != "always" || !destination.isEmpty()) line += "\t" + duration;
     if (!destination.isEmpty()) line += "\t" + destination;
-    const QString span = duration == "restart" ? QStringLiteral(" until restart")
-                         : duration == "always" ? QString()
-                                                : " for " + describeDuration(duration.toLongLong());
+    const QString span = durationSpan(duration);
     enqueue(line, Request::Command,
-            QString("%1%2 saved for %3. The next connection attempt uses this rule.")
-                .arg(allow ? "Allow" : "Block", span, what));
+            allow ? I18n::tr("Allow%1 saved for %2. The next connection attempt uses this rule.").arg(span, what)
+                  : I18n::tr("Block%1 saved for %2. The next connection attempt uses this rule.").arg(span, what));
     poll();
+}
+
+// « hasta reiniciar», « durante 5 minutos» o nada (siempre): va pegado a la decisión en los mensajes.
+QString FirewallClient::durationSpan(const QString &duration) {
+    if (duration == "restart") return I18n::tr(" until restart");
+    if (duration == "always") return {};
+    return I18n::tr(" for %1").arg(describeDuration(duration.toLongLong()));
 }
 
 void FirewallClient::trustFolder(const QString &folder, const QString &name, bool allow, const QString &duration) {
     const QString where = QDir::toNativeSeparators(folder);
     QString line = QString("FOLDER\t%1\t%2\t%3").arg(allow ? "allow" : "block", where, name.isEmpty() ? "*" : name);
     if (duration != "always") line += "\t" + duration;
-    const QString span = duration == "restart" ? QStringLiteral(" until restart")
-                         : duration == "always" ? QString()
-                                                : " for " + describeDuration(duration.toLongLong());
-    const QString who = name.isEmpty() ? QStringLiteral("Every program") : name;
-    enqueue(line, Request::Command,
-            allow ? QString("%1 in %2 can connect%3, also new builds there.").arg(who, where, span)
-                  : QString("%1 in %2 stays blocked%3.").arg(who, where, span));
+    const QString span = durationSpan(duration);
+    QString message;
+    if (name.isEmpty())
+        message = allow ? I18n::tr("Every program in %1 can connect%2, also new builds there.").arg(where, span)
+                        : I18n::tr("Every program in %1 stays blocked%2.").arg(where, span);
+    else
+        message = allow ? I18n::tr("%1 in %2 can connect%3, also new builds there.").arg(name, where, span)
+                        : I18n::tr("%1 in %2 stays blocked%3.").arg(name, where, span);
+    enqueue(line, Request::Command, message);
     poll();
 }
 
@@ -196,21 +203,21 @@ void FirewallClient::removeRule(const QString &id) {
     const auto *r = ruleById(id);
     const QString what = r ? describe(*r) : fileName(id);
     enqueue("REMOVE\t" + id, Request::Command,
-            QString("Rule removed for %1. The next connection will be blocked and ask again.").arg(what));
+            I18n::tr("Rule removed for %1. The next connection will be blocked and ask again.").arg(what));
     poll();
 }
 
 void FirewallClient::setLocalNetwork(bool allow) {
     enqueue(QString("LAN\t%1").arg(allow ? "allow" : "ask"), Request::Command,
-            allow ? QString("Local network connections no longer ask.")
-                  : QString("Local network connections ask like any other."));
+            allow ? I18n::tr("Local network connections no longer ask.")
+                  : I18n::tr("Local network connections ask like any other."));
     poll();
 }
 
 void FirewallClient::setAsk(bool ask) {
     enqueue(QString("MODE\t%1").arg(ask ? "ask" : "off"), Request::Command,
-            ask ? QString("Unknown applications are blocked until you decide.")
-                : QString("Unknown applications can connect. Saved rules still apply."));
+            ask ? I18n::tr("Unknown applications are blocked until you decide.")
+                : I18n::tr("Unknown applications can connect. Saved rules still apply."));
     poll();
 }
 
@@ -281,7 +288,7 @@ void FirewallClient::onDisconnected() {
     while (!queue_.empty()) {
         if (queue_.front().kind == Request::Command) {
             --commandsInFlight_;
-            emit commandFinished(false, "GateBouncer engine is not running. Nothing was changed.");
+            emit commandFinished(false, I18n::tr("GateBouncer engine is not running. Nothing was changed."));
         }
         queue_.pop_front();
     }
@@ -292,7 +299,7 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
     const bool ok = !lines.isEmpty() && lines.first().startsWith("OK");
     if (request.kind == Request::Command) {
         --commandsInFlight_;
-        const QString error = !ok && !lines.isEmpty() ? lines.first().section('\t', 1) : QString("No reply");
+        const QString error = !ok && !lines.isEmpty() ? lines.first().section('\t', 1) : I18n::tr("No reply");
         emit commandFinished(ok, ok ? request.okMessage : error);
         poll();
         return;

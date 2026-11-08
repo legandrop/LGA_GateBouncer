@@ -94,6 +94,8 @@ class FirewallClient final : public QObject {
     static bool publisherRuleAllowed(const QString &signer);
     // "15 minutes", "1 hour".
     static QString describeDuration(qint64 seconds);
+    // « until restart», « for 5 minutes» o vacío (siempre), traducido: va pegado a Allow o Block en los mensajes.
+    static QString durationSpan(const QString &duration);
     // Lo que le queda a una regla: vacío si es permanente, "until restart" o "12 min left".
     static QString remaining(const RuleItem &rule);
 

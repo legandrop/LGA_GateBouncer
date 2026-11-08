@@ -46,7 +46,8 @@ Retry 'git fetch' { git fetch -q origin }
 if ((git rev-parse HEAD) -ne (git rev-parse origin/main)) { Fail 'HEAD no es origin/main: pushear (o pullear) antes de publicar.' }
 Retry 'gh auth status' { gh auth status *> $null }
 if (git tag --list $tag) { Fail "el tag $tag ya existe en este clon." }
-$remoteTag = git ls-remote --tags origin "refs/tags/$tag"
+$remoteTag = $null
+Retry 'git ls-remote' { $script:remoteTag = git ls-remote --tags origin "refs/tags/$tag" }
 if ($remoteTag) { Fail "el tag $tag ya existe en origin." }
 # El instalador tiene que salir de este commit: el exe se armó después del último commit.
 $commitTime = [DateTimeOffset]::FromUnixTimeSeconds([int64](git log -1 --format=%ct)).LocalDateTime
@@ -68,10 +69,38 @@ if (-not $Yes) {
 }
 
 # ---- tag, release, notas y manifiesto
+# Si algo falla después del tag, se dice cómo dejar todo limpio para reintentar (nada se borra solo).
+$cleanup = @(
+    "  gh release delete $tag --repo $repo --yes",
+    "  git push origin :refs/tags/$tag",
+    "  git tag -d $tag"
+)
+function FailAfterTag([string]$why) {
+    Write-Host "ERROR: $why"
+    Write-Host 'Para dejarlo limpio y volver a publicar (lo que no exista da un error inofensivo):'
+    $cleanup | ForEach-Object { Write-Host $_ }
+    exit 1
+}
 git tag -a $tag -m "Release $tag"
 if ($LASTEXITCODE -ne 0) { Fail "no se pudo crear el tag $tag." }
-Retry "push del tag $tag" { git push -q origin $tag }
-Retry 'gh release create' { gh release create $tag $setup $sums --repo $repo --target main --title $tag --notes "Release $tag" }
+$pushed = $false
+for ($i = 1; $i -le 4 -and -not $pushed; $i++) {
+    git push -q origin $tag
+    $pushed = $LASTEXITCODE -eq 0
+    if (-not $pushed -and $i -lt 4) { Write-Host "  push del tag falló (intento $i de 4); reintento en 5 s"; Start-Sleep -Seconds 5 }
+}
+if (-not $pushed) { FailAfterTag "no se pudo subir el tag $tag." }
+# Reintentos idempotentes: si un intento anterior llegó a crear el release, se completan los archivos en vez de crearlo
+# de nuevo.
+$released = $false
+for ($i = 1; $i -le 4 -and -not $released; $i++) {
+    gh release view $tag --repo $repo *> $null
+    if ($LASTEXITCODE -eq 0) { gh release upload $tag $setup $sums --repo $repo --clobber }
+    else { gh release create $tag $setup $sums --repo $repo --verify-tag --title $tag --notes "Release $tag" }
+    $released = $LASTEXITCODE -eq 0
+    if (-not $released -and $i -lt 4) { Write-Host "  release falló (intento $i de 4); reintento en 5 s"; Start-Sleep -Seconds 5 }
+}
+if (-not $released) { FailAfterTag "no se pudo crear el release $tag." }
 & $wn publish $wnFile $version $repo $tag
 if ($LASTEXITCODE -ne 0) {
     Write-Host "AVISO: el release está publicado pero fallaron las notas. Reintentar con:"

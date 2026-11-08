@@ -2,7 +2,7 @@
 setlocal
 rem Arma el instalador local: compila la ventana y el motor, junta los archivos y corre Inno Setup con la version de
 rem CMakeLists.txt (project ... VERSION x.yy). Deja installer\LGA_GateBouncer_Setup_v<x.yy>.exe y su SHA256SUMS.
-rem No publica, no instala ni ejecuta nada: publicar es publicar.bat, aparte.
+rem No publica, no instala ni ejecuta nada: publicar es publicar.ps1, aparte.
 if not "%~1"=="--no-run" (
   echo Uso: instalador.bat --no-run
   exit /b 2

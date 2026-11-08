@@ -1,6 +1,7 @@
 #include "uiscale.h"
 #include <QByteArray>
 #include <QSettings>
+#include <windows.h>
 
 namespace Gate::UiScale {
 namespace {
@@ -47,8 +48,20 @@ void saveLevel(int level) {
     s.sync();
 }
 
+QSize primaryWorkArea() {
+    // Antes de la QApplication: el área útil de la pantalla principal en píxeles independientes de la resolución. Sin
+    // conciencia de DPI Windows ya la da escalada a 96 ppp y GetDpiForSystem devuelve 96; con ella, las dos cosas son
+    // reales. En los dos casos la cuenta da lo mismo.
+    RECT work{};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) return {};
+    const UINT dpi = GetDpiForSystem();
+    const qreal k = dpi ? 96.0 / dpi : 1.0;
+    return QSize(qRound((work.right - work.left) * k), qRound((work.bottom - work.top) * k));
+}
+
 void applyBeforeApp(int level) {
-    g_sessionLevel = clampLevel(level);
+    // El guardado no se toca: en una pantalla más grande vuelve solo.
+    g_sessionLevel = qMin(clampLevel(level), maxFittingLevel(primaryWorkArea()));
     if (g_sessionLevel == 0) return;
     g_hadPrevious = qEnvironmentVariableIsSet(kEnvName);
     g_previous = qgetenv(kEnvName);
