@@ -120,7 +120,6 @@ QFrame#fwMessage { background: #1D1B2C; border: 1px solid #3A3466; border-radius
 QLabel[pill] { border-radius: 4px; padding: 0 8px; font-size: 12px; font-weight: 600; }
 QLabel[pill="allow"] { background: #0E2B1D; border: 1px solid #26603F; color: #5ACB8B; }
 QLabel[pill="block"] { background: #361B1D; border: 1px solid #6B2E31; color: #F0645C; }
-QLabel[pill="temp"] { background: #25223B; border: 1px solid #5243A8; color: #C5BBF4; }
 QLabel[pill="dest"] { background: #2A2A31; border: 1px solid #3A3A43; color: #C4C3C9; }
 QLabel[pill="none"] { background: transparent; border: 1px solid #3A3A43; color: #9C9BA2; }
 QLabel[hint] { border-radius: 11px; padding: 0 9px; font-size: 12px; font-weight: 600; }
@@ -667,7 +666,7 @@ class RuleRowDelegate final : public QStyledItemDelegate {
             static const QHash<QString, QStringList> colors{
                 // fondo, borde, texto (los de QLabel[pill=…] y QLabel[chip="1"])
                 {"pill:allow", {"#0E2B1D", "#26603F", "#5ACB8B"}}, {"pill:block", {"#361B1D", "#6B2E31", "#F0645C"}},
-                {"pill:temp", {"#25223B", "#5243A8", "#C5BBF4"}},  {"pill:dest", {"#2A2A31", "#3A3A43", "#C4C3C9"}},
+                {"pill:dest", {"#2A2A31", "#3A3A43", "#C4C3C9"}},
                 {"chip", {"", "#3A3A43", "#9C9BA2"}}};
             const QStringList c = colors.value(kind, colors.value("pill:dest"));
             const QFont f = roleFont(option.font, 12, QFont::DemiBold);
@@ -2844,8 +2843,10 @@ void FirewallWindow::fillApps() {
             t->setItem(r, 1, e.perServer ? item("chip", e.rules.size() == 1 ? I18n::tr("1 server")
                                                                            : I18n::tr("%1 servers").arg(e.rules.size()))
                                          : item("text", I18n::tr("Anywhere")));
+            // Una regla temporal lleva el color de su decisión: verde si permite, rojo si bloquea.
+            const QString temporaryKind = r0.allow ? "pill:allow" : "pill:block";
             t->setItem(r, 2, c == "server"  ? item("pill:dest", I18n::tr("Per server"))
-                             : c == "temp"  ? item("pill:temp", temporaryRule(r0.allow, r0.expires))
+                             : c == "temp"  ? item(temporaryKind, temporaryRule(r0.allow, r0.expires))
                              : c == "allow" ? item("pill:allow", I18n::tr("Allow"))
                                             : item("pill:block", I18n::tr("Block")));
             qint64 lastBlock = 0, created = 0;
@@ -2985,7 +2986,7 @@ QWidget *FirewallWindow::detailPage(const QString &key) {
         auto *pw = new QWidget;
         auto *pl = new QHBoxLayout(pw);
         pl->setContentsMargins(0, 0, 0, 0);
-        pl->addWidget(r0.expires != 0 ? pill(temporaryRule(r0.allow, r0.expires), "temp")
+        pl->addWidget(r0.expires != 0 ? pill(temporaryRule(r0.allow, r0.expires), r0.allow ? "allow" : "block")
                                       : pill(r0.allow ? I18n::tr("Allow") : I18n::tr("Block"), r0.allow ? "allow" : "block"));
         pl->addStretch();
         kv(I18n::tr("Decision"), pw);
