@@ -1,8 +1,22 @@
 # LGA GateBouncer
 
-LGA GateBouncer is a native Windows per-application firewall under development. When an application without a rule
-tries to connect, GateBouncer blocks it and asks you; **Allow** or **Block** becomes a permanent rule for that
-executable. It has no bandwidth control.
+LGA GateBouncer is a native Windows per-application firewall under development.
+
+The first time a program tries to reach the internet, GateBouncer blocks it and a notice appears in the corner of the
+screen, without taking the focus away from what you were doing: it says which program it is, the folder it runs from
+and the address it wanted to reach. You decide there, **Allow** or **Block**, and the rule can be permanent or last a
+few minutes.
+
+How far a rule reaches is yours to choose too: that one file, every version of the app, every program from the same
+publisher, or a folder where you build your own tools. A rule can also be limited to a destination, so a program
+reaches your own servers and asks again for anything else.
+
+A catalog that ships with GateBouncer already recognizes many common programs and says what it would usually do, with
+no account and nothing to connect. For the rest you can add your own API key and have an AI model look at the program,
+its folder and the address it wanted, and explain what it is and what you gain or lose by allowing it. The answer only
+helps you decide: it never allows or blocks anything.
+
+It has no bandwidth control.
 
 The firewall engine needs no kernel driver: it uses the Windows Filtering Platform from an elevated service. Because a
 driverless firewall cannot hold a connection while it waits, the attempt that produced a request has already been
@@ -105,3 +119,12 @@ each connection until you decided. Loading a new kernel driver on current Window
 so that design is paused. Its documentation remains in [service](service/README.md) and [driver](driver/README.md).
 
 See [Simulation behavior](docs/Simulation.md) and [Third-party notices](docs/ThirdPartyNotices.md).
+
+## License
+
+Copyright © 2026 Lega Pugliese.
+
+GateBouncer is free software under the **GNU General Public License, version 3** ([LICENSE](LICENSE)): you can use it,
+study it, change it and share it, and anything you distribute that is built from it has to come with its source under
+the same license. The bundled Inter fonts and the Qt libraries it links to keep their own licenses; see
+[Third-party notices](docs/ThirdPartyNotices.md).
