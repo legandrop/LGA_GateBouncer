@@ -1,6 +1,6 @@
 # lgaupdate — auto-update de las apps LGA
 
-**Pieza canónica de `LGA_Base_QT_C_Py`, rev 4 (2026-11-08).** Cada app la copia **idéntica** a su
+**Pieza canónica de `LGA_Base_QT_C_Py`, rev 5 (2026-11-08).** Cada app la copia **idéntica** a su
 `libs/lgaupdate`, este README incluido, y no la edita: un cambio se hace acá, se sube la revisión
 y se vuelve a copiar a todas. Así comparar una copia con la canónica es un `diff -r` sin
 excepciones.
@@ -142,8 +142,8 @@ Hasta la rev 3 los carteles salían siempre en inglés, aunque la app estuviera 
 Ahora la app pide el idioma con `LgaUpdateConfig::language`: `"es"` pasa a castellano los
 carteles, el diálogo de la descarga, los rótulos de las notas (NUEVO, MEJORADO, CORREGIDO) y los
 avisos que muestra el helper; vacío (default) o cualquier otro valor deja el inglés, así que una
-app que solo re-copia se ve igual. Las notas de cada versión no se traducen: ya vienen escritas en
-el `WhatsNew.md` del producto.
+app que solo re-copia se ve igual. Las notas de cada versión no se traducen acá: vienen escritas en
+el `WhatsNew.md` del producto (desde la rev 5, también en inglés en las apps bilingües).
 
 - `LgaUpdateI18n.h` / `src/LgaUpdateI18n.cpp`: la tabla en castellano vive en el código (sin
   `.qm`) y un `QTranslator` propio la instala el constructor del servicio. Solo contesta los
@@ -156,6 +156,25 @@ el `WhatsNew.md` del producto.
   si falta una traducción o sobra una clave.
 - Estilo de las traducciones: el de las apps LGA en castellano (infinitivo o impersonal, nunca vos
   ni tú). Las letras de los atajos no cambian (las fija el código): «Act&ualizar ahora» sigue en U.
+
+### Rev 5: las notas en el idioma de la app (`text_en`)
+
+En una app bilingüe (GateBouncer, por ejemplo) con la interfaz en inglés, las notas de cada
+versión salían en castellano, que es el texto base de todo `WhatsNew.md`. Ahora un producto puede
+declararse bilingüe (`languages: [es, en]` en la cabecera de su `WhatsNew.md`) y escribir cada
+ítem también en inglés; `build_whats_new.py` de `LGA_RepoTools` lo publica en el campo opcional
+`text_en` de cada ítem de `whats_new.json`.
+
+- `LgaWhatsNew::Item::textEn` guarda ese texto (vacío si no viene). Un `text_en` que no es texto
+  invalida el JSON entero, como cualquier otro campo mal formado.
+- `LgaWhatsNew::displayText()` elige: el inglés si el updater está en inglés
+  (`LgaUpdateI18n::language()`) y el ítem lo trae; si no, el castellano. Lo usan `headline()` y
+  `toHtml()`, o sea el cartel de update, el aviso de después de instalar y el historial.
+- Sin cambios para nadie más: un producto monolingüe no trae `text_en`, y una app en castellano
+  sigue mostrando `text`. Los lectores viejos (rev ≤ 4 y `FM_WhatsNew` de FileManager S3)
+  ignoran el campo.
+- `tests/TestLgaWhatsNewLanguage.cpp` (`lgaupdate_language_tests`): parseo y elección del idioma,
+  sin red ni ventanas, con el mismo runner que el banco de reintentos.
 
 ## Historia
 

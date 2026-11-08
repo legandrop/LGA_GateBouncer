@@ -34,11 +34,13 @@ class QTimer;
  *
  *     {"schemaVersion":1,"product":"legandrop/LGA_PipeSync_Release","name":"LGA PipeSync",
  *      "versions":[{"version":"1.015","date":"2026-10-02",
- *                   "items":[{"kind":"new","text":"...","for":[...],
+ *                   "items":[{"kind":"new","text":"...","text_en":"...","for":[...],
  *                             "edition":["studio"],"platform":["mac"]}]}]}
  *
  * `text` ya trae el rotulo de rol ("Coordinators and reviewers: ..."). `edition` y `platform`
  * ausentes = todas. `for` y `edition` filtran solo si la app los pide (ver `range()`).
+ * `text_en` (rev 5, opcional) es el mismo item en ingles, solo en los productos bilingues: ver
+ * `displayText()`.
  */
 namespace LgaWhatsNew {
 
@@ -55,7 +57,11 @@ enum class Kind {
 
 struct Item {
     Kind kind = Kind::New;
+    /// El texto base, en castellano.
     QString text;
+    /// El mismo item en ingles (`text_en`). Vacio si el producto no es bilingue o el item no lo
+    /// trae (lo publicado antes de que el producto lo fuera).
+    QString textEn;
     /// "win" / "mac". Vacio = todas las plataformas.
     QStringList platforms;
     /// Audiencias del `[for:]`. Se filtran solo si el consumidor opta por audiencias.
@@ -136,6 +142,13 @@ QList<VersionNotes> filtered(const Notes &notes,
                              const QString &platform,
                              const QString &edition = QString(),
                              const std::optional<QStringList> &audiences = std::nullopt);
+
+/**
+ * El texto que se le muestra al usuario: el ingles si el updater esta en ingles
+ * (`LgaUpdateI18n::language()`, que sale de `LgaUpdateConfig::language`) y el item lo trae; si
+ * no, el castellano. Lo usan `headline()` y `toHtml()`.
+ */
+QString displayText(const Item &item);
 
 /// Texto del primer item de la version mas nueva del rango, o vacio. Para avisos de una linea.
 QString headline(const QList<VersionNotes> &versions);

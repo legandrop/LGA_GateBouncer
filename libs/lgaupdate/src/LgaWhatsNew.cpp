@@ -1,6 +1,7 @@
 #include "lgaupdate/LgaWhatsNew.h"
 
 #include "lgaupdate/LgaNetRetry.h"
+#include "lgaupdate/LgaUpdateI18n.h"
 #include "lgaupdate/LgaVersionCompare.h"
 
 #include <QCoreApplication>
@@ -212,6 +213,12 @@ Notes parse(const QByteArray &json)
             if (!textValue.isString() || item.text.isEmpty()) {
                 return invalid(QStringLiteral("versions[%1].items[%2].text vacio").arg(i).arg(j));
             }
+            // Opcional: ausente o vacio = sin ingles. Presente y que no es texto = JSON roto.
+            const QJsonValue textEnValue = itemObject.value(QStringLiteral("text_en"));
+            if (!textEnValue.isUndefined() && !textEnValue.isNull() && !textEnValue.isString()) {
+                return invalid(QStringLiteral("versions[%1].items[%2].text_en no es texto").arg(i).arg(j));
+            }
+            item.textEn = textEnValue.toString().trimmed();
             if (!readStringList(itemObject, QStringLiteral("for"), &item.roles)
                 || !readStringList(itemObject, QStringLiteral("edition"), &item.editions)
                 || !readStringList(itemObject, QStringLiteral("platform"), &item.platforms)) {
@@ -310,11 +317,19 @@ QList<VersionNotes> filtered(const Notes &notes,
     return range(notes, QString(), QString(), platform, edition, audiences);
 }
 
+QString displayText(const Item &item)
+{
+    if (!item.textEn.isEmpty() && LgaUpdateI18n::language() == QLatin1String("en")) {
+        return item.textEn;
+    }
+    return item.text;
+}
+
 QString headline(const QList<VersionNotes> &versions)
 {
     for (const VersionNotes &entry : versions) {
         if (!entry.items.isEmpty()) {
-            return entry.items.first().text;
+            return displayText(entry.items.first());
         }
     }
     return {};
@@ -376,7 +391,7 @@ QString toHtml(const QList<VersionNotes> &versions)
                 }
                 rows += QStringLiteral("<tr><td width='14' valign='top'>&#8226;</td>"
                                        "<td valign='top'>%1</td></tr>")
-                            .arg(item.text.toHtmlEscaped());
+                            .arg(displayText(item).toHtmlEscaped());
             }
             if (rows.isEmpty()) {
                 continue;

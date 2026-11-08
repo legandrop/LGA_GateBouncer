@@ -24,6 +24,21 @@ target_link_libraries(lgaupdate_retry_tests PRIVATE
     Qt6::Network
 )
 
+# Idioma de las notas (rev 5): `text_en` y `LgaWhatsNew::displayText()`. Sin red ni ventanas.
+# Cae en la misma carpeta que el de reintentos, asi que comparte el runtime de MinGW de abajo.
+add_executable(lgaupdate_language_tests TestLgaWhatsNewLanguage.cpp)
+
+set_target_properties(lgaupdate_language_tests PROPERTIES
+    WIN32_EXECUTABLE OFF
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lgaupdate_tests"
+)
+
+target_link_libraries(lgaupdate_language_tests PRIVATE
+    LGAUpdate
+    Qt6::Core
+)
+add_dependencies(lgaupdate_language_tests lgaupdate_retry_tests)
+
 if(WIN32 AND NOT MSVC)
     # El runtime de MinGW del compilador usado, junto al exe: el que trae <Qt>\bin (que el runner
     # pone en el PATH) es mas viejo, y con el el exe no resuelve sus importaciones.

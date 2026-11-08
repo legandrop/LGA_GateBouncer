@@ -14,6 +14,9 @@ v1.01:
   texto, acento, interruptores, estados) y deriva los demás tonos en HSL; `Theme::css`/`Theme::color` traducen y la
   ventana se rearma en vivo. Con la paleta de fábrica todo queda igual. Editor sólo de desarrollo
   (`GATEBOUNCER_PALETTE_EDITOR=1`) y siete paletas de prueba en `resources/palettes/`.
+- Las novedades del aviso de update salían siempre en castellano, aunque la ventana estuviera en inglés. Ahora
+  `libs/lgaupdate` es la rev 5 (`LgaWhatsNew::displayText()` elige el `text_en` de cada ítem si la app está en inglés)
+  y `docs/WhatsNew.md` es bilingüe desde la v1.01 (`languages: [es, en]`, una línea `en:` por ítem).
 
 v1.00:
 - Primera versión publicada. El firewall es `GateBouncerEngine.exe`, un servicio que filtra con WFP en modo usuario:

@@ -28,8 +28,10 @@
  *       por `Range`).
  *   4 — textos en ingles o castellano segun `LgaUpdateConfig::language` (`LgaUpdateI18n.h`):
  *       carteles, descarga, rotulos de las notas y avisos del helper. Default: ingles, como antes.
+ *   5 — notas en el idioma de la app: un item puede traer `text_en` (productos bilingues) y
+ *       `LgaWhatsNew::displayText()` lo elige si el updater esta en ingles; si no, el castellano.
  */
-#define LGAUPDATE_REVISION 4
+#define LGAUPDATE_REVISION 5
 
 class QNetworkAccessManager;
 class QNetworkReply;

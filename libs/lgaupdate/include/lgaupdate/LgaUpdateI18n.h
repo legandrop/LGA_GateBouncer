@@ -12,7 +12,8 @@
  * codigo y viaja con la copia de la biblioteca.
  *
  * Lo llama el constructor de `LgaUpdateService`: la app solo fija `language`. Las notas de cada
- * version no pasan por aca: vienen escritas en el WhatsNew.md del producto.
+ * version no pasan por aca: vienen escritas en el WhatsNew.md del producto, y en las apps
+ * bilingues `LgaWhatsNew::displayText()` elige su `text_en` cuando `language()` es "en".
  *
  * `tests/check_i18n.ps1` confronta la tabla con los `tr()` de `src/`: un texto nuevo sin
  * traduccion sale en ingles, nunca vacio.
