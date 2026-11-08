@@ -10,6 +10,7 @@
 #include <QApplication>
 #include <QComboBox>
 #include <QDialog>
+#include <QKeyEvent>
 #include <QLineEdit>
 #include <QLocalServer>
 #include <QLocalSocket>
@@ -104,6 +105,22 @@ void runSteps(Gate::FirewallWindow *window, QStringList steps) {
             emit combo->activated(value.toInt());
         } else {
             std::fprintf(stderr, "QA: campo o desplegable ausente: %s\n", qPrintable(step));
+        }
+    } else if (step.startsWith("focus:")) {
+        // Como un clic: la ventana pasa a ser la activa (un aviso abierto no se queda con las teclas).
+        if (QWidget *target = qaFind(window, step.mid(6))) {
+            target->window()->activateWindow();
+            target->setFocus(Qt::MouseFocusReason);
+        } else std::fprintf(stderr, "QA: control ausente: %s\n", qPrintable(step));
+    } else if (step == "key:down" || step == "key:up") {
+        // Una tecla de verdad al control con foco, como la del teclado; anota quién la recibió.
+        QWidget *focused = QApplication::focusWidget();
+        std::fprintf(stderr, "QA: %s a «%s»\n", qPrintable(step), focused ? qPrintable(focused->objectName()) : "nadie");
+        if (focused) {
+            const int key = step == "key:down" ? Qt::Key_Down : Qt::Key_Up;
+            QKeyEvent press(QEvent::KeyPress, key, Qt::NoModifier), release(QEvent::KeyRelease, key, Qt::NoModifier);
+            QApplication::sendEvent(focused, &press);
+            QApplication::sendEvent(focused, &release);
         }
     } else if (step.startsWith("dialogshot:")) {
         QWidget *dialog = QApplication::activeModalWidget();

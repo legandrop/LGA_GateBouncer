@@ -309,8 +309,9 @@ class Combo final : public QComboBox {
         const QString full = opt.currentText;
         opt.currentText.clear();
         sp.drawComplexControl(QStyle::CC_ComboBox, opt);
-        // El texto, con los mismos 10 de aire de la hoja de estilo y lugar para la flecha a la derecha.
-        const QRect field = rect().adjusted(11, 0, -26, 0);
+        // El texto, con los mismos 10 de aire de la hoja de estilo y lugar para la flecha a la derecha (5 de aire antes
+        // de la flecha: así «Cálido turquesa» entra entero en los 130 del desplegable de Colores).
+        const QRect field = rect().adjusted(11, 0, -20, 0);
         const QString shown = fontMetrics().elidedText(full, Qt::ElideRight, field.width());
         sp.setPen(palette().color(isEnabled() ? QPalette::Active : QPalette::Disabled, QPalette::ButtonText));
         sp.drawText(field, Qt::AlignLeft | Qt::AlignVCenter | Qt::TextSingleLine, shown);
@@ -1679,6 +1680,11 @@ void FirewallWindow::render(bool keepScroll) {
                     : view_ == "import"           ? importPage()
                                                   : overviewPage();
     page->setObjectName("fwPage");
+    // El control con foco lo recupera en la página nueva: al elegir otra paleta la página se rearma, y el desplegable
+    // tiene que seguir respondiendo a las flechas.
+    QString focusName;
+    if (auto *current = scroll_area_->widget())
+        if (QWidget *f = QApplication::focusWidget(); f && current->isAncestorOf(f)) focusName = f->objectName();
     auto *old = scroll_area_->takeWidget();
     scroll_area_->setWidget(page);
     if (old) old->deleteLater();
@@ -1688,9 +1694,11 @@ void FirewallWindow::render(bool keepScroll) {
     updateRefreshRates();
     updateSidebar();
     QPointer<QTableWidget> table = page->findChild<QTableWidget *>("fwTable");
-    QTimer::singleShot(0, this, [this, scroll, table, tableScrolled = tableScroll_.value(view_)] {
+    QPointer<QWidget> refocus = focusName.isEmpty() ? nullptr : page->findChild<QWidget *>(focusName);
+    QTimer::singleShot(0, this, [this, scroll, table, refocus, tableScrolled = tableScroll_.value(view_)] {
         scroll_area_->verticalScrollBar()->setValue(scroll);
         if (table) table->verticalScrollBar()->setValue(tableScrolled);
+        if (refocus) refocus->setFocus(Qt::OtherFocusReason);
     });
 }
 
@@ -3579,7 +3587,8 @@ QWidget *FirewallWindow::appCard() {
     cl->addWidget(divider());
     cl->addSpacing(12);
 
-    // Idioma y zoom en una grilla, para que los dos controles arranquen en la misma columna (Mighty Tools).
+    // Idioma, colores y zoom en una grilla, para que los controles arranquen en la misma columna (Mighty Tools). Los
+    // dos desplegables tienen el mismo ancho.
     auto *grid = new QGridLayout;
     grid->setContentsMargins(0, 0, 0, 0);
     grid->setHorizontalSpacing(12);
@@ -3600,7 +3609,7 @@ QWidget *FirewallWindow::appCard() {
         QTimer::singleShot(0, this, &FirewallWindow::relaunchWindow);
     });
 
-    grid->addWidget(text(I18n::tr("Zoom"), "strong"), 1, 0, Qt::AlignVCenter);
+    grid->addWidget(text(I18n::tr("Zoom"), "strong"), 2, 0, Qt::AlignVCenter);
     auto *seg = card("seg");
     seg->setFixedHeight(30);
     auto *sl = new QHBoxLayout(seg);
@@ -3629,20 +3638,20 @@ QWidget *FirewallWindow::appCard() {
         });
         sl->addWidget(b);
     }
-    grid->addWidget(seg, 1, 1, Qt::AlignVCenter | Qt::AlignLeft);
+    grid->addWidget(seg, 2, 1, Qt::AlignVCenter | Qt::AlignLeft);
 
     // Paleta de colores: se aplica en vivo (no reinicia la ventana) y queda guardada.
-    grid->addWidget(text(I18n::tr("Colors"), "strong"), 2, 0, Qt::AlignVCenter);
+    grid->addWidget(text(I18n::tr("Colors"), "strong"), 1, 0, Qt::AlignVCenter);
     auto *colors = new Combo;
     colors->setObjectName("app-palette");
     const QHash<QString, QString> paletteNames{
         {"default-1", I18n::tr("Violet")},         {"default-2", I18n::tr("Magenta")},
-        {"alto-contraste", I18n::tr("High contrast")}, {"grafito-ambar", I18n::tr("Graphite and amber")},
-        {"niebla", I18n::tr("Mist")},               {"pizarra-turquesa", I18n::tr("Warm and teal")}};
+        {"alto-contraste", I18n::tr("High contrast")}, {"grafito-ambar", I18n::tr("Graphite | amber")},
+        {"niebla", I18n::tr("Mist")},               {"pizarra-turquesa", I18n::tr("Warm teal")}};
     for (const QString &id : Palette::presetIds()) colors->addItem(paletteNames.value(id, id), id);
     colors->setCurrentIndex(qMax(0, colors->findData(Palette::savedPreset())));
-    colors->setFixedWidth(210);
-    grid->addWidget(colors, 2, 1, Qt::AlignVCenter | Qt::AlignLeft);
+    colors->setFixedWidth(130);
+    grid->addWidget(colors, 1, 1, Qt::AlignVCenter | Qt::AlignLeft);
     connect(colors, &QComboBox::activated, this, [colors](int index) {
         const QString id = colors->itemData(index).toString();
         if (id == Palette::savedPreset()) return;

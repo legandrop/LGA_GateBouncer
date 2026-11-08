@@ -215,8 +215,10 @@ QString remapSheet(const QString &sheet) {
 }
 
 QStringList presetIds() {
-    return {QStringLiteral("default-1"), QStringLiteral("default-2"), QStringLiteral("alto-contraste"),
-            QStringLiteral("grafito-ambar"), QStringLiteral("niebla"), QStringLiteral("pizarra-turquesa")};
+    // En el orden del desplegable de Settings: la primera es la de fábrica y Magenta (default-2) va última.
+    return {QStringLiteral("default-1"), QStringLiteral("alto-contraste"),
+            QStringLiteral("grafito-ambar"), QStringLiteral("niebla"), QStringLiteral("pizarra-turquesa"),
+            QStringLiteral("default-2")};
 }
 
 namespace {
