@@ -10,10 +10,12 @@ v1.01:
 - El updater (`libs/lgaupdate` rev 4) habla en el idioma de la app. La versión ya no se sube en cada cambio:
   `bump_version.bat` la sube al publicar, como en Mighty Tools. Logo de la barra a 20 px.
 - Base para paletas de color: los colores seguían fijos en `theme.h` y en las hojas de estilo. Ahora `src/palette.*`
-  los agrupa en 16 roles con un color base cada uno (fondos, bordes, títulos, rótulos del índice, cuatro niveles de
+  los agrupa en 17 roles con un color base cada uno (fondos, bordes, títulos, rótulos del índice, cuatro niveles de
   texto, acento, interruptores, estados) y deriva los demás tonos en HSL; `Theme::css`/`Theme::color` traducen y la
-  ventana se rearma en vivo. Con la paleta de fábrica todo queda igual. Editor sólo de desarrollo
-  (`GATEBOUNCER_PALETTE_EDITOR=1`) y siete paletas de prueba en `resources/palettes/`.
+  ventana se rearma en vivo. Editor sólo de desarrollo (`GATEBOUNCER_PALETTE_EDITOR=1`) y paletas de prueba en
+  `resources/palettes/`.
+- Permitir usaba el cian de «funciona» (etiquetas) o el violeta del botón principal (botones). Ahora tiene su verde
+  (`kAllow*`, rol `allow`) en etiquetas, sugerencia de IA y botones Allow, que pasan al estilo de Block.
 - Las novedades del aviso de update salían siempre en castellano, aunque la ventana estuviera en inglés. Ahora
   `libs/lgaupdate` es la rev 5 (`LgaWhatsNew::displayText()` elige el `text_en` de cada ítem si la app está en inglés)
   y `docs/WhatsNew.md` es bilingüe desde la v1.01 (`languages: [es, en]`, una línea `en:` por ítem).

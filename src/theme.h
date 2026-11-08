@@ -56,6 +56,12 @@ inline constexpr const char *kWarnBorder = "#5A4E26";
 inline constexpr const char *kError = "#F0645C";
 inline constexpr const char *kErrBg = "#361B1D";
 inline constexpr const char *kErrBorder = "#6B2E31";
+// Permitir (etiquetas, sugerencias y botones Allow): verde propio, como Block tiene su rojo; no es el cian de «funciona».
+inline constexpr const char *kAllow = "#5ACB8B";
+inline constexpr const char *kAllowBg = "#0E2B1D";
+inline constexpr const char *kAllowBorder = "#26603F";
+inline constexpr const char *kAllowHoverBg = "#133A27";
+inline constexpr const char *kAllowHoverBorder = "#3AA36B";
 
 inline constexpr const char *kSwitchOff = "#26262D";
 inline constexpr const char *kSwitchOffBorder = "#4A4A55";

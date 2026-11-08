@@ -61,6 +61,15 @@ void runSteps(Gate::FirewallWindow *window, QStringList steps) {
         // El editor de paletas (GATEBOUNCER_PALETTE_EDITOR=1).
         for (auto *w : QApplication::topLevelWidgets())
             if (w->objectName() == "paletteEditor" && w->isVisible()) w->grab().save(step.mid(11));
+    } else if (step.startsWith("sampletoast:")) {
+        // El aviso de ejemplo del editor de paletas (GATEBOUNCER_PALETTE_EDITOR=1).
+        for (auto *w : QApplication::topLevelWidgets())
+            if (auto *editor = dynamic_cast<Gate::PaletteEditor *>(w)) {
+                editor->showSampleToast();
+                QTimer::singleShot(600, qApp, [editor, file = step.mid(12)] {
+                    if (auto *t = editor->sampleToast()) t->grab().save(file);
+                });
+            }
     } else if (step.startsWith("palette:")) {
         // Cambia la paleta en vivo (lo mismo que hace el editor): «palette:» solo vuelve a la de fábrica.
         Gate::Palette::Data data = Gate::Palette::factory();

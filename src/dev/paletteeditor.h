@@ -26,6 +26,10 @@ class PaletteEditor final : public QWidget {
     // Al cerrar el editor (la app de desarrollo se cierra con él, no queda en la bandeja).
     std::function<void()> onClosed;
 
+    // Muestra un aviso de prueba (también para la QA: sampleToast() lo devuelve para capturarlo).
+    void showSampleToast();
+    QWidget *sampleToast() const;
+
   protected:
     void closeEvent(QCloseEvent *event) override;
 
@@ -35,7 +39,6 @@ class PaletteEditor final : public QWidget {
     void loadIndex(int index);
     void save();
     void pick(const QString &roleId, const QString &memberHex); // memberHex vacío: el base del grupo
-    void showSampleToast();
     void markDirty(bool dirty);
 
     QString folder_;

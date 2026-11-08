@@ -289,8 +289,8 @@ QString toastSheet() {
             border:1px solid %borderStrong%; border-radius:11px; padding:0 9px; }
         #accessToast QLabel#toastSuggestion[kind="block"] { color:%error%; border-color:%errBorder%;
             background:%errBg%; }
-        #accessToast QLabel#toastSuggestion[kind="allow"] { color:%okText%; border-color:%okBorder%;
-            background:%okBg%; }
+        #accessToast QLabel#toastSuggestion[kind="allow"] { color:%allow%; border-color:%allowBorder%;
+            background:%allowBg%; }
         #accessToast QLabel#toastWhat { font-size:13px; color:%textStrong%; }
         #accessToast QWidget#toastMoreLine { background:%divider%; }
         #accessToast QLabel#toastMoreHead { font-size:11px; font-weight:600; color:%textFaint%; }
@@ -317,9 +317,9 @@ QString toastSheet() {
             font-size:12.5px; font-weight:600; min-width:70px; max-width:70px; min-height:24px; max-height:24px; }
         #accessToast QPushButton#toastBlock { background:%errBg%; color:%error%; border:1px solid %errBorder%; }
         #accessToast QPushButton#toastBlock:hover { background:%blockHover%; border-color:%blockHoverBorder%; }
-        #accessToast QPushButton#toastAllow { background:%primary%; color:%onAccent%; border:1px solid %primaryBorder%; }
-        #accessToast QPushButton#toastAllow:hover { background:%primaryHover%; border-color:%primaryHoverBorder%; }
-        #accessToast QPushButton#toastAllow[rec="1"] { border-color:%primaryHoverBorder%; }
+        #accessToast QPushButton#toastAllow { background:%allowBg%; color:%allow%; border:1px solid %allowBorder%; }
+        #accessToast QPushButton#toastAllow:hover { background:%allowHover%; border-color:%allowHoverBorder%; }
+        #accessToast QPushButton#toastAllow[rec="1"] { border-color:%allowHoverBorder%; }
         #accessToast QPushButton#toastBlock[rec="1"] { border-color:%blockHoverBorder%; }
         #accessToast QPushButton#toastBlock:disabled, #accessToast QPushButton#toastAllow:disabled {
             background:%tile%; color:%textFaint%; border-color:%borderStrong%; }
@@ -349,6 +349,11 @@ QString toastSheet() {
         {"%primaryHover%", kPrimaryHover},
         {"%primaryHoverBorder%", kPrimaryHoverBorder},
         {"%onAccent%", kOnAccent},
+        {"%allow%", kAllow},
+        {"%allowBg%", kAllowBg},
+        {"%allowBorder%", kAllowBorder},
+        {"%allowHover%", kAllowHoverBg},
+        {"%allowHoverBorder%", kAllowHoverBorder},
         {"%okText%", kOkText},
         {"%okBg%", kOkBg},
         {"%okBorder%", kOkBorder},

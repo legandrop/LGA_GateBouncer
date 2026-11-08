@@ -1,0 +1,22 @@
+{
+    "colors": {
+        "accent": "#402491",
+        "border": "#2E2E36",
+        "card": "#1E1E23",
+        "control": "#2A2A31",
+        "desk": "#0D0D0F",
+        "error": "#F0645C",
+        "ink1": "#E3E1DA",
+        "ink2": "#C4C3C9",
+        "ink3": "#8C8B93",
+        "ink4": "#6E6D75",
+        "ok": "#4CC9EE",
+        "section": "#B75BFF",
+        "sheet": "#17171B",
+        "switch": "#4CC9EE",
+        "title": "#ECE9E2",
+        "warn": "#F2CB3F"
+    },
+    "liked": true,
+    "name": "Default 1"
+}

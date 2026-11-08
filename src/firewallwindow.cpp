@@ -118,21 +118,21 @@ QFrame[r="divider"] { background: #2A2A31; border: 0; }
 QFrame[r="seg"] { background: #15151A; border: 1px solid #2F2F37; border-radius: 7px; }
 QFrame#fwMessage { background: #1D1B2C; border: 1px solid #3A3466; border-radius: 8px; }
 QLabel[pill] { border-radius: 4px; padding: 0 8px; font-size: 12px; font-weight: 600; }
-QLabel[pill="allow"] { background: #0D2A33; border: 1px solid #24586A; color: #57CDEF; }
+QLabel[pill="allow"] { background: #0E2B1D; border: 1px solid #26603F; color: #5ACB8B; }
 QLabel[pill="block"] { background: #361B1D; border: 1px solid #6B2E31; color: #F0645C; }
 QLabel[pill="temp"] { background: #25223B; border: 1px solid #5243A8; color: #C5BBF4; }
 QLabel[pill="dest"] { background: #2A2A31; border: 1px solid #3A3A43; color: #C4C3C9; }
 QLabel[pill="none"] { background: transparent; border: 1px solid #3A3A43; color: #9C9BA2; }
 QLabel[hint] { border-radius: 11px; padding: 0 9px; font-size: 12px; font-weight: 600; }
 QLabel[hint="block"] { background: #361B1D; border: 1px solid #6B2E31; color: #F0645C; }
-QLabel[hint="allow"] { background: #0D2A33; border: 1px solid #24586A; color: #57CDEF; }
+QLabel[hint="allow"] { background: #0E2B1D; border: 1px solid #26603F; color: #5ACB8B; }
 QLabel[hint="either"] { background: transparent; border: 1px solid #3A3A43; color: #C4C3C9; }
 QLabel[hint="known"] { background: #25223B; border: 1px solid #5243A8; color: #C5BBF4; }
 QLabel[hint="none"] { background: transparent; border: 1px dashed #3A3A43; color: #8C8B93; }
 QLabel[chip] { border-radius: 4px; padding: 0 8px; font-size: 12px; font-weight: 600; }
 QLabel[chip="1"] { background: transparent; border: 1px solid #3A3A43; color: #9C9BA2; }
 QLabel[chip="wait"] { background: #F2CB3F; border: 1px solid #F2CB3F; color: #1C1606; }
-QLabel[chip="allow"] { background: #0D2A33; border: 1px solid #24586A; color: #57CDEF; }
+QLabel[chip="allow"] { background: #0E2B1D; border: 1px solid #26603F; color: #5ACB8B; }
 QLabel[chip="block"] { background: #361B1D; border: 1px solid #6B2E31; color: #F0645C; }
 QLabel[chip="mute"] { background: transparent; border: 1px solid #3A3A43; color: #9C9BA2; font-weight: 500; }
 QLabel[chip="warn"] { background: #F2CB3F; border: 0; color: #1C1606; }
@@ -149,11 +149,13 @@ QLabel#fwBadge { background: #F2CB3F; color: #1C1606; border-radius: 4px; font-s
 QPushButton { border: 1px solid #3A3A43; border-radius: 6px; background: #2A2A31; color: #E3E1DA; padding: 0 14px; min-height: 28px; font-size: 13px; font-weight: 500; }
 QPushButton:hover { background: #34343C; border: 1px solid #4A4A55; }
 QPushButton:disabled { background: #222227; border: 1px solid #2E2E36; color: #6E6D75; }
-QPushButton[k="primary"], QPushButton[k="allow"] { background: #443A91; border: 1px solid #5243A8; color: #DDDBEE; font-weight: 600; }
-QPushButton[k="primary"]:hover, QPushButton[k="allow"]:hover { background: #5446B4; border: 1px solid #7060D0; }
+QPushButton[k="primary"] { background: #443A91; border: 1px solid #5243A8; color: #DDDBEE; font-weight: 600; }
+QPushButton[k="allow"] { background: #0E2B1D; border: 1px solid #26603F; color: #5ACB8B; font-weight: 600; }
+QPushButton[k="primary"]:hover { background: #5446B4; border: 1px solid #7060D0; }
+QPushButton[k="allow"]:hover { background: #133A27; border: 1px solid #3AA36B; }
 QPushButton[k="block"] { background: #361B1D; border: 1px solid #6B2E31; color: #F0645C; font-weight: 600; }
 QPushButton[k="block"]:hover { background: #4A2326; border: 1px solid #8A3A3E; }
-QPushButton[k="allow"][rec="1"] { border: 1px solid #7060D0; }
+QPushButton[k="allow"][rec="1"] { border: 1px solid #3AA36B; }
 QPushButton[k="block"][rec="1"] { border: 1px solid #8A3A3E; }
 QPushButton[k="primary"]:disabled, QPushButton[k="allow"]:disabled, QPushButton[k="block"]:disabled { background: #222227; border: 1px solid #2E2E36; color: #6E6D75; }
 QPushButton[k="ghost"] { background: transparent; }
@@ -664,7 +666,7 @@ class RuleRowDelegate final : public QStyledItemDelegate {
         } else if (kind.startsWith("pill:") || kind == "chip") {
             static const QHash<QString, QStringList> colors{
                 // fondo, borde, texto (los de QLabel[pill=…] y QLabel[chip="1"])
-                {"pill:allow", {"#0D2A33", "#24586A", "#57CDEF"}}, {"pill:block", {"#361B1D", "#6B2E31", "#F0645C"}},
+                {"pill:allow", {"#0E2B1D", "#26603F", "#5ACB8B"}}, {"pill:block", {"#361B1D", "#6B2E31", "#F0645C"}},
                 {"pill:temp", {"#25223B", "#5243A8", "#C5BBF4"}},  {"pill:dest", {"#2A2A31", "#3A3A43", "#C4C3C9"}},
                 {"chip", {"", "#3A3A43", "#9C9BA2"}}};
             const QStringList c = colors.value(kind, colors.value("pill:dest"));

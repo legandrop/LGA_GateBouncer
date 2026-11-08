@@ -218,6 +218,8 @@ PaletteEditor::PaletteEditor(const QString &folder, QWidget *parent) : QWidget(p
 
 PaletteEditor::~PaletteEditor() { delete toast_.data(); }
 
+QWidget *PaletteEditor::sampleToast() const { return toast_.data(); }
+
 void PaletteEditor::closeEvent(QCloseEvent *event) {
     if (picker_) picker_->close();
     if (toast_) toast_->hide();

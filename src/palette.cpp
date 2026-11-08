@@ -30,9 +30,11 @@ const QVector<Role> kRoles = {
      {"#443A91", "#5243A8", "#5446B4", "#7060D0", "#9D8FE0", "#C5BBF4", "#A39DD0", "#DDDBEE", "#2A2552", "#25223B",
       "#1D1B2C", "#3A3466"}},
     {"switch", "Interruptores encendidos", "#4CC9EE", {}},
-    {"ok", "Funciona / permitido", "#4CC9EE", {"#4CC9EE", "#57CDEF", "#24586A", "#0D2A33"}},
+    {"ok", "Funciona: protección activa, firma válida, listo", "#4CC9EE", {"#4CC9EE", "#57CDEF", "#24586A", "#0D2A33"}},
     {"warn", "Pide atención", "#F2CB3F", {"#F2CB3F", "#5A4E26", "#1C1606"}},
-    {"error", "Bloqueado / error", "#F0645C", {"#F0645C", "#8A3A3E", "#6B2E31", "#4A2326", "#361B1D"}},
+    {"allow", "Permitir: botones, etiquetas y sugerencias", "#5ACB8B",
+     {"#5ACB8B", "#3AA36B", "#26603F", "#133A27", "#0E2B1D"}},
+    {"error", "Bloquear / error", "#F0645C", {"#F0645C", "#8A3A3E", "#6B2E31", "#4A2326", "#361B1D"}},
 };
 
 // Los tonos del interruptor encendido (theme.h), calculados dentro de «switch».
