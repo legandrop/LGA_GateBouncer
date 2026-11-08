@@ -4,6 +4,8 @@ release_repo: legandrop/LGA_GateBouncer
 tech_changelog: ChangeLog.md
 version_heading: "v{v}:"
 platforms: [win]
+languages: [es, en]
+en_from: "1.01"
 ---
 # What's new in LGA GateBouncer
 <!-- Editable while a version is unpublished. NOT append-only. Published versions are frozen. -->
@@ -12,8 +14,11 @@ platforms: [win]
 
 ## v1.01
 - [improved] Apps abre al instante, también la primera vez, y cambiar entre permitidas, bloqueadas y todas ya no se demora.
+  en: Apps opens instantly, even the first time, and switching between allowed, blocked and all no longer lags.
 - [improved] GateBouncer usa menos recursos mientras la ventana está cerrada y ocupa menos espacio en el disco.
-- [improved] Con la app en castellano, el aviso de actualización y su ventana también están en castellano.
+  en: GateBouncer uses fewer resources while its window is closed and takes up less disk space.
+- [improved] Con la app en castellano, el aviso de actualización y su ventana también están en castellano, y las novedades que muestra salen en el idioma que elegiste para GateBouncer.
+  en: With the app in Spanish, the update notice and its window are in Spanish too, and the what's new list they show is in the language you chose for GateBouncer.
 
 ## v1.00
 - [new] Primera versión de LGA GateBouncer: un firewall por aplicación para Windows que avisa cuando un programa sin regla quiere conectarse a internet y deja elegir Allow o Block desde el mismo aviso.
