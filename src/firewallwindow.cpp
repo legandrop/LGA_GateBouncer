@@ -2952,10 +2952,12 @@ QWidget *FirewallWindow::settingsPage() {
     auto *page = new QWidget;
     auto *l = column(page, 28, 12);
     l->setContentsMargins(28, 24, 28, 28);
-    l->addWidget(header(I18n::tr("Settings"), I18n::tr("Firewall mode, AI explanations, import and startup.")));
+    l->addWidget(header(I18n::tr("Settings"), I18n::tr("Firewall mode, updates, language, zoom, AI explanations and import.")));
     l->addSpacing(2);
     l->addWidget(how({I18n::tr("<b>Ask before unknown applications connect</b> is the switch of Protection: off, "
                                "everything without a rule connects."),
+                      I18n::tr("<b>App</b> looks for new versions at startup and every few hours, and sets the language "
+                               "and the zoom of this window."),
                       I18n::tr("<b>AI explanations</b> need your own key and your consent; they only explain, they "
                                "never allow or block."),
                       I18n::tr("<b>Import from NetLimiter</b> turns its rules for single applications into GateBouncer "

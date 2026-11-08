@@ -431,8 +431,11 @@ const QHash<QString, QString> &spanishTable() {
         E("No decisions since the engine started.", "Ninguna decisión desde que arrancó el motor."),
 
         // ---------- Ajustes: firewall
-        E("Firewall mode, AI explanations, import and startup.",
-          "Modo del firewall, explicaciones con IA, importación e inicio."),
+        E("Firewall mode, updates, language, zoom, AI explanations and import.",
+          "Modo del firewall, actualizaciones, idioma, zoom, explicaciones con IA e importación."),
+        E("<b>App</b> looks for new versions at startup and every few hours, and sets the language and the zoom of this "
+          "window.",
+          "<b>App</b> busca versiones nuevas al iniciar y cada pocas horas, y elige el idioma y el zoom de esta ventana."),
         E("<b>Ask before unknown applications connect</b> is the switch of Protection: off, everything without a rule "
           "connects.",
           "<b>Preguntar antes de que se conecten apps desconocidas</b> es el interruptor de Protección: apagado, se "
