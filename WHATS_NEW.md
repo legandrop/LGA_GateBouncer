@@ -1,5 +1,13 @@
 # What's new in LGA GateBouncer
 
+## v1.01 (2026-11-08)
+
+- **New:** Settings adds Colors: six palettes for the window and the notice, applied instantly and remembered.
+- **Improved:** Apps opens instantly, even the first time, and switching between allowed, blocked and all no longer lags.
+- **Improved:** GateBouncer uses fewer resources while its window is closed and takes up less disk space.
+- **Improved:** With the app in Spanish, the update notice and its window are in Spanish too, and the what's new list they show is in the language you chose for GateBouncer.
+- **Improved:** Allow has its own green across the window and the notice (buttons, Apps tags and the AI suggestion), just like Block has its red.
+
 ## v1.00 (2026-11-08)
 
 - **New:** Primera versión de LGA GateBouncer: un firewall por aplicación para Windows que avisa cuando un programa sin regla quiere conectarse a internet y deja elegir Allow o Block desde el mismo aviso.
