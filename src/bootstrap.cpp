@@ -22,6 +22,10 @@ bool initialize(QApplication &app) {
         if (family != loaded || !loaded.startsWith("Inter"))
             return false;
     }
+    // Títulos del Pliego (Bricolage Grotesque, tres pesos estáticos): optativos, sin ellos los títulos van en Inter.
+    for (const auto *name : {"BricolageGrotesque-SemiBold.ttf", "BricolageGrotesque-Bold.ttf",
+                             "BricolageGrotesque-ExtraBold.ttf"})
+        QFontDatabase::addApplicationFont(":/gatebouncer/resources/fonts/" + QString::fromLatin1(name));
     QFont font(family);
     font.setPixelSize(13);
     app.setFont(font);
@@ -29,14 +33,14 @@ bool initialize(QApplication &app) {
         return false;
     app.setWindowIcon(QIcon(":/gatebouncer/resources/icons/LGA_GateBouncer.png"));
     QPalette palette;
-    palette.setColor(QPalette::Window, QColor("#161616"));
-    palette.setColor(QPalette::Base, QColor("#1d1d1d"));
-    palette.setColor(QPalette::WindowText, QColor("#b2b2b2"));
-    palette.setColor(QPalette::Text, QColor("#b2b2b2"));
-    palette.setColor(QPalette::ButtonText, QColor("#b2b2b2"));
-    palette.setColor(QPalette::Button, QColor("#2a2a2a"));
-    palette.setColor(QPalette::Highlight, QColor("#393455"));
-    palette.setColor(QPalette::HighlightedText, QColor("#e6e6e6"));
+    palette.setColor(QPalette::Window, QColor("#17171B"));
+    palette.setColor(QPalette::Base, QColor("#15151A"));
+    palette.setColor(QPalette::WindowText, QColor("#C4C3C9"));
+    palette.setColor(QPalette::Text, QColor("#C4C3C9"));
+    palette.setColor(QPalette::ButtonText, QColor("#E3E1DA"));
+    palette.setColor(QPalette::Button, QColor("#2A2A31"));
+    palette.setColor(QPalette::Highlight, QColor("#25223B"));
+    palette.setColor(QPalette::HighlightedText, QColor("#ECE9E2"));
     app.setPalette(palette);
     app.setStyleSheet(R"(
         QWidget { color: #b2b2b2; font-family: 'Inter'; font-size: 13px; }

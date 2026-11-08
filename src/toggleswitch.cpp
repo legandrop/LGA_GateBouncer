@@ -1,4 +1,5 @@
 #include "toggleswitch.h"
+#include "theme.h"
 #include <QEasingCurve>
 #include <QEvent>
 #include <QHBoxLayout>
@@ -10,14 +11,14 @@
 #include <utility>
 
 namespace {
-// Colores del interruptor de Mighty Tools (Theme.h: kPrimary, kPrimaryBorder, kSwitchOff, kSwitchOffBorder,
-// kSwitchKnobOff, kSwitchKnobOn). El violeta prendido es el mismo del boton principal de GateBouncer.
-const QColor kOnFill("#443a91");
-const QColor kOnBorder("#5243a8");
-const QColor kOffFill("#2d2d33");
-const QColor kOffBorder("#3a3a44");
-const QColor kKnobOff("#7a7a80");
-const QColor kKnobOn("#dddbee");
+// Colores del interruptor del Pliego de Mighty Tools (Theme.h: kSwitchOn, kSwitchOnBorder, kSwitchOff,
+// kSwitchOffBorder, kSwitchKnobOff, kSwitchKnobOn): prendido es cian, el color de lo que funciona.
+const QColor kOnFill(Gate::Theme::kSwitchOn);
+const QColor kOnBorder(Gate::Theme::kSwitchOnBorder);
+const QColor kOffFill(Gate::Theme::kSwitchOff);
+const QColor kOffBorder(Gate::Theme::kSwitchOffBorder);
+const QColor kKnobOff(Gate::Theme::kSwitchKnobOff);
+const QColor kKnobOn(Gate::Theme::kSwitchKnobOn);
 // Deshabilitado: Mighty Tools no lo dibuja distinto; aca hay consentimientos que esperan un estado, asi que el
 // switch entero se atenua para que no parezca disponible.
 constexpr qreal kDisabledOpacity = 0.4;
@@ -34,10 +35,16 @@ ToggleSwitch::ToggleSwitch(QWidget *parent) : QAbstractButton(parent) {
     setCheckable(true);
     setFocusPolicy(Qt::NoFocus);
     setCursor(Qt::PointingHandCursor);
-    setFixedSize(30, 17);
+    setFixedSize(30, 16);
 }
 
-QSize ToggleSwitch::sizeHint() const { return QSize(30, 17); }
+QSize ToggleSwitch::sizeHint() const { return large_ ? QSize(42, 22) : QSize(30, 16); }
+
+void ToggleSwitch::setLarge(bool large) {
+    large_ = large;
+    setFixedSize(sizeHint());
+    update();
+}
 
 void ToggleSwitch::nextCheckState() {
     // Todo click del usuario pasa por aca (mouse, o click() desde el texto de su SwitchRow). Con el mouse, Qt
@@ -102,20 +109,24 @@ void ToggleSwitch::animateTo(qreal target) {
 }
 
 void ToggleSwitch::paintEvent(QPaintEvent *) {
-    // Caja 30 x 17 con borde de 1 y radio 8,5; perilla de 11 a 2 px del borde interno (left 3 apagado, left 16
-    // prendido). Durante la animacion los colores se mezclan por tint_ y la perilla va por knob_.
+    // Medidas del Pliego (`.sw`): caja de 30 x 16 (42 x 22 la grande) con borde de 1 y radio de media altura; la
+    // perilla es un círculo de 10 (14 en la grande) cuyo centro va de 8 a 22 (de 11 a 31 en la grande). Durante la
+    // animación los colores se mezclan por tint_ y la perilla va por knob_.
     QPainter painter(this);
     painter.setRenderHint(QPainter::Antialiasing, true);
     if (!isEnabled())
         painter.setOpacity(kDisabledOpacity);
     const QRectF box = QRectF(rect()).adjusted(0.5, 0.5, -0.5, -0.5);
+    const qreal radius = box.height() / 2.0;
     painter.setPen(QPen(mix(kOffBorder, kOnBorder, tint_), 1.0));
     painter.setBrush(mix(kOffFill, kOnFill, tint_));
-    painter.drawRoundedRect(box, 8.5, 8.5);
+    painter.drawRoundedRect(box, radius, radius);
     painter.setPen(Qt::NoPen);
     painter.setBrush(mix(kKnobOff, kKnobOn, tint_));
-    const qreal left = 1 + 2 + 13 * knob_;
-    painter.drawEllipse(QRectF(left, 1 + 2, 11, 11));
+    const qreal knob = large_ ? 7.0 : 5.0;
+    const qreal from = height() / 2.0;
+    const qreal to = width() - height() / 2.0;
+    painter.drawEllipse(QPointF(from + (to - from) * knob_, height() / 2.0), knob, knob);
 }
 
 // ------------------------------------------------------------------ SwitchRow

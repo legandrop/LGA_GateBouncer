@@ -14,6 +14,8 @@ class ToggleSwitch : public QAbstractButton {
   public:
     explicit ToggleSwitch(QWidget *parent = nullptr);
     QSize sizeHint() const override;
+    // La grande (42 x 22) va en el encabezado de una página, como el switch de una herramienta de Mighty Tools.
+    void setLarge(bool large);
 
   protected:
     void paintEvent(QPaintEvent *event) override;
@@ -25,6 +27,7 @@ class ToggleSwitch : public QAbstractButton {
 
     QVariantAnimation *anim_ = nullptr; // se crea con el primer click
     bool byUser_ = false;
+    bool large_ = false;
     qreal target_ = 0;  // hacia donde va la animacion en marcha
     qreal knob_ = 0;    // posicion de la perilla: 0 apagado, 1 prendido (con la curva)
     qreal tint_ = 0;    // mezcla de colores: 0 apagado, 1 prendido (lineal)

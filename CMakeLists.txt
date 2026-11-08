@@ -63,6 +63,7 @@ qt_add_library(GateBouncerGuiStage SHARED
     engine/folder_rule.h
     src/toggleswitch.cpp
     src/toggleswitch.h
+    src/theme.h
     src/productcontroller.cpp
     src/productcontroller.h
     src/engine/EngineViewClient.cpp
@@ -86,6 +87,9 @@ qt_add_resources(GateBouncerGuiStage "gatebouncer_assets"
         resources/fonts/Inter-Regular.ttf
         resources/fonts/Inter-Medium.ttf
         resources/fonts/Inter-SemiBold.ttf
+        resources/fonts/BricolageGrotesque-SemiBold.ttf
+        resources/fonts/BricolageGrotesque-Bold.ttf
+        resources/fonts/BricolageGrotesque-ExtraBold.ttf
         resources/icons/LGA_GateBouncer.png
         resources/icons/tray/tray_16.png
         resources/icons/tray/tray_20.png
@@ -177,6 +181,9 @@ qt_add_resources(GateBouncer "gatebouncer_app_assets"
         resources/fonts/Inter-Regular.ttf
         resources/fonts/Inter-Medium.ttf
         resources/fonts/Inter-SemiBold.ttf
+        resources/fonts/BricolageGrotesque-SemiBold.ttf
+        resources/fonts/BricolageGrotesque-Bold.ttf
+        resources/fonts/BricolageGrotesque-ExtraBold.ttf
         resources/icons/LGA_GateBouncer.png
         resources/icons/tray/tray_16.png
         resources/icons/tray/tray_20.png
