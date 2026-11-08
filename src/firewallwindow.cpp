@@ -3636,9 +3636,9 @@ QWidget *FirewallWindow::appCard() {
     auto *colors = new Combo;
     colors->setObjectName("app-palette");
     const QHash<QString, QString> paletteNames{
-        {"default-1", I18n::tr("Violet")},         {"default-2", I18n::tr("Plum")},
+        {"default-1", I18n::tr("Violet")},         {"default-2", I18n::tr("Magenta")},
         {"alto-contraste", I18n::tr("High contrast")}, {"grafito-ambar", I18n::tr("Graphite and amber")},
-        {"niebla", I18n::tr("Mist")},               {"pizarra-turquesa", I18n::tr("Warm slate and teal")}};
+        {"niebla", I18n::tr("Mist")},               {"pizarra-turquesa", I18n::tr("Warm and teal")}};
     for (const QString &id : Palette::presetIds()) colors->addItem(paletteNames.value(id, id), id);
     colors->setCurrentIndex(qMax(0, colors->findData(Palette::savedPreset())));
     colors->setFixedWidth(210);

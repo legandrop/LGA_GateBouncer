@@ -1,24 +1,24 @@
 {
+    "name": "Magenta",
+    "liked": true,
     "colors": {
-        "accent": "#8E2BAD",
-        "allow": "#5ACB8B",
-        "border": "#2E2E36",
+        "desk": "#0D0D0F",
+        "sheet": "#17171B",
         "card": "#1E1E23",
         "control": "#2A2A31",
-        "desk": "#0D0D0F",
-        "error": "#F0645C",
+        "border": "#2E2E36",
+        "title": "#ECE9E2",
+        "section": "#D95BE8",
         "ink1": "#E3E1DA",
         "ink2": "#C4C3C9",
         "ink3": "#8C8B93",
         "ink4": "#6E6D75",
-        "ok": "#4CC9EE",
-        "section": "#B75BFF",
-        "sheet": "#17171B",
-        "chosen": "#4A3F9E",
+        "accent": "#8E2BAD",
+        "chosen": "#8A3E9D",
         "switch": "#4CC9EE",
-        "title": "#ECE9E2",
-        "warn": "#F2CB3F"
-    },
-    "liked": true,
-    "name": "Default 2"
+        "ok": "#4CC9EE",
+        "warn": "#F2CB3F",
+        "allow": "#5ACB8B",
+        "error": "#F0645C"
+    }
 }
