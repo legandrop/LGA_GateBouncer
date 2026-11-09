@@ -1,5 +1,12 @@
 # What's new in LGA GateBouncer
 
+## v1.02 (2026-11-09)
+
+- **New:** Settings adds Rules: Export rules saves your rules to a file, complete as a backup before reinstalling Windows or only the portable ones to share with someone else, and Import rules adds them showing first what comes in and what clashes with yours.
+- **New:** Clean up rules suggests removing rules for programs and folders that are gone, and for installers and apps that have not tried to connect in a long time, with an automatic backup before removing.
+- **Improved:** A rule for a program that is not installed yet applies by itself when the program appears.
+- **Fixed:** A program inside a trusted folder no longer asks for each new server when it also has rules for some servers: the folder decides the ones without a rule.
+
 ## v1.01 (2026-11-08)
 
 - **New:** Settings adds Colors: six palettes for the window and the notice, applied instantly and remembered.
