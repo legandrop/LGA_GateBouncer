@@ -30,6 +30,10 @@ constexpr std::size_t SignerCacheLimit = 2000;
 
 std::uint8_t weightFor(Action action) { return action == Action::Allow ? WeightAllowRule : WeightBlockRule; }
 
+// Quién puede ser dueña de un permiso de destino: una regla por destino, o una carpeta de confianza que decidió un
+// servidor que ninguna regla por destino de la app nombraba.
+bool grantOwner(const Rule &rule) { return !rule.destination.empty() || rule.scope == Scope::Folder; }
+
 std::string toUtf8(const std::wstring &w) {
     if (w.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr, nullptr);
@@ -252,12 +256,12 @@ bool FirewallCore::start(std::wstring &error) {
     // verificar; los que la app no usó en una semana no vuelven.
     for (auto it = grants_.begin(); ok && it != grants_.end();) {
         const auto rule = rules_.find(it->second.ruleKey);
-        const bool verify = rule != rules_.end() && rule->second.scope != Scope::Path && rule->second.action == Action::Allow;
-        if (rule == rules_.end() || rule->second.destination.empty() ||
+        const bool verify = rule != rules_.end() && rule->second.scope != Scope::Path &&
+                            (rule->second.action == Action::Allow || rule->second.scope == Scope::Folder);
+        if (rule == rules_.end() || !grantOwner(rule->second) ||
             (rules_.count(key(it->second.path)) && rule->second.action == Action::Allow) ||
             now() - it->second.lastSeen > GrantIdleSeconds || !isFile(it->second.path) ||
-            (verify && (!stampOf(it->second.path, it->second.stamp) ||
-                        !matches(rule->second, it->second.path, signerOf(it->second.path))))) {
+            (verify && (!stampOf(it->second.path, it->second.stamp) || !coverValid(rule->second, it->second.path)))) {
             it = grants_.erase(it);
             continue;
         }
@@ -448,10 +452,12 @@ bool FirewallCore::grant(const std::wstring &path, const std::wstring &address, 
     const auto rk = ruleKey(rule);
     const auto old = grants_.find(gk);
     if (old != grants_.end() && !old->second.filters.empty()) {
-        // Ya está, o una IP compartida por dos destinos (una CDN): si uno la bloqueó, sigue bloqueada.
+        // Ya está, o una IP compartida por dos destinos (una CDN): si uno la bloqueó, sigue bloqueada. Un Block puesto
+        // por una carpeta (el servidor no tenía regla) sí cede ante una regla que nombra el servidor.
         const bool same = old->second.ruleKey == rk && old->second.action == rule.action;
+        const auto oldOwner = rules_.find(old->second.ruleKey);
         const bool keepBlock = old->second.action == Action::Block && rule.action == Action::Allow &&
-                               rules_.count(old->second.ruleKey);
+                               oldOwner != rules_.end() && oldOwner->second.scope != Scope::Folder;
         if (same || keepBlock) {
             old->second.lastSeen = now();
             return true;
@@ -496,6 +502,33 @@ void FirewallCore::eraseGrantsOf(const std::wstring &rk) {
         return;
     }
     for (auto g = grants_.begin(); g != grants_.end();) g = g->second.ruleKey == rk ? grants_.erase(g) : std::next(g);
+}
+
+bool FirewallCore::mayBelongTo(const Rule &rule, const std::wstring &path) {
+    if (rule.scope == Scope::Path) return key(rule.path) == key(path);
+    if (rule.scope == Scope::App) return rule.name == fileName(path);
+    return rule.scope == Scope::Publisher;
+}
+
+void FirewallCore::releaseFolderGrants(const std::function<bool(const Grant &)> &which) {
+    std::vector<std::wstring> gone;
+    for (const auto &[gk, g] : grants_) {
+        const auto owner = rules_.find(g.ruleKey);
+        if (owner != rules_.end() && owner->second.scope == Scope::Folder && which(g)) gone.push_back(gk);
+    }
+    if (gone.empty()) return;
+    std::wstring error;
+    if (!wfp_.begin(error)) {
+        lastError_ = L"Could not withdraw folder destination permits: " + error;
+        return;
+    }
+    for (const auto &gk : gone)
+        for (auto id : grants_.at(gk).filters) wfp_.removeFilter(id);
+    if (!wfp_.commit(error)) {
+        lastError_ = L"Could not withdraw folder destination permits: " + error;
+        return;
+    }
+    for (const auto &gk : gone) grants_.erase(gk);
 }
 
 void FirewallCore::erasePendingOf(const std::wstring &pathKey) {
@@ -812,6 +845,12 @@ bool FirewallCore::decideDestination(const std::wstring &path, Action action, Sc
         ++destinationRules_;
     }
     rules_[rk] = rule;
+    // Una carpeta pudo haber decidido ya este servidor (no tenía regla): ahora lo decide esta regla. Un nombre que la
+    // caché todavía no tiene también se suelta, por si es ese.
+    releaseFolderGrants([&](const Grant &g) {
+        const std::wstring host = dns_.nameFor(g.address, key(g.path));
+        return mayBelongTo(rule, g.path) && (host.empty() || destinationMatch(dest, host, g.address));
+    });
     // Pendientes que esta regla resuelve. El de la app decidida recibe el permiso ya (su firma se acaba de verificar);
     // los de otras rutas de la misma identidad se cubren en su próximo intento, con la firma verificada entonces.
     for (auto p = pending_.begin(); p != pending_.end();) {
@@ -929,6 +968,25 @@ bool FirewallCore::decideFolder(const std::wstring &folder, const std::wstring &
         if (old != covered_.end())
             for (auto id : old->second.filters) wfp_.removeFilter(id);
     }
+    // Los servidores que esta carpeta ya decidió (apps en modo por destino) pasan a la acción nueva; los de un archivo
+    // que ya no está se retiran.
+    std::map<std::wstring, std::vector<std::uint64_t>> freshGrants;
+    std::vector<std::wstring> goneGrants;
+    for (const auto &[gk, g] : grants_) {
+        if (g.ruleKey != rk || g.action == action) continue;
+        if (isFile(g.path)) {
+            auto &ids = freshGrants[gk];
+            if (!wfp_.addAppAddressFilter(g.path, g.address, action,
+                                          action == Action::Allow ? WeightAllowDestination : WeightBlockDestination, ids,
+                                          error)) {
+                wfp_.abort();
+                return false;
+            }
+        } else {
+            goneGrants.push_back(gk);
+        }
+        for (auto id : g.filters) wfp_.removeFilter(id);
+    }
     if (!wfp_.commit(error)) return false;
     for (const auto &[tk, target] : targets) {
         Covered c{target.first, rk, fresh[tk]};
@@ -936,6 +994,17 @@ bool FirewallCore::decideFolder(const std::wstring &folder, const std::wstring &
         covered_[tk] = c;
         erasePendingOf(tk);
     }
+    for (auto &[gk, ids] : freshGrants) {
+        auto &g = grants_.at(gk);
+        g.filters = std::move(ids);
+        g.action = action;
+    }
+    for (const auto &gk : goneGrants) grants_.erase(gk);
+    // Servidores que otra carpeta decidió para un exe dentro de ésta: si ésta le gana (más profunda, o la misma con el
+    // nombre del exe), los decide ella en el próximo intento. Por texto, sin tocar el disco: de más sólo se decide de
+    // nuevo.
+    const std::wstring prefix = key(rule.path) + L"\\";
+    releaseFolderGrants([&](const Grant &g) { return g.ruleKey != rk && key(g.path).rfind(prefix, 0) == 0; });
     rules_[rk] = rule;
     updateWatches();
     addActivity({now(), L"",
@@ -982,8 +1051,12 @@ bool FirewallCore::dropRule(std::map<std::wstring, Rule>::iterator it, const std
         if (!wfp_.commit(error)) return false;
         for (auto g = grants_.begin(); g != grants_.end();) g = g->second.ruleKey == it->first ? grants_.erase(g) : std::next(g);
         addActivity({now(), it->second.path, reason + L": " + describe(it->second), L"", 0, 0});
+        const Rule gone = it->second;
         rules_.erase(it);
         --destinationRules_;
+        // Lo que una carpeta decidió mientras la app estaba en modo por destino: si sale de ese modo (una regla de la
+        // app entera, o ya no le queda ninguna por destino), un Block de carpeta pesaría más que su regla nueva.
+        releaseFolderGrants([&](const Grant &g) { return mayBelongTo(gone, g.path); });
         return true;
     }
     if (it->second.scope == Scope::Path) {
@@ -993,8 +1066,13 @@ bool FirewallCore::dropRule(std::map<std::wstring, Rule>::iterator it, const std
         for (const auto &[ck, c] : covered_)
             if (c.ruleKey == it->first)
                 for (auto fid : c.filters) wfp_.removeFilter(fid);
+        // Una carpeta también decidió servidores de apps en modo por destino: esas IPs vuelven a preguntar.
+        for (const auto &[gk, g] : grants_)
+            if (g.ruleKey == it->first)
+                for (auto fid : g.filters) wfp_.removeFilter(fid);
     }
     if (!wfp_.commit(error)) return false;
+    for (auto g = grants_.begin(); g != grants_.end();) g = g->second.ruleKey == it->first ? grants_.erase(g) : std::next(g);
     // Lo que soltó pasa enseguida a la regla que le toque (una carpeta de más arriba, una de firma): con «Ask» apagado
     // su próximo intento no se bloquea y nunca llegaría a decidirse.
     std::vector<std::wstring> released;
@@ -1220,25 +1298,28 @@ void FirewallCore::recheckCoverage(bool full) {
         save(error);
     }
     // Lo mismo para los permisos de destino de reglas por firma que permiten.
+    // También los de una carpeta: el archivo tiene que seguir adentro.
     std::vector<std::pair<std::wstring, Seen>> grants;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto &[gk, g] : grants_) {
             const auto rule = rules_.find(g.ruleKey);
-            if (!g.filters.empty() && g.action == Action::Allow && rule != rules_.end() && rule->second.scope != Scope::Path)
-                grants.push_back({gk, {g.path, g.ruleKey, g.stamp}});
+            // Los Block de una carpeta también: un exe que salió de ella no sigue con su decisión.
+            if (!g.filters.empty() && rule != rules_.end() && rule->second.scope != Scope::Path &&
+                (g.action == Action::Allow || rule->second.scope == Scope::Folder))
+                grants.push_back({gk, {g.path, g.ruleKey, g.stamp, rule->second}});
         }
     }
     for (const auto &[gk, s] : grants) {
         FileStamp stamp;
         const bool present = stampOf(s.path, stamp);
         if (present && !full && stamp == s.stamp) continue;
-        const std::wstring signer = present ? signerOf(s.path) : std::wstring();
+        const bool valid = present && coverValid(s.rule, s.path);
         std::lock_guard<std::mutex> lock(mutex_);
         const auto g = grants_.find(gk);
         const auto rule = rules_.find(s.ruleKey);
         if (g == grants_.end() || g->second.ruleKey != s.ruleKey || rule == rules_.end()) continue;
-        if (present && matches(rule->second, s.path, signer)) {
+        if (valid) {
             g->second.stamp = stamp;
             continue;
         }
@@ -1666,15 +1747,28 @@ void FirewallCore::classifyDestination(const DropEvent &drop, const std::wstring
     if (address.empty()) return;
     const std::wstring host = dns_.nameFor(address, k);
     // Un Allow por firma se verifica de nuevo sobre el archivo actual antes de abrir nada.
-    bool needFresh = false, any = false;
+    bool needFresh = false, any = false, folders = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         const Rule *r = destinationRuleFor(drop.appPath, cached, host, address, any);
         needFresh = r && r->action == Action::Allow && r->scope != Scope::Path;
+        // Un destino que ninguna regla nombra lo decide la carpeta de confianza que tenga al exe (va última, como en
+        // classify): se mira dónde está el archivo de verdad, sin el mutex.
+        folders = !r && any && hasFolderRules();
     }
     FileStamp stamp;
     std::wstring signer = cached;
-    if (needFresh) signer = stampOf(drop.appPath, stamp) ? signerOf(drop.appPath) : std::wstring();
+    bool stamped = false;
+    if (needFresh) {
+        stamped = stampOf(drop.appPath, stamp);
+        signer = stamped ? signerOf(drop.appPath) : std::wstring();
+    }
+    FinalPath place;
+    bool placed = false;
+    if (folders) {
+        if (!needFresh) stamped = stampOf(drop.appPath, stamp);
+        placed = stamped && placeOf(drop.appPath, place);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     const auto rule = rules_.find(k);
     if (rule != rules_.end() && !rule->second.filters.empty()) return;
@@ -1697,6 +1791,22 @@ void FirewallCore::classifyDestination(const DropEvent &drop, const std::wstring
             return;
         }
         lastError_ = L"Could not apply " + describe(*r) + L": " + error;
+    } else if (any && placed) {
+        // Ninguna regla por destino nombra este servidor: decide la carpeta de confianza, sólo para esta dirección. Las
+        // decisiones por servidor siguen mandando: si el nombre aparece después y una regla lo nombra, su permiso
+        // reemplaza a este (applyHint).
+        if (const Rule *byFolder = folderRuleFor(place, folderNameKey(place.dos))) {
+            std::wstring error;
+            bool added = false;
+            if (grant(drop.appPath, address, *byFolder, stamp, error, &added)) {
+                pending_.erase(k + DestinationSeparator + address);
+                addGrantActivity(t, drop.appPath, address, *byFolder, drop.remoteAddress, drop.remotePort,
+                                 drop.protocol);
+                if (added) save(error);
+                return;
+            }
+            lastError_ = L"Could not apply " + describe(*byFolder) + L": " + error;
+        }
     }
     // Destino nuevo: un pendiente por dirección. Si la app ya no está en modo por destino (la regla se quitó en el
     // medio), pregunta por la app entera.
@@ -1898,7 +2008,7 @@ void FirewallCore::load() {
         if (rules_.count(c.ruleKey)) covered_[key(c.path)] = std::move(c);
     for (auto &g : grantList) {
         const auto rule = rules_.find(g.ruleKey);
-        if (rule == rules_.end() || rule->second.destination.empty()) continue;
+        if (rule == rules_.end() || !grantOwner(rule->second)) continue;
         g.action = rule->second.action;
         grants_[key(g.path) + DestinationSeparator + g.address] = std::move(g);
     }

@@ -12,6 +12,10 @@ en_from: "1.01"
 
 ## Unreleased
 
+## v1.02
+- [fixed] Un programa dentro de una carpeta de confianza ya no pide permiso para cada servidor nuevo cuando, además, tiene reglas para algunos servidores: los que no tienen regla los decide la carpeta.
+  en: A program inside a trusted folder no longer asks for each new server when it also has rules for some servers: the folder decides the ones without a rule.
+
 ## v1.01
 - [improved] Apps abre al instante, también la primera vez, y cambiar entre permitidas, bloqueadas y todas ya no se demora.
   en: Apps opens instantly, even the first time, and switching between allowed, blocked and all no longer lags.

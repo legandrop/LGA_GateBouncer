@@ -48,7 +48,14 @@ other driverless Windows firewalls.
   folder rule, or the same folder naming the executable), it takes over the files a folder rule had covered right away,
   with its own action; for a signature rule the signature is verified again on the file first. Destination rules for
   the same app release the file, so that its next attempt is decided per destination; with **Ask** turned off a
-  covered Block is kept instead (nothing would block that attempt) until Ask is on again. A folder on a volume mounted in
+  covered Block is kept instead (nothing would block that attempt) until Ask is on again. In that per-destination mode
+  the folder still decides the servers that no destination rule names: a blocked attempt to such a server, once its
+  name had time to arrive, gets a permit for that address with the folder's action instead of a request, so a trusted
+  folder never asks again for a program that has rules for a few servers. A destination rule that names the server
+  wins, also when its name arrives after the permit or the rule is saved later. These permits are rechecked like
+  covered paths (a file that left the folder loses them), follow the folder rule when its action changes and are
+  withdrawn with it, and also when another rule takes over (a destination rule for that server, the app leaving the
+  per-destination mode, a folder rule that wins); the next attempt is then decided again. A folder on a volume mounted in
   another folder is refused, because WFP reports its programs without a drive letter. The engine also watches each
   folder with a folder rule (`ReadDirectoryChangesW`, up to 60 folders): when an executable is created, rewritten or
   renamed into it, it is covered 1.5 seconds after it stops changing, with the same checks and precedence as a blocked

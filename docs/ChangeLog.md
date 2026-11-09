@@ -1,5 +1,13 @@
 # ChangeLog de LGA GateBouncer
 
+v1.02:
+- Una app en modo por destino (reglas por servidor atadas a su firma, como `python.exe`) pedía permiso por cada
+  servidor nuevo aunque estuviera dentro de una carpeta de confianza: la carpeta se consultaba sólo si la app no tenía
+  ninguna otra regla. Ahora, en `classifyDestination`, un servidor que ninguna regla por destino nombra lo decide la
+  carpeta que tenga al exe, con un permiso para esa dirección cuyo dueño es la regla de carpeta. Las reglas que nombran
+  el servidor siguen ganando, también si el nombre llega después o la regla se crea después. Esos permisos se
+  verifican, guardan, rehacen al cambiar la acción y se retiran con la carpeta, o cuando pasa a decidir otra regla.
+
 v1.01:
 - Apps tardaba 1,5 s la primera vez y ~200 ms por filtro: armaba un widget por fila y le pedía a Windows el ícono de
   cada programa en el hilo de la interfaz. Ahora un delegado pinta las filas, los íconos llegan desde un hilo propio

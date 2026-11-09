@@ -28,6 +28,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -225,6 +226,12 @@ class FirewallCore {
     bool grant(const std::wstring &path, const std::wstring &address, const Rule &rule, const FileStamp &stamp,
                std::wstring &error, bool *changed = nullptr);
     void eraseGrantsOf(const std::wstring &ruleKey);
+    // Retira los permisos de destino que puso una carpeta y cumplen `which`: cambió quién decide esos servidores (una
+    // regla por destino nueva, la app que sale del modo por destino, otra carpeta). El próximo intento se decide de
+    // nuevo. Con mutex_ tomado y fuera de otra transacción de WFP.
+    void releaseFolderGrants(const std::function<bool(const Grant &)> &which);
+    // La ruta puede ser de la identidad de la regla, sin mirar la firma (de más no rompe nada: sólo se decide de nuevo).
+    static bool mayBelongTo(const Rule &rule, const std::wstring &path);
     // Quita las reglas por destino de una identidad (cuando se decide sobre la app entera). Con mutex_ tomado.
     void dropDestinationRulesOf(const std::wstring &identity);
     void erasePendingOf(const std::wstring &pathKey);
