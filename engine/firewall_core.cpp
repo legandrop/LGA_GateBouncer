@@ -1,6 +1,8 @@
 #include "firewall_core.h"
 #include "destination_match.h"
 #include "signature.h"
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -27,6 +29,11 @@ constexpr std::size_t ActivityLimit = 2000;
 constexpr std::size_t PendingLimit = 500;
 constexpr std::size_t VerifyQueueLimit = 1000;
 constexpr std::size_t SignerCacheLimit = 2000;
+// Último uso: las conexiones abiertas se miran cada minuto y usage.tsv se escribe cada diez si cambió.
+constexpr auto UsagePoll = std::chrono::seconds(60);
+constexpr auto UsageSave = std::chrono::minutes(10);
+constexpr std::size_t UsageLimit = 20000;
+constexpr std::int64_t UsageKeepSeconds = 400LL * 24 * 3600;
 
 std::uint8_t weightFor(Action action) { return action == Action::Allow ? WeightAllowRule : WeightBlockRule; }
 
@@ -200,6 +207,7 @@ std::int64_t FirewallCore::now() {
 bool FirewallCore::start(std::wstring &error) {
     std::lock_guard<std::mutex> lock(mutex_);
     load();
+    loadUsage();
     if (!wfp_.open(options_.dynamic, error) || !wfp_.ensureObjects(error)) return false;
     // Un arranque reconstruye todo desde las reglas guardadas en UNA transacción: si algo falla, quedan los filtros
     // anteriores tal cual y nunca un bloqueo general sin sus permisos de base.
@@ -212,7 +220,7 @@ bool FirewallCore::start(std::wstring &error) {
         if (!ok) break;
         if (rule.scope != Scope::Path || !rule.destination.empty()) continue;
         // Un ejecutable que ya no existe (desinstalado, actualizado, disco sin montar) no frena el arranque:
-        // su regla queda guardada y, mientras falte, esa ruta vuelve a preguntar.
+        // su regla queda guardada sin filtro y lo toma en el primer intento del exe, cuando vuelva (classify).
         if (!isFile(rule.path)) {
             ++skipped;
             continue;
@@ -332,6 +340,7 @@ void FirewallCore::stop() {
     verifyWake_.notify_all();
     if (verifyThread_.joinable()) verifyThread_.join();
     dns_.stop();
+    saveUsage();
     wfp_.close();
     std::lock_guard<std::mutex> lock(mutex_);
     // El último uso de los permisos de destino sólo se guarda con otros cambios: al cerrar se deja al día, así un
@@ -540,6 +549,8 @@ void FirewallCore::erasePendingOf(const std::wstring &pathKey) {
 
 void FirewallCore::onResolved(const std::wstring &app, const std::wstring &host,
                               const std::vector<std::wstring> &addresses) {
+    // La app resolvió un nombre: intenta conectarse (último uso de sus reglas, para depurar las que no se usan).
+    noteUse(app, now());
     // Hilo de ETW: sólo se encola. Sin reglas por destino no hace falta mirar el DNS.
     if (destinationRules_ <= 0) return;
     {
@@ -1040,6 +1051,166 @@ bool FirewallCore::removeRule(const std::wstring &id, std::wstring &error) {
     return dropRule(it, L"Rule removed", error) && save(error);
 }
 
+bool FirewallCore::importRule(Action action, Scope scope, const std::wstring &signer, const std::wstring &name,
+                              const std::wstring &path, const std::wstring &destination, bool replace,
+                              std::wstring &error) {
+    for (const auto *field : {&signer, &name, &path, &destination})
+        if (field->find(L'\0') != std::wstring::npos) {
+            error = L"Invalid character in the rule";
+            return false;
+        }
+    Rule rule;
+    rule.scope = scope;
+    rule.action = action;
+    if (!destination.empty()) {
+        rule.destination = normalizeDestination(destination);
+        if (rule.destination.empty()) {
+            error = L"Invalid destination: use a server name, *.domain or an IP address";
+            return false;
+        }
+    }
+    if (scope == Scope::Path) {
+        // Una ruta absoluta con letra de unidad, como las que informa WFP. El archivo puede no estar todavía.
+        if (path.size() < 4 || !std::iswalpha(path[0]) || path[1] != L':' || path[2] != L'\\' ||
+            path.find_first_of(L"\t\r\n|*?\"<>") != std::wstring::npos || path.find(L':', 2) != std::wstring::npos) {
+            error = L"Invalid application path";
+            return false;
+        }
+        rule.path = path;
+    } else if (scope == Scope::App || scope == Scope::Publisher) {
+        if (signer.empty() || signer.size() > 512 || signer.find_first_of(L"\t\r\n|") != std::wstring::npos) {
+            error = L"Invalid signer";
+            return false;
+        }
+        if (scope == Scope::Publisher && !publisherRuleAllowed(signer)) {
+            error = L"All apps from " + signer + L" would include Windows tools. Use This app, any version.";
+            return false;
+        }
+        rule.signer = signer;
+        if (scope == Scope::App) {
+            const std::wstring n = fileName(name);
+            if (n.empty() || n.size() > 255 || n.find_first_of(L"\\/:*?\"<>|\t\r\n") != std::wstring::npos) {
+                error = L"Invalid program name";
+                return false;
+            }
+            rule.name = n;
+        }
+    } else {
+        error = L"Folder rules are imported with FOLDER";
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto rk = ruleKey(rule);
+    const auto existing = rules_.find(rk);
+    if (existing != rules_.end() && existing->second.action == action && existing->second.expires == 0) {
+        error = L"exists";
+        return false;
+    }
+    // Lo que esta regla reemplazaría: la misma con otra acción, la app entera de la identidad (si es por destino) o sus
+    // reglas por destino (si es de la app entera). La misma con la misma acción pero temporal no choca: pasa a
+    // permanente.
+    const std::wstring identity = identityKey(rule);
+    const Rule *mine = existing != rules_.end() && existing->second.action != action ? &existing->second : nullptr;
+    if (!mine && !rule.destination.empty()) {
+        const auto whole = rules_.find(identity);
+        if (whole != rules_.end()) mine = &whole->second;
+    }
+    if (!mine && rule.destination.empty())
+        for (const auto &[k, r] : rules_)
+            if (!r.destination.empty() && identityKey(r) == identity) {
+                mine = &r;
+                break;
+            }
+    if (mine && !replace) {
+        error = L"conflict: " + std::wstring(mine->action == Action::Allow ? L"Allow " : L"Block ") + describe(*mine);
+        return false;
+    }
+    rule.created = now();
+    rule.lastBlock = existing != rules_.end() ? existing->second.lastBlock : 0;
+    if (!rule.destination.empty()) {
+        const auto whole = rules_.find(identity);
+        if (whole != rules_.end() && !dropRule(whole, L"Rule replaced by an imported rule", error)) return false;
+        if (existing != rules_.end())
+            eraseGrantsOf(rk); // otra acción: los permisos por IP se rehacen en el próximo intento
+        else
+            ++destinationRules_;
+        rules_[rk] = rule;
+        releaseFolderGrants([&](const Grant &g) { return mayBelongTo(rule, g.path); });
+    } else if (scope == Scope::Path) {
+        const auto k = key(path);
+        Rule fresh = rule;
+        // Regla nueva y retiro de la vieja (y de la cobertura que esa ruta tuviera) en una sola transacción. Si el exe
+        // no está, la regla queda sin filtro y lo toma en su primer intento (classify).
+        if (!wfp_.begin(error)) return false;
+        std::wstring filterError;
+        if (!wfp_.addAppFilter(fresh.path, action, Direction::Outbound, weightFor(action), fresh.filters, filterError)) {
+            if (filterError.rfind(L"FwpmGetAppIdFromFileName0", 0) != 0) {
+                wfp_.abort();
+                error = filterError;
+                return false;
+            }
+            fresh.filters.clear();
+        }
+        if (existing != rules_.end())
+            for (auto id : existing->second.filters) wfp_.removeFilter(id);
+        const auto cov = covered_.find(k);
+        if (cov != covered_.end())
+            for (auto id : cov->second.filters) wfp_.removeFilter(id);
+        if (!wfp_.commit(error)) return false;
+        if (cov != covered_.end()) covered_.erase(cov);
+        rules_[k] = fresh;
+        dropDestinationRulesOf(k);
+        erasePendingOf(k);
+    } else {
+        // Firma sin destino: los archivos que la regla ya cubría (otra acción) se rehacen; los demás se cubren en su
+        // próximo intento, con la firma verificada entonces.
+        std::map<std::wstring, std::vector<std::uint64_t>> fresh;
+        if (!wfp_.begin(error)) return false;
+        for (const auto &[ck, c] : covered_) {
+            if (c.ruleKey != rk) continue;
+            if (!wfp_.addAppFilter(c.path, action, Direction::Outbound, weightFor(action), fresh[ck], error)) {
+                if (error.rfind(L"FwpmGetAppIdFromFileName0", 0) != 0) {
+                    wfp_.abort();
+                    return false;
+                }
+                error.clear();
+                fresh[ck].clear(); // el archivo ya no está: se retira abajo
+            }
+            for (auto id : c.filters) wfp_.removeFilter(id);
+        }
+        if (!wfp_.commit(error)) return false;
+        error.clear();
+        for (auto &[ck, ids] : fresh) {
+            if (ids.empty())
+                covered_.erase(ck);
+            else
+                covered_[ck].filters = std::move(ids);
+        }
+        rules_[rk] = rule;
+        dropDestinationRulesOf(rk);
+    }
+    // Pedidos que esta regla resuelve: salen de la lista y se deciden en su próximo intento (la firma del pedido se
+    // verifica de nuevo entonces), como con decide().
+    for (auto p = pending_.begin(); p != pending_.end();) {
+        const auto pk = key(p->second.path);
+        bool resolved = false;
+        if (rule.destination.empty()) {
+            resolved = scope == Scope::Path ? pk == key(path)
+                                            : !rules_.count(pk) && matches(rule, p->second.path, p->second.signer);
+        } else if (identityMatches(rule, p->second.path, p->second.signer)) {
+            const std::wstring address = DnsNames::normalize(p->second.remoteAddress);
+            const std::wstring host = p->second.host.empty() ? dns_.nameFor(address, pk) : p->second.host;
+            resolved = p->second.perDestination && destinationMatch(rule.destination, host, address);
+        }
+        p = resolved ? pending_.erase(p) : std::next(p);
+    }
+    addActivity({now(), rule.path,
+                 (action == Action::Allow ? L"Rule imported: Allow " : L"Rule imported: Block ") + describe(rule), L"", 0,
+                 0});
+    requestCoverageReview();
+    return save(error);
+}
+
 bool FirewallCore::dropRule(std::map<std::wstring, Rule>::iterator it, const std::wstring &reason, std::wstring &error) {
     // Todo en una transacción: si falla, la regla queda entera y se reintenta después.
     if (!wfp_.begin(error)) return false;
@@ -1139,6 +1310,7 @@ void FirewallCore::expireRules() {
 
 void FirewallCore::onDrop(const DropEvent &drop) {
     if (drop.appPath.empty()) return;
+    noteUse(drop.appPath, fileTimeToUnix(drop.time)); // antes de mutex_: no hace falta tenerlo para anotar
     std::lock_guard<std::mutex> lock(mutex_);
     const auto k = key(drop.appPath);
     const auto t = fileTimeToUnix(drop.time);
@@ -1175,8 +1347,8 @@ void FirewallCore::onDrop(const DropEvent &drop) {
         return;
     }
     if (std::find(askFilters_.begin(), askFilters_.end(), drop.filterId) == askFilters_.end()) return;
-    // Carrera: la regla se guardó mientras el aviso viajaba. Una regla sin filtros es la que se omitió al arrancar
-    // porque faltaba el ejecutable: su app volvió, así que se pregunta de nuevo y la decisión la reinstala.
+    // Carrera: la regla se guardó mientras el aviso viajaba. Una regla sin filtros es la que se omitió al arrancar (o se
+    // importó) porque faltaba el ejecutable: su app volvió y classify le pone el filtro.
     if (rule != rules_.end() && !rule->second.filters.empty()) return;
     if (cov != covered_.end() && !cov->second.filters.empty()) return;
     {
@@ -1189,6 +1361,8 @@ void FirewallCore::onDrop(const DropEvent &drop) {
 
 void FirewallCore::verifyLoop() {
     auto nextRecheck = std::chrono::steady_clock::now() + CoverageRecheck;
+    auto nextPoll = std::chrono::steady_clock::now() + UsagePoll;
+    auto nextUsageSave = std::chrono::steady_clock::now() + UsageSave;
     for (;;) {
         DropEvent drop;
         DnsHint hint;
@@ -1196,7 +1370,7 @@ void FirewallCore::verifyLoop() {
         std::vector<Ahead> ahead;
         {
             std::unique_lock<std::mutex> lock(verifyMutex_);
-            auto wake = std::min(nextRecheck, std::chrono::steady_clock::now() + ExpiryCheck);
+            auto wake = std::min({nextRecheck, nextPoll, std::chrono::steady_clock::now() + ExpiryCheck});
             // Un bloqueo que espera su nombre se decide al vencer la espera aunque no llegue nada más.
             if (const auto held = nameWait_.nextDeadline()) wake = std::min(wake, *held);
             // Un .exe que avisó el vigía se cubre cuando deja de cambiar.
@@ -1250,6 +1424,14 @@ void FirewallCore::verifyLoop() {
             recheckCoverage(++recheckRound_ % FullRecheckEvery == 0);
             nextRecheck = std::chrono::steady_clock::now() + CoverageRecheck;
         }
+        if (std::chrono::steady_clock::now() >= nextPoll) {
+            pollConnections();
+            nextPoll = std::chrono::steady_clock::now() + UsagePoll;
+        }
+        if (std::chrono::steady_clock::now() >= nextUsageSave) {
+            saveUsage();
+            nextUsageSave = std::chrono::steady_clock::now() + UsageSave;
+        }
     }
 }
 
@@ -1258,6 +1440,33 @@ void FirewallCore::recheckCoverage(bool full) {
     // y pierde el filtro si su firma ya no coincide con la regla, o si una regla por carpeta ya no lo tiene adentro (la
     // ruta pasa ahora por un enlace). Un exe recompilado en su lugar sigue cubierto por su carpeta. En la vuelta completa
     // se verifica todo, aunque el sello coincida. Sin mutex mientras se verifica: puede tardar.
+    // Reglas de ruta sin filtro (el exe faltaba al arrancar o al importarse): si el archivo ya está, toman su filtro.
+    // Con «Ask» apagado su primer intento no se bloquea, así que classify nunca las vería.
+    {
+        std::vector<std::pair<std::wstring, std::wstring>> waiting; // clave, ruta
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            for (const auto &[k, r] : rules_)
+                if (r.scope == Scope::Path && r.destination.empty() && r.filters.empty()) waiting.push_back({k, r.path});
+        }
+        bool applied = false;
+        for (const auto &[k, path] : waiting) {
+            if (!isFile(path)) continue;
+            std::lock_guard<std::mutex> lock(mutex_);
+            const auto r = rules_.find(k);
+            if (r == rules_.end() || !r->second.filters.empty()) continue;
+            std::wstring error;
+            if (!installRule(r->second, error)) continue;
+            erasePendingOf(k);
+            addActivity({now(), path, L"Rule applied: the program is back", L"", 0, 0});
+            applied = true;
+        }
+        if (applied) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            std::wstring error;
+            save(error);
+        }
+    }
     struct Seen {
         std::wstring path, ruleKey;
         FileStamp stamp;
@@ -1676,11 +1885,25 @@ void FirewallCore::classify(const DropEvent &drop, const std::wstring &cached, b
         std::lock_guard<std::mutex> lock(mutex_);
         const auto rule = rules_.find(k);
         if (rule != rules_.end() && !rule->second.filters.empty()) return;
+        // Una regla de ruta sin filtro: el exe no estaba cuando se guardó o se cargó (una regla importada después de
+        // formatear, un programa que se reinstala). Ahora que intenta conectarse, existe: toma su filtro.
+        if (rule != rules_.end() && rule->second.scope == Scope::Path) {
+            std::wstring error;
+            if (installRule(rule->second, error)) {
+                erasePendingOf(k);
+                const bool allow = rule->second.action == Action::Allow;
+                addActivity({t, drop.appPath,
+                             allow ? L"Allowed by rule · next attempt connects" : L"Blocked by rule",
+                             drop.remoteAddress, drop.remotePort, drop.protocol});
+                save(error);
+                return;
+            }
+        }
         const auto cov = covered_.find(k);
         if (cov != covered_.end() && !cov->second.filters.empty()) return;
         // Modo por destino: la app no tiene regla entera propia y alguna regla por destino es de su identidad.
         if (rule == rules_.end()) destinationRuleFor(drop.appPath, cached, {}, {}, perDestination);
-        // Una regla de ruta propia (sin filtro porque faltaba el exe al arrancar) manda: se pregunta, sin firma.
+        // Una regla de ruta propia cuyo filtro no se pudo poner arriba manda: se pregunta, sin firma.
         if (!perDestination && (rule != rules_.end() || !signerRuleFor(drop.appPath, signer))) signer.clear();
         // Las carpetas de confianza van después de todo lo demás: sólo para quien no tiene otra regla.
         folders = !perDestination && rule == rules_.end() && hasFolderRules();
@@ -2082,6 +2305,184 @@ bool FirewallCore::save(std::wstring &error) {
         return false;
     }
     return true;
+}
+
+void FirewallCore::noteUse(const std::wstring &path, std::int64_t when) {
+    if (path.empty() || when <= 0) return;
+    const auto k = key(path);
+    std::lock_guard<std::mutex> lock(usageMutex_);
+    auto &last = usage_[k];
+    if (when <= last) return;
+    last = when;
+    usageDirty_ = true;
+    if (usage_.size() <= UsageLimit) return;
+    // Lleno: primero se olvida lo que no se vio en más de un año; si no alcanza, la décima parte más vieja.
+    for (auto it = usage_.begin(); it != usage_.end();) it = it->second < when - UsageKeepSeconds ? usage_.erase(it) : std::next(it);
+    if (usage_.size() <= UsageLimit) return;
+    std::vector<std::int64_t> times;
+    times.reserve(usage_.size());
+    for (const auto &[p, t] : usage_) times.push_back(t);
+    const auto cut = times.begin() + std::ptrdiff_t(times.size() / 10);
+    std::nth_element(times.begin(), cut, times.end());
+    const std::int64_t oldest = *cut;
+    for (auto it = usage_.begin(); it != usage_.end();) it = it->second <= oldest ? usage_.erase(it) : std::next(it);
+}
+
+void FirewallCore::pollConnections() {
+    // Conexiones TCP abiertas o en curso hacia afuera de la PC, por proceso. Cubre a las apps que van directo por IP
+    // (sin consulta DNS). Una conexión corta entre dos miradas no se ve: el último uso es aproximado.
+    std::set<DWORD> pids;
+    const auto table = [](ULONG family, std::vector<char> &buffer) {
+        DWORD size = 0;
+        for (int i = 0; i < 4; ++i) {
+            const DWORD r = GetExtendedTcpTable(buffer.empty() ? nullptr : buffer.data(), &size, FALSE, family,
+                                                TCP_TABLE_OWNER_PID_CONNECTIONS, 0);
+            if (r == NO_ERROR) return !buffer.empty();
+            if (r != ERROR_INSUFFICIENT_BUFFER) return false;
+            buffer.assign(std::size_t(size) + 4096, 0);
+            size = DWORD(buffer.size());
+        }
+        return false;
+    };
+    const auto active = [](DWORD state) { return state == MIB_TCP_STATE_ESTAB || state == MIB_TCP_STATE_SYN_SENT; };
+    std::vector<char> buffer;
+    if (table(AF_INET, buffer)) {
+        const auto *t = reinterpret_cast<const MIB_TCPTABLE_OWNER_PID *>(buffer.data());
+        for (DWORD i = 0; i < t->dwNumEntries; ++i) {
+            const auto &row = t->table[i];
+            const DWORD remote = row.dwRemoteAddr; // orden de red: el primer octeto es el byte bajo
+            if (remote == 0 || (remote & 0xFF) == 127 || !active(row.dwState) || row.dwOwningPid <= 4) continue;
+            pids.insert(row.dwOwningPid);
+        }
+    }
+    buffer.clear();
+    if (table(AF_INET6, buffer)) {
+        const auto *t = reinterpret_cast<const MIB_TCP6TABLE_OWNER_PID *>(buffer.data());
+        static const UCHAR loopback[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        static const UCHAR none[16] = {};
+        for (DWORD i = 0; i < t->dwNumEntries; ++i) {
+            const auto &row = t->table[i];
+            if (!std::memcmp(row.ucRemoteAddr, loopback, 16) || !std::memcmp(row.ucRemoteAddr, none, 16) ||
+                !active(row.dwState) || row.dwOwningPid <= 4)
+                continue;
+            pids.insert(row.dwOwningPid);
+        }
+    }
+    const auto t = now();
+    std::size_t looked = 0;
+    for (const DWORD pid : pids) {
+        if (++looked > 2000) break;
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (!process) continue;
+        wchar_t image[MAX_PATH * 2] = {};
+        DWORD size = DWORD(std::size(image));
+        if (QueryFullProcessImageNameW(process, 0, image, &size)) noteUse(std::wstring(image, size), t);
+        CloseHandle(process);
+    }
+}
+
+void FirewallCore::loadUsage() {
+    std::lock_guard<std::mutex> lock(usageMutex_);
+    usage_.clear();
+    usageSince_ = 0;
+    if (!options_.dataDir.empty()) {
+        std::ifstream in(options_.dataDir + L"\\usage.tsv", std::ios::binary);
+        std::string line;
+        while (std::getline(in, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const auto tab = line.rfind('\t');
+            if (tab == std::string::npos || tab == 0) continue;
+            const std::int64_t t = std::atoll(line.c_str() + tab + 1);
+            if (t <= 0) continue;
+            const std::string first = line.substr(0, tab);
+            if (first == "since")
+                usageSince_ = t;
+            else if (first[0] != '#' && usage_.size() < UsageLimit)
+                usage_[key(fromUtf8(first))] = t;
+        }
+    }
+    // Primer arranque de un motor que anota uso (o un archivo perdido): desde ahora.
+    if (usageSince_ <= 0) {
+        usageSince_ = now();
+        usageDirty_ = true;
+    }
+}
+
+void FirewallCore::saveUsage() {
+    if (options_.dataDir.empty()) return;
+    std::ostringstream out;
+    {
+        std::lock_guard<std::mutex> lock(usageMutex_);
+        if (!usageDirty_) return;
+        out << "# LGA GateBouncer usage v1: last connection attempt per program\n";
+        out << "since\t" << usageSince_ << "\n";
+        for (const auto &[p, t] : usage_) out << toUtf8(p) << "\t" << t << "\n";
+        usageDirty_ = false;
+    }
+    const std::wstring target = options_.dataDir + L"\\usage.tsv";
+    const std::wstring temp = target + L".tmp";
+    HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const auto text = out.str();
+    DWORD written = 0;
+    bool ok = file != INVALID_HANDLE_VALUE && WriteFile(file, text.data(), DWORD(text.size()), &written, nullptr) &&
+              written == text.size() && FlushFileBuffers(file);
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    ok = ok && MoveFileExW(temp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!ok) {
+        // Se reintenta en la vuelta siguiente: perder unos minutos de uso no cambia nada.
+        std::lock_guard<std::mutex> lock(usageMutex_);
+        usageDirty_ = true;
+    }
+}
+
+std::map<std::wstring, std::int64_t> FirewallCore::usage(std::int64_t &since) {
+    // Copia del uso antes de tomar mutex_: los dos mutex nunca se toman en el orden contrario al de onDrop.
+    std::map<std::wstring, std::int64_t> seen;
+    {
+        std::lock_guard<std::mutex> lock(usageMutex_);
+        seen = usage_;
+        since = usageSince_;
+    }
+    std::map<std::wstring, std::int64_t> byName; // nombre del exe -> último uso de cualquier copia
+    for (const auto &[p, t] : seen) {
+        auto &n = byName[fileName(p)];
+        n = std::max(n, t);
+    }
+    const auto at = [&](const std::wstring &path) {
+        const auto it = seen.find(key(path));
+        return it == seen.end() ? std::int64_t(0) : it->second;
+    };
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Coberturas y permisos por IP, ya sumados por regla dueña: una sola pasada por cada mapa.
+    std::map<std::wstring, std::int64_t> owned;
+    for (const auto &[ck, c] : covered_) {
+        auto &o = owned[c.ruleKey];
+        o = std::max(o, at(c.path));
+    }
+    for (const auto &[gk, g] : grants_) {
+        auto &o = owned[g.ruleKey];
+        o = std::max({o, g.lastSeen, at(g.path)});
+    }
+    std::map<std::wstring, std::int64_t> out;
+    for (const auto &[k, r] : rules_) {
+        const auto rk = ruleKey(r);
+        std::int64_t last = r.lastBlock;
+        if (const auto o = owned.find(rk); o != owned.end()) last = std::max(last, o->second);
+        if (r.scope == Scope::Path) last = std::max(last, at(r.path));
+        // Una app «cualquier versión»: cualquier copia con ese nombre que intentó conectarse (de más, no de menos: así
+        // nunca se sugiere borrar una regla que se usa).
+        if (r.scope == Scope::App) {
+            const auto n = byName.find(r.name);
+            if (n != byName.end()) last = std::max(last, n->second);
+        }
+        if (r.scope == Scope::Folder) {
+            const std::wstring prefix = key(r.path) + L"\\";
+            for (auto it = seen.lower_bound(prefix); it != seen.end() && it->first.compare(0, prefix.size(), prefix) == 0; ++it)
+                if (r.name.empty() || fileName(it->first) == r.name) last = std::max(last, it->second);
+        }
+        out[rk] = last;
+    }
+    return out;
 }
 
 } // namespace gbe

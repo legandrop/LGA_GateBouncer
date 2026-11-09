@@ -22,4 +22,4 @@ target_link_libraries(GateBouncerEngineUnitTest PRIVATE gatebouncer_engine_core 
 
 add_executable(GateBouncerEngine engine_main.cpp firewall_core.cpp pipe_server.cpp signature.cpp dns_names.cpp
   folder_rule.cpp folder_watch.cpp)
-target_link_libraries(GateBouncerEngine PRIVATE gatebouncer_engine_core wintrust crypt32 shell32 ole32 tdh)
+target_link_libraries(GateBouncerEngine PRIVATE gatebouncer_engine_core wintrust crypt32 shell32 ole32 tdh iphlpapi)

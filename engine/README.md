@@ -94,6 +94,12 @@ other driverless Windows firewalls.
 - **Temporary rules.** A decision can last from one minute to a week, or until the engine restarts. The engine checks
   expiry every ten seconds; an expired rule is removed (with the paths it covered) and the application asks again.
   Until-restart rules are never written to the rules file.
+- **Last use.** To suggest rules that can be cleaned up, the engine remembers when each program last tried to connect:
+  a name lookup of its own (the DNS listener above), an open outbound TCP connection (the connection tables are read
+  once a minute, so a very short connection between two looks is missed) or a blocked attempt. It is kept per program
+  path in `usage.tsv`, next to the rules and written every ten minutes, with the date it started counting; a rule's
+  last use is the latest of the programs it covers (for "this app, any version", any copy with that file name).
+  Nothing is removed automatically.
 - **The window's own requests.** The installed `GateBouncer.exe` may connect to TCP port 443 only, for AI
   explanations, without a request of its own. Nothing else about it is exempt.
 
@@ -130,15 +136,17 @@ GateBouncer were not installed until the service starts again. Rules are saved i
 administrators can change it.
 
 Startup rebuilds every filter in a single WFP transaction: if anything fails, the previous filters stay as they were.
-A rule whose executable is missing (uninstalled, updated to a new folder, unmounted drive) is kept but skipped, so
-that path asks again.
+A rule whose executable is missing (uninstalled, updated to a new folder, unmounted drive) is kept without a filter;
+when a program appears at that path (checked every minute, and at its first blocked attempt) the rule takes its filter,
+so a restored backup works as programs are reinstalled. Like any path rule, it follows the path, not the file: whatever
+program is later placed at that exact path gets the rule.
 
 ## Local channel
 
 The desktop window talks to the engine over the named pipe `\\.\pipe\LGA.GateBouncer.Engine`: one UTF-8 request
 line, tab-separated fields, and a reply terminated by `END`. Interactive users can read status, pending requests,
 rules and activity, but cannot create instances of the pipe. Only the installed `GateBouncer.exe` next to the engine,
-or an elevated process, can change rules (`DECIDE`, `FOLDER`, `REMOVE`, `MODE`, `LAN allow|ask`). `PENDING` rows end with the
+or an elevated process, can change rules (`DECIDE`, `FOLDER`, `REMOVE`, `IMPORT`, `MODE`, `LAN allow|ask`). `PENDING` rows end with the
 destination name (empty when unknown); `STATUS` reports `lan` and a `names` line with DNS listener counters.
 `DECIDE` takes the reach of the rule (`path`,
 `app` or `publisher`), the executable and optionally how long it lasts (`always`, `restart` or a number of seconds,
@@ -146,7 +154,12 @@ from 60 to 604800) and a destination; the engine reads the signer from the file 
 `RULES` reports each rule's expiry (0 permanent, -1 until restart, otherwise Unix time), destination and path.
 Protocol version 4 (`HELLO`) adds a last `PENDING` field, `app` or `destination`, for applications in destination mode.
 Version 5 adds `FOLDER <allow|block> <folder> <file name, or * for every program> [duration]`, which validates and
-resolves the folder itself, and `folder` rows in `RULES` (the folder as path, the file name or empty as name). The
+resolves the folder itself, and `folder` rows in `RULES` (the folder as path, the file name or empty as name).
+Version 6 adds `USAGE` (a `since` line, then each rule's id as in `RULES` and its last use as Unix time, 0 when never
+seen) and `IMPORT <allow|block> <path|app|publisher> <signer> <file name> <path> <destination or empty> <keep|replace>`,
+which restores a permanent rule from an exported file without checking any file: a path rule may name a program that is
+not there yet, and a signer rule only ever matches files that signer really signs. With `keep` it answers `exists` or
+`conflict: <your rule>` and changes nothing when the rule would replace one of yours. The
 permission check uses the client's
 executable path:
 it keeps other programs from changing rules by accident, but it is not a boundary against malicious software already

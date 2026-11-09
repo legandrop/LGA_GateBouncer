@@ -147,6 +147,13 @@ class FirewallCore {
                       std::int64_t expires = 0);
     // id: la ruta de una regla Path o la clave de una regla App/Publisher.
     bool removeRule(const std::wstring &id, std::wstring &error);
+    // Una regla de un archivo exportado, siempre permanente y sin verificar ningún archivo: una de ruta puede ser de un
+    // exe que todavía no está (toma su filtro cuando aparece) y una de firma sólo coincide con lo que ese firmante firma
+    // de verdad. Sin replace, no toca una regla tuya que choque (error «exists» o «conflict»).
+    bool importRule(Action action, Scope scope, const std::wstring &signer, const std::wstring &name,
+                    const std::wstring &path, const std::wstring &destination, bool replace, std::wstring &error);
+    // Último intento de conexión visto de cada regla (por su ruleKey; 0 = nunca) y desde cuándo se anota.
+    std::map<std::wstring, std::int64_t> usage(std::int64_t &since);
 
     struct Status {
         bool ask = true, dynamic = false, allApps = true, localNetwork = true;
@@ -245,6 +252,17 @@ class FirewallCore {
     void addActivity(Activity a);
     void load();
     bool save(std::wstring &error);
+
+    // Último uso por ruta: la app intentó conectarse (consulta DNS propia, conexión TCP abierta fuera de la PC o
+    // bloqueo). Se guarda en usage.tsv, aparte de rules.tsv, para que un motor anterior no lo lea como reglas rotas.
+    void noteUse(const std::wstring &path, std::int64_t when);
+    void pollConnections(); // hilo de verificación, cada minuto
+    void loadUsage();
+    void saveUsage(); // si cambió; hilo de verificación y stop()
+    std::mutex usageMutex_; // sólo protege usage_*; nunca se toma mutex_ con éste tomado
+    std::map<std::wstring, std::int64_t> usage_; // ruta en minúsculas -> último uso
+    std::int64_t usageSince_ = 0;
+    bool usageDirty_ = false;
 
     CoreOptions options_;
     WfpEngine wfp_;

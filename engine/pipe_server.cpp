@@ -217,8 +217,8 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
     std::ostringstream out;
     if (command == "HELLO") {
         // Versión 4: reglas por destino (PENDING y RULES con un campo más, DECIDE con destino). Versión 5: reglas por
-        // carpeta (FOLDER, y filas «folder» en RULES).
-        out << "OK\tGateBouncerEngine\t5\t" << (mayChange ? "control" : "view") << "\nEND\n";
+        // carpeta (FOLDER, y filas «folder» en RULES). Versión 6: USAGE (último uso por regla) e IMPORT.
+        out << "OK\tGateBouncerEngine\t6\t" << (mayChange ? "control" : "view") << "\nEND\n";
         return out.str();
     }
     if (command == "STATUS") {
@@ -281,8 +281,22 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         out << "END\n";
         return out.str();
     }
-    const bool changes =
-        command == "DECIDE" || command == "FOLDER" || command == "REMOVE" || command == "MODE" || command == "LAN";
+    if (command == "USAGE") {
+        // since: desde cuándo se anota el uso. Después, una fila por regla (mismo id que RULES) con el último intento de
+        // conexión visto de lo que cubre, o 0 si nunca se vio.
+        std::int64_t since = 0;
+        const auto used = core_.usage(since);
+        out << "OK\nsince\t" << since << "\n";
+        for (const auto &r : core_.rules()) {
+            const auto u = used.find(FirewallCore::ruleKey(r));
+            out << field(r.scope == Scope::Path && r.destination.empty() ? r.path : FirewallCore::ruleKey(r)) << "\t"
+                << (u == used.end() ? 0 : u->second) << "\n";
+        }
+        out << "END\n";
+        return out.str();
+    }
+    const bool changes = command == "DECIDE" || command == "FOLDER" || command == "REMOVE" || command == "MODE" ||
+                         command == "LAN" || command == "IMPORT";
     if (!changes) return err(L"Unknown command");
     if (!mayChange) return err(L"Only GateBouncer or an administrator can change rules");
     std::wstring error;
@@ -314,6 +328,13 @@ std::string PipeServer::handle(const std::string &request, bool mayChange) {
         ok = core_.decideFolder(wide(f[2]), wide(f[3]), f[1] == "allow" ? Action::Allow : Action::Block, error, expires);
     else if (command == "REMOVE" && f.size() == 2)
         ok = core_.removeRule(wide(f[1]), error);
+    // IMPORT <allow|block> <path|app|publisher> <firmante> <nombre> <ruta> <destino o vacío> <keep|replace>: una regla
+    // de un archivo exportado, permanente. keep no toca una regla tuya que choque.
+    else if (command == "IMPORT" && f.size() == 8 && (f[1] == "allow" || f[1] == "block") &&
+             (f[2] == "path" || f[2] == "app" || f[2] == "publisher") && (f[7] == "keep" || f[7] == "replace"))
+        ok = core_.importRule(f[1] == "allow" ? Action::Allow : Action::Block,
+                              f[2] == "app" ? Scope::App : f[2] == "publisher" ? Scope::Publisher : Scope::Path,
+                              wide(f[3]), wide(f[4]), wide(f[5]), wide(f[6]), f[7] == "replace", error);
     else if (command == "MODE" && f.size() == 2 && (f[1] == "ask" || f[1] == "off"))
         ok = core_.setAsk(f[1] == "ask", error);
     else if (command == "LAN" && f.size() == 2 && (f[1] == "allow" || f[1] == "ask"))
