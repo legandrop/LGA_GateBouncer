@@ -4,6 +4,7 @@
 #include "customtooltip.h"
 #include "explain/KnownApps.h"
 #include "folder_rule.h"
+#include "rulestransfer.h"
 #include "foldertrust.h"
 #include "i18n.h"
 #include "platform/WindowFrame.h"
@@ -45,6 +46,7 @@
 #include <QPushButton>
 #include <QScrollArea>
 #include <QScrollBar>
+#include <QSaveFile>
 #include <QSettings>
 #include <QShowEvent>
 #include <QPersistentModelIndex>
@@ -1602,6 +1604,7 @@ QString FirewallWindow::pageKey() const {
     QString key = QString("%1|%2%3%4%5%6|").arg(view_).arg(s.connected).arg(s.ask).arg(s.allApps).arg(s.control)
                       .arg(s.localNetwork);
     key += QString::number(firewall_.busy()) + "|"; // los botones se habilitan de nuevo al terminar un comando
+    key += QString::number(firewall_.engineVersion()) + "|"; // Settings → Rules pide la versión 6
     const auto pendingKey = [this] {
         QString k;
         for (const auto &p : firewall_.pending()) k += p.id + p.host + QString::number(p.attempts) + ";";
@@ -1870,6 +1873,777 @@ void FirewallWindow::trustFolderDialog(const QString &folder, const QString &nam
             firewall_.trustFolder(resolved->first, resolved->second, allowed);
             d->close();
         });
+    d->open();
+}
+
+// ------------------------------------------------------------------------------------------------------------------
+// Reglas: exportar, importar y depurar (Settings → Rules). Los tres diálogos con el estilo de «Trust a folder».
+
+namespace {
+
+constexpr int kRulesWide = 640; // ancho del texto de los diálogos de reglas
+
+// El diálogo sin marco de «Trust a folder», con su título.
+QDialog *rulesDialog(QWidget *parent, const QString &name, const QString &title, QVBoxLayout **layout) {
+    auto *d = new QDialog(parent, Qt::Dialog | Qt::FramelessWindowHint);
+    d->setObjectName(name);
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    Theme::sheet(d, "QDialog { background: #17171B; border: 1px solid #2E2E36; }\n"
+                    "QScrollArea#rules-list { background: #15151A; border: 1px solid #2A2A31; border-radius: 8px; }\n"
+                    "QScrollArea#rules-list > QWidget > QWidget { background: transparent; }");
+    auto *l = column(d, 18, 8);
+    l->addWidget(text(title, "cardtitle"));
+    *layout = l;
+    return d;
+}
+
+QLabel *wideText(const QString &value, const char *role = "sub") {
+    auto *t = text(value, role, true);
+    t->setFixedWidth(kRulesWide);
+    return t;
+}
+
+// Fecha corta de un último uso: hora si es hoy, «Nov 2» este año, «Nov 2, 2025» antes.
+QString dayText(qint64 seconds) {
+    const QDateTime t = QDateTime::fromSecsSinceEpoch(seconds);
+    if (t.date() == QDate::currentDate()) return t.toString("HH:mm");
+    const QLocale locale(spanish() ? QLocale::Spanish : QLocale::English);
+    if (t.date().year() == QDate::currentDate().year()) return locale.toString(t.date(), spanish() ? "d MMM" : "MMM d");
+    return locale.toString(t.date(), spanish() ? "d MMM yyyy" : "MMM d, yyyy");
+}
+
+// Una fila de las listas de reglas: la casilla (o su lugar), el ícono, qué es y qué hace, y a la derecha la acción con
+// una línea chica (la tuya en un choque, el último uso, el motivo de un salteo).
+QWidget *ruleListRow(QWidget *lead, const QString &iconPath, const QString &title, const QString &subtitle,
+                     const QString &badge, const char *badgeKind, const QString &aside, const char *asideRole = "faint") {
+    auto *w = new QWidget;
+    w->setMinimumHeight(50);
+    auto *h = new QHBoxLayout(w);
+    h->setContentsMargins(12, 6, 12, 6);
+    h->setSpacing(11);
+    auto *slot = new QWidget;
+    slot->setFixedWidth(30);
+    auto *sl = new QHBoxLayout(slot);
+    sl->setContentsMargins(0, 0, 0, 0);
+    if (lead) sl->addWidget(lead, 0, Qt::AlignCenter);
+    h->addWidget(slot, 0, Qt::AlignVCenter);
+    h->addWidget(appIcon(iconPath, 30), 0, Qt::AlignVCenter);
+    auto *t = new QVBoxLayout;
+    t->setSpacing(1);
+    t->addWidget(new ElideLabel(title, "strong"));
+    if (!subtitle.isEmpty()) {
+        // Una ruta se recorta al medio (se ven la unidad y el exe); un texto, al final.
+        const bool path =
+            (subtitle.size() > 2 && subtitle[1] == QLatin1Char(':')) || subtitle.startsWith(QLatin1String("\\\\"));
+        t->addWidget(new ElideLabel(subtitle, "faint", path ? Qt::ElideMiddle : Qt::ElideRight));
+    }
+    h->addLayout(t, 1);
+    auto *side = new QVBoxLayout;
+    side->setSpacing(3);
+    if (!badge.isEmpty()) side->addWidget(pill(badge, badgeKind), 0, Qt::AlignRight);
+    if (!aside.isEmpty()) {
+        auto *a = new ElideLabel(aside, asideRole);
+        a->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+        a->setFixedWidth(badge.isEmpty() ? 300 : 220); // sin acción al lado (salteadas), el motivo tiene más lugar
+        side->addWidget(a, 0, Qt::AlignRight);
+    }
+    h->addLayout(side);
+    return w;
+}
+
+// Encabezado de un grupo de la lista: el nombre en versalitas, cuántas son y una línea que dice qué significa.
+QWidget *ruleGroupHeader(const QString &title, int count, const QString &caption, QWidget *right = nullptr) {
+    auto *w = new QWidget;
+    auto *v = new QVBoxLayout(w);
+    v->setContentsMargins(12, 12, 12, 6);
+    v->setSpacing(2);
+    auto *h = row(8);
+    h->addWidget(caps(title, "section"));
+    h->addWidget(text(QString::number(count), "faint"));
+    h->addStretch();
+    if (right) h->addWidget(right);
+    v->addLayout(h);
+    if (!caption.isEmpty()) v->addWidget(text(caption, "faint", true));
+    return w;
+}
+
+// Una ruta larga en un texto que se parte en renglones: puede cortar después de cada «\» (espacio de ancho cero).
+QString breakablePath(const QString &path) {
+    return QDir::toNativeSeparators(path).replace("\\", QString("\\") + QChar(0x200B));
+}
+
+// Debajo del nombre: la ruta entera en una regla de archivo; si no, qué cubre la regla.
+QString ruleSubtitle(const RulesTransfer::Rule &rule) {
+    return rule.scope == QLatin1String("path") ? QDir::toNativeSeparators(rule.path) : RulesTransfer::describe(rule);
+}
+
+// La lista desplazable de los diálogos de reglas, con la altura justa hasta un tope (más alto con la ventana más alta).
+QScrollArea *ruleList(QWidget *content, int maxHeight = 380) {
+    auto *area = new QScrollArea;
+    area->setObjectName("rules-list");
+    area->setWidgetResizable(true);
+    area->setFrameShape(QFrame::NoFrame);
+    area->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    area->setWidget(content);
+    area->setFixedWidth(kRulesWide);
+    content->adjustSize();
+    area->setFixedHeight(qMin(maxHeight, content->sizeHint().height() + 4));
+    return area;
+}
+
+// Mira el disco en un hilo aparte (un servidor que no responde no traba la ventana) y vuelve al hilo de la interfaz.
+void checkInBackground(QObject *owner, const QStringList &files, const QStringList &folders,
+                       std::function<void(const QHash<QString, bool> &)> done) {
+    QPointer<QObject> guard(owner);
+    std::thread([guard, files, folders, done] {
+        const auto exists = RulesTransfer::checkPaths(files, folders);
+        if (!QCoreApplication::instance()) return;
+        QMetaObject::invokeMethod(
+            QCoreApplication::instance(),
+            [guard, exists, done] {
+                if (guard) done(exists);
+            },
+            Qt::QueuedConnection);
+    }).detach();
+}
+
+// QA: la ruta que elegiría el usuario, sin abrir el diálogo de archivos (sólo dentro de un recorrido de QA).
+QString qaRulesFile(const char *variable) {
+    return qEnvironmentVariableIsEmpty("GATEBOUNCER_QA_SHOT") ? QString() : qEnvironmentVariable(variable);
+}
+
+// Escribe el archivo entero o nada (QSaveFile).
+bool writeRulesFile(const QString &fileName, const QByteArray &bytes, QString &error) {
+    QSaveFile out(fileName);
+    if (!out.open(QIODevice::WriteOnly) || out.write(bytes) != bytes.size() || !out.commit()) {
+        error = I18n::tr("The file could not be saved: %1").arg(out.errorString());
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+QString FirewallWindow::rulesUnavailable(bool changes) const {
+    const auto &s = firewall_.status();
+    if (!s.connected) return I18n::tr("The engine is not running.");
+    if (firewall_.engineVersion() < 6)
+        return I18n::tr("The engine needs an update to export, import or clean up rules.");
+    if (changes && !s.control) return I18n::tr("This window can only view rules: import and clean up are off.");
+    if (changes && !canDecide()) return I18n::tr("The engine is busy. Try again in a moment.");
+    return {};
+}
+
+QString FirewallWindow::iconPathFor(const QString &scope, const QString &path, const QString &name) const {
+    if (scope == QLatin1String("path")) return path;
+    if (scope != QLatin1String("app") || name.isEmpty()) return {};
+    for (const auto &r : firewall_.rules())
+        if (r.scope == QLatin1String("covered") && FirewallClient::fileName(r.path).compare(name, Qt::CaseInsensitive) == 0)
+            return r.path;
+    return {};
+}
+
+void FirewallWindow::rulesSummary(const QString &title, const QStringList &lines, const QStringList &failed,
+                                  const QString &extraLabel, const std::function<void()> &extra) {
+    QVBoxLayout *l = nullptr;
+    auto *d = rulesDialog(this, "rules-summary-dialog", title, &l);
+    for (const auto &line : lines) l->addWidget(wideText(line, "body"));
+    if (!failed.isEmpty()) {
+        l->addSpacing(4);
+        auto *list = new QWidget;
+        auto *ll = new QVBoxLayout(list);
+        ll->setContentsMargins(12, 10, 12, 10);
+        ll->setSpacing(6);
+        for (int i = 0; i < failed.size() && i < 200; ++i) ll->addWidget(text(failed[i], "bad", true));
+        l->addWidget(ruleList(list, 220));
+    }
+    l->addSpacing(10);
+    auto *buttons = row(8);
+    buttons->addStretch();
+    if (extra) {
+        auto *more = button(extraLabel);
+        more->setObjectName("rules-summary-extra");
+        connect(more, &QPushButton::clicked, d, extra);
+        buttons->addWidget(more);
+    }
+    auto *close = button(I18n::tr("Close"), "primary");
+    close->setObjectName("rules-summary-close");
+    close->setMinimumWidth(84);
+    connect(close, &QPushButton::clicked, d, &QDialog::close);
+    buttons->addWidget(close);
+    l->addLayout(buttons);
+    d->open();
+}
+
+void FirewallWindow::exportRulesDialog() {
+    if (const QString why = rulesUnavailable(false); !why.isEmpty()) {
+        message(why);
+        return;
+    }
+    QVBoxLayout *l = nullptr;
+    auto *d = rulesDialog(this, "export-rules-dialog", I18n::tr("Export rules"), &l);
+    l->addWidget(wideText(I18n::tr("Saves your permanent rules to a file: to bring them back after reinstalling Windows, "
+                                   "or to give them to someone else. Temporary rules are not exported.")));
+    l->addSpacing(6);
+    auto *seg = card("seg");
+    seg->setFixedHeight(30);
+    auto *sl = new QHBoxLayout(seg);
+    sl->setContentsMargins(2, 2, 2, 2);
+    sl->setSpacing(2);
+    auto *fullButton = button(I18n::tr("Full backup"), "seg");
+    fullButton->setObjectName("export-full");
+    auto *shareButton = button(I18n::tr("Share"), "seg");
+    shareButton->setObjectName("export-share");
+    for (auto *b : {fullButton, shareButton}) {
+        b->setFixedHeight(24);
+        sl->addWidget(b);
+    }
+    auto *segRow = row(12);
+    segRow->addWidget(seg);
+    auto *howMany = text({}, "faint");
+    howMany->setObjectName("export-count");
+    segRow->addWidget(howMany);
+    segRow->addStretch();
+    l->addLayout(segRow);
+    l->addSpacing(2);
+    auto *what = wideText({}, "body");
+    what->setObjectName("export-what");
+    l->addWidget(what);
+    auto *warning = wideText({}, "faint");
+    l->addWidget(warning);
+    l->addSpacing(10);
+    auto *buttons = row(8);
+    buttons->addStretch();
+    auto *cancel = button(I18n::tr("Cancel"));
+    cancel->setObjectName("export-cancel");
+    auto *save = button(I18n::tr("Export…"), "primary");
+    save->setObjectName("export-save");
+    for (auto *b : {cancel, save}) {
+        b->setMinimumWidth(84);
+        buttons->addWidget(b);
+    }
+    l->addLayout(buttons);
+
+    auto full = std::make_shared<bool>(true);
+    const auto show = [this, full, fullButton, shareButton, howMany, what, warning, save] {
+        fullButton->setProperty("on", *full ? "1" : "0");
+        shareButton->setProperty("on", *full ? "0" : "1");
+        repolish(fullButton);
+        repolish(shareButton);
+        const int n = int(RulesTransfer::exportable(firewall_.rules(), *full).size());
+        howMany->setText(n == 1 ? I18n::tr("1 rule") : I18n::tr("%1 rules").arg(n));
+        what->setText(*full ? I18n::tr("Every permanent rule: for files, apps, publishers and folders, and the two "
+                                       "Protection switches.")
+                            : I18n::tr("Only rules by signature: an app or a publisher, for the whole app or one "
+                                       "server."));
+        warning->setText(*full ? I18n::tr("The file lists the paths of your programs and folders: keep it for yourself.")
+                               : I18n::tr("No paths, folders or switches go in the file: nothing about your PC."));
+        save->setEnabled(n > 0);
+    };
+    connect(fullButton, &QPushButton::clicked, d, [full, show] { *full = true; show(); });
+    connect(shareButton, &QPushButton::clicked, d, [full, show] { *full = false; show(); });
+    show();
+    connect(cancel, &QPushButton::clicked, d, &QDialog::close);
+    connect(save, &QPushButton::clicked, d, [this, d, full] {
+        const bool fullBackup = *full;
+        const auto write = [this, fullBackup](QString fileName) {
+            if (fileName.isEmpty()) return;
+            if (!fileName.endsWith(".gbrules", Qt::CaseInsensitive)) fileName += ".gbrules";
+            const int n = int(RulesTransfer::exportable(firewall_.rules(), fullBackup).size());
+            QString error;
+            if (!writeRulesFile(fileName, RulesTransfer::build(firewall_.rules(), firewall_.status(), fullBackup), error)) {
+                message(error);
+                return;
+            }
+            message(n == 1 ? I18n::tr("1 rule exported to %1.").arg(QDir::toNativeSeparators(fileName))
+                           : I18n::tr("%1 rules exported to %2.").arg(n).arg(QDir::toNativeSeparators(fileName)));
+        };
+        d->close();
+        if (const QString qa = qaRulesFile("GATEBOUNCER_QA_EXPORT_FILE"); !qa.isEmpty()) {
+            write(qa);
+            return;
+        }
+        const QString start = QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
+                                  .filePath(RulesTransfer::defaultFileName());
+        auto *dialog = new QFileDialog(this, I18n::tr("Export rules"), start, I18n::tr("GateBouncer rules (*.gbrules)"));
+        dialog->setObjectName("export-rules-file-dialog");
+        dialog->setOption(QFileDialog::DontUseNativeDialog);
+        dialog->setAttribute(Qt::WA_DeleteOnClose);
+        dialog->setAcceptMode(QFileDialog::AcceptSave);
+        dialog->setDefaultSuffix("gbrules");
+        connect(dialog, &QFileDialog::fileSelected, this, write);
+        dialog->open();
+    });
+    d->open();
+}
+
+void FirewallWindow::importRules() {
+    if (const QString why = rulesUnavailable(true); !why.isEmpty()) {
+        message(why);
+        return;
+    }
+    if (rulesWorking_) return;
+    const auto load = [this](const QString &fileName) {
+        if (fileName.isEmpty()) return;
+        RulesTransfer::File file;
+        QString error;
+        if (!RulesTransfer::read(fileName, file, error)) {
+            message(error);
+            return;
+        }
+        QStringList folders, files;
+        RulesTransfer::pathsToCheck(file, folders, files);
+        rulesWorking_ = true;
+        checkInBackground(this, files, folders, [this, fileName](const QHash<QString, bool> &exists) {
+            rulesWorking_ = false;
+            importRulesDialog(fileName, exists);
+        });
+    };
+    if (const QString qa = qaRulesFile("GATEBOUNCER_QA_IMPORT_FILE"); !qa.isEmpty()) {
+        load(qa);
+        return;
+    }
+    auto *dialog = new QFileDialog(this, I18n::tr("Import rules"),
+                                   QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation),
+                                   I18n::tr("GateBouncer rules (*.gbrules);;All files (*)"));
+    dialog->setObjectName("import-rules-file-dialog");
+    dialog->setOption(QFileDialog::DontUseNativeDialog);
+    dialog->setAttribute(Qt::WA_DeleteOnClose);
+    dialog->setFileMode(QFileDialog::ExistingFile);
+    connect(dialog, &QFileDialog::fileSelected, this, load);
+    dialog->open();
+}
+
+void FirewallWindow::importRulesDialog(const QString &fileName, const QHash<QString, bool> &exists) {
+    RulesTransfer::File file;
+    QString error;
+    // Se vuelve a leer: entre la elección y la lista pudo cambiar, y lo que se ve es lo que se manda.
+    if (!RulesTransfer::read(fileName, file, error)) {
+        message(error);
+        return;
+    }
+    using RulesTransfer::State;
+    const auto planned = RulesTransfer::plan(file, firewall_.rules(), exists, exists);
+    QVector<int> fresh, same, conflicts;
+    QStringList skippedRows;
+    for (int i = 0; i < planned.size(); ++i) {
+        switch (planned[i].state) {
+        case State::New: fresh << i; break;
+        case State::Same: same << i; break;
+        case State::Conflict: conflicts << i; break;
+        case State::Skipped: break;
+        }
+    }
+    int skippedCount = int(file.skipped.size());
+    for (const auto &p : planned) skippedCount += p.state == State::Skipped;
+
+    QVBoxLayout *l = nullptr;
+    auto *d = rulesDialog(this, "import-rules-dialog", I18n::tr("Import rules"), &l);
+    const int total = int(file.rules.size() + file.skipped.size());
+    const QString kind = file.full ? (file.exported.isEmpty() ? I18n::tr("Full backup")
+                                                              : I18n::tr("Full backup from %1").arg(file.exported))
+                                   : (file.exported.isEmpty() ? I18n::tr("Shared rules")
+                                                              : I18n::tr("Shared rules from %1").arg(file.exported));
+    const QString amount = total == 1 ? I18n::tr("1 rule") : I18n::tr("%1 rules").arg(total);
+    auto *source = new ElideLabel(QStringList{QFileInfo(fileName).fileName(), kind, amount}.join(" · "), "body",
+                                  Qt::ElideMiddle);
+    source->setFixedWidth(kRulesWide);
+    l->addWidget(source);
+    l->addWidget(wideText(I18n::tr("Rules you already have stay as they are. A conflict is off: turn it on to replace "
+                                   "yours with the one in the file. Nothing changes until you import.")));
+    l->addSpacing(4);
+
+    // Las casillas de cada fila, en el orden de planned (nullptr: sin casilla).
+    auto toggles = std::make_shared<QVector<QPointer<ToggleSwitch>>>(planned.size());
+    auto *content = new QWidget;
+    auto *cl = new QVBoxLayout(content);
+    cl->setContentsMargins(0, 0, 0, 6);
+    cl->setSpacing(0);
+    const auto rowFor = [this, planned, toggles](int i, bool withSwitch, bool on) {
+        const auto &p = planned[i];
+        ToggleSwitch *sw = nullptr;
+        if (withSwitch) {
+            sw = new ToggleSwitch;
+            sw->setObjectName(QString("import-row-%1").arg(i));
+            sw->setChecked(on);
+            (*toggles)[i] = sw;
+        }
+        const QString aside = p.state == State::Conflict ? p.yours : p.note;
+        return ruleListRow(sw, iconPathFor(p.rule.scope, p.rule.path, p.rule.name), RulesTransfer::title(p.rule),
+                           ruleSubtitle(p.rule), p.rule.allow ? I18n::tr("Allow") : I18n::tr("Block"),
+                           p.rule.allow ? "allow" : "block", aside,
+                           p.state == State::Conflict ? "warn" : "faint");
+    };
+    const auto addGroup = [&](const QString &title, const QVector<int> &rows, const QString &caption, bool withSwitch,
+                              bool on, bool collapsed) {
+        if (rows.isEmpty()) return;
+        if (cl->count()) cl->addWidget(divider());
+        QPushButton *toggle = nullptr;
+        if (collapsed) {
+            toggle = button(I18n::tr("Show"), "link");
+            toggle->setObjectName("import-show-same");
+        }
+        cl->addWidget(ruleGroupHeader(title, int(rows.size()), caption, toggle));
+        auto *box = new QWidget;
+        auto *bl = new QVBoxLayout(box);
+        bl->setContentsMargins(0, 0, 0, 0);
+        bl->setSpacing(0);
+        const auto fill = [bl, rows, rowFor, withSwitch, on] {
+            for (const int i : rows) bl->addWidget(rowFor(i, withSwitch, on));
+        };
+        if (!collapsed) fill();
+        else {
+            box->hide();
+            connect(toggle, &QPushButton::clicked, box, [box, bl, toggle, fill] {
+                if (!bl->count()) fill();
+                box->setVisible(!box->isVisible());
+                toggle->setText(box->isVisible() ? I18n::tr("Hide") : I18n::tr("Show"));
+            });
+        }
+        cl->addWidget(box);
+    };
+    addGroup(I18n::tr("New"), fresh, I18n::tr("Rules you do not have. They are added."), true, true, false);
+    addGroup(I18n::tr("Conflicts with your rules"), conflicts,
+             I18n::tr("You have a different rule for the same app. Yours stays unless you turn the row on."), true,
+             false, false);
+    addGroup(I18n::tr("Already in your rules"), same, I18n::tr("Exactly the same rule. Nothing to do."), false, false,
+             same.size() > 3);
+    if (skippedCount) {
+        if (cl->count()) cl->addWidget(divider());
+        cl->addWidget(ruleGroupHeader(I18n::tr("Skipped"), skippedCount, I18n::tr("These are not imported.")));
+        for (const auto &p : planned)
+            if (p.state == State::Skipped)
+                cl->addWidget(ruleListRow(nullptr, {}, RulesTransfer::title(p.rule), ruleSubtitle(p.rule),
+                                          {}, "dest", p.reason));
+        for (const auto &s : file.skipped) cl->addWidget(ruleListRow(nullptr, {}, s.what, {}, {}, "dest", s.reason));
+    }
+    if (!cl->count()) cl->addWidget(ruleGroupHeader(I18n::tr("Empty file"), 0, I18n::tr("The file has no rules.")));
+    l->addWidget(ruleList(content, qBound(300, height() - 340, 900)));
+
+    // Full backup: los dos interruptores de Protection, sólo si se tildan (por defecto queda lo tuyo).
+    QPointer<ToggleSwitch> askSwitch, lanSwitch;
+    if (file.full && file.hasProtection) {
+        const auto &s = firewall_.status();
+        const auto onOff = [](bool on) { return on ? I18n::trc("switch", "On") : I18n::trc("switch", "Off"); };
+        const auto option = [&](const QString &name, const QString &title, bool inFile, bool yours) {
+            auto *w = new QWidget;
+            w->setFixedWidth(kRulesWide);
+            auto *h = new QHBoxLayout(w);
+            h->setContentsMargins(0, 4, 0, 0);
+            h->setSpacing(14);
+            auto *t = new QVBoxLayout;
+            t->setSpacing(1);
+            t->addWidget(text(title, "strong", true));
+            t->addWidget(text(inFile == yours ? I18n::tr("The same as yours (%1).").arg(onOff(yours))
+                                              : I18n::tr("In the file: %1 · Yours: %2").arg(onOff(inFile), onOff(yours)),
+                              "small", true));
+            h->addLayout(t, 1);
+            auto *sw = new ToggleSwitch;
+            sw->setObjectName(name);
+            sw->setEnabled(inFile != yours);
+            h->addWidget(sw, 0, Qt::AlignVCenter);
+            l->addWidget(w);
+            return sw;
+        };
+        l->addSpacing(4);
+        askSwitch = option("import-ask", I18n::tr("Also apply: Ask before unknown applications connect"), file.ask, s.ask);
+        lanSwitch = option("import-lan", I18n::tr("Also apply: Allow the local network without asking"),
+                           file.localNetwork, s.localNetwork);
+    }
+    auto *status = wideText({}, "sub");
+    status->setObjectName("import-status");
+    status->hide();
+    l->addWidget(status);
+    l->addSpacing(10);
+    auto *buttons = row(8);
+    buttons->addStretch();
+    auto *cancel = button(I18n::tr("Cancel"));
+    cancel->setObjectName("import-cancel");
+    auto *apply = button({}, "primary");
+    apply->setObjectName("import-apply");
+    for (auto *b : {cancel, apply}) {
+        b->setMinimumWidth(84);
+        buttons->addWidget(b);
+    }
+    l->addLayout(buttons);
+
+    const auto count = [toggles] {
+        int n = 0;
+        for (const auto &t : *toggles) n += t && t->isChecked();
+        return n;
+    };
+    const auto refresh = [this, count, apply, askSwitch, lanSwitch] {
+        const int n = count();
+        const bool extra = (askSwitch && askSwitch->isChecked()) || (lanSwitch && lanSwitch->isChecked());
+        apply->setText(n == 1 ? I18n::tr("Import 1 rule") : I18n::tr("Import %1 rules").arg(n));
+        apply->setEnabled((n > 0 || extra) && rulesUnavailable(true).isEmpty());
+    };
+    for (const auto &t : *toggles)
+        if (t) connect(t.data(), &ToggleSwitch::toggled, d, refresh);
+    for (auto *sw : {askSwitch.data(), lanSwitch.data()})
+        if (sw) connect(sw, &ToggleSwitch::toggled, d, refresh);
+    refresh();
+    connect(cancel, &QPushButton::clicked, d, &QDialog::close);
+    connect(apply, &QPushButton::clicked, d,
+            [this, d, planned, toggles, askSwitch, lanSwitch, file, status, apply, cancel] {
+        if (const QString why = rulesUnavailable(true); !why.isEmpty()) {
+            message(why);
+            return;
+        }
+        struct Op {
+            QString line, what;
+            bool replace = false, setting = false;
+        };
+        QVector<Op> ops;
+        for (int i = 0; i < planned.size(); ++i) {
+            const auto &t = (*toggles)[i];
+            if (!t || !t->isChecked()) continue;
+            const bool replace = planned[i].state == State::Conflict;
+            ops.push_back({RulesTransfer::commandFor(planned[i].rule, replace), RulesTransfer::describe(planned[i].rule),
+                           replace, false});
+        }
+        if (askSwitch && askSwitch->isChecked())
+            ops.push_back({QString("MODE\t%1").arg(file.ask ? "ask" : "off"),
+                           I18n::tr("Ask before unknown applications connect"), false, true});
+        if (lanSwitch && lanSwitch->isChecked())
+            ops.push_back({QString("LAN\t%1").arg(file.localNetwork ? "allow" : "ask"),
+                           I18n::tr("Allow the local network without asking"), false, true});
+        if (ops.isEmpty()) return;
+        // Todo apagado mientras el motor responde: lo que se manda es lo que se veía al apretar.
+        for (const auto &t : *toggles)
+            if (t) t->setEnabled(false);
+        for (auto *sw : {askSwitch.data(), lanSwitch.data()})
+            if (sw) sw->setEnabled(false);
+        apply->setEnabled(false);
+        cancel->setEnabled(false);
+        status->show();
+        status->setText(I18n::tr("Importing… 0 of %1").arg(ops.size()));
+        struct Tally {
+            int done = 0, added = 0, replaced = 0, already = 0, kept = 0, settings = 0;
+            QStringList failed;
+        };
+        auto tally = std::make_shared<Tally>();
+        const int total = int(ops.size());
+        QPointer<QDialog> dialog(d);
+        QPointer<QLabel> progress(status);
+        for (const auto &op : ops)
+            firewall_.call(op.line, true, [this, op, tally, total, dialog, progress](bool ok, const QStringList &lines) {
+                ++tally->done;
+                const QString error = lines.isEmpty() ? QString() : lines.first().section('\t', 1);
+                if (ok) {
+                    if (op.setting) ++tally->settings;
+                    else if (op.replace) ++tally->replaced;
+                    else ++tally->added;
+                } else if (RulesTransfer::isExists(error)) {
+                    ++tally->already;
+                } else if (RulesTransfer::isConflict(error)) {
+                    ++tally->kept;
+                } else {
+                    tally->failed << QString("%1: %2").arg(op.what, error.isEmpty() ? I18n::tr("No reply") : error);
+                }
+                if (progress) progress->setText(I18n::tr("Importing… %1 of %2").arg(tally->done).arg(total));
+                if (tally->done < total) return;
+                if (dialog) dialog->close();
+                QStringList lines2;
+                lines2 << (tally->added == 1 ? I18n::tr("1 rule added.") : I18n::tr("%1 rules added.").arg(tally->added));
+                if (tally->replaced)
+                    lines2 << (tally->replaced == 1 ? I18n::tr("1 of your rules replaced.")
+                                                    : I18n::tr("%1 of your rules replaced.").arg(tally->replaced));
+                if (tally->already)
+                    lines2 << (tally->already == 1 ? I18n::tr("1 was already in your rules.")
+                                                   : I18n::tr("%1 were already in your rules.").arg(tally->already));
+                if (tally->kept)
+                    lines2 << (tally->kept == 1 ? I18n::tr("1 conflicts with one of yours: yours stays.")
+                                                : I18n::tr("%1 conflict with yours: yours stay.").arg(tally->kept));
+                if (tally->settings)
+                    lines2 << (tally->settings == 1 ? I18n::tr("1 Protection switch applied.")
+                                                    : I18n::tr("%1 Protection switches applied.").arg(tally->settings));
+                if (!tally->failed.isEmpty())
+                    lines2 << (tally->failed.size() == 1 ? I18n::tr("1 could not be imported:")
+                                                         : I18n::tr("%1 could not be imported:").arg(tally->failed.size()));
+                rulesSummary(I18n::tr("Import finished"), lines2, tally->failed);
+            });
+    });
+    d->open();
+}
+
+void FirewallWindow::cleanupRules() {
+    if (const QString why = rulesUnavailable(true); !why.isEmpty()) {
+        message(why);
+        return;
+    }
+    if (rulesWorking_) return;
+    rulesWorking_ = true;
+    QPointer<FirewallWindow> self(this);
+    firewall_.usage([self](bool ok, qint64 since, const QHash<QString, qint64> &lastUse) {
+        if (!self) return;
+        if (!ok) {
+            self->rulesWorking_ = false;
+            self->message(I18n::tr("The engine did not say when each rule was last used. Nothing was changed."));
+            return;
+        }
+        const auto rules = self->firewall_.rules();
+        QStringList files, folders;
+        RulesTransfer::cleanupPaths(rules, files, folders);
+        checkInBackground(self, files, folders, [self, rules, lastUse, since](const QHash<QString, bool> &exists) {
+            self->rulesWorking_ = false;
+            self->cleanupRulesDialog(rules, lastUse, since, exists);
+        });
+    });
+}
+
+void FirewallWindow::cleanupRulesDialog(const QVector<FirewallClient::RuleItem> &rules,
+                                        const QHash<QString, qint64> &lastUse, qint64 since,
+                                        const QHash<QString, bool> &exists) {
+    const qint64 now = QDateTime::currentSecsSinceEpoch();
+    const auto candidates = RulesTransfer::cleanup(rules, lastUse, since, now, exists);
+    QVBoxLayout *l = nullptr;
+    auto *d = rulesDialog(this, "cleanup-rules-dialog", I18n::tr("Clean up rules"), &l);
+    l->addWidget(wideText(I18n::tr("Rules for programs or folders that are gone, and rules not used in a long time. "
+                                   "Nothing is removed until you press Remove, and a full backup is saved first.")));
+    if (since > 0) {
+        QString tracked = I18n::tr("Use is tracked since %1.").arg(dayText(since));
+        if (now - since < RulesTransfer::UnusedDays * 86400)
+            tracked += " " + I18n::tr("Rules without use are suggested once enough days have passed since then.");
+        auto *t = wideText(tracked, "faint");
+        t->setObjectName("cleanup-since");
+        l->addWidget(t);
+    } else {
+        l->addWidget(wideText(I18n::tr("The engine does not track use yet: only rules for missing files and folders are "
+                                       "suggested."),
+                              "faint"));
+    }
+    l->addSpacing(4);
+
+    auto toggles = std::make_shared<QVector<QPair<QPointer<ToggleSwitch>, QString>>>(); // casilla, id de la regla
+    auto *content = new QWidget;
+    auto *cl = new QVBoxLayout(content);
+    cl->setContentsMargins(0, 0, 0, 6);
+    cl->setSpacing(0);
+    struct GroupText {
+        QString title, caption;
+        bool on;
+    };
+    const GroupText groups[] = {
+        {I18n::tr("Program no longer exists"), I18n::tr("The file of the rule is not on this PC anymore."), true},
+        {I18n::tr("Folder no longer exists"), I18n::tr("The folder of the rule is not on this PC anymore."), true},
+        {I18n::tr("Installers not used in 14 days"),
+         I18n::tr("Setup and update programs, or programs in Temp or Downloads."), false},
+        {I18n::tr("Not used in 90 days"), I18n::tr("No connection attempt in that time. It may still be needed."),
+         false},
+    };
+    for (int g = 0; g < 4; ++g) {
+        QVector<const RulesTransfer::Candidate *> mine;
+        for (const auto &c : candidates)
+            if (int(c.group) == g) mine << &c;
+        if (mine.isEmpty()) continue;
+        if (cl->count()) cl->addWidget(divider());
+        cl->addWidget(ruleGroupHeader(groups[g].title, int(mine.size()), groups[g].caption));
+        for (const auto *c : mine) {
+            auto *sw = new ToggleSwitch;
+            sw->setObjectName(QString("cleanup-row-%1").arg(toggles->size()));
+            sw->setChecked(groups[g].on);
+            toggles->push_back({sw, c->rule.id});
+            const QString used = c->lastUse > 0 ? I18n::tr("Last used: %1").arg(dayText(c->lastUse))
+                                 : since > 0     ? I18n::tr("Never seen since %1").arg(dayText(since))
+                                                 : QString();
+            QString subtitle = FirewallClient::describe(c->rule);
+            if (c->rule.scope == QLatin1String("path")) subtitle = QDir::toNativeSeparators(c->rule.path);
+            cl->addWidget(ruleListRow(sw, iconPathFor(c->rule.scope, c->rule.path, c->rule.name),
+                                      RulesTransfer::title(c->rule), subtitle,
+                                      c->rule.allow ? I18n::tr("Allow") : I18n::tr("Block"),
+                                      c->rule.allow ? "allow" : "block", used));
+        }
+    }
+    if (!cl->count())
+        cl->addWidget(ruleGroupHeader(I18n::tr("Nothing to clean up"), 0,
+                                      I18n::tr("Every rule is for a program or folder on this PC, and none is unused.")));
+    l->addWidget(ruleList(content, qBound(300, height() - 340, 900)));
+    auto *status = wideText({}, "sub");
+    status->setObjectName("cleanup-status");
+    status->hide();
+    l->addWidget(status);
+    l->addSpacing(10);
+    auto *buttons = row(8);
+    buttons->addStretch();
+    auto *cancel = button(I18n::tr("Cancel"));
+    cancel->setObjectName("cleanup-cancel");
+    auto *remove = button({}, "block");
+    remove->setObjectName("cleanup-remove");
+    for (auto *b : {cancel, remove}) {
+        b->setMinimumWidth(84);
+        buttons->addWidget(b);
+    }
+    l->addLayout(buttons);
+    const auto refresh = [this, toggles, remove] {
+        int n = 0;
+        for (const auto &t : *toggles) n += t.first && t.first->isChecked();
+        remove->setText(n == 1 ? I18n::tr("Remove 1 rule") : I18n::tr("Remove %1 rules").arg(n));
+        remove->setEnabled(n > 0 && rulesUnavailable(true).isEmpty());
+    };
+    for (const auto &t : *toggles) connect(t.first.data(), &ToggleSwitch::toggled, d, refresh);
+    refresh();
+    connect(cancel, &QPushButton::clicked, d, &QDialog::close);
+    connect(remove, &QPushButton::clicked, d, [this, d, toggles, status, remove, cancel] {
+        if (const QString why = rulesUnavailable(true); !why.isEmpty()) {
+            message(why);
+            return;
+        }
+        QVector<QPair<QString, QString>> chosen; // id, qué es
+        for (const auto &t : *toggles)
+            if (t.first && t.first->isChecked()) {
+                const auto *r = firewall_.ruleById(t.second);
+                if (r) chosen.push_back({r->id, FirewallClient::describe(*r)});
+            }
+        if (chosen.isEmpty()) return;
+        // Antes de borrar, el respaldo entero: si no se puede guardar, no se borra nada.
+        const QString folder = RulesTransfer::backupFolder();
+        const QString backup = QDir(folder).filePath(
+            QString("GateBouncer rules %1.gbrules").arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HHmmss")));
+        QString error;
+        if (!QDir().mkpath(folder) ||
+            !writeRulesFile(backup, RulesTransfer::build(firewall_.rules(), firewall_.status(), true), error)) {
+            message(I18n::tr("The backup could not be saved, so nothing was removed. %1").arg(error));
+            return;
+        }
+        for (const auto &t : *toggles)
+            if (t.first) t.first->setEnabled(false);
+        remove->setEnabled(false);
+        cancel->setEnabled(false);
+        status->show();
+        status->setText(I18n::tr("Removing… 0 of %1").arg(chosen.size()));
+        struct Tally {
+            int done = 0, removed = 0;
+            QStringList failed;
+        };
+        auto tally = std::make_shared<Tally>();
+        const int total = int(chosen.size());
+        QPointer<QDialog> dialog(d);
+        QPointer<QLabel> progress(status);
+        const QString shownBackup = QDir::toNativeSeparators(backup);
+        for (const auto &c : chosen)
+            firewall_.call("REMOVE\t" + c.first, true,
+                           [this, c, tally, total, dialog, progress, folder, shownBackup](bool ok, const QStringList &lines) {
+                ++tally->done;
+                if (ok) ++tally->removed;
+                else {
+                    const QString error = lines.isEmpty() ? QString() : lines.first().section('\t', 1);
+                    tally->failed << QString("%1: %2").arg(c.second, error.isEmpty() ? I18n::tr("No reply") : error);
+                }
+                if (progress) progress->setText(I18n::tr("Removing… %1 of %2").arg(tally->done).arg(total));
+                if (tally->done < total) return;
+                if (dialog) dialog->close();
+                QStringList lines2;
+                lines2 << (tally->removed == 1 ? I18n::tr("1 rule removed.")
+                                               : I18n::tr("%1 rules removed.").arg(tally->removed));
+                lines2 << I18n::tr("A full backup was saved first: %1").arg(breakablePath(shownBackup));
+                if (!tally->failed.isEmpty())
+                    lines2 << (tally->failed.size() == 1 ? I18n::tr("1 could not be removed:")
+                                                         : I18n::tr("%1 could not be removed:").arg(tally->failed.size()));
+                rulesSummary(I18n::tr("Clean up finished"), lines2, tally->failed, I18n::tr("Open backup folder"),
+                             [folder] { QDesktopServices::openUrl(QUrl::fromLocalFile(folder)); });
+            });
+    });
     d->open();
 }
 
@@ -3269,7 +4043,8 @@ QWidget *FirewallWindow::settingsPage() {
     auto *page = new QWidget;
     auto *l = column(page, 28, 12);
     l->setContentsMargins(28, 24, 28, 28);
-    l->addWidget(header(I18n::tr("Settings"), I18n::tr("Firewall mode, updates, language, zoom, AI explanations and import.")));
+    l->addWidget(header(I18n::tr("Settings"),
+                        I18n::tr("Firewall mode, updates, language, zoom, AI explanations, your rules and import.")));
     l->addSpacing(2);
     l->addWidget(how({I18n::tr("<b>Ask before unknown applications connect</b> is the switch of Protection: off, "
                                "everything without a rule connects."),
@@ -3277,6 +4052,8 @@ QWidget *FirewallWindow::settingsPage() {
                                "and the zoom of this window."),
                       I18n::tr("<b>AI explanations</b> need your own key and your consent; they only explain, they "
                                "never allow or block."),
+                      I18n::tr("<b>Rules</b> saves your rules to a file and brings them back, also on another PC, and "
+                               "suggests rules to remove: programs that are gone and rules nobody uses."),
                       I18n::tr("<b>Import from NetLimiter</b> turns its rules for single applications into GateBouncer "
                                "rules.")},
                      I18n::tr("Closing the window keeps the firewall running: the engine is a Windows service. Quit in "
@@ -3504,6 +4281,45 @@ QWidget *FirewallWindow::settingsPage() {
                 Qt::QueuedConnection);
         }).detach();
     });
+
+    // Reglas: exportar, importar y depurar. Exportar sólo lee (también sin control); los otros dos cambian reglas.
+    auto *rc = card();
+    auto *rl = cardColumn(rc, 0);
+    rl->addWidget(text(I18n::tr("Rules"), "cardtitle"));
+    rl->addSpacing(4);
+    const QString readBlocked = rulesUnavailable(false), changeBlocked = rulesUnavailable(true);
+    auto *exportButton = button(I18n::tr("Export…"));
+    exportButton->setObjectName("rules-export");
+    exportButton->setEnabled(readBlocked.isEmpty());
+    connect(exportButton, &QPushButton::clicked, this, &FirewallWindow::exportRulesDialog);
+    setRow(rl, I18n::tr("Export rules"),
+           I18n::tr("A full backup to bring everything back after reinstalling Windows, or only the rules by signature "
+                    "to share with someone."),
+           exportButton, true);
+    auto *importButton = button(I18n::tr("Choose file…"));
+    importButton->setObjectName("rules-import");
+    importButton->setEnabled(changeBlocked.isEmpty());
+    connect(importButton, &QPushButton::clicked, this, &FirewallWindow::importRules);
+    setRow(rl, I18n::tr("Import rules"),
+           I18n::tr("Adds the rules you do not have yet. You see the list first; where a rule conflicts with yours, "
+                    "yours stays unless you choose otherwise."),
+           importButton);
+    auto *cleanButton = button(I18n::tr("Review…"));
+    cleanButton->setObjectName("rules-cleanup");
+    cleanButton->setEnabled(changeBlocked.isEmpty());
+    connect(cleanButton, &QPushButton::clicked, this, &FirewallWindow::cleanupRules);
+    setRow(rl, I18n::tr("Clean up rules"),
+           I18n::tr("Suggests rules for programs and folders that are gone, installers, and rules not used in 90 days. "
+                    "Nothing is removed on its own."),
+           cleanButton);
+    // Un comando en curso apaga los botones un instante: eso no merece un aviso.
+    if (!changeBlocked.isEmpty() && firewall_.busy() == false) {
+        rl->addSpacing(2);
+        auto *why = text(changeBlocked, "warn", true);
+        why->setObjectName("rules-unavailable");
+        rl->addWidget(why);
+    }
+    l->addWidget(rc);
 
     auto *imp = card();
     auto *ih = new QHBoxLayout(imp);

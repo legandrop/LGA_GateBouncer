@@ -8,6 +8,8 @@ class QLocalSocket;
 #include <QTimer>
 #include <QVector>
 #include <deque>
+#include <vector>
+#include <functional>
 
 namespace Gate {
 
@@ -88,6 +90,17 @@ class FirewallClient final : public QObject {
     void setRefresh(int rulesMs, int activityMs);
     // Sube cada vez que llegan reglas distintas: para no recalcular lo que sale de ellas.
     quint64 rulesVersion() const { return rulesVersion_; }
+    // La versión del protocolo que dice HELLO al conectar (0 mientras no se sabe o sin motor). Exportar, importar y
+    // depurar reglas piden la 6 (USAGE e IMPORT).
+    int engineVersion() const { return engineVersion_; }
+
+    // Un pedido suelto con su respuesta entera (la primera línea es OK o ERR\t<motivo>), sin mensaje en la ventana ni
+    // commandFinished: para los diálogos que mandan muchos (importar, depurar) y resumen al final. changes: el pedido
+    // cambia reglas o estado, y al terminar se pide todo de nuevo. Sin motor, done llega con ok = false.
+    using Reply = std::function<void(bool ok, const QStringList &lines)>;
+    void call(const QString &line, bool changes, Reply done);
+    // Último uso de cada regla (USAGE, protocolo 6): since = desde cuándo anota el motor; uso 0 = nunca visto.
+    void usage(std::function<void(bool ok, qint64 since, const QHash<QString, qint64> &lastUse)> done);
 
     static QString fileName(const QString &path);
     static QString protocolName(int protocol);
@@ -115,10 +128,14 @@ class FirewallClient final : public QObject {
   private:
     struct Request {
         QString line;
-        enum Kind { Status, Pending, Rules, Activity, Command } kind;
+        // Las cuatro lecturas primero: lastRaw_ guarda la última respuesta de cada una para no rearmar sin cambios.
+        enum Kind { Status, Pending, Rules, Activity, Command, Hello, Call } kind;
         QString okMessage;
+        Reply done;          // Call: la respuesta entera
+        bool changes = false; // Call: cambia reglas o estado
     };
     void enqueue(const QString &line, Request::Kind kind, const QString &okMessage = {});
+    void enqueue(Request request);
     void poll();
     void sendNext();
     void onReadyRead();
@@ -136,6 +153,8 @@ class FirewallClient final : public QObject {
     qint64 rulesAt_ = 0, activityAt_ = 0; // cuándo se pidieron por última vez
     bool forceFull_ = true;
     quint64 rulesVersion_ = 0;
+    int engineVersion_ = 0;
+    bool helloAsked_ = false; // HELLO va una vez por conexión
     QHash<QString, int> pathIndex_; // ruta en minúsculas -> primera regla de la app entera con esa ruta (ruleFor)
     Status status_;
     QVector<PendingItem> pending_;

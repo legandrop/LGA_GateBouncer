@@ -84,6 +84,21 @@ class FirewallWindow final : public QMainWindow {
     // «Trust a folder»: una regla por carpeta, con la carpeta y el nombre del exe (vacío: todos) ya propuestos. Valida
     // mientras se escribe con la misma regla del motor, que igual la vuelve a validar al crearla.
     void trustFolderDialog(const QString &folder, const QString &name);
+    // Reglas (Settings → Rules): exportar a un .gbrules, importar uno con lista previa y depurar las que sobran. Piden
+    // el protocolo 6 del motor; rulesUnavailable dice por qué no se puede (vacío si se puede). Importar y depurar
+    // cambian reglas: además piden control (canDecide).
+    QString rulesUnavailable(bool changes) const;
+    void exportRulesDialog();
+    void importRules();
+    void importRulesDialog(const QString &fileName, const QHash<QString, bool> &exists);
+    void cleanupRules();
+    void cleanupRulesDialog(const QVector<FirewallClient::RuleItem> &rules, const QHash<QString, qint64> &lastUse,
+                            qint64 since, const QHash<QString, bool> &exists);
+    // Resumen al terminar: líneas sueltas, la lista de lo que falló y, si hace falta, un botón más (abrir la carpeta).
+    void rulesSummary(const QString &title, const QStringList &lines, const QStringList &failed,
+                      const QString &extraLabel = {}, const std::function<void()> &extra = {});
+    // La ruta de un ícono para una regla sin ruta (por firma): la de una app que esa regla ya cubre, si la hay.
+    QString iconPathFor(const QString &scope, const QString &path, const QString &name) const;
 
     QWidget *overviewPage();
     QWidget *requestsPage();
@@ -141,6 +156,7 @@ class FirewallWindow final : public QMainWindow {
     QVector<NetLimiterRule> netLimiterRules_;
     QString netLimiterFile_;
     bool closing_ = false;
+    bool rulesWorking_ = false; // un diálogo de reglas mira el disco o espera al motor: no se abre otro
     bool staleWhileHidden_ = false; // el motor cambió algo mientras la ventana no se veía
     // appEntries() sale de las reglas: se recalcula sólo cuando llegan reglas distintas.
     mutable QVector<AppEntry> entriesCache_;

@@ -231,13 +231,50 @@ void FirewallClient::setAsk(bool ask) {
 }
 
 void FirewallClient::enqueue(const QString &line, Request::Kind kind, const QString &okMessage) {
-    if (kind == Request::Command) ++commandsInFlight_;
-    queue_.push_back({line, kind, okMessage});
+    Request request;
+    request.line = line;
+    request.kind = kind;
+    request.okMessage = okMessage;
+    enqueue(std::move(request));
+}
+
+void FirewallClient::enqueue(Request request) {
+    if (request.kind == Request::Command) ++commandsInFlight_;
+    queue_.push_back(std::move(request));
     sendNext();
+}
+
+void FirewallClient::call(const QString &line, bool changes, Reply done) {
+    Request request;
+    request.line = line;
+    request.kind = Request::Call;
+    request.done = std::move(done);
+    request.changes = changes;
+    enqueue(std::move(request));
+}
+
+void FirewallClient::usage(std::function<void(bool, qint64, const QHash<QString, qint64> &)> done) {
+    call("USAGE", false, [done](bool ok, const QStringList &lines) {
+        qint64 since = 0;
+        QHash<QString, qint64> last;
+        if (ok)
+            for (const auto &row : lines.mid(1)) {
+                const QString name = row.section('\t', 0, 0), value = row.section('\t', 1);
+                if (name.isEmpty()) continue;
+                if (name == QLatin1String("since")) since = value.toLongLong();
+                else last.insert(name.toLower(), value.toLongLong()); // el id, como lo compara ruleById
+            }
+        done(ok, since, last);
+    });
 }
 
 void FirewallClient::poll() {
     if (!active_) return;
+    // La versión del protocolo, una vez por conexión: decide qué puede pedir la ventana.
+    if (!helloAsked_) {
+        helloAsked_ = true;
+        enqueue("HELLO", Request::Hello);
+    }
     // Un ciclo de lectura a la vez: si el anterior sigue en cola no se apila otro.
     for (const auto &r : queue_)
         if (r.kind == Request::Status) return;
@@ -286,7 +323,9 @@ void FirewallClient::onReadyRead() {
     buffer_.clear();
     QStringList lines = QString::fromUtf8(raw).split('\n');
     while (!lines.isEmpty() && (lines.last().isEmpty() || lines.last() == "END")) lines.removeLast();
-    const int slot = int(request.kind);
+    // Sólo las cuatro lecturas se comparan con la respuesta anterior; HELLO, los comandos y los pedidos sueltos, siempre.
+    const bool cached = request.kind <= Request::Activity;
+    const int slot = cached ? int(request.kind) : 0;
     QByteArray compared = raw;
     if (request.kind == Request::Status) {
         // Los contadores de DNS de STATUS («names») cambian con cualquier consulta de la PC y la ventana no los usa:
@@ -296,8 +335,8 @@ void FirewallClient::onReadyRead() {
             if (!line.startsWith("names\t")) kept << line;
         compared = kept.join('\n');
     }
-    if (request.kind == Request::Command || compared != lastRaw_[slot]) {
-        if (request.kind != Request::Command) lastRaw_[slot] = compared;
+    if (!cached || compared != lastRaw_[slot]) {
+        if (cached) lastRaw_[slot] = compared;
         apply(request, lines);
     }
     sendNext();
@@ -316,14 +355,21 @@ void FirewallClient::onDisconnected() {
     pathIndex_.clear();
     ++rulesVersion_;
     activity_.clear();
+    engineVersion_ = 0;
+    helloAsked_ = false;
+    // Los pedidos sueltos se responden después de vaciar la cola: un diálogo que manda el siguiente al recibir la
+    // respuesta no lo apila sobre los que se están descartando.
+    std::vector<Reply> unanswered;
     while (!queue_.empty()) {
         if (queue_.front().kind == Request::Command) {
             --commandsInFlight_;
             emit commandFinished(false, I18n::tr("GateBouncer engine is not running. Nothing was changed."));
         }
+        if (queue_.front().kind == Request::Call && queue_.front().done) unanswered.push_back(queue_.front().done);
         queue_.pop_front();
     }
     if (wasConnected) emit changed();
+    for (const auto &done : unanswered) done(false, {});
 }
 
 void FirewallClient::apply(const Request &request, const QStringList &lines) {
@@ -335,6 +381,20 @@ void FirewallClient::apply(const Request &request, const QStringList &lines) {
         // Una decisión cambia reglas y pedidos: se pide todo, también con la ventana escondida.
         forceFull_ = true;
         poll();
+        return;
+    }
+    if (request.kind == Request::Call) {
+        if (request.changes) {
+            forceFull_ = true;
+            poll();
+        }
+        if (request.done) request.done(ok, lines);
+        return;
+    }
+    if (request.kind == Request::Hello) {
+        // «OK\tGateBouncerEngine\t<versión>\t<control|view>».
+        engineVersion_ = ok ? lines.first().section('\t', 2, 2).toInt() : 0;
+        emit changed();
         return;
     }
     if (!ok) return;
