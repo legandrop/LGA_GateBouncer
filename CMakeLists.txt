@@ -189,6 +189,7 @@ set_target_properties(GateBouncerGuiStage PROPERTIES PREFIX "" AUTOMOC ON)
 get_target_property(gatebouncer_app_sources GateBouncerGuiStage SOURCES)
 list(FILTER gatebouncer_app_sources EXCLUDE REGEX "deployment_ordinary_stage.cpp|src/main.cpp")
 qt_add_executable(GateBouncer WIN32 ${gatebouncer_app_sources} src/app_main.cpp src/firewallwindow.cpp src/firewallwindow.h
+    src/rulestransfer.cpp src/rulestransfer.h
     src/platform/WindowFrame.h src/platform/WindowFrameWin.cpp src/uiscale.cpp src/uiscale.h
     # Editor de paletas, sólo con GATEBOUNCER_PALETTE_EDITOR=1 (desarrollo).
     src/dev/paletteeditor.cpp src/dev/paletteeditor.h src/dev/LgaColorPickerDialog.cpp src/dev/LgaColorPickerDialog.h)
