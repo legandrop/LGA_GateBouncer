@@ -2601,7 +2601,8 @@ void FirewallWindow::cleanupRulesDialog(const QVector<FirewallClient::RuleItem> 
         const QString backup = QDir(folder).filePath(
             QString("GateBouncer rules %1.gbrules").arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HHmmss")));
         QString error;
-        if (!QDir().mkpath(folder) ||
+        if (!QDir().mkpath(folder)) error = I18n::tr("The folder %1 could not be created.").arg(folder);
+        if (!error.isEmpty() ||
             !writeRulesFile(backup, RulesTransfer::build(firewall_.rules(), firewall_.status(), true), error)) {
             message(I18n::tr("The backup could not be saved, so nothing was removed. %1").arg(error));
             return;

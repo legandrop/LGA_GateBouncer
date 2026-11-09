@@ -15,6 +15,12 @@ en_from: "1.01"
 ## v1.02
 - [fixed] Un programa dentro de una carpeta de confianza ya no pide permiso para cada servidor nuevo cuando, además, tiene reglas para algunos servidores: los que no tienen regla los decide la carpeta.
   en: A program inside a trusted folder no longer asks for each new server when it also has rules for some servers: the folder decides the ones without a rule.
+- [new] Settings suma Rules: Export rules guarda tus reglas en un archivo, completo para respaldar antes de formatear o sólo las portables para compartir con otra persona, e Import rules las suma mostrando antes qué entra y qué choca con las tuyas.
+  en: Settings adds Rules: Export rules saves your rules to a file, complete as a backup before reinstalling Windows or only the portable ones to share with someone else, and Import rules adds them showing first what comes in and what clashes with yours.
+- [new] Clean up rules propone quitar las reglas de programas y carpetas que ya no están, y las de instaladores y apps que no se intentan conectar hace tiempo, con un respaldo automático antes de quitar.
+  en: Clean up rules suggests removing rules for programs and folders that are gone, and for installers and apps that have not tried to connect in a long time, with an automatic backup before removing.
+- [improved] Una regla de un programa que todavía no está instalado se aplica sola cuando el programa aparece.
+  en: A rule for a program that is not installed yet applies by itself when the program appears.
 
 ## v1.01
 - [improved] Apps abre al instante, también la primera vez, y cambiar entre permitidas, bloqueadas y todas ya no se demora.

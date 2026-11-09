@@ -7,6 +7,12 @@ v1.02:
   carpeta que tenga al exe, con un permiso para esa dirección cuyo dueño es la regla de carpeta. Las reglas que nombran
   el servidor siguen ganando, también si el nombre llega después o la regla se crea después. Esos permisos se
   verifican, guardan, rehacen al cambiar la acción y se retiran con la carpeta, o cuando pasa a decidir otra regla.
+- No había forma de respaldar las reglas, pasarlas a otra PC ni limpiar las de programas desinstalados o instaladores
+  viejos: el motor no sabía cuándo se usó cada regla. Ahora anota el último intento de conexión por programa (consultas
+  DNS, conexiones abiertas cada minuto, bloqueos) en `usage.tsv` y lo da con `USAGE`; `IMPORT` restaura reglas sin
+  verificar archivos (protocolo v6). Settings suma la tarjeta Rules: Export (Full backup o Share, sólo firmas), Import
+  (lista previa; si choca queda la tuya) y Clean up (lo que ya no existe marcado; instaladores a 14 días y sin uso a
+  90, desmarcados; respaldo automático antes de quitar). Una regla de ruta sin su exe toma el filtro cuando vuelve.
 
 v1.01:
 - Apps tardaba 1,5 s la primera vez y ~200 ms por filtro: armaba un widget por fila y le pedía a Windows el ícono de

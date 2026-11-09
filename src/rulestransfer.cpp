@@ -12,10 +12,37 @@
 #include <QJsonObject>
 #include <QLocale>
 #include <QRegularExpression>
+#include <QHostAddress>
 #include <QSet>
+#include <windows.h>
 
 namespace Gate::RulesTransfer {
 namespace {
+
+// 1: está, y es del tipo pedido; 0: no está (Windows lo dice: archivo o ruta no encontrados); -1: no se sabe (sin
+// permiso de lectura, una carpeta de otro usuario): nunca se sugiere quitar por eso.
+int presence(const QString &path, bool folder) {
+    const std::wstring p = QDir::toNativeSeparators(path.trimmed()).toStdWString();
+    const DWORD a = GetFileAttributesW(p.c_str());
+    if (a != INVALID_FILE_ATTRIBUTES) return ((a & FILE_ATTRIBUTE_DIRECTORY) != 0) == folder ? 1 : 0;
+    const DWORD e = GetLastError();
+    return e == ERROR_FILE_NOT_FOUND || e == ERROR_PATH_NOT_FOUND ? 0 : -1;
+}
+
+// Un destino de la red propia (una IP privada, de enlace local o de Tailscale, o un nombre sin dominio público): en
+// Share no sale, porque dice algo de la red de quien exporta y al otro no le sirve.
+bool localDestination(const QString &destination) {
+    const QString d = destination.trimmed().toLower();
+    QHostAddress a;
+    if (a.setAddress(d))
+        return a.isLoopback() || a.isLinkLocal() || a.isPrivateUse() || a.isUniqueLocalUnicast() ||
+               a.isInSubnet(QHostAddress("100.64.0.0"), 10);
+    const QString host = d.startsWith(QLatin1String("*.")) ? d.mid(2) : d;
+    if (!host.contains('.')) return true;
+    for (const char *suffix : {".local", ".lan", ".home", ".internal", ".localdomain", ".home.arpa", ".ts.net"})
+        if (host.endsWith(QLatin1String(suffix))) return true;
+    return false;
+}
 
 constexpr char Format[] = "LGA GateBouncer rules";
 constexpr int Version = 1;
@@ -101,6 +128,7 @@ QVector<FirewallClient::RuleItem> exportable(const QVector<FirewallClient::RuleI
         if (r.expires != 0) continue;
         const bool signature = r.scope == QLatin1String("app") || r.scope == QLatin1String("publisher");
         const bool local = r.scope == QLatin1String("path") || r.scope == QLatin1String("folder");
+        if (signature && !full && !r.destination.isEmpty() && localDestination(r.destination)) continue;
         if (signature || (full && local && !r.path.isEmpty())) out.push_back(r);
     }
     return out;
@@ -421,9 +449,11 @@ QHash<QString, bool> checkPaths(const QStringList &files, const QStringList &fol
     };
     // Una unidad desconectada o un servidor que no responde no dicen nada del archivo: esa ruta no figura.
     for (const auto &f : files)
-        if (reachable(f)) out.insert(lower(f), QFileInfo(f).isFile());
+        if (reachable(f))
+            if (const int p = presence(f, false); p >= 0) out.insert(lower(f), p == 1);
     for (const auto &d : folders)
-        if (reachable(d)) out.insert(lower(d), QFileInfo(d).isDir());
+        if (reachable(d))
+            if (const int p = presence(d, true); p >= 0) out.insert(lower(d), p == 1);
     return out;
 }
 

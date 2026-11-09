@@ -645,6 +645,7 @@ const QHash<QString, QString> &spanishTable() {
         E("Remove %1 rules", "Quitar %1 reglas"),
         E("The backup could not be saved, so nothing was removed. %1",
           "No se pudo guardar el respaldo, así que no se quitó nada. %1"),
+        E("The folder %1 could not be created.", "No se pudo crear la carpeta %1."),
         E("The engine did not say when each rule was last used. Nothing was changed.",
           "El motor no informó el último uso de cada regla. No se cambió nada."),
         E("Removing… 0 of %1", "Quitando… 0 de %1"),
